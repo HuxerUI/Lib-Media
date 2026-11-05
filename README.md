@@ -1,12 +1,11 @@
 # Lib-Media
 
 Lib-Media is the media library for [HuxerUI](https://github.com/HuxerUI/HuxerUI). It brings media playback, native
-image/video selection, and saving to the system photo library into one C++ library, with decoded-media playback and
-codecs planned in the same repository.
+image/video selection, saving to the system photo library, and headless AAC-LC/H.264 decoding into one C++ library.
+Decoded-input playback and encoding will build on the shared media values in this repository.
 
-Applications link **`HuxerUI::Media`**, use APIs in **`huxerui::media`**, and register **`Install`** once. Each capability
-has its own handle and lifecycle, so an application can use playback, selection, or saving independently. Platform
-adapters reuse native media services and the public HuxerUI SDK's file, task, window, and rendering facilities.
+Link **`HuxerUI::Media`** and use APIs in **`huxerui::media`**. Playback and photo-library access use the
+**`Install`** application hook. Decoders can run independently of that hook, a UI runtime, or a window.
 
 Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 
@@ -15,6 +14,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 - [Integration](#integration)
 - [Media playback](#media-playback)
 - [Media selection and saving](#media-selection-and-saving)
+- [Media decoding](#media-decoding)
 - [Preview, builds, and validation](#preview-builds-and-validation)
 - [Repository layout](#repository-layout)
 - [Roadmap](#roadmap)
@@ -26,8 +26,9 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`mediaplayer.h`](include/huxerui/mediaplayer.h) |
 | Native image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`medialibrary.h`](include/huxerui/medialibrary.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`medialibrary.h`](include/huxerui/medialibrary.h) |
+| AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`mediacodec.h`](include/huxerui/mediacodec.h) / [`mediaformat.h`](include/huxerui/mediaformat.h) |
 | Decoded-media playback | Planned — [#102](https://github.com/HuxerUI/HuxerUI/issues/102) | PCM output and timestamped video-frame playback; no public API yet |
-| Audio/video codecs | Planned — [#20](https://github.com/HuxerUI/HuxerUI/issues/20) | Codec discovery, encoding, and decoding; no public API yet |
+| Audio/video encoding | Planned after the decoder foundation | No public encoder API yet |
 
 Native selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
 SDK `FileReference` values, which can be retained for reading, imported to local files, or passed to `MediaSource` for
@@ -35,19 +36,20 @@ playback of supported audio/video content. Saving takes a readable local `File` 
 
 ## Platform support
 
-| Platform | Playback backend / video output | Native selection | Saving |
-| --- | --- | --- | --- |
-| Android | Media3 ExoPlayer / TextureView | System Photo Picker; legacy `ACTION_PICK` gallery fallback | MediaStore on Android 10+ |
-| iOS | AVFoundation / AVPlayerLayer | PHPicker on iOS 15+ | Photos add-only access on iOS 15+ |
-| macOS | AVFoundation / AVPlayerLayer | Unavailable | Unavailable |
-| Windows | Media Foundation MediaEngine / D3D11 frame server and HWND swap chain | Unavailable | Unavailable |
-| Linux | GtkMediaFile / GdkTexture through HuxerUI ExternalTexture | Unavailable | Unavailable |
-| Web | HTMLMediaElement / native video element | Unavailable | Unavailable |
+| Platform | Playback backend / video output | Native selection | Saving | Headless decoder |
+| --- | --- | --- | --- | --- |
+| Android | Media3 ExoPlayer / TextureView | System Photo Picker; legacy `ACTION_PICK` gallery fallback | MediaStore on Android 10+ | NDK MediaCodec |
+| iOS | AVFoundation / AVPlayerLayer | PHPicker on iOS 15+ | Photos add-only access on iOS 15+ | AudioConverter / VideoToolbox |
+| macOS | AVFoundation / AVPlayerLayer | Unavailable | Unavailable | AudioConverter / VideoToolbox |
+| Windows | Media Foundation MediaEngine / D3D11 frame server and HWND swap chain | Unavailable | Unavailable | Media Foundation transforms (experimental) |
+| Linux | GtkMediaFile / GdkTexture through HuxerUI ExternalTexture | Unavailable | Unavailable | GStreamer (opt-in, experimental) |
+| Web | HTMLMediaElement / native video element | Unavailable | Unavailable | WebCodecs |
 
-Android's library minimum is API 23; playback uses Media3 `1.9.3` resolved by Gradle. Linux requires GTK 4.14+ and a
-working GTK media backend. Windows requires Media Foundation components and D3D11-capable hardware. Container, codec,
-and streaming-protocol support follows the native backend. Applications own network permissions, transport-security
-policy, browser CORS/mixed-content rules, and any background playback or audio-session configuration.
+Android's library minimum is API 23; playback uses Media3 `1.9.3` resolved by Gradle. Linux builds require GTK 4.14+,
+and Linux playback needs a working GTK media backend. Windows playback needs Media Foundation components and
+D3D11-capable hardware. Playback container, codec, and streaming-protocol support follows the native backend.
+Applications own network permissions, transport-security policy, browser CORS/mixed-content rules, and any background
+playback or audio-session configuration.
 
 Selection and saving have independent availability. On unsupported platforms, their capability query returns
 `max_selection_count = 0` and `can_save = false`; operations return `Unsupported`. Playback remains available through
@@ -55,10 +57,10 @@ its own adapter. See [selection limits and compatibility](#selection-limits-and-
 
 ## Integration
 
-Use a C++20 HuxerUI application and an installed SDK with `ApplicationContext`, `AppOptions::application_hooks`, and
-window platform factories. Native photo-library access additionally requires the SDK's shared `Result` type,
-callback-to-Task bridge, native file-reference factories, and window presentation coordination listed in the
-[SDK integration guide](docs/medialibrary.md#sdk-integration). Lib-Media consumes public SDK interfaces.
+Lib-Media uses C++20 and the public HuxerUI SDK. Playback and photo-library access use `ApplicationContext`,
+`AppOptions::application_hooks`, and window platform factories. Native photo-library access also uses the SDK's
+shared `Result` type, callback-to-Task bridge, native file-reference factories, and window presentation coordination
+listed in the [SDK integration guide](docs/medialibrary.md#sdk-integration).
 
 Clone the library beside your application:
 
@@ -75,7 +77,8 @@ huxerui_use_library(your_app
 )
 ```
 
-Register the installation hook in the application's startup unit. `App` below is your root View function:
+For playback and photo-library access, register the installation hook in the application's startup unit.
+`App` below is your root View function:
 
 ```cpp
 #include <huxerui/huxerui.h>
@@ -90,9 +93,9 @@ const huxerui::Application application{
 };
 ```
 
-The same hook registers playback and photo-library integration. Installation does not create sessions, present UI, or
-request permission. Put the components below in codegen-enabled C++ sources with the corresponding headers included.
-The [preview application](examples/preview/src/app.cpp) provides a complete integration.
+The hook registers platform integration. Put the UI components below in codegen-enabled C++ sources with the
+corresponding headers included. The [preview application](examples/preview/src/app.cpp) provides a complete integration.
+For headless decoding, include `<huxerui/mediacodec.h>` and see [Media decoding](#media-decoding).
 
 ### Handles and execution
 
@@ -179,7 +182,8 @@ without the optional HLS/DASH modules. Browser playback may require a user gestu
 The library does not configure process-wide Apple audio sessions or add background services.
 
 Playlists, speed control, track/subtitle selection, DRM, casting, downloads, PiP, system media controls, and raw decoded
-frame/PCM input are not current playback features. Decoded-media playback and codecs are covered by the [roadmap](#roadmap).
+frame/PCM input are not current playback features. Use the separate [codec sessions](#media-decoding) for decoded CPU
+output; device playback of that output remains on the [roadmap](#roadmap).
 
 ## Media selection and saving
 
@@ -281,6 +285,28 @@ provider cleanup failures. Once an iOS Photos transaction is submitted, it may f
 source remains retained until completion. Partial selection results are released if materializing any item fails.
 See the [media library guide](docs/medialibrary.md) and [`medialibrary.h`](include/huxerui/medialibrary.h) for details.
 
+## Media decoding
+
+`AudioDecoder` and `VideoDecoder` are move-only sessions with bounded queues. Supply complete access units from a source
+or demuxer: raw AAC-LC with AudioSpecificConfig produces mono/stereo S16 or F32 PCM, and length-prefixed H.264 with
+`avcC` produces I420 or NV12 video. Returned frames own immutable CPU storage and remain readable after reset and close.
+
+- `Probe(config, completion)` checks a configuration by opening and releasing a temporary decoder.
+  `Create()` starts a session asynchronously.
+- `TrySubmit()` copies an accepted packet. On `WouldBlock`, keep the packet and retry when the session can accept input.
+- `TryRead()` returns a format, frame, or `EndOfStream` event on success. An empty optional means no output is ready yet.
+- `Finish()` drains accepted input and emits one `EndOfStream`. `Reset()` discards queued work and restarts decoding.
+- `Close()` and destruction retire the session immediately. The optional `cleanup_completed` callback reports teardown
+  after admitted wakeups return. On native platforms, it also follows worker exit.
+
+Each native session and probe has its own worker. Web sessions run on the event loop that created them. On Linux, enable
+`-DHUXERUI_MEDIA_GSTREAMER=ON` with GStreamer 1.24+ development packages and installed AAC/H.264 parser and decoder plugins.
+
+AAC/H.264 fixture decoding passed on an Android 12 device, an iOS simulator, Apple Silicon macOS, and Chrome through the
+C++/WASM API. Windows timestamp matching has a simulated regression test. Native decoder validation is pending on
+Windows, Linux, and physical iOS devices. See the [decoding guide](docs/mediacodec.md) for examples, queue limits,
+platform requirements, and validation instructions.
+
 ## Preview, builds, and validation
 
 The [preview](examples/preview) exercises the library through three tabs:
@@ -330,7 +356,9 @@ ctest --test-dir build/tests --output-on-failure
 
 Tests cover playback state transitions, coalesced seeking/progress, looping, stale callbacks, preferences, surface
 ownership, and media-library result validation, cancellation, late replies, and session retirement. When Node and the
-SDK Web registry are available, CTest also exercises the Web adapter with simulated media elements.
+SDK Web registry are available, CTest also exercises the Web adapter with simulated media elements. Codec tests use
+generated AAC/H.264 fixtures and cover queue backpressure, native worker isolation, cleanup ordering, and late WebCodecs
+callbacks. See the [codec validation instructions](docs/mediacodec.md#validation) for standalone and browser runs.
 
 Windows adds native muted audio smoke tests and video geometry tests. To check frame transfer and presentation against
 a real source, run `build/tests/tests/media_windows_video.exe /path/to/video.mp4` with a short clip under 20 seconds.
@@ -349,17 +377,21 @@ and the mixed chooser. Automated contract tests do not replace native device or 
 | [`src/`](src) | Shared session state, validation, and platform routing |
 | [`platform/`](platform) | Native adapters and platform package integration |
 | [`examples/preview/`](examples/preview) | Consumer application for playback and photo-library access |
-| [`tests/`](tests) | Shared contracts, Web adapter checks, and Windows native checks |
+| [`tests/`](tests) | Shared contracts, codec fixtures, and platform checks |
 | [`docs/medialibrary.md`](docs/medialibrary.md) | Photo-library integration and lifecycle details |
+| [`docs/mediacodec.md`](docs/mediacodec.md) | Decoder usage, ownership, platform limits, and validation |
+| [`docs/codec-design.md`](docs/codec-design.md) | Shared lifecycle design and remaining playback/encoding milestones |
 
 ## Roadmap
 
-Decoded-media playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) will cover PCM output and timestamped
-video-frame presentation, with bounded queues, a playback clock, and A/V synchronization. Audio/video codecs
-([#20](https://github.com/HuxerUI/HuxerUI/issues/20)) will cover platform codec discovery, encoding, decoding, and explicit
-input/output ownership. Both belong to Lib-Media; their APIs are not implemented yet.
+The [codec and decoded-playback design](docs/codec-design.md) records the shared formats, ownership rules, six-platform
+lifecycle contract, and delivery order. The AAC/AVC decoding milestone is now implemented, with remaining platform
+validation called out in the [decoding guide](docs/mediacodec.md).
 
-The planned APIs will share media format, timestamp, and buffer-ownership contracts. Codec operations and nonvisual PCM
-playback should be usable without a `View`, `Runtime`, or window, with `ExternalTexture` providing video presentation.
-Existing file/URL playback will continue to use native players. HuxerUI remains responsible for general file, task,
-window, and texture facilities; media-specific behavior belongs in this library.
+Decoded-media playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) will consume these same AudioFrame and
+VideoFrame values for PCM device output and timestamped video presentation, with bounded queues, a playback clock,
+and A/V synchronization. Encoding and broader codec discovery remain later stages of
+[#20](https://github.com/HuxerUI/HuxerUI/issues/20). No public playback-of-frames or encoder API is exported yet.
+
+Existing file/URL playback continues to use native players. HuxerUI owns general file, task, window, and texture
+facilities; media-specific behavior stays in Lib-Media.

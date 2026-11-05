@@ -33,3 +33,42 @@ if (WIN32)
     add_test(NAME media_windows_audio COMMAND media_windows_smoke)
     set_tests_properties(media_windows_audio PROPERTIES TIMEOUT 30)
 endif ()
+
+if (NOT EMSCRIPTEN AND (APPLE OR ANDROID OR WIN32 OR HUXERUI_MEDIA_GSTREAMER))
+    add_executable(media_codec_native_tests codec_native.cpp)
+    target_link_libraries(media_codec_native_tests PRIVATE huxerui_media HuxerUI::huxerui_static)
+    target_compile_features(media_codec_native_tests PRIVATE cxx_std_20)
+    target_compile_definitions(media_codec_native_tests PRIVATE MEDIA_CODEC_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/codec")
+    if (ANDROID)
+        target_link_options(media_codec_native_tests PRIVATE
+                "LINKER:--wrap=AMediaCodec_dequeueOutputBuffer" "LINKER:--wrap=AMediaCodec_getOutputBuffer")
+    elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND HUXERUI_MEDIA_GSTREAMER)
+        target_include_directories(media_codec_native_tests PRIVATE "${PROJECT_SOURCE_DIR}/src")
+        target_compile_definitions(media_codec_native_tests PRIVATE MEDIA_CODEC_TEST_GSTREAMER=1)
+    endif ()
+    add_test(NAME media_codec_native COMMAND media_codec_native_tests)
+    set_tests_properties(media_codec_native PROPERTIES TIMEOUT 90)
+endif ()
+
+add_executable(media_codec_contract_tests codec_contract.cpp)
+target_link_libraries(media_codec_contract_tests PRIVATE huxerui_media HuxerUI::huxerui_static)
+target_compile_features(media_codec_contract_tests PRIVATE cxx_std_20)
+target_include_directories(media_codec_contract_tests PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME media_codec_contract COMMAND media_codec_contract_tests)
+set_tests_properties(media_codec_contract PROPERTIES TIMEOUT 30)
+
+if (MEDIA_NODE_EXECUTABLE)
+    add_test(NAME media_codec_web_contract
+            COMMAND "${MEDIA_NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/codec_web_contract.cjs")
+endif ()
+
+if (EMSCRIPTEN)
+    add_executable(media_codec_web_native codec_web_native.cpp)
+    target_link_libraries(media_codec_web_native PRIVATE huxerui_media HuxerUI::huxerui_static)
+    target_compile_features(media_codec_web_native PRIVATE cxx_std_20)
+    target_link_options(media_codec_web_native PRIVATE
+            "SHELL:--preload-file \"${CMAKE_CURRENT_SOURCE_DIR}/fixtures/codec@/fixtures\""
+            "-sALLOW_MEMORY_GROWTH=1" "-sEXIT_RUNTIME=0" "-sEXPORTED_FUNCTIONS=['_main']")
+    set_target_properties(media_codec_web_native PROPERTIES SUFFIX ".js")
+    configure_file(codec_wasm.html "${CMAKE_CURRENT_BINARY_DIR}/codec_wasm.html" COPYONLY)
+endif ()

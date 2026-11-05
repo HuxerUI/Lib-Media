@@ -86,27 +86,41 @@ target_include_directories(huxerui_media PUBLIC
 )
 target_include_directories(huxerui_media PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+if (ANDROID)
+    target_link_libraries(huxerui_media PRIVATE mediandk)
+endif ()
+
 if (WIN32)
     target_compile_definitions(huxerui_media PRIVATE NOMINMAX UNICODE _UNICODE)
-    target_link_libraries(huxerui_media PRIVATE mfplat mfuuid mf d3d11 dxgi oleaut32)
+    target_link_libraries(huxerui_media PRIVATE mfplat mfuuid mf d3d11 dxgi oleaut32 ole32 wmcodecdspuuid)
 endif ()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(MEDIA_GTK REQUIRED IMPORTED_TARGET "gtk4>=4.14")
     target_link_libraries(huxerui_media PRIVATE PkgConfig::MEDIA_GTK)
+    option(HUXERUI_MEDIA_GSTREAMER "Enable Linux AAC/AVC codecs using installed GStreamer plugins" OFF)
+    if (HUXERUI_MEDIA_GSTREAMER)
+        pkg_check_modules(MEDIA_GSTREAMER REQUIRED IMPORTED_TARGET
+                "gstreamer-app-1.0>=1.24" "gstreamer-audio-1.0>=1.24" "gstreamer-video-1.0>=1.24")
+        target_link_libraries(huxerui_media PRIVATE PkgConfig::MEDIA_GSTREAMER)
+        target_compile_definitions(huxerui_media PRIVATE HUXERUI_MEDIA_GSTREAMER=1)
+    endif ()
 endif ()
 
 if (EMSCRIPTEN)
     set_property(TARGET huxerui_media APPEND PROPERTY INTERFACE_LINK_DEPENDS
-            "${CMAKE_CURRENT_SOURCE_DIR}/platform/web/media.js")
+            "${CMAKE_CURRENT_SOURCE_DIR}/platform/web/media.js"
+            "${CMAKE_CURRENT_SOURCE_DIR}/platform/web/codec.js")
     target_link_options(huxerui_media INTERFACE
             "SHELL:--pre-js \"${CMAKE_CURRENT_SOURCE_DIR}/platform/web/media.js\""
+            "SHELL:--pre-js \"${CMAKE_CURRENT_SOURCE_DIR}/platform/web/codec.js\""
+            "--bind"
     )
 endif ()
 
 if (APPLE)
-    target_link_libraries(huxerui_media PRIVATE "-framework AVFoundation" "-framework QuartzCore" "-framework CoreMedia")
+    target_link_libraries(huxerui_media PRIVATE "-framework AVFoundation" "-framework QuartzCore" "-framework CoreMedia" "-framework AudioToolbox" "-framework VideoToolbox" "-framework CoreVideo")
     if (IOS)
         target_link_libraries(huxerui_media PRIVATE "-framework Photos" "-framework PhotosUI" "-framework UniformTypeIdentifiers")
     endif ()

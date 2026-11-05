@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lib-Media WebCodecs fixture test</title>
+<pre id="result">Running…</pre>
+<script src="../platform/web/codec.js"></script>
+<script>
+(async () => {
+  const result = document.getElementById('result');
+  const delay = () => new Promise(resolve => setTimeout(resolve, 5));
+  const bytes = async file => new Uint8Array(await (await fetch('fixtures/codec/' + file)).arrayBuffer());
+  const check = (value, message) => { if (!value) throw new Error(message); };
+  try {
+    for (const name of ['aac', 'avc']) {
+      const audio = name === 'aac';
+      const description = await bytes(name + '.config');
+      const manifest = (await (await fetch('fixtures/codec/' + name + '.txt')).text()).trim().split('\n').map(line => line.split(' '));
+      const id = HuxerMediaCodec.open(audio ? {audio, rate: 48000, channels: 2, planar: false, sampleFormat: 'f32', description}
+        : {audio, width: 64, height: 48, description});
+      const deadline = performance.now() + 15000;
+      while (!HuxerMediaCodec.ready(id) && !HuxerMediaCodec.error(id) && performance.now() < deadline) await delay();
+      check(!HuxerMediaCodec.error(id), HuxerMediaCodec.error(id));
+      check(HuxerMediaCodec.ready(id), 'Initialization timeout');
+      for (const [file, pts, dts, duration, scale, key] of manifest) {
+        HuxerMediaCodec.submit(id, await bytes(file), Math.round(Number(pts) * 1e6 / Number(scale)), Math.round(Number(duration) * 1e6 / Number(scale)), key === '1');
+      }
+      HuxerMediaCodec.finish(id);
+      let count = 0, samples = 0;
+      while (performance.now() < deadline) {
+        check(!HuxerMediaCodec.error(id), HuxerMediaCodec.error(id));
+        let frame;
+        while ((frame = HuxerMediaCodec.poll(id))) {
+          ++count;
+          check(frame.planes.length > 0 && frame.planes[0].length > 0, 'Empty CPU output');
+          if (audio) samples += frame.samples;
+          else check(frame.width === 64 && frame.height === 48, 'Unexpected video size');
+        }
+        if (HuxerMediaCodec.ended(id)) break;
+        await delay();
+      }
+      check(count === manifest.length, name + ' frame count: ' + count);
+      if (audio) check(samples === 1024 * manifest.length, 'AAC sample count changed');
+      check(HuxerMediaCodec.close(id) === '', 'Cleanup failed');
+    }
+    result.textContent = 'PASS: AAC/AVC WebCodecs fixtures, CPU copies, EOS and cleanup';
+  } catch (error) { result.textContent = 'FAIL: ' + error.message; }
+})();
+</script>

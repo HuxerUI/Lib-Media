@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lib-Media C++ WASM decoder test</title>
+<pre>Running C++ decoder sessions…</pre>
+<script type="module">
+import create from './media_codec_web_native.js';
+try {
+  const module = await create({noInitialRun: true, huxeruiStorageKey: 'org.huxerui.media.codec.test'});
+  module._main();
+} catch (error) { document.body.textContent = 'FAIL: ' + error.message; }
+</script>
