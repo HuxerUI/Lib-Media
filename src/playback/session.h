@@ -2,13 +2,13 @@
 
 #include "device.h"
 
-#ifndef __EMSCRIPTEN__
 #include "codec/executor.h"
+#include <chrono>
 #include <mutex>
 
 namespace huxerui::media::detail {
 
-class PlaybackSession {
+class PlaybackSession : public std::enable_shared_from_this<PlaybackSession> {
 public:
   using Factory = std::function<std::unique_ptr<PlaybackDevice>()>;
   static PlaybackResult<std::shared_ptr<PlaybackSession>> Create(
@@ -24,11 +24,13 @@ public:
 
 private:
   PlaybackSession(const AudioPlaybackConfig& config, std::size_t capacity, std::size_t refill, Factory factory);
-  void Run(bool output_lost);
-  bool Tick(std::uint64_t epoch, bool output_lost);
+  void Schedule(unsigned delay = 0);
+  void Run(bool check_output);
+  bool Tick(std::uint64_t epoch, bool check_output);
+  bool PauseAt(std::uint64_t epoch, PlaybackState next);
   std::size_t Write(std::uint64_t epoch);
-  void Open();
-  void Release();
+  bool Open(std::uint64_t epoch);
+  bool Release();
   void Cleanup();
   void SetState(PlaybackState state);
   std::optional<PlaybackError> ControlError() const;
@@ -48,16 +50,22 @@ private:
   std::vector<std::int16_t> queue_, scratch_;
   std::function<void()> wakeup_;
   std::function<void(PlaybackResult<void>)> cleanup_completed_;
+#ifdef __EMSCRIPTEN__
+  std::optional<std::chrono::steady_clock::time_point> due_;
+  std::uint64_t dispatch_ = 0;
+#else
   std::function<void()> completion_;
   std::shared_ptr<CodecWorker> worker_;
+#endif
 
-  // Device operations and run-local state belong to the worker.
-  enum class RunState { Priming, Running, Paused };
+  // Device operations and run-local state belong to the worker or owning event loop.
+  enum class RunState { Priming, Starting, Running, Paused };
   std::unique_ptr<PlaybackDevice> device_;
   std::uint64_t run_base_ = 0;
   RunState run_state_ = RunState::Priming;
   bool accepts_media_ = true;
+  std::optional<std::uint64_t> opening_epoch_;
+  std::optional<PlaybackState> pending_pause_;
   std::optional<PlaybackError> release_error_;
 };
 } // namespace huxerui::media::detail
-#endif

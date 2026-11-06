@@ -7,10 +7,11 @@
 /// submit AudioFrame values from a decoder or another producer. The session owns the output device and the
 /// playback timeline. The producer owns source loading, decoding, seeking and any input format conversion.
 ///
-/// PCM playback is available on Android API 26+, iOS 15+, and macOS, subject to the output route and requested format.
+/// PCM playback is available on Android API 26+, iOS 15+, macOS, and supported browsers. Availability depends on
+/// the output route, PCM format, and browser capabilities.
 /// Use the API independently of a View, Runtime or window. The application manages audio focus and background
 /// playback policy. See AudioPlaybackConfig for supported formats and callback delivery. Enable video in
-/// DecodedPlaybackConfig to add a caller-driven presenter on Android, iOS, or macOS.
+/// DecodedPlaybackConfig to add a caller-driven presenter on Android, iOS, macOS, or Web.
 
 #include <chrono>
 #include <functional>
@@ -96,22 +97,24 @@ struct AudioPlaybackConfig {
 
   /// Optional coalesced signal that state, position or input capacity may have changed.
   /// Read Snapshot() or schedule the producer to retry pending input. The session invokes this callback on
-  /// its worker outside session locks. It may run before Create() returns, so capture independently owned or weak
-  /// state. It may call Close(). Return promptly without throwing or waiting for the worker or cleanup.
+  /// its native worker or the owning browser event loop, outside session locks. Native delivery may race Create(),
+  /// so capture independently owned or weak state. The callback may call Close(). Return promptly without
+  /// throwing or waiting for cleanup.
   std::function<void()> wakeup;
 
   /// Optional final result delivered once after Close(), destruction or an operational failure.
-  /// Delivery follows native release, the return of admitted wakeups and worker exit. Success confirms release.
+  /// Delivery follows device release, the return of admitted wakeups and, on native platforms, worker exit.
+  /// On Web, delivery follows asynchronous AudioContext close on the owning event loop. Success confirms release.
   /// Failure describes a release error independently of any operational error. Delivery remains pending while
-  /// unsafe native work is still outstanding. The callback runs off the caller's stack.
+  /// unsafe device work is still outstanding. The callback runs off the caller's stack.
   /// Use captures that survive retirement. Return promptly without throwing or waiting for other media work.
   std::function<void(PlaybackResult<void>)> cleanup_completed;
 };
 
 /// @brief Enabled tracks for one decoded playback session.
 ///
-/// Enable at least one track. Audio is supported on Android API 26+, iOS 15+, and macOS. Video is supported on
-/// Android, iOS, and macOS. When both tracks are enabled, submit frames from the same media timeline.
+/// Enable at least one track. Audio is supported on Android API 26+, iOS 15+, macOS, and supported browsers.
+/// Video is supported on Android, iOS, macOS, and Web. When both tracks are enabled, submit frames from the same timeline.
 struct DecodedPlaybackConfig {
   /// PCM device configuration. Leave empty for video-only playback.
   std::optional<AudioPlaybackConfig> audio;
@@ -172,21 +175,23 @@ struct VideoPresentation {
 /// drive PresentVideo() on the presentation thread. Seal each enabled track and use Snapshot() to observe Ended.
 /// Reset() retires the timeline for another stream or seek.
 ///
-/// Controls, submission and snapshots may run concurrently on a live handle. Concurrent submissions are ordered
-/// by acceptance. Move or destroy the handle after its callers stop. Audio controls acquire locks and submission
-/// copies bytes. Call outside real-time render callbacks. The session serializes device work on its own worker.
+/// On native platforms, controls, submission and snapshots may run concurrently on a live handle. Concurrent
+/// submissions are ordered by acceptance. Move or destroy the handle after its callers stop. Each native session
+/// serializes device work on its worker. On Web, use the session on the browser window event loop that created it.
+/// Audio controls acquire locks and submission copies bytes. Call outside real-time render callbacks.
 /// @see AudioPlaybackConfig, AudioFrame, PlaybackSnapshot
 class DecodedPlayback final {
 public:
   /// @brief Create a session for the enabled tracks and open any configured PCM device asynchronously.
   ///
-  /// Video-only sessions begin in Paused. With audio, the initial state is Starting. Native open errors publish
-  /// Failed and initiate cleanup. Opening and wakeups can race the return of Create(). Confirmed audio position
+  /// Video-only sessions begin in Paused. With audio, the initial state is Starting. Device open errors publish
+  /// Failed and initiate cleanup. On native platforms, opening and wakeups can race Create(). Confirmed audio position
   /// drives synchronized video until audio drains. Video-only playback and a video tail after audio drain use
   /// monotonic time. Drive PresentVideo() periodically when video is enabled, including during drain.
   /// On iOS, configure and activate the application-owned AVAudioSession before enabling audio. An interruption,
   /// lost output route, or engine invalidation fails the current run even while paused. Restore the audio
   /// session before creating a fresh playback session.
+  /// On Web, enabling audio requires a secure context with AudioWorklet and output timestamp support.
   /// @param config Enabled tracks and PCM settings, copied into the session.
   /// @return An owning handle, or a synchronous Unsupported, InvalidArgument or ResourceExhausted error.
   /// A synchronous failure schedules no callbacks.
@@ -257,6 +262,7 @@ public:
   /// Startup and refill wait for available PCM and the configured threshold. A sealed short tail or capacity
   /// pressure can start sooner. In a synchronized session, the audio device also waits until the first video
   /// frame is queued or video input is sealed. Resuming a paused device can continue with its pending media.
+  /// On Web, request play from a user gesture such as a button click so browser autoplay policy can allow output.
   /// @return Success when play is requested or already intended. Inspect Snapshot() for the observed device
   /// state. Ended requires Reset() and returns InvalidState. Failed and closed sessions return an error.
   /// @see Pause(), Snapshot(), AudioPlaybackConfig::refill_threshold
@@ -266,6 +272,7 @@ public:
   ///
   /// Paused reports that the native pause took effect and the published position is frozen. Device progress
   /// already admitted may still advance before that boundary. During opening or reset, this clears pending play intent.
+  /// A pending device start can be superseded by pause while retaining submitted audio.
   /// @return Success when pause is requested or already intended. Ended returns InvalidState. Failed and closed
   /// sessions return an error.
   /// @see Play(), Snapshot()
@@ -305,8 +312,8 @@ public:
   /// @brief Retire the current epoch and recreate the device asynchronously.
   ///
   /// The discard barrier waits for an admitted video upload, then clears queued media, the clock, underruns,
-  /// sealing and play intent. Device discard and reopening follow on the worker. Video-only reset completes
-  /// synchronously. Gain and mute preferences carry forward. Wait for audio readiness before retrying.
+  /// sealing and play intent. Device discard and reopening follow on the worker or browser event loop. Video-only
+  /// reset completes synchronously. Gain and mute preferences carry forward. Wait for audio readiness before retrying.
   /// The next accepted frame supplies the new timeline anchor.
   /// @return The new generation. A repeated reset during device recreation returns the pending generation.
   /// Starting returns InvalidState. Failed and closed sessions return an error.

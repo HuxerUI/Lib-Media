@@ -60,6 +60,8 @@ set_tests_properties(media_codec_contract PROPERTIES TIMEOUT 30)
 if (MEDIA_NODE_EXECUTABLE)
     add_test(NAME media_codec_web_contract
             COMMAND "${MEDIA_NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/codec_web_contract.cjs")
+    add_test(NAME media_playback_web_contract
+            COMMAND "${MEDIA_NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/playback_web_contract.cjs")
 endif ()
 
 if (EMSCRIPTEN)
@@ -71,6 +73,16 @@ if (EMSCRIPTEN)
             "-sALLOW_MEMORY_GROWTH=1" "-sEXIT_RUNTIME=0" "-sEXPORTED_FUNCTIONS=['_main']")
     set_target_properties(media_codec_web_native PROPERTIES SUFFIX ".js")
     configure_file(codec_wasm.html "${CMAKE_CURRENT_BINARY_DIR}/codec_wasm.html" COPYONLY)
+
+    set(MEDIA_PREVIEW_SOURCE_DIR "${PROJECT_SOURCE_DIR}/examples/preview/src")
+    add_executable(media_playback_web_native playback_web_native.cpp frame_texture_contract.cpp
+            "${MEDIA_PREVIEW_SOURCE_DIR}/frame_texture.cpp")
+    target_link_libraries(media_playback_web_native PRIVATE huxerui_media HuxerUI::huxerui_static)
+    target_compile_features(media_playback_web_native PRIVATE cxx_std_20)
+    target_include_directories(media_playback_web_native PRIVATE "${MEDIA_PREVIEW_SOURCE_DIR}")
+    target_link_options(media_playback_web_native PRIVATE "-sFORCE_FILESYSTEM=1"
+            "-sEXPORTED_RUNTIME_METHODS=addRunDependency,removeRunDependency,stringToNewUTF8")
+    configure_file(playback_wasm.html "${CMAKE_CURRENT_BINARY_DIR}/playback_wasm.html" COPYONLY)
 endif ()
 
 if (ANDROID OR APPLE)

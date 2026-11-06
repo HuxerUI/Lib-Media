@@ -11,18 +11,20 @@ struct PlaybackProgress {
   bool accepts_media = true;
 };
 
-// One worker owns the device. Frame counts are relative to the current native run.
+// A worker or event loop owns the device. Frame counts are relative to the current run.
+// Control operations return false while awaiting acknowledgement and may be polled with the same arguments.
 class PlaybackDevice {
 public:
   virtual ~PlaybackDevice() = default;
   // Signal output loss from native callbacks. The worker then checks the device through Observe().
-  virtual PlaybackResult<void> Open(const AudioFormat& format, std::size_t capacity,
+  virtual PlaybackResult<bool> Open(const AudioFormat& format, std::size_t capacity,
                                    std::function<void()> output_lost) = 0;
   virtual PlaybackResult<std::size_t> Write(std::span<const std::int16_t> samples) = 0;
-  virtual PlaybackResult<void> Start() = 0;
-  virtual PlaybackResult<void> Pause() = 0;
+  virtual PlaybackResult<bool> Start() = 0;
+  // Pause can supersede a pending Start without discarding submitted PCM.
+  virtual PlaybackResult<bool> Pause() = 0;
   virtual PlaybackResult<PlaybackProgress> Observe(bool input_empty) = 0;
-  virtual PlaybackResult<void> Close() = 0;
+  virtual PlaybackResult<bool> Close() = 0;
 };
 
 std::unique_ptr<PlaybackDevice> MakePlaybackDevice();

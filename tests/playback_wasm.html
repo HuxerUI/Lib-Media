@@ -1,0 +1,170 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lib-Media Web playback sample</title>
+<button id="start" disabled>Play generated PCM</button>
+<pre id="result">Loading…</pre>
+<script type="module">
+import create from './media_playback_web_native.js';
+
+const start = document.getElementById('start');
+const result = document.getElementById('result');
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+const check = (value, message) => { if (!value) throw new Error(message); };
+
+function checkFrameTexture(module) {
+  const canvas = new OffscreenCanvas(120, 72);
+  const context = canvas.getContext('2d', {willReadFrequently: true});
+  const clone = VideoFrame.prototype.clone;
+  const frames = [];
+  const originals = [];
+  const colors = [[255, 255, 255], [128, 128, 128], [0, 0, 0], [255, 0, 0], [0, 255, 0], [0, 0, 255]];
+  VideoFrame.prototype.clone = function() {
+    const frame = clone.call(this);
+    originals.push(this);
+    context.drawImage(frame, 0, 0);
+    frames.push({frame, width: frame.displayWidth, height: frame.displayHeight,
+                 pixels: context.getImageData(0, 0, 120, 72).data});
+    return frame;
+  };
+  try { module.runFrameTextureContract(); }
+  finally { VideoFrame.prototype.clone = clone; }
+  check(frames.length === 3, 'Expected three publications into one texture');
+  frames.forEach(({frame, width, height, pixels}, index) => {
+    check(width === 120 && height === 72, 'The Web frame did not use the visible crop');
+    const pixel = (x, y, expected) => {
+      const offset = (y * width + x) * 4;
+      check(expected.every((channel, i) => Math.abs(channel - pixels[offset + i]) <= 3) &&
+            pixels[offset + 3] === 255, 'Unexpected Web frame pixel at ' + x + ', ' + y);
+    };
+    colors.forEach((color, band) => pixel(10 + band * 20, 24, color));
+    pixel(index === 1 ? 106 : 10, 64, colors[0]);
+    pixel(index === 1 ? 10 : 106, 64, colors[2]);
+    check(!frame.displayWidth && !originals[index].displayWidth, 'A Web frame survived its texture');
+  });
+}
+
+async function wait(playback, condition, description) {
+  const deadline = performance.now() + 6000;
+  while (performance.now() < deadline) {
+    const snapshot = playback.snapshot();
+    check(!snapshot.error, snapshot.error);
+    if (condition(snapshot)) return snapshot;
+    await delay(5);
+  }
+  throw new Error(description + ': ' + JSON.stringify(playback.snapshot()));
+}
+
+async function runPcm(playback) {
+  const state = (name) => wait(playback, snapshot => snapshot.state === name, 'Expected ' + name);
+  await wait(playback, s => s.state === 'Paused' || s.state === 'Buffering', 'Device did not open');
+  check(playback.submit(-2400, 12000), 'PCM did not fill the queue');
+  check(!playback.submit(9600, 4800), 'PCM queue exceeded its capacity');
+  check(playback.snapshot().position === -2400 && playback.snapshot().buffered === 12000,
+        'Accepting PCM advanced the presentation clock');
+
+  result.textContent = 'Checking pause and underrun…';
+  await wait(playback, s => s.state === 'Playing' && s.position >= -1440, 'PCM presentation did not start');
+  playback.pause();
+  const paused = await state('Paused');
+  check(paused.position < 9600, 'PCM drained before the pause');
+  await delay(120);
+  check(playback.snapshot().position === paused.position, 'The paused clock advanced');
+  playback.play();
+  const starved = await state('Buffering');
+  check(starved.position === 9600 && starved.underruns === 1, 'Underrun lost media or counted silence');
+  await delay(100);
+  check(playback.snapshot().position === 9600, 'Underrun silence advanced the clock');
+
+  result.textContent = 'Checking refill and reset…';
+  check(playback.submit(9600, 12000), 'Refill failed');
+  await state('Playing');
+  playback.reset();
+  check(playback.rejectsRetiredEpoch(), 'Reset accepted a stale submission');
+  check(!playback.submit(41000, 1024), 'Reset accepted input before the new device was ready');
+  await state('Paused');
+  check(playback.snapshot().position === null, 'The new epoch received old PCM progress');
+
+  result.textContent = 'Checking short-tail drain and close…';
+  check(playback.submit(41000, 1024), 'Short tail was rejected');
+  playback.finish();
+  check(playback.snapshot().position === 41000, 'Sealing input advanced the clock');
+  playback.play();
+  const ended = await state('Ended');
+  check(ended.position === 42024 && ended.buffered === 0, 'Short tail was not presented completely');
+
+  playback.reset();
+  await state('Paused');
+  check(playback.submit(0, 12000), 'New run could not accept PCM');
+  playback.play();
+  await state('Playing');
+  playback.close();
+  playback.close();
+  check(playback.snapshot().state === 'Closed' && playback.cleaned() === 0, 'Close was not a logical barrier');
+  await wait(playback, () => playback.cleaned() !== 0, 'AudioContext cleanup did not complete');
+  await delay(100);
+  check(playback.cleaned() === 1 && playback.snapshot().state === 'Closed', 'A retired device changed state');
+}
+
+async function runAv(playback) {
+  result.textContent = 'Checking video against the PCM clock…';
+  await wait(playback, s => s.state !== 'Starting', 'A/V device did not open');
+  check(playback.submit(0, 12000), 'A/V rejected PCM');
+  check(playback.submitVideo(0, 1000) && playback.submitVideo(1000, 9000), 'A/V rejected its first video frames');
+  await wait(playback, s => s.state === 'Playing' && s.position >= 2000, 'A/V audio did not advance');
+  const late = playback.presentVideo();
+  check(late.dropped === 1 && late.pts === 1000, 'The video scheduler did not drop the expired frame');
+  check(playback.submitVideo(10000, 10000) && playback.submitVideo(20000, 12000), 'A/V rejected its video tail');
+  playback.pause();
+  const paused = await wait(playback, s => s.state === 'Paused', 'A/V did not pause');
+  await delay(80);
+  check(playback.snapshot().position === paused.position && playback.presentVideo().pts === null,
+        'A/V advanced during pause');
+
+  playback.play();
+  const starved = await wait(playback, s => s.state === 'Buffering' && s.underruns === 1, 'A/V did not underrun');
+  check(starved.position === 12000 && playback.presentVideo().pts === null,
+        'A/V published a due frame while audio was starved');
+  await delay(80);
+  check(playback.snapshot().position === starved.position && playback.presentVideo().pts === null,
+        'Video advanced during audio starvation');
+
+  check(playback.submit(12000, 4800), 'A/V could not refill its audio queue');
+  playback.finish();
+  playback.finishVideo();
+  let tailPublished;
+  const ended = await wait(playback, snapshot => {
+    if (playback.presentVideo().pts === 20000) tailPublished = performance.now();
+    return snapshot.state === 'Ended';
+  }, 'A/V did not present its final interval');
+  check(tailPublished !== undefined && performance.now() - tailPublished >= 240 && ended.position >= 32000,
+        'A/V reached Ended before displaying the final video frame');
+  playback.close();
+  await wait(playback, () => playback.cleaned() !== 0, 'A/V cleanup did not complete');
+  check(playback.cleaned() === 1, 'A/V cleanup failed');
+}
+
+try {
+  const module = await create({huxeruiStorageKey: 'org.huxerui.media.playback.test'});
+  checkFrameTexture(module);
+  start.disabled = false;
+  result.textContent = 'NV12/I420 texture checks passed. Press Play to run the PCM sample.';
+  start.addEventListener('click', async () => {
+    start.disabled = true;
+    try {
+      for (const [video, run] of [[false, runPcm], [true, runAv]]) {
+        const playback = new module.PlaybackSample(video);
+        try {
+          playback.play();
+          await run(playback);
+        } finally { playback.delete(); }
+      }
+      result.textContent = 'PASS: Web textures, PCM timing, synchronized video, tail drain, and cleanup';
+    } catch (error) {
+      result.textContent = 'FAIL: ' + error.message;
+      console.error(error);
+    } finally {
+      start.disabled = false;
+    }
+  });
+} catch (error) { result.textContent = 'FAIL: ' + error.message; }
+</script>

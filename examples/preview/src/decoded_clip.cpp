@@ -194,6 +194,6 @@ Task<std::string> PlayDecodedClip(std::shared_ptr<Resources> resources, std::sha
 huxerui::Task<std::string> media_preview::PlayDecodedClip(std::shared_ptr<huxerui::Resources>,
                                                          std::shared_ptr<huxerui::ExternalTexture>,
                                                          bool, std::function<bool()>) {
-  co_return "Decoded frame playback is available on Android, iOS, and macOS.";
+  co_return "Decoded frame playback is available on Android, iOS, macOS, and Web.";
 }
 #endif

@@ -1,6 +1,5 @@
 #pragma once
 
-#ifndef __EMSCRIPTEN__
 #include "session.h"
 #include "video_scheduler.h"
 
@@ -42,4 +41,3 @@ private:
 };
 
 } // namespace huxerui::media::detail
-#endif

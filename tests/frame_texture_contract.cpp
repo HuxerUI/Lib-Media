@@ -5,6 +5,10 @@
 #include <iostream>
 #include <stdexcept>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/bind.h>
+#endif
+
 using namespace huxerui;
 using namespace huxerui::media;
 
@@ -85,26 +89,36 @@ void CheckPixels(const VideoFrame& frame) {
   }
 }
 
+void RunFrameTextureContract() {
+  auto texture = media_preview::MakeFrameTexture({300, 180});
+  Check(bool(texture), "Frame texture is unavailable");
+  auto revision = texture->Revision();
+  for (auto layout : {VideoPixelFormat::NV12, VideoPixelFormat::I420, VideoPixelFormat::NV12}) {
+    const auto frame = MakeFrame(layout);
+    CheckPixels(frame);
+    media_preview::PublishFrame(*texture, frame);
+    Check(texture->Revision() == ++revision, "Publishing to the same texture did not advance its revision");
+  }
+  auto unknown = MakeFrame(VideoPixelFormat::NV12);
+  unknown.format.matrix = ColorMatrix::Unknown;
+  unknown.format.range = ColorRange::Unknown;
+  CheckPixels(unknown);
+}
+
 } // namespace
 
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_BINDINGS(media_frame_texture_contract) {
+  emscripten::function("runFrameTextureContract", &RunFrameTextureContract);
+}
+#else
 int main() {
   try {
-    auto texture = media_preview::MakeFrameTexture({300, 180});
-    Check(bool(texture), "Frame texture is unavailable");
-    auto revision = texture->Revision();
-    for (auto layout : {VideoPixelFormat::NV12, VideoPixelFormat::I420, VideoPixelFormat::NV12}) {
-      const auto frame = MakeFrame(layout);
-      CheckPixels(frame);
-      media_preview::PublishFrame(*texture, frame);
-      Check(texture->Revision() == ++revision, "Publishing to the same texture did not advance its revision");
-    }
-    auto unknown = MakeFrame(VideoPixelFormat::NV12);
-    unknown.format.matrix = ColorMatrix::Unknown;
-    unknown.format.range = ColorRange::Unknown;
-    CheckPixels(unknown);
+    RunFrameTextureContract();
     std::cout << "NV12/I420 color, crop, stride and texture revisions passed\n";
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;
   }
 }
+#endif

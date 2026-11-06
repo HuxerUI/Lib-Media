@@ -1,6 +1,5 @@
 #include "session.h"
 
-#ifndef __EMSCRIPTEN__
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -11,7 +10,7 @@ namespace {
 
 template<class T> T Require(PlaybackResult<T> result) {
   if (!result.Succeeded()) throw std::move(result).Error();
-  if constexpr (!std::is_void_v<T>) return std::move(result).Value();
+  return std::move(result).Value();
 }
 
 std::optional<std::size_t> Frames(std::chrono::milliseconds duration, std::uint32_t rate) {
@@ -43,6 +42,7 @@ PlaybackResult<std::shared_ptr<PlaybackSession>> PlaybackSession::Create(const A
     return PlaybackFailure<std::shared_ptr<PlaybackSession>>(PlaybackErrorCode::Unsupported, "Playback requires interleaved S16 PCM");
   try {
     auto session = std::shared_ptr<PlaybackSession>(new PlaybackSession(config, *capacity, *refill, std::move(factory)));
+#ifndef __EMSCRIPTEN__
     std::function<void()> completion;
     if (session->cleanup_completed_) {
       completion = [session] {
@@ -52,15 +52,33 @@ PlaybackResult<std::shared_ptr<PlaybackSession>> PlaybackSession::Create(const A
         callback(std::move(result));
       };
     }
-    session->worker_ = CodecWorker::Start([session](bool output_lost) { session->Run(output_lost); });
+    session->worker_ = CodecWorker::Start([session](bool signaled) { session->Run(signaled); });
     session->completion_ = std::move(completion);
-    session->worker_->Schedule();
+#endif
+    session->Schedule();
     return R::Success(std::move(session));
   } catch (const std::bad_alloc&) {
     return PlaybackFailure<std::shared_ptr<PlaybackSession>>(PlaybackErrorCode::ResourceExhausted, "Cannot allocate playback storage");
   } catch (const std::system_error& error) {
     return PlaybackFailure<std::shared_ptr<PlaybackSession>>(PlaybackErrorCode::ResourceExhausted, "Cannot start playback worker", error.what());
   }
+}
+
+void PlaybackSession::Schedule(unsigned delay) {
+#ifdef __EMSCRIPTEN__
+  const auto due = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay);
+  if (due_ && *due_ <= due) return;
+  const auto dispatch = dispatch_ + 1;
+  DispatchCodec([self = shared_from_this(), dispatch] {
+    if (self->dispatch_ != dispatch) return;
+    self->due_.reset();
+    self->Run(true);
+  }, delay);
+  dispatch_ = dispatch;
+  due_ = due;
+#else
+  worker_->Schedule(delay);
+#endif
 }
 
 std::optional<PlaybackError> PlaybackSession::ControlError() const {
@@ -84,7 +102,7 @@ PlaybackResult<SubmitStatus> PlaybackSession::Submit(const AudioFrame& frame) {
   if (frame.sample_count > capacity_ - (accepted_ - presented_)) {
     if (blocked_frames_ != frame.sample_count) {
       blocked_frames_ = frame.sample_count;
-      worker_->Schedule();
+      Schedule();
     }
     return R::Success(SubmitStatus::WouldBlock);
   }
@@ -98,7 +116,7 @@ PlaybackResult<SubmitStatus> PlaybackSession::Submit(const AudioFrame& frame) {
   if (!anchor_) anchor_ = pts->ticks;
   accepted_ += frame.sample_count;
   blocked_frames_ = 0;
-  worker_->Schedule();
+  Schedule();
   return R::Success(SubmitStatus::Accepted);
 }
 
@@ -110,7 +128,7 @@ PlaybackResult<void> PlaybackSession::RequestPlay(bool play, bool allow_ended) {
     return PlaybackFailure(PlaybackErrorCode::InvalidState, "Reset is required after Ended");
   }
   play_ = play;
-  worker_->Schedule();
+  Schedule();
   return PlaybackResult<void>::Success();
 }
 PlaybackResult<void> PlaybackSession::SetVolume(double volume) {
@@ -133,7 +151,7 @@ PlaybackResult<void> PlaybackSession::Finish() {
   if (state_ == PlaybackState::Starting || state_ == PlaybackState::Resetting)
     return PlaybackFailure(PlaybackErrorCode::InvalidState, "Playback input is not ready");
   sealed_ = true;
-  worker_->Schedule();
+  Schedule();
   return PlaybackResult<void>::Success();
 }
 PlaybackResult<void> PlaybackSession::Reset() {
@@ -148,7 +166,7 @@ PlaybackResult<void> PlaybackSession::Reset() {
   blocked_frames_ = 0;
   anchor_.reset();
   SetState(PlaybackState::Resetting);
-  worker_->Schedule();
+  Schedule();
   return PlaybackResult<void>::Success();
 }
 PlaybackSnapshot PlaybackSession::Snapshot() const {
@@ -163,7 +181,7 @@ void PlaybackSession::Close() noexcept {
   ++epoch_;
   state_ = PlaybackState::Closed;
   error_.reset();
-  if (!cleaned_) worker_->Schedule();
+  if (!cleaned_) Schedule();
 }
 void PlaybackSession::SetState(PlaybackState state) {
   if (state_ != state) { state_ = state; dirty_ = true; }
@@ -172,21 +190,34 @@ bool PlaybackSession::Current(std::uint64_t epoch) const noexcept {
   return epoch == epoch_ && state_ != PlaybackState::Closed && state_ != PlaybackState::Failed;
 }
 
-void PlaybackSession::Open() {
-  device_ = factory_();
-  if (!device_) throw PlaybackError{PlaybackErrorCode::Unsupported, "PCM playback is unavailable", {}};
-  Require(device_->Open(format_, capacity_, [worker = std::weak_ptr(worker_)] {
+bool PlaybackSession::Open(std::uint64_t epoch) {
+  if (!device_) {
+    device_ = factory_();
+    if (!device_) throw PlaybackError{PlaybackErrorCode::Unsupported, "PCM playback is unavailable", {}};
+    opening_epoch_ = epoch;
+  }
+#ifdef __EMSCRIPTEN__
+  const auto ready = Require(device_->Open(format_, capacity_, {}));
+#else
+  const auto ready = Require(device_->Open(format_, capacity_, [worker = std::weak_ptr(worker_)] {
     if (auto current = worker.lock()) current->Signal();
   }));
+#endif
+  if (ready) opening_epoch_.reset();
+  return ready;
 }
-void PlaybackSession::Release() {
+bool PlaybackSession::Release() {
   if (device_) {
     auto result = device_->Close();
+    if (result.Succeeded() && !result.Value()) return false;
     device_.reset();
     if (!result.Succeeded() && !release_error_) release_error_ = std::move(result).Error();
   }
+  opening_epoch_.reset();
+  pending_pause_.reset();
   run_state_ = RunState::Priming;
   accepts_media_ = true;
+  return true;
 }
 
 std::size_t PlaybackSession::Write(std::uint64_t epoch) {
@@ -212,28 +243,42 @@ std::size_t PlaybackSession::Write(std::uint64_t epoch) {
   return written;
 }
 
-bool PlaybackSession::Tick(std::uint64_t epoch, bool output_lost) {
+bool PlaybackSession::Tick(std::uint64_t epoch, bool check_output) {
   PlaybackState state;
-  bool observe, input_empty;
+  bool play, observe, input_empty;
   {
     std::lock_guard lock(mutex_);
     state = state_;
     if (!Current(epoch) || state == PlaybackState::Ended) return false;
-    observe = play_ && run_state_ == RunState::Running;
+    play = play_;
+    observe = play && run_state_ == RunState::Running;
     input_empty = committed_ == accepted_;
   }
   if (state == PlaybackState::Starting || state == PlaybackState::Resetting) {
-    Release();
+    if (opening_epoch_ != epoch) {
+      if (!Release()) return true;
+      run_base_ = 0;
+    }
     if (release_error_) throw *release_error_;
-    run_base_ = 0;
-    Open();
+    if (!Open(epoch)) return true;
     std::lock_guard lock(mutex_);
     if (!Current(epoch)) return false;
     SetState(PlaybackState::Paused);
     return play_;
   }
 
-  if (!observe && output_lost && device_) Require(device_->Observe(input_empty));
+  if (pending_pause_) return PauseAt(epoch, *pending_pause_);
+  if (run_state_ == RunState::Starting) {
+    if (!play) return PauseAt(epoch, PlaybackState::Paused);
+    if (!Require(device_->Start())) return true;
+    run_state_ = RunState::Running;
+    std::lock_guard lock(mutex_);
+    if (!Current(epoch)) return false;
+    observe = play_;
+    input_empty = committed_ == accepted_;
+    if (play_) SetState(PlaybackState::Playing);
+  }
+  if (!observe && check_output && device_) Require(device_->Observe(input_empty));
   if (observe) {
     const auto progress = Require(device_->Observe(input_empty));
     std::lock_guard lock(mutex_);
@@ -271,26 +316,9 @@ bool PlaybackSession::Tick(std::uint64_t epoch, bool output_lost) {
     if (!device_) run_base_ = presented_;
   }
 
-  if (next != PlaybackState::Playing) {
-    if (next == PlaybackState::Buffering && !accepts_media_) {
-      Release();
-      if (release_error_) throw *release_error_;
-    } else if (run_state_ == RunState::Running) {
-      Require(device_->Pause());
-      run_state_ = RunState::Paused;
-    }
-    std::lock_guard lock(mutex_);
-    if (!Current(epoch)) return false;
-    if (next == PlaybackState::Buffering) {
-      ++underruns_;
-      run_state_ = RunState::Priming;
-      if (!play_) next = PlaybackState::Paused;
-    }
-    SetState(next);
-    return next != PlaybackState::Ended && play_;
-  }
+  if (next != PlaybackState::Playing) return PauseAt(epoch, next);
 
-  if (!device_) Open();
+  if ((!device_ || opening_epoch_) && !Open(epoch)) return true;
   const auto written = Write(epoch);
   if (run_state_ != RunState::Running) {
     {
@@ -301,7 +329,10 @@ bool PlaybackSession::Tick(std::uint64_t epoch, bool output_lost) {
                       queued < std::min<std::uint64_t>(refill_, accepted_ - presented_)))
         return true;
     }
-    Require(device_->Start());
+    if (!Require(device_->Start())) {
+      run_state_ = RunState::Starting;
+      return true;
+    }
     run_state_ = RunState::Running;
     std::lock_guard lock(mutex_);
     if (Current(epoch)) SetState(PlaybackState::Playing);
@@ -309,8 +340,37 @@ bool PlaybackSession::Tick(std::uint64_t epoch, bool output_lost) {
   return true;
 }
 
+bool PlaybackSession::PauseAt(std::uint64_t epoch, PlaybackState next) {
+  if (next == PlaybackState::Buffering && !accepts_media_) {
+    if (!Release()) {
+      pending_pause_ = next;
+      return true;
+    }
+    if (release_error_) throw *release_error_;
+  } else if (run_state_ == RunState::Running || run_state_ == RunState::Starting) {
+    if (!Require(device_->Pause())) {
+      pending_pause_ = next;
+      return true;
+    }
+    run_state_ = RunState::Paused;
+  }
+  pending_pause_.reset();
+  std::lock_guard lock(mutex_);
+  if (!Current(epoch)) return false;
+  if (next == PlaybackState::Buffering) {
+    ++underruns_;
+    run_state_ = RunState::Priming;
+    if (!play_) next = PlaybackState::Paused;
+  }
+  SetState(next);
+  return next != PlaybackState::Ended && play_;
+}
+
 void PlaybackSession::Cleanup() {
-  Release();
+  if (!Release()) {
+    Schedule(4);
+    return;
+  }
   {
     std::lock_guard lock(mutex_);
     cleaned_ = true;
@@ -318,9 +378,17 @@ void PlaybackSession::Cleanup() {
     std::vector<std::int16_t>().swap(scratch_);
   }
   wakeup_ = {};
+#ifdef __EMSCRIPTEN__
+  if (auto callback = std::move(cleanup_completed_)) {
+    auto result = release_error_ ? PlaybackResult<void>::Failure(std::move(*release_error_))
+                                 : PlaybackResult<void>::Success();
+    callback(std::move(result));
+  }
+#else
   worker_->Finish(std::move(completion_));
+#endif
 }
-void PlaybackSession::Run(bool output_lost) {
+void PlaybackSession::Run(bool check_output) {
   std::uint64_t epoch;
   {
     std::lock_guard lock(mutex_);
@@ -330,7 +398,7 @@ void PlaybackSession::Run(bool output_lost) {
   bool poll = false;
   std::optional<PlaybackError> failure;
   try {
-    poll = Tick(epoch, output_lost);
+    poll = Tick(epoch, check_output);
   } catch (PlaybackError& error) {
     failure = std::move(error);
   } catch (const std::bad_alloc&) {
@@ -353,11 +421,13 @@ void PlaybackSession::Run(bool output_lost) {
   {
     std::lock_guard lock(mutex_);
     if (state_ != PlaybackState::Closed && state_ != PlaybackState::Failed) {
-      if (poll) worker_->Schedule(4);
+      if (poll) Schedule(4);
+#ifdef __EMSCRIPTEN__
+      else if (state_ != PlaybackState::Ended) Schedule(100);
+#endif
       return;
     }
   }
   Cleanup();
 }
 } // namespace huxerui::media::detail
-#endif

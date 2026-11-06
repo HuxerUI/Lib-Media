@@ -11,7 +11,7 @@ namespace {
 
 class MacPlaybackDevice final : public PlaybackDevice {
 public:
-  PlaybackResult<void> Open(const AudioFormat& format, std::size_t capacity, std::function<void()>) override {
+  PlaybackResult<bool> Open(const AudioFormat& format, std::size_t capacity, std::function<void()>) override {
     @autoreleasepool {
       channels_ = format.ChannelCount();
       quantum_ = std::max(1u, format.sample_rate / 50);
@@ -20,7 +20,7 @@ public:
       player_ = [[AVAudioPlayerNode alloc] init];
       format_ = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:format.sample_rate channels:channels_];
       if (!engine_ || !player_ || !format_)
-        return PlaybackFailure(PlaybackErrorCode::Unsupported, "Cannot create the macOS PCM format or engine");
+        return PlaybackFailure<bool>(PlaybackErrorCode::Unsupported, "Cannot create the macOS PCM format or engine");
       auto changed = std::make_shared<std::atomic_bool>(false);
       changed_ = changed;
       observer_ = [NSNotificationCenter.defaultCenter addObserverForName:AVAudioEngineConfigurationChangeNotification
@@ -30,10 +30,10 @@ public:
       NSError* error = nil;
       if (![engine_ startAndReturnError:&error]) {
         const char* description = error.localizedDescription.UTF8String;
-        return PlaybackFailure(PlaybackErrorCode::DeviceFailure, description ? description : "Cannot start the macOS audio engine",
+        return PlaybackFailure<bool>(PlaybackErrorCode::DeviceFailure, description ? description : "Cannot start the macOS audio engine",
                                std::to_string(error.code));
       }
-      return PlaybackResult<void>::Success();
+      return PlaybackResult<bool>::Success(true);
     }
   }
 
@@ -65,19 +65,19 @@ public:
     }
   }
 
-  PlaybackResult<void> Start() override {
+  PlaybackResult<bool> Start() override {
     @autoreleasepool {
-      if (!Valid()) return PlaybackResult<void>::Failure(RouteError());
+      if (!Valid()) return PlaybackResult<bool>::Failure(RouteError());
       [player_ play];
-      return PlaybackResult<void>::Success();
+      return PlaybackResult<bool>::Success(true);
     }
   }
 
-  PlaybackResult<void> Pause() override {
+  PlaybackResult<bool> Pause() override {
     @autoreleasepool {
-      if (!Valid()) return PlaybackResult<void>::Failure(RouteError());
+      if (!Valid()) return PlaybackResult<bool>::Failure(RouteError());
       [player_ pause];
-      return PlaybackResult<void>::Success();
+      return PlaybackResult<bool>::Success(true);
     }
   }
 
@@ -92,7 +92,7 @@ public:
     }
   }
 
-  PlaybackResult<void> Close() override {
+  PlaybackResult<bool> Close() override {
     @autoreleasepool {
       if (observer_) [NSNotificationCenter.defaultCenter removeObserver:observer_];
       observer_ = nil;
@@ -103,7 +103,7 @@ public:
       engine_ = nil;
       format_ = nil;
       changed_.reset();
-      return PlaybackResult<void>::Success();
+      return PlaybackResult<bool>::Success(true);
     }
   }
 

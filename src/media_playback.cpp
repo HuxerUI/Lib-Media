@@ -1,7 +1,7 @@
 #include "playback/decoded_session.h"
 #include "playback/device.h"
 
-#if !defined(__ANDROID__) && !defined(__APPLE__)
+#if !defined(__ANDROID__) && !defined(__APPLE__) && !defined(__EMSCRIPTEN__)
 namespace huxerui::media::detail {
 std::unique_ptr<PlaybackDevice> MakePlaybackDevice() { return {}; }
 } // namespace huxerui::media::detail
@@ -23,7 +23,7 @@ DecodedPlayback& DecodedPlayback::operator=(DecodedPlayback&& other) noexcept {
 DecodedPlayback::~DecodedPlayback() { Close(); }
 
 PlaybackResult<DecodedPlayback> DecodedPlayback::Create(const DecodedPlaybackConfig& config) {
-#if defined(__ANDROID__) || defined(__APPLE__)
+#if defined(__ANDROID__) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
   auto session = detail::DecodedSession::Create(config);
   if (!session.Succeeded()) return PlaybackResult<DecodedPlayback>::Failure(std::move(session).Error());
   return PlaybackResult<DecodedPlayback>::Success(DecodedPlayback(std::move(session).Value()));
@@ -32,7 +32,6 @@ PlaybackResult<DecodedPlayback> DecodedPlayback::Create(const DecodedPlaybackCon
 #endif
 }
 
-#ifndef __EMSCRIPTEN__
 PlaybackResult<SubmitStatus> DecodedPlayback::TrySubmitAudio(const PlaybackEpoch& epoch, const AudioFrame& frame) {
   return session_ ? session_->SubmitAudio(epoch, frame) : Closed<SubmitStatus>();
 }
@@ -57,20 +56,4 @@ PlaybackResult<PlaybackEpoch> DecodedPlayback::Reset() { return session_ ? sessi
 PlaybackEpoch DecodedPlayback::Epoch() const { return session_ ? session_->Epoch() : PlaybackEpoch{}; }
 PlaybackSnapshot DecodedPlayback::Snapshot() const { return session_ ? session_->Snapshot() : PlaybackSnapshot{}; }
 void DecodedPlayback::Close() noexcept { if (session_) session_->Close(); }
-#else
-PlaybackResult<SubmitStatus> DecodedPlayback::TrySubmitAudio(const PlaybackEpoch&, const AudioFrame&) { return Closed<SubmitStatus>(); }
-PlaybackResult<SubmitStatus> DecodedPlayback::TrySubmitVideo(const PlaybackEpoch&, const VideoFrame&) { return Closed<SubmitStatus>(); }
-PlaybackResult<void> DecodedPlayback::FinishVideo(const PlaybackEpoch&) { return Closed(); }
-PlaybackResult<VideoPresentation> DecodedPlayback::PresentVideo(
-    const PlaybackEpoch&, const std::function<void(const VideoFrame&)>&) { return Closed<VideoPresentation>(); }
-PlaybackResult<void> DecodedPlayback::Play() { return Closed(); }
-PlaybackResult<void> DecodedPlayback::Pause() { return Closed(); }
-PlaybackResult<void> DecodedPlayback::SetVolume(double) { return Closed(); }
-PlaybackResult<void> DecodedPlayback::SetMuted(bool) { return Closed(); }
-PlaybackResult<void> DecodedPlayback::FinishAudio(const PlaybackEpoch&) { return Closed(); }
-PlaybackResult<PlaybackEpoch> DecodedPlayback::Reset() { return Closed<PlaybackEpoch>(); }
-PlaybackEpoch DecodedPlayback::Epoch() const { return {}; }
-PlaybackSnapshot DecodedPlayback::Snapshot() const { return {}; }
-void DecodedPlayback::Close() noexcept {}
-#endif
 } // namespace huxerui::media

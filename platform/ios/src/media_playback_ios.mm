@@ -50,19 +50,19 @@ PlaybackError NativeFailure(NSException* error) {
 
 class IosPlaybackDevice final : public PlaybackDevice {
 public:
-  PlaybackResult<void> Open(const AudioFormat& format, std::size_t capacity,
+  PlaybackResult<bool> Open(const AudioFormat& format, std::size_t capacity,
                             std::function<void()> output_lost) override {
     @autoreleasepool {
       @try {
         auto* session = AVAudioSession.sharedInstance;
         if (!session.currentRoute.outputs.count)
-          return PlaybackFailure(PlaybackErrorCode::DeviceFailure, "Activate an iOS audio session with an output route");
+          return PlaybackFailure<bool>(PlaybackErrorCode::DeviceFailure, "Activate an iOS audio session with an output route");
         engine_ = [[AVAudioEngine alloc] init];
         player_ = [[AVAudioPlayerNode alloc] init];
         format_ = [[AVAudioFormat alloc] initStandardFormatWithSampleRate:format.sample_rate
                                                                 channels:format.ChannelCount()];
         if (!engine_ || !player_ || !format_)
-          return PlaybackFailure(PlaybackErrorCode::Unsupported, "Cannot configure iOS PCM output");
+          return PlaybackFailure<bool>(PlaybackErrorCode::Unsupported, "Cannot configure iOS PCM output");
 
         status_ = std::make_shared<RunStatus>();
         status_->wakeup = std::move(output_lost);
@@ -72,14 +72,14 @@ public:
         NSError* error = nil;
         if (![engine_ startAndReturnError:&error]) {
           const auto* message = error.localizedDescription.UTF8String;
-          return PlaybackFailure(PlaybackErrorCode::DeviceFailure, message ? message : "Cannot start the iOS audio engine",
+          return PlaybackFailure<bool>(PlaybackErrorCode::DeviceFailure, message ? message : "Cannot start the iOS audio engine",
                                  std::to_string(error.code));
         }
         capacity_ = capacity;
         quantum_ = std::max(1u, format.sample_rate / 50);
         return CheckOutput();
       } @catch (NSException* error) {
-        return PlaybackResult<void>::Failure(NativeFailure(error));
+        return PlaybackResult<bool>::Failure(NativeFailure(error));
       }
     }
   }
@@ -119,7 +119,7 @@ public:
     }
   }
 
-  PlaybackResult<void> Start() override {
+  PlaybackResult<bool> Start() override {
     @autoreleasepool {
       auto output = CheckOutput();
       if (!output.Succeeded()) return output;
@@ -127,12 +127,12 @@ public:
         [player_ play];
         return CheckOutput();
       } @catch (NSException* error) {
-        return PlaybackResult<void>::Failure(NativeFailure(error));
+        return PlaybackResult<bool>::Failure(NativeFailure(error));
       }
     }
   }
 
-  PlaybackResult<void> Pause() override {
+  PlaybackResult<bool> Pause() override {
     @autoreleasepool {
       auto output = CheckOutput();
       if (!output.Succeeded()) return output;
@@ -140,7 +140,7 @@ public:
         [player_ pause];
         return CheckOutput();
       } @catch (NSException* error) {
-        return PlaybackResult<void>::Failure(NativeFailure(error));
+        return PlaybackResult<bool>::Failure(NativeFailure(error));
       }
     }
   }
@@ -159,17 +159,17 @@ public:
     }
   }
 
-  PlaybackResult<void> Close() override {
+  PlaybackResult<bool> Close() override {
     @autoreleasepool {
       if (status_) status_->loss.store(OutputLoss::Retired);
       for (id observer in observers_) [NSNotificationCenter.defaultCenter removeObserver:observer];
       observers_ = nil;
-      auto result = PlaybackResult<void>::Success();
+      auto result = PlaybackResult<bool>::Success(true);
       @try {
         [player_ stop];
         [engine_ stop];
       } @catch (NSException* error) {
-        result = PlaybackResult<void>::Failure(NativeFailure(error));
+        result = PlaybackResult<bool>::Failure(NativeFailure(error));
       }
       buffers_.clear();
       player_ = nil;
@@ -181,11 +181,11 @@ public:
   }
 
 private:
-  PlaybackResult<void> CheckOutput() const {
+  PlaybackResult<bool> CheckOutput() const {
     const auto reason = status_ ? status_->loss.load() : OutputLoss::Retired;
     if (reason != OutputLoss::None || !engine_.isRunning)
-      return PlaybackResult<void>::Failure(OutputError(reason));
-    return PlaybackResult<void>::Success();
+      return PlaybackResult<bool>::Failure(OutputError(reason));
+    return PlaybackResult<bool>::Success(true);
   }
 
   void WatchOutput(AVAudioSession* session) {

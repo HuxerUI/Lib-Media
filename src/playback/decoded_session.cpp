@@ -1,6 +1,5 @@
 #include "decoded_session.h"
 
-#ifndef __EMSCRIPTEN__
 #include <stdexcept>
 
 namespace huxerui::media::detail {
@@ -236,4 +235,3 @@ void DecodedSession::Close() noexcept {
 }
 
 } // namespace huxerui::media::detail
-#endif

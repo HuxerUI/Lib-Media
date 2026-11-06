@@ -11,13 +11,16 @@
 #elif defined(MEDIA_PREVIEW_MACOS)
 #include <CoreVideo/CoreVideo.h>
 #include <huxerui/macos/external_texture.h>
+#elif defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#include <huxerui/web/external_texture.h>
 #endif
 
 using namespace huxerui;
 using namespace huxerui::media;
 
 namespace media_preview {
-#if defined(__ANDROID__) || defined(MEDIA_PREVIEW_MACOS) || defined(MEDIA_PREVIEW_IOS)
+#if defined(__ANDROID__) || defined(MEDIA_PREVIEW_MACOS) || defined(MEDIA_PREVIEW_IOS) || defined(__EMSCRIPTEN__)
 namespace {
 
 unsigned Sample(const VideoPlane& plane, unsigned x, unsigned y, unsigned component = 0) {
@@ -167,6 +170,48 @@ std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size) {
 
 void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
   Upload(texture, ConvertFramePixels(frame), frame.format.visible.width, frame.format.visible.height);
+}
+#elif defined(__EMSCRIPTEN__)
+namespace {
+
+EM_JS(emscripten::EM_VAL, CreatePreviewVideoFrame,
+      (emscripten::EM_VAL bytes, unsigned width, unsigned height, double timestamp), {
+  try {
+    return Emval.toHandle(new VideoFrame(Emval.toValue(bytes), {
+      format: 'RGBA', codedWidth: width, codedHeight: height, timestamp
+    }));
+  } catch (_) {
+    return Emval.toHandle(null);
+  }
+});
+
+} // namespace
+
+std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size) {
+  if (emscripten::val::global("VideoFrame").isUndefined())
+    throw std::runtime_error("Web VideoFrame requires a supported browser and a secure context");
+  return std::make_shared<web::VideoFrameTexture>(size);
+}
+
+void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
+  const auto pixels = ConvertFramePixels(frame);
+  const auto timestamp = frame.pts.Rescale(1'000'000);
+  constexpr std::int64_t max_safe_integer = 9'007'199'254'740'991;
+  if (!timestamp || timestamp->ticks < -max_safe_integer || timestamp->ticks > max_safe_integer)
+    throw std::runtime_error("VideoFrame timestamp exceeds the browser range");
+  const auto bytes = emscripten::val(emscripten::typed_memory_view(
+      pixels.size(), reinterpret_cast<const unsigned char*>(pixels.data())));
+  const auto visible = frame.format.visible;
+  auto native = emscripten::val::take_ownership(
+      CreatePreviewVideoFrame(bytes.as_handle(), visible.width, visible.height, double(timestamp->ticks)));
+  if (native.isNull()) throw std::runtime_error("Cannot create the Web preview VideoFrame");
+  try {
+    static_cast<web::VideoFrameTexture&>(texture).Publish(native);
+  } catch (...) {
+    native.call<void>("close");
+    throw;
+  }
+  native.call<void>("close");
 }
 #elif !defined(MEDIA_PREVIEW_IOS)
 std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size) { return {}; }

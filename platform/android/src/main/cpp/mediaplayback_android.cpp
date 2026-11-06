@@ -20,12 +20,12 @@ std::int64_t MonotonicNanoseconds() {
 
 class AndroidPlaybackDevice final : public PlaybackDevice {
 public:
-  PlaybackResult<void> Open(const AudioFormat& format, std::size_t capacity, std::function<void()>) override {
+  PlaybackResult<bool> Open(const AudioFormat& format, std::size_t capacity, std::function<void()>) override {
     // Keep the platform library loaded while any native service threads can still use it.
     static void* library = dlopen("libaaudio.so", RTLD_NOW | RTLD_LOCAL);
     library_ = library;
     if (!library_ || !Load())
-      return PlaybackFailure(PlaybackErrorCode::Unsupported, "AAudio PCM playback requires Android API 26 or later");
+      return PlaybackFailure<bool>(PlaybackErrorCode::Unsupported, "AAudio PCM playback requires Android API 26 or later");
 
     AAudioStreamBuilder* builder = nullptr;
     const auto created = create_builder_(&builder);
@@ -44,16 +44,16 @@ public:
     channels_ = format.ChannelCount();
     if (rate_(stream_) != std::int32_t(format.sample_rate) || format_(stream_) != AAUDIO_FORMAT_PCM_I16 ||
         channels_ != std::size_t(channel_count_(stream_)))
-      return PlaybackFailure(PlaybackErrorCode::Unsupported, "AAudio did not open the requested PCM format");
+      return PlaybackFailure<bool>(PlaybackErrorCode::Unsupported, "AAudio did not open the requested PCM format");
     const auto device_capacity = capacity_(stream_);
     const auto burst = burst_(stream_);
     if (device_capacity <= 0 || burst <= 0 || std::size_t(burst) > capacity)
-      return PlaybackFailure(PlaybackErrorCode::Unsupported, "AAudio priming exceeds the playback queue bounds");
+      return PlaybackFailure<bool>(PlaybackErrorCode::Unsupported, "AAudio priming exceeds the playback queue bounds");
     quantum_ = std::min<std::size_t>(burst, capacity);
     native_capacity_ = std::min<std::size_t>(device_capacity, capacity);
     padding_limit_ = std::uint64_t(native_capacity_) * 3;
     silence_.resize(std::min(quantum_, native_capacity_) * channels_);
-    return PlaybackResult<void>::Success();
+    return PlaybackResult<bool>::Success(true);
   }
 
   PlaybackResult<std::size_t> Write(std::span<const std::int16_t> samples) override {
@@ -61,15 +61,15 @@ public:
     if (result.Succeeded()) media_written_ += result.Value();
     return result;
   }
-  PlaybackResult<void> Start() override {
+  PlaybackResult<bool> Start() override {
     epoch_time_ = MonotonicNanoseconds();
     last_progress_ = Clock::now();
     const auto status = start_(stream_);
     if (status < 0) return Error(status, "Cannot start AAudio output");
-    return PlaybackResult<void>::Success();
+    return PlaybackResult<bool>::Success(true);
   }
 
-  PlaybackResult<void> Pause() override {
+  PlaybackResult<bool> Pause() override {
     const auto status = pause_(stream_);
     if (status < 0) return Error(status, "Cannot pause AAudio output");
     const auto deadline = Clock::now() + 500ms;
@@ -81,8 +81,8 @@ public:
       state = next;
     }
     if (state != AAUDIO_STREAM_STATE_PAUSED)
-      return PlaybackFailure(PlaybackErrorCode::DeviceFailure, "AAudio did not acknowledge pause");
-    return PlaybackResult<void>::Success();
+      return PlaybackFailure<bool>(PlaybackErrorCode::DeviceFailure, "AAudio did not acknowledge pause");
+    return PlaybackResult<bool>::Success(true);
   }
 
   PlaybackResult<PlaybackProgress> Observe(bool input_empty) override {
@@ -131,8 +131,8 @@ public:
     return R::Success({presented_, padded_ == 0});
   }
 
-  PlaybackResult<void> Close() override {
-    auto result = PlaybackResult<void>::Success();
+  PlaybackResult<bool> Close() override {
+    auto result = PlaybackResult<bool>::Success(true);
     if (stream_) {
       const auto closed = close_(stream_);
       if (closed < 0) result = Error(closed, "Cannot close AAudio output");
@@ -152,8 +152,8 @@ private:
       return PlaybackFailure<std::size_t>(PlaybackErrorCode::DeviceFailure, "AAudio changed the native write origin");
     return PlaybackResult<std::size_t>::Success(std::size_t(result));
   }
-  static PlaybackResult<void> Error(aaudio_result_t status, const char* message) {
-    return PlaybackFailure(PlaybackErrorCode::DeviceFailure, message, std::to_string(status));
+  static PlaybackResult<bool> Error(aaudio_result_t status, const char* message) {
+    return PlaybackFailure<bool>(PlaybackErrorCode::DeviceFailure, message, std::to_string(status));
   }
 
   template<class Function> bool Load(Function& function, const char* name) {

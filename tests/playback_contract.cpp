@@ -50,24 +50,29 @@ private:
 
 struct Control {
   Gate observe, pause, close;
+  std::atomic_bool start_pending = false;
   std::atomic_bool fail_pause = false;
   std::atomic_bool fail_close = false;
   std::atomic_int opens = 0;
+  std::atomic_int starts = 0;
   std::atomic_int cleanup = 0;
   std::atomic_int submitted_sample = 0;
 };
 class Device final : public PlaybackDevice {
 public:
   explicit Device(std::shared_ptr<Control> control) : control_(std::move(control)) {}
-  PlaybackResult<void> Open(const AudioFormat&, std::size_t, std::function<void()>) override {
+  PlaybackResult<bool> Open(const AudioFormat&, std::size_t, std::function<void()>) override {
     ++control_->opens;
-    return PlaybackResult<void>::Success();
+    return PlaybackResult<bool>::Success(true);
   }
-  PlaybackResult<void> Start() override { return PlaybackResult<void>::Success(); }
-  PlaybackResult<void> Pause() override {
+  PlaybackResult<bool> Start() override {
+    ++control_->starts;
+    return PlaybackResult<bool>::Success(!control_->start_pending);
+  }
+  PlaybackResult<bool> Pause() override {
     control_->pause.Enter();
-    if (control_->fail_pause) return PlaybackFailure(PlaybackErrorCode::DeviceFailure, "Injected pause failure");
-    return PlaybackResult<void>::Success();
+    if (control_->fail_pause) return PlaybackFailure<bool>(PlaybackErrorCode::DeviceFailure, "Injected pause failure");
+    return PlaybackResult<bool>::Success(true);
   }
   PlaybackResult<std::size_t> Write(std::span<const std::int16_t> samples) override {
     control_->submitted_sample = samples.front();
@@ -78,10 +83,10 @@ public:
     control_->observe.Enter();
     return PlaybackResult<PlaybackProgress>::Success({written_});
   }
-  PlaybackResult<void> Close() override {
+  PlaybackResult<bool> Close() override {
     control_->close.Enter();
-    if (control_->fail_close) return PlaybackFailure(PlaybackErrorCode::DeviceFailure, "Injected release failure");
-    return PlaybackResult<void>::Success();
+    if (control_->fail_close) return PlaybackFailure<bool>(PlaybackErrorCode::DeviceFailure, "Injected release failure");
+    return PlaybackResult<bool>::Success(true);
   }
 private:
   std::shared_ptr<Control> control_;
@@ -170,6 +175,28 @@ void EndedWaitsForPause() {
   Wait([&] { return session.control->cleanup == 1; }, "Operational failure did not complete device cleanup");
 }
 
+void PauseSupersedesPendingStart() {
+  Session session;
+  auto& playback = *session.state;
+  auto control = session.control;
+  control->start_pending = true;
+  Wait([&] { return playback.Snapshot().state == PlaybackState::Paused; }, "Opening did not finish");
+  Check(playback.Submit(Frame(Config(control).format, 0, 1024)).Value() == SubmitStatus::Accepted &&
+        playback.Finish().Succeeded() && playback.RequestPlay(true).Succeeded(), "Cannot request a pending start");
+  Wait([&] { return control->starts > 0; }, "The device did not receive the start request");
+  Check(playback.RequestPlay(false).Succeeded(), "Cannot pause a pending start");
+  Wait([&] { return control->pause.entered.load(); }, "Pause waited for the pending start");
+  const auto paused = playback.Snapshot();
+  Check(paused.state == PlaybackState::Paused && paused.position->ticks == 0 &&
+        paused.audio_buffered_duration.ticks == 1024, "Pause changed the queued PCM or position");
+
+  control->start_pending = false;
+  Check(playback.RequestPlay(true).Succeeded(), "Cannot resume after canceling startup");
+  Wait([&] { return playback.Snapshot().state == PlaybackState::Ended; }, "The preserved PCM did not drain");
+  Check(playback.Snapshot().position->ticks == 1024 && control->opens == 1,
+        "Canceling startup discarded PCM or reopened the device");
+}
+
 void Lifecycle() {
   Session first;
   auto& playback = *first.state;
@@ -221,6 +248,7 @@ int main() {
     BackpressureStartsBelowRefill();
     RefillKeepsDevice();
     EndedWaitsForPause();
+    PauseSupersedesPendingStart();
     Lifecycle();
     std::cout << "PCM backpressure, device reuse, drain ordering, reset and cleanup passed\n";
   } catch (const std::exception& error) {

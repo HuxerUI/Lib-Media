@@ -534,7 +534,7 @@ before completion. Application callbacks run outside session locks and may reque
 
 ### Six platform mappings
 
-Android, iOS, and macOS implement the shared contract. The remaining rows describe planned device paths.
+Android, iOS, macOS, and Web implement the PCM contract. The Windows and Linux rows describe planned device paths.
 
 | Platform | Clock and underrun | Drain | Pause, reset and cleanup |
 | --- | --- | --- | --- |
@@ -608,9 +608,25 @@ and [output route changes](https://developer.apple.com/documentation/avfaudio/av
 The iOS preview holds its audio session through the playback cleanup callback. It deactivates the session on the
 main queue once the last preview audio user releases it, including any loaded Video or Music source.
 
+The Web adapter uses the shared PCM queue and transport state machine on the browser window event loop. An
+AudioWorklet consumes copied interleaved S16 input from a fixed-capacity ring. The worklet reports media ranges in
+AudioContext frames. The bridge intersects those ranges with `getOutputTimestamp().contextTime`, converted to the
+requested sample rate. Rendered but unconfirmed samples remain charged against capacity. Underrun silence adds
+no media duration. Pause and resume wait for browser acknowledgement. A pause can supersede an unacknowledged
+resume while preserving queued audio. During playback, five seconds without confirming any outstanding PCM
+produces a device failure and retains the last confirmed position. New progress restarts the interval, and
+pausing clears it. Reset retires the worklet and waits for
+the old context to close before creating a new one. The JS bridge drops reports and setup continuations from retired
+runs. It transfers ordinary ArrayBuffers and loads its module from a blob URL.
+
+The Chrome WASM sample uses synthetic stereo PCM at 48 kHz and checks queue saturation, pause, underrun and refill,
+short-tail drain, epoch reset, and asynchronous close. It also checks late video frame dropping, video hold
+during audio starvation, and final video presentation after PCM drain. A Node contract test checks the
+render-to-output mapping, including a silence gap and a late callback after retirement.
+
 ### Video scheduling
 
-The Frames preview on Android, iOS, and macOS enables video in `DecodedPlayback::Create()` with the same four-second AVC track
+The Frames preview on Android, iOS, macOS, and Web enables video in `DecodedPlayback::Create()` with the same four-second AVC track
 for both modes. Video-only playback starts its monotonic clock at the first queued video PTS. The native codec
 test checks the original 24-frame H.264 fixture's exact presentation timestamps and durations.
 
@@ -654,9 +670,11 @@ Consumers use the public installed package; no SDK source checkout is required.
 The installed Android texture API exposes BitmapTexture and a GL_TEXTURE_2D copy path. Apple exposes retained
 PixelBufferTexture and Metal copies; Windows/Linux expose pixel/native texture paths. These are actual public contracts,
 not a generic promise that every codec output can be imported without conversion. The first CPU decoder milestone needs
-no new SDK interface. The Android, iOS, and macOS previews convert SDR NV12 and I420 to RGB on the CPU. Android uses
-the public GL texture path. iOS and macOS each publish to their platform's pixel buffer texture. The AVC fixture preview
-uses BT.601 and limited range when color metadata is unavailable and reports the fallback.
+no new SDK interface. The Android, iOS, macOS, and Web previews convert SDR NV12 and I420 to RGB on the CPU. Android
+uses the public GL texture path. iOS and macOS each publish to their platform's pixel buffer texture. Web creates
+a browser RGBA VideoFrame from the visible pixels and publishes it through the SDK's VideoFrameTexture. The texture
+retains its own clone, and the uploader closes the original after publication. The AVC fixture preview uses
+BT.601 and limited range when color metadata is unavailable and reports the fallback.
 
 A future native-frame optimization may require a generic renderer import capability, especially for Android native
 buffers or specific YUV/HDR layouts. Specify and test the exact missing resource, synchronization, and color contract
