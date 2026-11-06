@@ -1,6 +1,6 @@
 # Media decoding
 
-`<huxerui/mediaformat.h>` and `<huxerui/mediacodec.h>` provide the first implementation stage of
+`<huxerui/media_format.h>` and `<huxerui/media_codec.h>` provide the first implementation stage of
 [codec issue #20](https://github.com/HuxerUI/HuxerUI/issues/20). Link `HuxerUI::Media` with the installed public SDK.
 No `Install()`, View, Runtime, window, or application Task is needed. Existing MediaPlayer and photo-library APIs are unchanged.
 
@@ -128,7 +128,7 @@ The headers contain complete method contracts. This helper illustrates the three
 on a UI thread; call it from the application's scheduled consumer when wakeup signals readiness:
 
 ```cpp
-#include <huxerui/mediacodec.h>
+#include <huxerui/media_codec.h>
 
 using namespace huxerui::media;
 

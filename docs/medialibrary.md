@@ -1,6 +1,6 @@
 # Native photo and video libraries
 
-Include `<huxerui/medialibrary.h>`, link `HuxerUI::Media`, and register `huxerui::media::Install` in `application_hooks`.
+Include `<huxerui/media_library.h>`, link `HuxerUI::Media`, and register `huxerui::media::Install` in `application_hooks`.
 `UseMediaPicker()` and `UseMediaLibrary()` return composition-owned handles bound to their original window.
 Obtain them during composition, then launch operations through a `TaskScope` from event callbacks or committed Lifecycle setup.
 Unmount cancels pending native requests and makes retained handles unavailable; a still-live application Task receives an `Unavailable` error.

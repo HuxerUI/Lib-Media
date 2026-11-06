@@ -1,6 +1,6 @@
 #pragma once
 
-#include <huxerui/mediacodec.h>
+#include <huxerui/media_codec.h>
 
 #ifndef __EMSCRIPTEN__
 #include <chrono>

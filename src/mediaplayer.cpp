@@ -1,4 +1,4 @@
-#include <huxerui/mediaplayer.h>
+#include <huxerui/media_player.h>
 #include "detail/media_library.h"
 
 #include <algorithm>

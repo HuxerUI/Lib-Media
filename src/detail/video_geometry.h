@@ -1,7 +1,7 @@
 #pragma once
 
 #include <algorithm>
-#include <huxerui/mediaplayer.h>
+#include <huxerui/media_player.h>
 
 namespace huxerui::media::detail {
 

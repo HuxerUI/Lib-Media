@@ -4,7 +4,7 @@
 #include <deque>
 #include <thread>
 
-#include <huxerui/mediaplayer.h>
+#include <huxerui/media_player.h>
 #include <huxerui/external_texture.h>
 #include <huxerui/platform_registry.h>
 #include <huxerui/state.h>

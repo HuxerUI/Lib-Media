@@ -3,7 +3,7 @@
 /// @file
 /// @brief Native audio/video playback, observable state, and an optional video view for HuxerUI.
 ///
-/// Include <huxerui/mediaplayer.h> and link HuxerUI::Media. Register Install() through the application's
+/// Include <huxerui/media_player.h> and link HuxerUI::Media. Register Install() through the application's
 /// application hooks before creating a session with UseMediaPlayer(). Applications own playback controls and platform
 /// permissions; supported codecs and network protocols depend on the native backend.
 
@@ -410,7 +410,7 @@ private:
 /// @code{.cpp}
 /// // Define this component in a codegen-enabled .cpp file.
 /// #include <huxerui/huxerui.h>
-/// #include <huxerui/mediaplayer.h>
+/// #include <huxerui/media_player.h>
 ///
 /// using namespace huxerui;
 /// using namespace huxerui::media;

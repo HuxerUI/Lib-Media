@@ -1,4 +1,4 @@
-#include <huxerui/mediaplayer.h>
+#include <huxerui/media_player.h>
 
 #include <cmath>
 #include <deque>

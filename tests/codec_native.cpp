@@ -1,4 +1,4 @@
-#include <huxerui/mediacodec.h>
+#include <huxerui/media_codec.h>
 
 #ifdef MEDIA_CODEC_TEST_GSTREAMER
 #include "codec/backend.h"

@@ -3,8 +3,8 @@
 /// @file
 /// @brief Exact media timestamps, compressed access units, and CPU audio and video frames.
 ///
-/// Include <huxerui/mediaformat.h> and link HuxerUI::Media. These values can be used in headless code.
-/// Use <huxerui/mediacodec.h> to submit compressed packets and receive validated CPU frames.
+/// Include <huxerui/media_format.h> and link HuxerUI::Media. These values can be used in headless code.
+/// Use <huxerui/media_codec.h> to submit compressed packets and receive validated CPU frames.
 /// When constructing frames yourself, call Validate() before using their format, timing, and planes.
 
 #include <cstdint>

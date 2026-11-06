@@ -3,7 +3,7 @@
 /// @file
 /// @brief Headless, bounded, asynchronous AAC-LC and H.264 decoding.
 ///
-/// Include <huxerui/mediacodec.h> and link HuxerUI::Media. Use the decoders directly from headless code.
+/// Include <huxerui/media_codec.h> and link HuxerUI::Media. Use the decoders directly from headless code.
 /// The application supplies decoder initialization data and complete compressed access units in decode order.
 /// Decoder output consists of format events, retained CPU frames, and an end-of-stream event.
 
@@ -11,7 +11,7 @@
 #include <memory>
 #include <string>
 #include <variant>
-#include <huxerui/mediaformat.h>
+#include <huxerui/media_format.h>
 
 namespace huxerui::media {
 namespace detail { template<class Output> class DecoderState; }

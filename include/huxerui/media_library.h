@@ -3,7 +3,7 @@
 /// @file
 /// @brief Native image/video selection and publication to the system photo library for HuxerUI.
 ///
-/// Include <huxerui/medialibrary.h> and link HuxerUI::Media. Register Install() through the application's
+/// Include <huxerui/media_library.h> and link HuxerUI::Media. Register Install() through the application's
 /// application hooks before obtaining composition-owned handles with UseMediaPicker() or UseMediaLibrary().
 /// Launch asynchronous operations through TaskScope from UI events or committed Lifecycle setup.
 /// Android and iOS provide native backends; other platforms report unavailable capabilities and Unsupported operations.
@@ -243,7 +243,7 @@ private:
 /// @code{.cpp}
 /// // Define this component in a codegen-enabled .cpp file.
 /// #include <huxerui/huxerui.h>
-/// #include <huxerui/medialibrary.h>
+/// #include <huxerui/media_library.h>
 ///
 /// using namespace huxerui;
 /// using namespace huxerui::media;
@@ -308,7 +308,7 @@ MediaLibrary UseMediaLibrary();
 /// @brief Registers this platform's playback, video output, and native media-library integration for an application.
 ///
 /// Add this function once to AppOptions::application_hooks for each application using the library. The declaration
-/// in mediaplayer.h names the same function; applications using both features still register it only once.
+/// in media_player.h names the same function; applications using both features still register it only once.
 /// Do not call it during ordinary recomposition. Installation does not create sessions, present UI, or grant access.
 /// @param context Application context receiving the library's platform registrations during installation.
 /// @code{.cpp}

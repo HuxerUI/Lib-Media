@@ -1,6 +1,6 @@
 #include <huxerui/huxerui.h>
-#include <huxerui/mediaplayer.h>
-#include <huxerui/medialibrary.h>
+#include <huxerui/media_player.h>
+#include <huxerui/media_library.h>
 #include <app_resources.h>
 
 #include <algorithm>

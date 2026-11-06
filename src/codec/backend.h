@@ -1,6 +1,6 @@
 #pragma once
 
-#include <huxerui/mediacodec.h>
+#include <huxerui/media_codec.h>
 #include <deque>
 #include <mutex>
 

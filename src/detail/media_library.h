@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <variant>
-#include <huxerui/medialibrary.h>
+#include <huxerui/media_library.h>
 #include <huxerui/platform_registry.h>
 
 namespace huxerui::media::detail {

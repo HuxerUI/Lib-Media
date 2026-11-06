@@ -56,11 +56,11 @@ All types remain in `huxerui::media`. Public headers and remaining planned heade
 
 | Header | Proposed contents |
 | --- | --- |
-| `mediaformat.h` | Exact timestamps, audio/video format descriptions, encoded packets, and owned raw frames |
-| `mediacodec.h` | Capability probes, codec configuration, errors, and typed encoder/decoder sessions |
-| `mediaplayback.h` | Later decoded-input playback; consumes the same format and frame types |
-| Existing `mediaplayer.h` | Existing file/reference/URL player, unchanged |
-| Existing `medialibrary.h` | Existing selection and publication, unchanged |
+| `media_format.h` | Exact timestamps, audio/video format descriptions, encoded packets, and owned raw frames |
+| `media_codec.h` | Capability probes, codec configuration, errors, and typed encoder/decoder sessions |
+| `media_playback.h` | Later decoded-input playback; consumes the same format and frame types |
+| Existing `media_player.h` | Existing file/reference/URL player, unchanged |
+| Existing `media_library.h` | Existing selection and publication, unchanged |
 
 Use `AudioDecoder`, `VideoDecoder`, `AudioEncoder`, and `VideoEncoder` as concrete, move-only session handles. These
 four names express different input/output types; they do not imply four copies of the internal queue/state machinery.
@@ -526,7 +526,7 @@ lifetime independently before replacing the initial owned CPU output.
 | Milestone | Deliverable | Acceptance gate |
 | --- | --- | --- |
 | Cross-platform feasibility | Small codec probes for all six targets, including browser lifecycle behavior | Native operations and callback cleanup mapped before API freeze; unavailable validation recorded explicitly |
-| Shared contract | mediaformat.h values, validation, checked timestamps, owned planes | No UI dependency; overflow/stride/time tests; API redundancy review; common lifecycle contract |
+| Shared contract | media_format.h values, validation, checked timestamps, owned planes | No UI dependency; overflow/stride/time tests; API redundancy review; common lifecycle contract |
 | Audio decoding | AAC-LC to requested supported PCM on each capable backend | Packet fixture to PCM, sample counts/timing, bounded memory, EOS and reset; platform support matrix |
 | Video decoding | AVC to supported CPU YUV on each capable backend | Plane/crop checks, B-frame order, format changes, retained output after close; platform support matrix |
 | Decoded playback | Audio device output, then video presentation and A/V scheduling | Synthetic input plus real decoder pipeline, measured timing, independent lifetimes |

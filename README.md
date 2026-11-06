@@ -23,10 +23,10 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 
 | Capability | Current status | Public entry points |
 | --- | --- | --- |
-| Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`mediaplayer.h`](include/huxerui/mediaplayer.h) |
-| Native image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`medialibrary.h`](include/huxerui/medialibrary.h) |
-| Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`medialibrary.h`](include/huxerui/medialibrary.h) |
-| AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`mediacodec.h`](include/huxerui/mediacodec.h) / [`mediaformat.h`](include/huxerui/mediaformat.h) |
+| Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`media_player.h`](include/huxerui/media_player.h) |
+| Native image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
+| Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
+| AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
 | Decoded-media playback | Planned — [#102](https://github.com/HuxerUI/HuxerUI/issues/102) | PCM output and timestamped video-frame playback; no public API yet |
 | Audio/video encoding | Planned after the decoder foundation | No public encoder API yet |
 
@@ -82,8 +82,8 @@ For playback and photo-library access, register the installation hook in the app
 
 ```cpp
 #include <huxerui/huxerui.h>
-#include <huxerui/mediaplayer.h>
-#include <huxerui/medialibrary.h>
+#include <huxerui/media_player.h>
+#include <huxerui/media_library.h>
 
 huxerui::View App();
 
@@ -95,7 +95,7 @@ const huxerui::Application application{
 
 The hook registers platform integration. Put the UI components below in codegen-enabled C++ sources with the
 corresponding headers included. The [preview application](examples/preview/src/app.cpp) provides a complete integration.
-For headless decoding, include `<huxerui/mediacodec.h>` and see [Media decoding](#media-decoding).
+For headless decoding, include `<huxerui/media_codec.h>` and see [Media decoding](#media-decoding).
 
 ### Handles and execution
 
@@ -164,7 +164,7 @@ Web files. A network source is `MediaSource(MediaHttpSource{"https://your-server
 
 Disconnected commands return `false` and are not queued. Invalid source arguments, nonfinite/negative seek positions,
 or volume outside `[0, 1]` throw `std::invalid_argument`. Stale callbacks from replaced sources or retired sessions are
-ignored. See [`mediaplayer.h`](include/huxerui/mediaplayer.h) for complete command, state, and subscription contracts.
+ignored. See [`media_player.h`](include/huxerui/media_player.h) for complete command, state, and subscription contracts.
 
 ### Video output and current limits
 
@@ -283,7 +283,7 @@ closes it. Native selection shares the SDK's window presentation coordination wi
 Canceling a save cannot undo committed publication. Android attempts to delete an unfinished pending entry, subject to
 provider cleanup failures. Once an iOS Photos transaction is submitted, it may finish after cancellation; its staged
 source remains retained until completion. Partial selection results are released if materializing any item fails.
-See the [media library guide](docs/medialibrary.md) and [`medialibrary.h`](include/huxerui/medialibrary.h) for details.
+See the [media library guide](docs/medialibrary.md) and [`media_library.h`](include/huxerui/media_library.h) for details.
 
 ## Media decoding
 
