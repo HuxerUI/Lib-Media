@@ -126,14 +126,6 @@ struct VideoDecoderConfig {
   std::function<void(CodecResult<void>)> cleanup_completed;
 };
 
-/// @brief Successful outcomes of submitting a compressed access unit.
-enum class SubmitStatus {
-  /// The decoder has copied and queued the packet. Native decoding may still be pending.
-  Accepted,
-  /// The decoder consumed no input. Retry the same packet when startup, reset, or queue capacity allows it.
-  WouldBlock
-};
-
 /// @brief End of a successfully drained stream.
 ///
 /// The decoder emits this once after Finish() and all delayed frames. The session remains open for Reset() or Close().

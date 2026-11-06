@@ -1,11 +1,12 @@
 # Lib-Media
 
 Lib-Media is the media library for [HuxerUI](https://github.com/HuxerUI/HuxerUI). It brings media playback, native
-image/video selection, saving to the system photo library, and headless AAC-LC/H.264 decoding into one C++ library.
-Decoded-input playback and encoding will build on the shared media values in this repository.
+image/video selection, saving to the system photo library, headless AAC-LC/H.264 decoding, and decoded PCM output
+into one C++ library.
 
-Link **`HuxerUI::Media`** and use APIs in **`huxerui::media`**. Playback and photo-library access use the
-**`Install`** application hook. Decoders can run independently of that hook, a UI runtime, or a window.
+Link **`HuxerUI::Media`** and use APIs in **`huxerui::media`**. Register the **`Install`** application hook
+for file/URL playback and photo-library access. Decoding and PCM output can run independently of that hook,
+a UI runtime, or a window.
 
 Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 
@@ -15,6 +16,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 - [Media playback](#media-playback)
 - [Media selection and saving](#media-selection-and-saving)
 - [Media decoding](#media-decoding)
+- [PCM playback](#pcm-playback)
 - [Preview, builds, and validation](#preview-builds-and-validation)
 - [Repository layout](#repository-layout)
 - [Roadmap](#roadmap)
@@ -27,7 +29,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Native image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
 | AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
-| Decoded-media playback | Planned — [#102](https://github.com/HuxerUI/HuxerUI/issues/102) | PCM output and timestamped video-frame playback; no public API yet |
+| Decoded PCM playback | First stage of [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android API 26+ and macOS | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | Audio/video encoding | Planned after the decoder foundation | No public encoder API yet |
 
 Native selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
@@ -182,8 +184,8 @@ without the optional HLS/DASH modules. Browser playback may require a user gestu
 The library does not configure process-wide Apple audio sessions or add background services.
 
 Playlists, speed control, track/subtitle selection, DRM, casting, downloads, PiP, system media controls, and raw decoded
-frame/PCM input are not current playback features. Use the separate [codec sessions](#media-decoding) for decoded CPU
-output; device playback of that output remains on the [roadmap](#roadmap).
+frame/PCM input are outside the file and URL player. Use [codec sessions](#media-decoding) for decoded CPU output
+and [DecodedPlayback](#pcm-playback) to play its PCM frames.
 
 ## Media selection and saving
 
@@ -307,6 +309,25 @@ C++/WASM API. Windows timestamp matching has a simulated regression test. Native
 Windows, Linux, and physical iOS devices. See the [decoding guide](docs/mediacodec.md) for examples, queue limits,
 platform requirements, and validation instructions.
 
+## PCM playback
+
+`DecodedPlayback` accepts `AudioFrame` from a decoder or a PCM generator. Configure an exact interleaved S16 format
+with mono or stereo channels. The session opens asynchronously and starts paused. Submit contiguous timestamps on
+the configured sample grid. An accepted submission copies the frame so the producer can release its storage.
+
+- Call `Play()` and retry the same frame after `WouldBlock` when playback returns capacity.
+- Read `Snapshot()` for device-observed position, outstanding media duration and underruns. Pause preserves pending
+  media. During starvation the position freezes after the committed tail and playback resumes after refill. A frame
+  blocked by capacity can trigger an earlier start.
+- Call `FinishAudio()` to seal input. `Ended` follows device confirmation of the final media sample and pause. Use `Reset()`
+  for a fresh timeline and `cleanup_completed` to observe release after logical `Close()`.
+
+Android uses AAudio on API 26+ and macOS uses AVAudioEngine. Other platforms currently report `Unsupported`.
+The [native playback test](tests/playback_native.cpp) is a headless example that plays both generated PCM and the AAC
+fixture through this API. With tests enabled, run `ctest --test-dir build/tests -R media_playback --output-on-failure`
+on macOS. The same native executable runs against the fixture on Android hardware. See the
+[playback contract and device mappings](docs/codec-design.md#decoded-playback-boundary) for timing and lifecycle details.
+
 ## Preview, builds, and validation
 
 The [preview](examples/preview) exercises the library through three tabs:
@@ -388,10 +409,9 @@ The [codec and decoded-playback design](docs/codec-design.md) records the shared
 lifecycle contract, and delivery order. The AAC/AVC decoding milestone is now implemented, with remaining platform
 validation called out in the [decoding guide](docs/mediacodec.md).
 
-Decoded-media playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) will consume these same AudioFrame and
-VideoFrame values for PCM device output and timestamped video presentation, with bounded queues, a playback clock,
-and A/V synchronization. Encoding and broader codec discovery remain later stages of
-[#20](https://github.com/HuxerUI/HuxerUI/issues/20). No public playback-of-frames or encoder API is exported yet.
+The next stages of decoded playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) extend PCM support and
+use the playback clock to schedule `VideoFrame` presentation. Encoding and broader codec discovery remain later
+stages of [#20](https://github.com/HuxerUI/HuxerUI/issues/20).
 
 Existing file/URL playback continues to use native players. HuxerUI owns general file, task, window, and texture
 facilities; media-specific behavior stays in Lib-Media.

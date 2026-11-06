@@ -22,11 +22,12 @@ public:
   static std::shared_ptr<CodecWorker> Start(std::function<void(bool)> work);
   void Schedule(unsigned delay_ms = 0);
   void NotifyCredit();
+  void Finish(std::function<void()> completion);
   void Finish(CodecResult<void> result, std::function<void(CodecResult<void>)> callback);
 private:
   friend class CodecReaper;
   using Clock = std::chrono::steady_clock;
-  struct Completion {
+  struct CodecCompletion {
     CodecResult<void> result;
     std::function<void(CodecResult<void>)> callback;
   };
@@ -37,7 +38,7 @@ private:
   std::optional<Clock::time_point> due_;
   bool credit_available_ = false, finished_ = false;
   std::function<void(bool)> work_;
-  std::optional<Completion> completion_;
+  std::variant<CodecCompletion, std::function<void()>> completion_{std::in_place_index<1>};
   std::promise<void> exit_;
   std::future<void> exited_ = exit_.get_future();
   std::thread thread_;

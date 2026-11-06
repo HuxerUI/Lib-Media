@@ -1,8 +1,8 @@
 # Codec and decoded-playback design
 
-Status: shared CPU media values and the first AAC/AVC decoder milestone are implemented. See the
-[decoding guide](mediacodec.md) for the exported API, supported subset, actual platform validation, and current limits.
-The playback and encoder sections remain design work; the broader acceptance plan below is not a claim of completed validation.
+The shared CPU media values, first AAC/AVC decoder milestone and first Android/macOS PCM playback milestone are
+implemented. The [decoding guide](mediacodec.md) records decoder validation. The
+[PCM acceptance section](#first-implementation-and-acceptance) records playback validation and the remaining work.
 
 The current implementation uses concrete asynchronous Probe calls, without hardware selection/classification. Windows
 starts with synchronous system MFTs; Linux is an explicit optional GStreamer dependency. Video reserves a conservative
@@ -58,7 +58,7 @@ All types remain in `huxerui::media`. Public headers and remaining planned heade
 | --- | --- |
 | `media_format.h` | Exact timestamps, audio/video format descriptions, encoded packets, and owned raw frames |
 | `media_codec.h` | Capability probes, codec configuration, errors, and typed encoder/decoder sessions |
-| `media_playback.h` | Later decoded-input playback; consumes the same format and frame types |
+| `media_playback.h` | Decoded-input playback, starting with PCM output and a playback clock |
 | Existing `media_player.h` | Existing file/reference/URL player, unchanged |
 | Existing `media_library.h` | Existing selection and publication, unchanged |
 
@@ -461,41 +461,150 @@ this design does not claim that every driver is bounded or that release cannot f
 
 ## Decoded playback boundary
 
-After decoding works, `DecodedPlayback` consumes AudioFrame/VideoFrame without owning their producer or decoder.
-Audio-only and video-only configurations do not manufacture a missing track. Initially accept exact configured formats;
-conversion/resampling is explicit and capability checked. Its independently bounded queues retain shared immutable
-frames; holding those references may in turn backpressure the decoder's output pool.
+`DecodedPlayback` in `media_playback.h` owns the device and the playback timeline. The producer owns source
+reading, decoding and seeking. Start with an audio-only session that accepts `AudioFrame` from any producer.
+Use the installed SDK's shared media values and `Result`. Share `SubmitStatus` between codec and playback through
+`media_format.h`. Keep playback failures and device diagnostics in the playback session.
 
-The planned playback policy is:
+### PCM input and capacity
 
-- With audio, use native consumed/presented sample position and latency information as the master clock, not the number
-  of submitted bytes. With video only, anchor a monotonic clock to the configured timeline start.
-- Pause freezes the clock and preserves queued content. On audio underrun, allow already queued hardware audio to finish,
-  then freeze at the last media sample; resume from that position when a configured refill threshold is met. Any device
-  silence inserted to keep output alive does not advance the media playhead.
-- Publish video frames when due. In real-time playback, superseded late video frames may be dropped with a reported
-  counter; offline codec output never uses this policy. An empty video queue does not stop an audio master clock.
-- Reset the playback timeline explicitly for seeking/discontinuity. The application resets its source, decoder, and
-  playback under its own barrier. Playback does not invoke decoder Reset or seek files on the caller's behalf.
-- End-of-input is per enabled stream. Completion requires native audio drain and reaching the final video presentation
-  endpoint. Unknown final video duration needs an explicit end timestamp or a documented last-PTS endpoint rule.
-- Device loss/interruption is reported; background execution, audio focus, and Apple audio-session policy remain app-owned.
+Configure one `AudioFormat`, a maximum queued duration and a start/refill threshold. The first implementation
+supports interleaved S16 mono or stereo at a sample rate the adapter can open. The initial device tests use
+48 kHz stereo. An adapter can change the sample representation for its device path while keeping the media sample
+rate and channel order. The platform mixer can adapt the stream to the physical device. Format changes require a new
+configuration boundary.
 
-Concrete queue durations, late-frame thresholds, and synchronization tolerance are playback configuration/measurement
-work in #102. The design does not claim an unmeasured cross-platform latency or accuracy guarantee. Format changes
-require an explicit playback reconfiguration boundary in the first implementation, rather than silently restarting audio.
+`TrySubmitAudio()` validates the whole frame and copies only its addressed samples into bounded playback storage.
+The caller can release a decoder frame as soon as submission returns. This lets the playback queue reach its startup
+threshold even when the decoder's output pool is smaller than that threshold. `WouldBlock` leaves the frame for retry.
+A frame larger than the configured capacity fails immediately. Measure capacity in sample frames and charge accepted
+media until it is observed as presented or discarded by a barrier. Native buffers and conversion scratch have their
+own fixed bounds.
 
-DecodedPlayback adopts the same separation: Close logically stops admission and scheduling immediately; cleanup
-completion follows retirement of audio-device work, timers, presentation jobs, and application callbacks. A successful
-Finish/drain is a different event and must account for audible completion. Close may allow already committed device
-samples to finish until native stop takes effect; it does not claim immediate physical silence. No new frame publication
-may be admitted after the logical barrier; cleanup waits for already admitted publication calls to return. A renderer's
-snapshot or a caller-retained ExternalTexture may retain its last published frame independently. Its eventual release
-is not a reason to hold the playback session open, and playback closure never closes its external decoder.
+Convert input PTS to the configured sample grid with `MediaTimestamp::Rescale(sample_rate)`. The first accepted
+frame anchors the epoch. Each subsequent PTS must equal the anchor plus the number of already accepted sample
+frames on that grid. Check arithmetic before admission. Gaps and overlaps require the producer to correct the input
+or reset the timeline. Any intentional silence the producer submits counts as media.
 
-Only the selected frame is sent to an existing SDK texture. Compatible output keeps texture identity stable; a change
-to intrinsic logical size creates a new texture and one structural UI update. Per-frame data does not flow through State
-or PlatformPayload. Visibility may avoid visual conversion, but does not authorize pausing audio or retiring the session.
+### Playback position, starvation and drain
+
+Within an epoch, maintain three counts of sample frames with `0 <= presented <= committed <= accepted`. The
+device adapter commits PCM in whole sample frames, including partial native writes. It maps native clock observations
+or completion of a contiguous range to the presented count. The position is the anchor plus that count at the
+configured sample rate. Before an anchor exists the position is empty. Acceptance and native writes leave the
+presented count unchanged.
+
+Use the device's presentation observation where available. A backend with buffer completion reports progress in
+buffer increments. Validate the epoch, native clock origin and observation freshness. A temporary loss of timing
+holds the last valid position. Each backend documents its observation boundary and resolution. The first stage
+reports observations directly and measures delay on each tested route.
+
+| Event | Shared behavior |
+| --- | --- |
+| Create and play | Open asynchronously and start paused. A play request starts output once the accepted backlog reaches the refill threshold and the device can start. A valid frame blocked by capacity allows a shorter start. Validate that the required native priming fits the configured capacity. |
+| Pause and resume | Pause stops admission of new device submissions and takes effect when the adapter acknowledges it. Freeze the reported position at that boundary and preserve queued media. Account for any later observation of the committed tail on resume. A final drain confirmed before pause takes effect can reach Ended first. |
+| Underrun and refill | When running input runs out, record the end of the current media range and account for that tail as it plays. Enter Buffering and count one underrun when the tail is confirmed. Continue writing while PCM is ready and the device run accepts it. At a gap, keep a writable run paused for refill and retire a run that can no longer accept media. Resume from the same media position once the threshold or capacity condition is met. Map device silence and any start padding outside the media count. |
+| Finish and Ended | `FinishAudio()` seals the accepted sample count and is idempotent. A final short batch can start below the refill threshold while play is requested. A paused session can drain after resume. Ended requires a valid device observation covering the final media frame or a verified normal drain acknowledgement for that range, followed by native pause when the device is running. A pause failure is reported before Ended. An empty stream can end immediately. |
+| Device interruption or loss | Freeze the last confirmed position and report the condition separately from Buffering. If the endpoint invalidates queued data or clock continuity, fail the epoch and report the operational error. The app owns background execution, audio focus and Apple audio-session policy. |
+
+Keep play intent, input sealing and device progress separate. A single snapshot can expose position, buffered duration
+derived from `accepted - presented`, transport state and the underrun count. A coalesced wakeup signals changes or new
+capacity. Device read counts, software queue emptiness and elapsed wall time can guide scheduling. Only a presentation
+observation or a normal drain fence advances the final position. Muted media still consumes its sample frames. Apply
+gain and mute when preparing the device buffer so the change takes effect at a submission boundary.
+
+### Reset and cleanup
+
+`Reset()` immediately retires the current epoch for submissions and observations. The adapter discards pending
+native work asynchronously, then returns ready and paused. Input returns `WouldBlock` while starting or resetting.
+The next frame supplies a new anchor. The application coordinates its source and decoder reset. Give each device run
+within an epoch its own identity so a reopened device can report a new counter origin without changing the media position.
+
+`Close()` and destruction end admission immediately and schedule native discard and release. Previously committed
+audio may still be heard while native stop takes effect. Advance the generation before invoking native stop, flush
+or dispose so canceled native callbacks cannot advance the playhead or complete a drain. An admitted wakeup may
+finish. If registered, `cleanup_completed` runs once after device and buffer release, callback quiescence and native
+worker exit. A fatal playback error initiates the same cleanup and remains observable until Close. Report release
+failures separately from playback failures. Unsafe work that cannot be retired keeps completion pending. Ended
+remains observable until Reset or Close and does not itself release the session.
+
+Native adapters serialize device commands on one worker per session. Native callbacks report bounded progress to
+that worker through adapter-owned state. Web uses the owning event loop and retires worklet messages and promises
+before completion. Application callbacks run outside session locks and may request Close.
+
+### Six platform mappings
+
+Android and macOS implement the shared contract in this milestone. The other rows describe the planned device paths.
+
+| Platform | Clock and underrun | Drain | Pause, reset and cleanup |
+| --- | --- | --- | --- |
+| Android | AAudio shared output on API 26+. Map fresh `getTimestamp(CLOCK_MONOTONIC)` observations to the current device run. Use nonblocking writes during startup and refill. Keep the clock observable at a starved tail with bounded silence ranges. | A fresh timestamp must cross the end of the last media range. Treat `STOPPED` and the post-stop read count as control observations. | Acknowledge the native pause state and freeze the public clock. Refill can open a fresh stream after a confirmed starved tail. Reset or Close retires the run before discard and release on the worker. |
+| macOS | `AVAudioEngine` and `AVAudioPlayerNode` with bounded PCM buffers. Advance by the contiguous prefix of current-run `dataPlayedBack` completions. The empty queue enters Buffering when that prefix reaches the last media frame. | The last buffer's normal `dataPlayedBack` completion confirms the tail. Check engine and route validity before accounting for completions. | Pause and resume the player node. On reset or close, retire callbacks, stop the node and engine, and release buffers and observers on the worker. |
+| iOS | Implement its own engine/player-node adapter with the same `dataPlayedBack` boundary. Observe interruptions and route changes through the app's audio session. | Confirm the final contiguous completed buffer for the active route and run. Device invalidation fails the epoch. | Use node pause for ordinary suspension. Stop and release the node, engine and observers on teardown. The app configures and activates `AVAudioSession`. |
+| Windows | WASAPI shared render on the owning COM worker. Normalize `IAudioClock::GetPosition` using `GetFrequency`. Map endpoint ranges to committed media, including any silence inserted at underrun. Use padding for writes. | Require the device position to cover the final mapped media range. | `IAudioClient::Stop` and Start implement pause and resume. Stop, Reset, release render and clock interfaces, then release COM on retirement. |
+| Linux | An optional libpulse adapter uses the installed PulseAudio-compatible server. Map valid stream timing and latency to media ranges. Reconcile read/write indices across starvation and keep cork/refill under session control. | Combine a successful `pa_stream_drain` with timing that covers the final range at the output boundary. | Cork preserves pending audio. Flush discards it. Cancel outstanding operations, remove callbacks, disconnect and release owned stream and mainloop resources. |
+| Web | A bounded AudioWorklet queue reports which context frame ranges carried media. Intersect those reports with `AudioContext.getOutputTimestamp().contextTime` to advance the playhead through media only. Start or resume from a browser-allowed context. | Confirm drain when the output timestamp reaches the end of the final reported media range. | Suspend and resume the owned context. Retire the old node and port on reset. Close the context asynchronously, settle or safely detach pending work, and release the JS/WASM bridge on its owner. |
+
+Gate Android PCM availability on the AAudio library and entry points at runtime to preserve the library's API 23
+baseline. Older devices report Unsupported for this path. The AAudio library remains loaded for the process,
+while cleanup releases each session's stream. On Android, label native writes as media or silence. Add
+only bounded padding for native priming of a short final batch or to keep observations flowing across a sealed or
+starved tail. Give pending PCM priority while the route can still play it continuously. Retire a starved device
+run only after its media boundary is confirmed. A fresh run starts at the same media position with a new native
+origin. Validate each timestamp against the run's start or resume time and the mapped sample ranges. Bound queued
+padding, total padding for one tail and the time spent awaiting a valid observation.
+
+Gate the Linux adapter on an explicit dependency and server availability. If a route loses the evidence needed
+to establish progress or a normal drain, hold progress until an observation resumes or report a device error.
+Record the buffer and timing limits for each validated route.
+
+Device references are [AAudio stream control and timing](https://developer.android.com/ndk/reference/group/audio),
+[the AAudio legacy stop implementation](https://android.googlesource.com/platform/frameworks/av/+/2a6e1b0211e3337931c65a33e07c344719ca4328/media/libaaudio/src/legacy/AudioStreamTrack.cpp),
+[Apple player node scheduling](https://developer.apple.com/documentation/avfaudio/avaudioplayernode),
+[Apple playback completion](https://developer.apple.com/documentation/avfaudio/avaudioplayernodecompletioncallbacktype/dataplayedback),
+[WASAPI device position](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclock-getposition),
+[PulseAudio stream timing](https://freedesktop.org/software/pulseaudio/doxygen/streams.html) and
+[Web Audio output timestamps](https://www.w3.org/TR/webaudio/#dom-audiocontext-getoutputtimestamp).
+
+### First implementation and acceptance
+
+Temporary device probes exercised the proposed native timing boundaries with 48 kHz stereo PCM.
+
+- Android 12 hardware returned stale startup timestamps and stopped reporting valid timestamps at an unpadded
+  tail. A normal stop reached `STOPPED` and advanced the read count before timing could confirm the remaining
+  samples. With bounded padding, fresh device timestamps crossed both a 9,600-frame media tail after pause and
+  resume and a 1,024-frame short tail.
+- The macOS engine delivered playback completions across pause, resume and refill. Its render cursor advanced
+  through starvation. Stopping also invoked the completion of a canceled buffer, which confirms the need for
+  run retirement before stop.
+
+The native playback test runs a generated PCM tone and the existing AAC packet fixture through the same playback
+input on Android hardware and macOS. The AAC producer configures the decoder for interleaved S16 and releases each output frame
+after submission. Use the fixture's full sample count and negative initial PTS to check the exact final timeline
+position. Run both as headless consumers of the installed SDK. A preview control can observe the same snapshot.
+
+- Saturate the queue and retry the same frame. Exercise a 100 ms refill threshold with a four-frame decoder pool.
+- Observe progress while audio plays. Pause with queued media, resume, and force starvation and refill. Check
+  that device silence adds zero media duration and the position remains monotonic within the epoch.
+- Seal a short tail below the refill threshold and observe Ended at the last sample boundary. Test pause during
+  drain, as well as Reset and Close racing with pending device completions.
+- Check that closing playback does not retire its producer. Verify a single cleanup result after release and
+  that another session progresses while a device teardown is pending.
+
+The native test passed on Android 12 hardware and macOS with 48 kHz stereo S16. Both paths reached 12,288 ticks at
+48 kHz after submitting all 13 AAC frames from the negative initial PTS. The Android device required enough
+initial data to fill its native buffer even after reporting `STARTED`. The adapter requests a native capacity of
+up to 200 ms and can add bounded silence when it is still priming and has no further ready PCM. Contract tests
+exercise copied input, a stale observation across Reset, release failure and an unrelated session progressing
+during blocked teardown. Validate each remaining adapter and measure route timing before adding video scheduling.
+
+### Later video scheduling
+
+Use the audio position as master when both tracks are enabled and a monotonic timeline for video-only playback.
+Bound retained video frames separately and select the due frame for the existing `ExternalTexture`. Report
+superseded late frames and keep the audio clock running when video is empty. Keep texture identity stable for a
+compatible logical size. Reaching Ended requires each enabled track's final presentation boundary. A renderer
+snapshot may hold the last displayed frame independently of session cleanup.
 
 ## SDK reuse and open integration gates
 
@@ -529,7 +638,8 @@ lifetime independently before replacing the initial owned CPU output.
 | Shared contract | media_format.h values, validation, checked timestamps, owned planes | No UI dependency; overflow/stride/time tests; API redundancy review; common lifecycle contract |
 | Audio decoding | AAC-LC to requested supported PCM on each capable backend | Packet fixture to PCM, sample counts/timing, bounded memory, EOS and reset; platform support matrix |
 | Video decoding | AVC to supported CPU YUV on each capable backend | Plane/crop checks, B-frame order, format changes, retained output after close; platform support matrix |
-| Decoded playback | Audio device output, then video presentation and A/V scheduling | Synthetic input plus real decoder pipeline, measured timing, independent lifetimes |
+| PCM playback | Shared semantics across six platforms with Android hardware and macOS as the first implementation targets | Generated PCM and AAC decoder output, measured presentation and drain boundaries, independent lifetimes |
+| Decoded video playback | Video presentation and A/V scheduling on the verified audio clock | Bounded video queues, timing measurements and stable texture identity |
 | Encoding and expansion | Typed encoders across target platforms and additional formats | Configuration events, priming/reordering metadata, round trips, capability/dependency reports |
 
 Codec fixtures include initialization data, packet boundaries, timing, expected output dimensions/sample counts, and

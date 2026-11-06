@@ -96,6 +96,14 @@ struct AudioFormat {
   bool operator==(const AudioFormat&) const = default;
 };
 
+/// @brief Successful outcomes of submitting media to a bounded session.
+enum class SubmitStatus {
+  /// The session accepted the entire input and owns the bytes needed for asynchronous work.
+  Accepted,
+  /// The session consumed no input. Retry when startup, reset, or queue capacity allows it.
+  WouldBlock
+};
+
 /// @brief A complete compressed access unit with timing on the source's media timeline.
 ///
 /// Supply one raw AAC access unit or one complete length-prefixed AVC picture access unit per packet. Keep data

@@ -47,10 +47,13 @@ public:
 private:
   static void Complete(std::shared_ptr<CodecWorker> worker) {
     worker->thread_.join();
-    auto completion = std::move(*worker->completion_);
-    worker->completion_.reset();
+    auto completion = std::move(worker->completion_);
     worker.reset();
-    if (completion.callback) completion.callback(std::move(completion.result));
+    if (auto* codec = std::get_if<CodecWorker::CodecCompletion>(&completion)) {
+      if (codec->callback) codec->callback(std::move(codec->result));
+    } else if (auto& callback = std::get<1>(completion)) {
+      callback();
+    }
   }
 
   static void Run(Queue& queue) {
@@ -118,7 +121,13 @@ void CodecWorker::NotifyCredit() {
 
 void CodecWorker::Finish(CodecResult<void> result, std::function<void(CodecResult<void>)> callback) {
   std::lock_guard lock(mutex_);
-  completion_.emplace(Completion{std::move(result), std::move(callback)});
+  completion_.emplace<CodecCompletion>(CodecCompletion{std::move(result), std::move(callback)});
+  finished_ = true;
+}
+
+void CodecWorker::Finish(std::function<void()> completion) {
+  std::lock_guard lock(mutex_);
+  completion_ = std::move(completion);
   finished_ = true;
 }
 
