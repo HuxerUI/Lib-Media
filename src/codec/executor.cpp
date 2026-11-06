@@ -112,10 +112,10 @@ void CodecWorker::Schedule(unsigned delay_ms) {
   }
 }
 
-void CodecWorker::NotifyCredit() {
+void CodecWorker::Signal() {
   std::lock_guard lock(mutex_);
   if (finished_) return;
-  credit_available_ = true;
+  signaled_ = true;
   changed_.notify_one();
 }
 
@@ -134,15 +134,15 @@ void CodecWorker::Finish(std::function<void()> completion) {
 void CodecWorker::Run() {
   std::unique_lock lock(mutex_);
   while (!finished_) {
-    if (!credit_available_) {
+    if (!signaled_) {
       if (!due_) { changed_.wait(lock); continue; }
       const auto due = *due_;
       if (Clock::now() < due) { changed_.wait_until(lock, due); continue; }
     }
     due_.reset();
-    const auto credit = std::exchange(credit_available_, false);
+    const auto signaled = std::exchange(signaled_, false);
     lock.unlock();
-    work_(credit);
+    work_(signaled);
     lock.lock();
   }
 }

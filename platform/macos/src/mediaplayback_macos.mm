@@ -11,7 +11,7 @@ namespace {
 
 class MacPlaybackDevice final : public PlaybackDevice {
 public:
-  PlaybackResult<void> Open(const AudioFormat& format, std::size_t capacity) override {
+  PlaybackResult<void> Open(const AudioFormat& format, std::size_t capacity, std::function<void()>) override {
     @autoreleasepool {
       channels_ = format.ChannelCount();
       quantum_ = std::max(1u, format.sample_rate / 50);

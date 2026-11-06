@@ -52,7 +52,7 @@ PlaybackResult<std::shared_ptr<PlaybackSession>> PlaybackSession::Create(const A
         callback(std::move(result));
       };
     }
-    session->worker_ = CodecWorker::Start([session](bool) { session->Run(); });
+    session->worker_ = CodecWorker::Start([session](bool output_lost) { session->Run(output_lost); });
     session->completion_ = std::move(completion);
     session->worker_->Schedule();
     return R::Success(std::move(session));
@@ -175,7 +175,9 @@ bool PlaybackSession::Current(std::uint64_t epoch) const noexcept {
 void PlaybackSession::Open() {
   device_ = factory_();
   if (!device_) throw PlaybackError{PlaybackErrorCode::Unsupported, "PCM playback is unavailable", {}};
-  Require(device_->Open(format_, capacity_));
+  Require(device_->Open(format_, capacity_, [worker = std::weak_ptr(worker_)] {
+    if (auto current = worker.lock()) current->Signal();
+  }));
 }
 void PlaybackSession::Release() {
   if (device_) {
@@ -210,7 +212,7 @@ std::size_t PlaybackSession::Write(std::uint64_t epoch) {
   return written;
 }
 
-bool PlaybackSession::Tick(std::uint64_t epoch) {
+bool PlaybackSession::Tick(std::uint64_t epoch, bool output_lost) {
   PlaybackState state;
   bool observe, input_empty;
   {
@@ -231,6 +233,7 @@ bool PlaybackSession::Tick(std::uint64_t epoch) {
     return play_;
   }
 
+  if (!observe && output_lost && device_) Require(device_->Observe(input_empty));
   if (observe) {
     const auto progress = Require(device_->Observe(input_empty));
     std::lock_guard lock(mutex_);
@@ -317,7 +320,7 @@ void PlaybackSession::Cleanup() {
   wakeup_ = {};
   worker_->Finish(std::move(completion_));
 }
-void PlaybackSession::Run() {
+void PlaybackSession::Run(bool output_lost) {
   std::uint64_t epoch;
   {
     std::lock_guard lock(mutex_);
@@ -327,7 +330,7 @@ void PlaybackSession::Run() {
   bool poll = false;
   std::optional<PlaybackError> failure;
   try {
-    poll = Tick(epoch);
+    poll = Tick(epoch, output_lost);
   } catch (PlaybackError& error) {
     failure = std::move(error);
   } catch (const std::bad_alloc&) {

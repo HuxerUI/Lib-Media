@@ -47,7 +47,7 @@ template<class Output> DecoderState<Output>::Credit::~Credit() {
 #ifdef __EMSCRIPTEN__
     DispatchCodec([session] { session->CreditAvailable(); });
 #else
-    session->worker_->NotifyCredit();
+    session->worker_->Signal();
 #endif
   }
 }

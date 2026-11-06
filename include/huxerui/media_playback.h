@@ -7,10 +7,10 @@
 /// submit AudioFrame values from a decoder or another producer. The session owns the output device and the
 /// playback timeline. The producer owns source loading, decoding, seeking and any input format conversion.
 ///
-/// PCM playback is available on Android API 26+ and macOS, subject to the output route and requested format.
+/// PCM playback is available on Android API 26+, iOS 15+, and macOS, subject to the output route and requested format.
 /// Use the API independently of a View, Runtime or window. The application manages audio focus and background
 /// playback policy. See AudioPlaybackConfig for supported formats and callback delivery. Enable video in
-/// DecodedPlaybackConfig to add a caller-driven presenter on Android and macOS.
+/// DecodedPlaybackConfig to add a caller-driven presenter on Android, iOS, or macOS.
 
 #include <chrono>
 #include <functional>
@@ -110,8 +110,8 @@ struct AudioPlaybackConfig {
 
 /// @brief Enabled tracks for one decoded playback session.
 ///
-/// Enable at least one track. Audio is supported on Android API 26+ and macOS. Video is supported on Android
-/// and macOS. When both tracks are enabled, submit frames from the same media timeline.
+/// Enable at least one track. Audio is supported on Android API 26+, iOS 15+, and macOS. Video is supported on
+/// Android, iOS, and macOS. When both tracks are enabled, submit frames from the same media timeline.
 struct DecodedPlaybackConfig {
   /// PCM device configuration. Leave empty for video-only playback.
   std::optional<AudioPlaybackConfig> audio;
@@ -184,6 +184,9 @@ public:
   /// Failed and initiate cleanup. Opening and wakeups can race the return of Create(). Confirmed audio position
   /// drives synchronized video until audio drains. Video-only playback and a video tail after audio drain use
   /// monotonic time. Drive PresentVideo() periodically when video is enabled, including during drain.
+  /// On iOS, configure and activate the application-owned AVAudioSession before enabling audio. An interruption,
+  /// lost output route, or engine invalidation fails the current run even while paused. Restore the audio
+  /// session before creating a fresh playback session.
   /// @param config Enabled tracks and PCM settings, copied into the session.
   /// @return An owning handle, or a synchronous Unsupported, InvalidArgument or ResourceExhausted error.
   /// A synchronous failure schedules no callbacks.

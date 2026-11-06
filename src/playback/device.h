@@ -15,7 +15,9 @@ struct PlaybackProgress {
 class PlaybackDevice {
 public:
   virtual ~PlaybackDevice() = default;
-  virtual PlaybackResult<void> Open(const AudioFormat& format, std::size_t capacity) = 0;
+  // Signal output loss from native callbacks. The worker then checks the device through Observe().
+  virtual PlaybackResult<void> Open(const AudioFormat& format, std::size_t capacity,
+                                   std::function<void()> output_lost) = 0;
   virtual PlaybackResult<std::size_t> Write(std::span<const std::int16_t> samples) = 0;
   virtual PlaybackResult<void> Start() = 0;
   virtual PlaybackResult<void> Pause() = 0;

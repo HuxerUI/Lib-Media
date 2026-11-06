@@ -124,8 +124,13 @@ Task<std::string> PlayDecodedClip(std::shared_ptr<Resources> resources, std::sha
     audio = Require(AudioDecoder::Create(config));
     playback_config.emplace();
     playback_config->format = sync_audio;
+#if defined(MEDIA_PREVIEW_IOS)
+    playback_config->cleanup_completed = [audio_use = RetainPreviewAudioSession(true)](PlaybackResult<void>) mutable {
+      audio_use.reset();
+    };
+#endif
   }
-  auto playback = Require(DecodedPlayback::Create({.audio = playback_config, .video = true}));
+  auto playback = Require(DecodedPlayback::Create({.audio = std::move(playback_config), .video = true}));
   const auto epoch = playback.Epoch();
   Require(playback.Play());
 
@@ -189,6 +194,6 @@ Task<std::string> PlayDecodedClip(std::shared_ptr<Resources> resources, std::sha
 huxerui::Task<std::string> media_preview::PlayDecodedClip(std::shared_ptr<huxerui::Resources>,
                                                          std::shared_ptr<huxerui::ExternalTexture>,
                                                          bool, std::function<bool()>) {
-  co_return "Decoded frame playback is available on Android and macOS.";
+  co_return "Decoded frame playback is available on Android, iOS, and macOS.";
 }
 #endif

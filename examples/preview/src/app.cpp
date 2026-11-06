@@ -187,6 +187,14 @@ View MediaPage(bool music) {
   const auto& colors = UseTheme().colors;
   const bool compact = UseViewportClass() == ViewportClass::Compact;
 
+  if constexpr (media_preview::preview_audio_session_supported) {
+    const bool has_source = !source_name->empty();
+    Lifecycle([has_source] {
+      auto audio_use = has_source ? media_preview::RetainPreviewAudioSession(false) : nullptr;
+      return [audio_use = std::move(audio_use)]() mutable { audio_use.reset(); };
+    }, has_source);
+  }
+
   player.OnError([error_message](const MediaError& error) {
     error_message = (error.fatal ? "Error: " : "Notice: ") + error.message
         + (error.platform_code.empty() ? "" : " (" + error.platform_code + ")");
@@ -398,7 +406,7 @@ View LibraryPage() {
 View FramesPage() {
   auto texture = UseState(std::shared_ptr<ExternalTexture>{});
   auto notice = UseState(std::string(media_preview::frame_texture_supported
-      ? "Choose video-only or synchronized playback." : "Frame preview is available on Android and macOS."));
+      ? "Choose video-only or synchronized playback." : "Frame preview is available on Android, iOS, and macOS."));
   auto playing = UseState(false);
   auto paused = UseState(false);
   auto tasks = UseTaskScope();

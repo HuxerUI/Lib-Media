@@ -17,7 +17,7 @@ using namespace huxerui;
 using namespace huxerui::media;
 
 namespace media_preview {
-#if defined(__ANDROID__) || defined(MEDIA_PREVIEW_MACOS)
+#if defined(__ANDROID__) || defined(MEDIA_PREVIEW_MACOS) || defined(MEDIA_PREVIEW_IOS)
 namespace {
 
 unsigned Sample(const VideoPlane& plane, unsigned x, unsigned y, unsigned component = 0) {
@@ -57,7 +57,9 @@ Bytes ConvertFramePixels(const VideoFrame& frame) {
   }
   return pixels;
 }
+#endif
 
+#if defined(__ANDROID__) || defined(MEDIA_PREVIEW_MACOS)
 namespace {
 #if defined(__ANDROID__)
 class UploadContext {
@@ -166,7 +168,7 @@ std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size) {
 void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
   Upload(texture, ConvertFramePixels(frame), frame.format.visible.width, frame.format.visible.height);
 }
-#else
+#elif !defined(MEDIA_PREVIEW_IOS)
 std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size) { return {}; }
 #endif
 } // namespace media_preview

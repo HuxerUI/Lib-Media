@@ -1,6 +1,13 @@
 #include <huxerui/media_codec.h>
 #include <huxerui/media_playback.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(__APPLE__) && TARGET_OS_IOS
+#import <AVFoundation/AVFoundation.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -292,12 +299,57 @@ void AudioAndVideo(AudioPlaybackConfig config) {
   Check(*cleaned == 1, "A/V device cleanup failed");
   std::cout << "A/V playback: gated audio, stale producer, video tail and device cleanup passed\n";
 }
+
+#if defined(__APPLE__) && TARGET_OS_IOS
+void ActivateIosAudio() {
+  @autoreleasepool {
+    auto* session = AVAudioSession.sharedInstance;
+    NSError* error = nil;
+    if (![session setCategory:AVAudioSessionCategoryPlayback error:&error] || ![session setActive:YES error:&error]) {
+      const auto* message = error.localizedDescription.UTF8String;
+      throw std::runtime_error(message ? message : "Cannot activate the iOS test audio session");
+    }
+  }
+}
+
+void IosOutputLoss(AudioPlaybackConfig config, NSNotificationName name, NSDictionary* info, const char* expected,
+                   bool paused) {
+  @autoreleasepool {
+    auto cleaned = std::make_shared<std::atomic_int>(0);
+    config.cleanup_completed = [cleaned](PlaybackResult<void> result) { *cleaned = result.Succeeded() ? 1 : -1; };
+    auto playback = Require(DecodedPlayback::Create({.audio = config}));
+    RetireSession retire{playback, *cleaned};
+    WaitState(playback, PlaybackState::Paused, "iOS device did not open before the notification");
+    const auto epoch = playback.Epoch();
+    Check(Require(playback.TrySubmitAudio(epoch, Tone(config.format, 0, 12000))) == SubmitStatus::Accepted,
+          "Cannot queue iOS notification test audio");
+    Require(playback.Play());
+    WaitState(playback, PlaybackState::Playing, "iOS notification test audio did not start");
+    if (paused) {
+      Require(playback.Pause());
+      WaitState(playback, PlaybackState::Paused, "iOS notification test audio did not pause");
+    }
+    const auto position = playback.Snapshot().position;
+    [NSNotificationCenter.defaultCenter postNotificationName:name object:AVAudioSession.sharedInstance userInfo:info];
+    Wait([&] { return playback.Snapshot().state == PlaybackState::Failed; }, "iOS audio loss did not fail playback");
+    const auto failure = playback.Snapshot();
+    Check(failure.error && failure.error->code == PlaybackErrorCode::DeviceFailure &&
+          failure.error->message.find(expected) != std::string::npos, "Unexpected iOS audio loss error");
+    Wait([&] { return *cleaned != 0; }, "iOS audio loss did not retire the device");
+    Check(*cleaned == 1 && playback.Snapshot().position == failure.position, "iOS audio loss advanced a retired clock");
+    if (paused) Check(failure.position == position, "iOS audio loss advanced the paused clock");
+  }
+}
+#endif
 } // namespace
 
 int main(int argc, char** argv) {
   try {
+#if defined(__APPLE__) && TARGET_OS_IOS
+    ActivateIosAudio();
+#endif
     AudioPlaybackConfig config;
-    config.format = {48000, AudioSampleFormat::S16, AudioPacking::Interleaved, AudioChannelLayout::Stereo};
+    config.format = {48000, AudioSampleFormat::S16, AudioPacking::Interleaved, huxerui::media::AudioChannelLayout::Stereo};
     auto cleaned = std::make_shared<std::atomic<int>>(0);
     config.cleanup_completed = [cleaned](PlaybackResult<void> result) { *cleaned = result.Succeeded() ? 1 : -1; };
     auto playback = Require(DecodedPlayback::Create({.audio = config}));
@@ -315,6 +367,16 @@ int main(int argc, char** argv) {
     PublicationBarrier(false);
     PublicationBarrier(true);
     AudioAndVideo(config);
+#if defined(__APPLE__) && TARGET_OS_IOS
+    for (bool paused : {false, true}) {
+      IosOutputLoss(config, AVAudioSessionInterruptionNotification,
+                    @{AVAudioSessionInterruptionTypeKey: @(AVAudioSessionInterruptionTypeBegan)}, "interrupted", paused);
+      IosOutputLoss(config, AVAudioSessionRouteChangeNotification,
+                    @{AVAudioSessionRouteChangeReasonKey: @(AVAudioSessionRouteChangeReasonOldDeviceUnavailable)},
+                    "route changed", paused);
+    }
+    std::cout << "iOS interruption and output-route invalidation passed in Playing and Paused\n";
+#endif
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

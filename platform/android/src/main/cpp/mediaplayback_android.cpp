@@ -20,7 +20,7 @@ std::int64_t MonotonicNanoseconds() {
 
 class AndroidPlaybackDevice final : public PlaybackDevice {
 public:
-  PlaybackResult<void> Open(const AudioFormat& format, std::size_t capacity) override {
+  PlaybackResult<void> Open(const AudioFormat& format, std::size_t capacity, std::function<void()>) override {
     // Keep the platform library loaded while any native service threads can still use it.
     static void* library = dlopen("libaaudio.so", RTLD_NOW | RTLD_LOCAL);
     library_ = library;

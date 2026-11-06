@@ -1,7 +1,7 @@
 #include "playback/decoded_session.h"
 #include "playback/device.h"
 
-#if !defined(__ANDROID__) && !defined(MEDIA_PLAYBACK_MACOS)
+#if !defined(__ANDROID__) && !defined(__APPLE__)
 namespace huxerui::media::detail {
 std::unique_ptr<PlaybackDevice> MakePlaybackDevice() { return {}; }
 } // namespace huxerui::media::detail
@@ -23,7 +23,7 @@ DecodedPlayback& DecodedPlayback::operator=(DecodedPlayback&& other) noexcept {
 DecodedPlayback::~DecodedPlayback() { Close(); }
 
 PlaybackResult<DecodedPlayback> DecodedPlayback::Create(const DecodedPlaybackConfig& config) {
-#if defined(__ANDROID__) || defined(MEDIA_PLAYBACK_MACOS)
+#if defined(__ANDROID__) || defined(__APPLE__)
   auto session = detail::DecodedSession::Create(config);
   if (!session.Succeeded()) return PlaybackResult<DecodedPlayback>::Failure(std::move(session).Error());
   return PlaybackResult<DecodedPlayback>::Success(DecodedPlayback(std::move(session).Value()));

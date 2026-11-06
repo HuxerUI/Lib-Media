@@ -59,7 +59,7 @@ struct Control {
 class Device final : public PlaybackDevice {
 public:
   explicit Device(std::shared_ptr<Control> control) : control_(std::move(control)) {}
-  PlaybackResult<void> Open(const AudioFormat&, std::size_t) override {
+  PlaybackResult<void> Open(const AudioFormat&, std::size_t, std::function<void()>) override {
     ++control_->opens;
     return PlaybackResult<void>::Success();
   }

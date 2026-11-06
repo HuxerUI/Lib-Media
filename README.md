@@ -29,7 +29,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Native image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
 | AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
-| Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android and macOS (PCM on Android API 26+) | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
+| Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, and macOS (PCM on Android API 26+) | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | Audio/video encoding | Planned after the decoder foundation | No public encoder API yet |
 
 Native selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
@@ -323,10 +323,14 @@ submission copies the frame so the producer can release its storage.
 - Call `FinishAudio(epoch)` to seal input. `Ended` follows device confirmation of the final media sample and pause.
   `Reset()` returns the new token. Use `cleanup_completed` to observe device release after logical `Close()`.
 
-Android uses AAudio on API 26+ and macOS uses AVAudioEngine. Other platforms currently report `Unsupported`.
+Android uses AAudio on API 26+. iOS 15+ and macOS use AVAudioEngine. On iOS, configure and activate the
+application's `AVAudioSession` before creating a playback session with audio. Restore it and create a fresh
+playback session after an interruption or invalidated output route. Other platforms currently report `Unsupported`.
 The [native playback test](tests/playback_native.cpp) is a headless example that plays both generated PCM and the AAC
 fixture through this API. With tests enabled, run `ctest --test-dir build/tests -R media_playback --output-on-failure`
-on macOS. The same native executable runs against the fixture on Android hardware. See the
+on macOS. The native executable also runs against the fixture on Android hardware and the iOS Simulator. The iOS
+test injects interruption and output-route notifications during playback and while paused. Physical iOS route and
+interruption validation is pending. See the
 [playback contract and device mappings](docs/codec-design.md#decoded-playback-boundary) for timing and lifecycle details.
 
 ### Decoded video and synchronized playback
@@ -352,7 +356,7 @@ The [preview](examples/preview) exercises the library through four tabs.
 | Video | Local/reference/URL sources, playback controls, progress, seeking, volume, looping, and video fitting |
 | Music | Audio playback using the same player API without a video surface |
 | Library | Native image/video/mixed selection, capability-aware multi-select, retained references, and publication |
-| Frames | Video-only and synchronized decoded playback on Android and macOS |
+| Frames | Video-only and synchronized decoded playback on Android, iOS, and macOS |
 
 The Library tab disables multi-select when the maximum is below two; otherwise it requests up to three items within
 the native limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use

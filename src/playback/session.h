@@ -24,8 +24,8 @@ public:
 
 private:
   PlaybackSession(const AudioPlaybackConfig& config, std::size_t capacity, std::size_t refill, Factory factory);
-  void Run();
-  bool Tick(std::uint64_t epoch);
+  void Run(bool output_lost);
+  bool Tick(std::uint64_t epoch, bool output_lost);
   std::size_t Write(std::uint64_t epoch);
   void Open();
   void Release();
