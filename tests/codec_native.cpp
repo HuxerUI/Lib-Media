@@ -99,6 +99,9 @@ struct Signal {
 };
 template<class Decoder, class Config, class Frame>
 void Decode(Config config, const std::vector<EncodedPacket>& packets, std::size_t expected) {
+  auto presentation_order = packets;
+  std::stable_sort(presentation_order.begin(), presentation_order.end(),
+                   [](const auto& left, const auto& right) { return left.pts.Compare(right.pts) == -1; });
   auto signal = std::make_shared<Signal>();
   config.wakeup = [signal] { signal->Wake(); };
   config.cleanup_completed = [signal](CodecResult<void> result) {
@@ -116,7 +119,6 @@ void Decode(Config config, const std::vector<EncodedPacket>& packets, std::size_
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
     std::size_t submitted = 0, frames = 0, samples = 0, formats = 0;
     bool sealed = false, eos = false;
-    std::optional<MediaTimestamp> last;
     while (!eos && std::chrono::steady_clock::now() < deadline) {
       while (submitted < packets.size()) {
         auto result = decoder.TrySubmit(packets[submitted]);
@@ -135,11 +137,12 @@ void Decode(Config config, const std::vector<EncodedPacket>& packets, std::size_
         if (auto* frame = std::get_if<Frame>(&*read.Value())) {
           Check(formats > 0, "Frame preceded its format");
           Check(frame->Validate(), "Invalid decoded frame");
-          Check(!last || frame->pts.Compare(*last).value() >= 0, "Frames not in presentation order");
-          last = frame->pts;
-          bool matched = false;
-          for (const auto& packet : packets) if (packet.pts.ticks == frame->pts.ticks && packet.pts.timescale == frame->pts.timescale) matched = true;
-          Check(matched, "Native adapter lost the original exact PTS");
+          Check(frames < presentation_order.size(), "Native adapter produced an extra frame");
+          const auto& packet = presentation_order[frames];
+          Check(packet.pts.ticks == frame->pts.ticks && packet.pts.timescale == frame->pts.timescale,
+                "Native adapter changed the expected PTS sequence");
+          if constexpr (std::is_same_v<Frame, VideoFrame>)
+            Check(frame->duration == packet.duration, "Native adapter changed the video frame duration");
           for (const auto& plane : frame->planes) {
             const auto data = [&] {
               if constexpr (std::is_same_v<Frame, AudioFrame>) return plane.AsBytes();

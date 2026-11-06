@@ -50,3 +50,25 @@ huxerui_use_library(example_media
         TARGET HuxerUI::Media
         PATH "${CMAKE_CURRENT_SOURCE_DIR}/../.."
 )
+
+if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
+    if (ANDROID OR (APPLE AND NOT IOS))
+        set(PREVIEW_FIXTURE_ROOT "${CMAKE_CURRENT_BINARY_DIR}/sync-fixture")
+        set(CODEC_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fixtures/codec")
+        file(GLOB PREVIEW_FIXTURE_FILES CONFIGURE_DEPENDS
+                "${CODEC_FIXTURE_DIR}/sync-*"
+        )
+        foreach (fixture IN LISTS PREVIEW_FIXTURE_FILES)
+            get_filename_component(filename "${fixture}" NAME)
+            configure_file("${fixture}" "${PREVIEW_FIXTURE_ROOT}/raw/${filename}" COPYONLY)
+        endforeach ()
+        huxerui_add_resources(example_media ROOT "${PREVIEW_FIXTURE_ROOT}" NAMESPACE fixture)
+        target_compile_definitions(example_media PRIVATE MEDIA_PREVIEW_FRAMES=1)
+    endif ()
+    if (ANDROID)
+        target_link_libraries(example_media PRIVATE EGL GLESv3)
+    elseif (APPLE AND NOT IOS)
+        target_compile_definitions(example_media PRIVATE MEDIA_PREVIEW_MACOS=1)
+        target_link_libraries(example_media PRIVATE "-framework CoreVideo")
+    endif ()
+endif ()

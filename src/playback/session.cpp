@@ -102,11 +102,13 @@ PlaybackResult<SubmitStatus> PlaybackSession::Submit(const AudioFrame& frame) {
   return R::Success(SubmitStatus::Accepted);
 }
 
-PlaybackResult<void> PlaybackSession::RequestPlay(bool play) {
+PlaybackResult<void> PlaybackSession::RequestPlay(bool play, bool allow_ended) {
   std::lock_guard lock(mutex_);
   if (auto error = ControlError()) return PlaybackResult<void>::Failure(std::move(*error));
-  if (state_ == PlaybackState::Ended)
+  if (state_ == PlaybackState::Ended) {
+    if (allow_ended) return PlaybackResult<void>::Success();
     return PlaybackFailure(PlaybackErrorCode::InvalidState, "Reset is required after Ended");
+  }
   play_ = play;
   worker_->Schedule();
   return PlaybackResult<void>::Success();

@@ -3,6 +3,8 @@
 #include <huxerui/media_library.h>
 #include <app_resources.h>
 
+#include "decoded_preview.h"
+
 #include <algorithm>
 #include <functional>
 #include <iomanip>
@@ -393,6 +395,46 @@ View LibraryPage() {
 }
 
 [[huxerui::composable]]
+View FramesPage() {
+  auto texture = UseState(std::shared_ptr<ExternalTexture>{});
+  auto notice = UseState(std::string(media_preview::frame_texture_supported
+      ? "Choose video-only or synchronized playback." : "Frame preview is available on Android and macOS."));
+  auto playing = UseState(false);
+  auto paused = UseState(false);
+  auto tasks = UseTaskScope();
+  auto resources = UseService<Resources>();
+  auto play = [texture, playing, paused, tasks, resources, notice](bool with_audio) {
+    if (!media_preview::frame_texture_supported || playing.Get()) return;
+    playing = true;
+    paused = false;
+    notice = with_audio ? "Playing A/V sync clip..." : "Playing video clip...";
+    tasks.Launch([texture, playing, paused, resources, notice, with_audio]() -> Task<void> {
+      try {
+        texture = media_preview::MakeFrameTexture({240, 180});
+        notice = co_await media_preview::PlayDecodedClip(resources, texture.Get(), with_audio,
+                                                         [paused] { return paused.Get(); });
+      } catch (const std::exception& error) {
+        notice = error.what();
+      }
+      playing = false;
+    });
+  };
+  const auto image = texture.Get();
+  const bool can_play = media_preview::frame_texture_supported && !playing.Get();
+  return Column {
+    Text("Decoded playback", TextRole::Title),
+    (image ? Image(image).Fit(ImageFit::Contain).With(Frame{.width = 300.0F, .height = 180.0F}) : View{}),
+    Flow {
+      Button("Play video").OnClick([play] { play(false); }).With(Enabled{can_play}),
+      Button("Play A/V sync").OnClick([play] { play(true); }).With(Enabled{can_play}),
+      Button(playing.Get() && paused.Get() ? "Resume" : "Pause")
+          .OnClick([paused] { paused = !paused.Get(); }).With(Enabled{playing.Get()}),
+    }.With(Spacing(10.0F)),
+    Text(notice),
+  }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));
+}
+
+[[huxerui::composable]]
 View MediaContent() {
   auto selected = UseState(std::size_t{0});
   const bool compact = UseViewportClass() == ViewportClass::Compact;
@@ -400,8 +442,9 @@ View MediaContent() {
     TopAppBar("Media"),
     ScrollView(Column {
       Text("HUXERUI / MEDIA PREVIEW", TextRole::Label).With(Foreground(UseTheme().colors.on_surface_variant)),
-      Tabs({"Video", "Music", "Library"}, selected).OnChanged([selected](std::size_t index) { selected = index; }),
-      (selected.Get() == 2 ? LibraryPage() : MediaPage(selected.Get() == 1)).Key(selected.Get()),
+      Tabs({"Video", "Music", "Library", "Frames"}, selected).OnChanged([selected](std::size_t index) { selected = index; }),
+      (selected.Get() == 3 ? FramesPage() :
+       selected.Get() == 2 ? LibraryPage() : MediaPage(selected.Get() == 1)).Key(selected.Get()),
       Text("Switching pages stops playback and clears the current source.", TextRole::Label)
           .With(Foreground(UseTheme().colors.on_surface_variant)),
     }.With(Frame{.max_width = 1000.0F}, Padding(compact ? 16.0F : 32.0F),

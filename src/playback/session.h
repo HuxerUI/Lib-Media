@@ -14,7 +14,7 @@ public:
   static PlaybackResult<std::shared_ptr<PlaybackSession>> Create(
       const AudioPlaybackConfig& config, Factory factory = MakePlaybackDevice);
   PlaybackResult<SubmitStatus> Submit(const AudioFrame& frame);
-  PlaybackResult<void> RequestPlay(bool play);
+  PlaybackResult<void> RequestPlay(bool play, bool allow_ended = false);
   PlaybackResult<void> SetVolume(double volume);
   PlaybackResult<void> SetMuted(bool muted);
   PlaybackResult<void> Finish();

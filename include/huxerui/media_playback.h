@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file
-/// @brief Headless playback of decoded PCM through a native audio device.
+/// @brief Playback and presentation timing for decoded audio and video frames.
 ///
 /// Include <huxerui/media_playback.h> and link HuxerUI::Media. Create a session with a fixed PCM format and
 /// submit AudioFrame values from a decoder or another producer. The session owns the output device and the
@@ -9,17 +9,19 @@
 ///
 /// PCM playback is available on Android API 26+ and macOS, subject to the output route and requested format.
 /// Use the API independently of a View, Runtime or window. The application manages audio focus and background
-/// playback policy. See AudioPlaybackConfig for supported formats and callback delivery.
+/// playback policy. See AudioPlaybackConfig for supported formats and callback delivery. Enable video in
+/// DecodedPlaybackConfig to add a caller-driven presenter on Android and macOS.
 
 #include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include <huxerui/media_format.h>
 
 namespace huxerui::media {
-namespace detail { class PlaybackSession; }
+namespace detail { class DecodedSession; }
 
 /// @brief Portable categories for playback setup, input, device and cleanup failures.
 ///
@@ -67,7 +69,7 @@ enum class PlaybackState {
   Buffering,
   /// The session has started device output. This includes the period in which sealed input drains.
   Playing,
-  /// The device confirmed all accepted samples and output is paused. Reset to start another epoch.
+  /// All configured tracks reached their presentation boundaries. Reset to start another epoch.
   Ended,
   /// The old epoch is retired and the device is being recreated. Submission returns WouldBlock.
   Resetting,
@@ -106,31 +108,69 @@ struct AudioPlaybackConfig {
   std::function<void(PlaybackResult<void>)> cleanup_completed;
 };
 
+/// @brief Enabled tracks for one decoded playback session.
+///
+/// Enable at least one track. Audio is supported on Android API 26+ and macOS. Video is supported on Android
+/// and macOS. When both tracks are enabled, submit frames from the same media timeline.
+struct DecodedPlaybackConfig {
+  /// PCM device configuration. Leave empty for video-only playback.
+  std::optional<AudioPlaybackConfig> audio;
+  /// Enable the bounded decoded video queue and caller-driven presentation.
+  bool video = false;
+};
+
 /// @brief A consistent snapshot of the current epoch and its observable transport state.
 struct PlaybackSnapshot {
   /// Last published transport state. A default snapshot describes a closed handle.
   PlaybackState state = PlaybackState::Closed;
-  /// Boundary after the presented media samples, expressed in ticks at the configured sample rate.
-  /// Empty until the first frame of an epoch is accepted. Initially equals that frame's rescaled PTS, which
-  /// can be negative. It advances with device-confirmed media, freezes when paused or starved, and ignores
-  /// silence inserted by the device adapter. Update granularity depends on the output route.
+  /// Playback position in the active timeline. PCM uses the configured sample rate.
+  /// PCM starts at the first accepted frame's PTS and advances with device-confirmed media. It freezes when
+  /// paused or starved and ignores device-inserted silence. Video-only position becomes available when
+  /// PresentVideo() first observes a queued frame. Video-only playback and a video tail after confirmed audio
+  /// drain use a nanosecond clock. Compare or rescale MediaTimestamp values when the clock changes.
   std::optional<MediaTimestamp> position;
   /// Duration of accepted media awaiting presentation, including samples submitted to the device.
   /// Expressed at the configured sample rate. Failed and closed sessions report zero queued duration.
-  MediaTimestamp buffered_duration;
+  MediaTimestamp audio_buffered_duration;
   /// Number of starvation gaps confirmed after playback started in this epoch. Reset() clears the count.
-  std::uint64_t underruns = 0;
-  /// True once FinishAudio() seals the epoch. Use state to observe when the sealed input has played.
-  bool input_finished = false;
+  std::uint64_t audio_underruns = 0;
+  /// True once FinishAudio() seals audio input for this epoch. Use state to observe overall drain completion.
+  bool audio_input_finished = false;
   /// Operational failure while state is Failed. The cleanup callback carries any separate release error.
   std::optional<PlaybackError> error;
 };
 
-/// @brief A move-only session for bounded decoded audio playback.
+/// @brief Identifies one input and presentation generation of a DecodedPlayback session.
 ///
-/// Wait for opening to finish, then submit a contiguous sequence of frames and call Play(). Retry the same
-/// frame after WouldBlock. A registered wakeup can schedule retries as capacity returns. Seal input with
-/// FinishAudio() and use Snapshot() to observe Ended. Reset() retires the timeline for another stream or seek.
+/// Capture this value before starting producer work and pass it with the resulting frames and EOS. Reset and Close
+/// retire it immediately. Tokens from another session are invalid even if its playback position matches.
+class PlaybackEpoch {
+public:
+  /// Creates an invalid token. Use DecodedPlayback::Epoch() to capture a live generation.
+  PlaybackEpoch() = default;
+
+  /// Compares the identity of two generations. A retired token remains comparable.
+  bool operator==(const PlaybackEpoch&) const = default;
+
+private:
+  explicit PlaybackEpoch(std::shared_ptr<const void> identity) : identity_(std::move(identity)) {}
+  std::shared_ptr<const void> identity_;
+  friend class detail::DecodedSession;
+};
+
+/// @brief The work completed by one call to PresentVideo().
+struct VideoPresentation {
+  /// Present if a frame was published. Its value is the scheduling position minus that frame's PTS in milliseconds.
+  std::optional<double> lag_ms;
+  /// Number of queued frames discarded because their presentation intervals had elapsed.
+  std::size_t dropped = 0;
+};
+
+/// @brief A move-only session for bounded decoded audio, video, or synchronized playback.
+///
+/// Submit contiguous PCM and video in presentation order. Retry the same frame after WouldBlock. For video,
+/// drive PresentVideo() on the presentation thread. Seal each enabled track and use Snapshot() to observe Ended.
+/// Reset() retires the timeline for another stream or seek.
 ///
 /// Controls, submission and snapshots may run concurrently on a live handle. Concurrent submissions are ordered
 /// by acceptance. Move or destroy the handle after its callers stop. Audio controls acquire locks and submission
@@ -138,15 +178,17 @@ struct PlaybackSnapshot {
 /// @see AudioPlaybackConfig, AudioFrame, PlaybackSnapshot
 class DecodedPlayback final {
 public:
-  /// @brief Validate the configuration and schedule asynchronous device opening.
+  /// @brief Create a session for the enabled tracks and open any configured PCM device asynchronously.
   ///
-  /// Opening begins in Starting and publishes Paused when the device is ready. Native open errors publish
-  /// Failed and initiate cleanup. Opening and wakeups can race the return of Create().
-  /// @param config Exact PCM format, queue limits and optional callbacks, copied into the session.
+  /// Video-only sessions begin in Paused. With audio, the initial state is Starting. Native open errors publish
+  /// Failed and initiate cleanup. Opening and wakeups can race the return of Create(). Confirmed audio position
+  /// drives synchronized video until audio drains. Video-only playback and a video tail after audio drain use
+  /// monotonic time. Drive PresentVideo() periodically when video is enabled, including during drain.
+  /// @param config Enabled tracks and PCM settings, copied into the session.
   /// @return An owning handle, or a synchronous Unsupported, InvalidArgument or ResourceExhausted error.
   /// A synchronous failure schedules no callbacks.
-  /// @see Snapshot(), AudioPlaybackConfig::wakeup
-  [[nodiscard]] static PlaybackResult<DecodedPlayback> Create(const AudioPlaybackConfig& config);
+  /// @see Snapshot(), Epoch(), PresentVideo()
+  static PlaybackResult<DecodedPlayback> Create(const DecodedPlaybackConfig& config);
 
   /// @brief Transfer ownership of a session and its callbacks.
   /// The source handle behaves as closed after the transfer.
@@ -167,6 +209,7 @@ public:
   /// frame after rescaling to the configured sample rate. Reset the epoch before submitting a discontinuity.
   /// Capacity counts both software PCM and device submissions until presentation. If a valid frame cannot fit
   /// in the remaining space, a pending play request can start queued media below the usual refill threshold.
+  /// @param epoch Current token from Epoch() or Reset(). Retired and foreign tokens return InvalidState.
   /// @param frame Valid frame in the configured format. Keep its plane bytes stable throughout the call.
   /// @return Accepted after copying the whole frame, after which the producer can release the source bytes.
   /// WouldBlock consumes no bytes during opening, reset or temporary saturation. Retry the same frame when
@@ -174,16 +217,47 @@ public:
   /// larger than the entire capacity. Sealed input returns InvalidState. Failed and closed sessions report
   /// their operational error or Closed, respectively.
   /// @see AudioFrame::Validate(), AudioPlaybackConfig::buffer_capacity, FinishAudio(), Reset()
-  [[nodiscard]] PlaybackResult<SubmitStatus> TrySubmitAudio(const AudioFrame& frame);
+  PlaybackResult<SubmitStatus> TrySubmitAudio(const PlaybackEpoch& epoch, const AudioFrame& frame);
+
+  /// @brief Retain a decoded video frame for presentation in the given generation.
+  /// @param epoch Current token from Epoch(). Retired and foreign tokens return InvalidState.
+  /// @param frame Valid CPU frame with a positive duration. Submit in nondecreasing PTS order and keep the
+  /// underlying plane bytes immutable while retained. The session retains the plane references without copying pixels.
+  /// A plane owner's final release may run during presentation or retirement. Keep it short and avoid reentering
+  /// the same session from its destructor.
+  /// @return Accepted after retaining the frame or WouldBlock while opening, resetting, or at the two-frame limit.
+  /// Disabled or sealed video input returns InvalidState. Invalid frame geometry or timing returns InvalidArgument.
+  PlaybackResult<SubmitStatus> TrySubmitVideo(const PlaybackEpoch& epoch, const VideoFrame& frame);
+
+  /// @brief Seal video input for this generation and preserve the final queued frame through presentation.
+  /// @return Success when sealed or already sealed. Disabled video and retired or foreign epochs return InvalidState.
+  /// @see FinishAudio(), PresentVideo(), Snapshot()
+  PlaybackResult<void> FinishVideo(const PlaybackEpoch& epoch);
+
+  /// @brief Advance video scheduling and synchronously publish at most one due frame.
+  ///
+  /// Call from the thread that owns the renderer or texture publisher, including while audio is draining. The
+  /// callback borrows the frame for this call and may read Snapshot(). Keep it short. Calls to PresentVideo(),
+  /// Reset() and Close() serialize with an admitted callback. Call them after publish returns. A retired epoch
+  /// cannot begin a publication. Exceptions from publish propagate and the selected frame remains pending.
+  ///
+  /// The presenter owns the texture. Pause, Ended, Reset and Close leave an already published image available.
+  /// Replace or clear the presentation target on the presentation thread if a new epoch should start blank.
+  /// @param epoch Current token from Epoch(). Retired and foreign tokens return InvalidState.
+  /// @param publish Synchronous frame consumer, such as an upload to a caller-owned ExternalTexture.
+  /// @return Publication and discard information. An empty lag means no frame was published.
+  PlaybackResult<VideoPresentation> PresentVideo(
+      const PlaybackEpoch& epoch, const std::function<void(const VideoFrame&)>& publish);
 
   /// @brief Request playback or record play intent while opening or resetting.
   ///
   /// Startup and refill wait for available PCM and the configured threshold. A sealed short tail or capacity
-  /// pressure can start sooner. Resuming a paused device can continue with its pending media.
+  /// pressure can start sooner. In a synchronized session, the audio device also waits until the first video
+  /// frame is queued or video input is sealed. Resuming a paused device can continue with its pending media.
   /// @return Success when play is requested or already intended. Inspect Snapshot() for the observed device
   /// state. Ended requires Reset() and returns InvalidState. Failed and closed sessions return an error.
   /// @see Pause(), Snapshot(), AudioPlaybackConfig::refill_threshold
-  [[nodiscard]] PlaybackResult<void> Play();
+  PlaybackResult<void> Play();
 
   /// @brief Clear play intent and request a pause while keeping queued media.
   ///
@@ -192,66 +266,74 @@ public:
   /// @return Success when pause is requested or already intended. Ended returns InvalidState. Failed and closed
   /// sessions return an error.
   /// @see Play(), Snapshot()
-  [[nodiscard]] PlaybackResult<void> Pause();
+  PlaybackResult<void> Pause();
 
   /// @brief Set the gain used to prepare subsequent device submissions.
   ///
   /// A prepared device submission carries the gain selected at preparation. The default gain is 1 and the
   /// setting survives Reset(). While muted, the session stores this gain for later use.
   /// @param volume Finite value in [0, 1]. Zero produces silence and one applies unity gain.
-  /// @return Success when the preference is stored. An invalid value returns InvalidArgument. Failed and closed
-  /// sessions return an error.
+  /// @return Success when the preference is stored. An invalid value returns InvalidArgument. Disabled audio
+  /// returns InvalidState. Failed and closed sessions return an error.
   /// @see SetMuted()
-  [[nodiscard]] PlaybackResult<void> SetVolume(double volume);
+  PlaybackResult<void> SetVolume(double volume);
 
   /// @brief Set whether subsequent device submissions are silent.
   ///
   /// Muting preserves the selected gain and muted media still advances the playhead. The setting defaults to
   /// false and survives Reset().
   /// @param muted True to prepare silent samples, false to use the stored gain.
-  /// @return Success when the preference is stored. Failed and closed sessions return an error.
+  /// @return Success when the preference is stored. Disabled audio returns InvalidState. Failed and closed
+  /// sessions return an error.
   /// @see SetVolume()
-  [[nodiscard]] PlaybackResult<void> SetMuted(bool muted);
+  PlaybackResult<void> SetMuted(bool muted);
 
   /// @brief Seal audio input and allow the accepted media to drain.
   ///
   /// Play intent controls whether pending audio drains. Use Play() to drain a paused session. A sealed tail
-  /// can start below the refill threshold. Ended becomes observable after the device confirms the final sample
-  /// and pauses. An epoch with no pending media can end while paused.
+  /// can start below the refill threshold. In PCM-only sessions, Ended becomes observable after the device
+  /// confirms the final sample and pauses. An epoch with no pending media can end while paused.
+  /// @param epoch Current token from Epoch() or Reset(). Retired and foreign tokens return InvalidState.
   /// @return Success when sealed or already sealed, including after Ended. Starting or Resetting returns
   /// InvalidState. Failed and closed sessions return an error.
   /// @see Play(), Snapshot(), Reset()
-  [[nodiscard]] PlaybackResult<void> FinishAudio();
+  PlaybackResult<void> FinishAudio(const PlaybackEpoch& epoch);
 
   /// @brief Retire the current epoch and recreate the device asynchronously.
   ///
-  /// The discard barrier immediately clears queued media, the clock, underruns, sealing and play intent.
-  /// Device discard and reopening follow on the worker. Gain and mute preferences carry forward. Wait for
-  /// readiness before retrying input. The next accepted frame supplies the new timeline anchor.
-  /// @return Success when reset is accepted or already pending. Starting returns InvalidState. Failed and
-  /// closed sessions return an error.
+  /// The discard barrier waits for an admitted video upload, then clears queued media, the clock, underruns,
+  /// sealing and play intent. Device discard and reopening follow on the worker. Video-only reset completes
+  /// synchronously. Gain and mute preferences carry forward. Wait for audio readiness before retrying.
+  /// The next accepted frame supplies the new timeline anchor.
+  /// @return The new generation. A repeated reset during device recreation returns the pending generation.
+  /// Starting returns InvalidState. Failed and closed sessions return an error.
   /// @see TrySubmitAudio(), Snapshot()
-  [[nodiscard]] PlaybackResult<void> Reset();
+  PlaybackResult<PlaybackEpoch> Reset();
+
+  /// @brief Capture the current input and publication generation without retaining the session.
+  /// @return The current token, or an invalid token for a closed or moved-from handle.
+  [[nodiscard]] PlaybackEpoch Epoch() const;
 
   /// @brief Read one coherent copy of the published transport and timing state.
   ///
-  /// The position and buffered duration use the sample grid of the session. Values can change immediately
+  /// The buffered duration describes PCM on its sample grid. Values can change immediately
   /// after the call. Use the wakeup callback to schedule another read when progress is available.
   /// @return The current snapshot, including any operational error. A moved-from handle returns a default
   /// closed snapshot.
   /// @see PlaybackSnapshot, AudioPlaybackConfig::wakeup
   [[nodiscard]] PlaybackSnapshot Snapshot() const;
 
-  /// @brief Retire the session immediately and schedule native discard and release.
+  /// @brief Retire the session and schedule native discard and release.
   ///
-  /// Safe to repeat or call from wakeup. Retirement ends admission of new input, controls and wakeups.
+  /// Safe to repeat or call from wakeup. Close waits for an admitted video upload to return. Retirement then
+  /// ends admission of new input, controls and wakeups.
   /// A previously admitted wakeup may finish after return. Device samples already committed may still play
   /// until native stop takes effect. Observe cleanup_completed before retiring state used by wakeups.
   /// @see AudioPlaybackConfig::cleanup_completed
   void Close() noexcept;
 
 private:
-  explicit DecodedPlayback(std::shared_ptr<detail::PlaybackSession> session);
-  std::shared_ptr<detail::PlaybackSession> session_;
+  explicit DecodedPlayback(std::shared_ptr<detail::DecodedSession> session);
+  std::shared_ptr<detail::DecodedSession> session_;
 };
 } // namespace huxerui::media

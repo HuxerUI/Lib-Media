@@ -145,7 +145,7 @@ void RefillKeepsDevice() {
     const auto snapshot = playback.Snapshot();
     return snapshot.state == PlaybackState::Buffering && snapshot.position->ticks == 12000;
   }, "Device completion stalled with PCM still in the software queue");
-  Check(playback.Snapshot().underruns == 1 && session.control->opens == 1,
+  Check(playback.Snapshot().audio_underruns == 1 && session.control->opens == 1,
         "A completed batch was counted as starvation or a writable device was reopened");
   Check(playback.Submit(Frame(format, 12000, 1024)).Value() == SubmitStatus::Accepted && playback.Finish().Succeeded(),
         "Cannot submit a short final refill");

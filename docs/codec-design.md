@@ -598,13 +598,36 @@ up to 200 ms and can add bounded silence when it is still priming and has no fur
 exercise copied input, a stale observation across Reset, release failure and an unrelated session progressing
 during blocked teardown. Validate each remaining adapter and measure route timing before adding video scheduling.
 
-### Later video scheduling
+### Video scheduling
 
-Use the audio position as master when both tracks are enabled and a monotonic timeline for video-only playback.
-Bound retained video frames separately and select the due frame for the existing `ExternalTexture`. Report
-superseded late frames and keep the audio clock running when video is empty. Keep texture identity stable for a
-compatible logical size. Reaching Ended requires each enabled track's final presentation boundary. A renderer
-snapshot may hold the last displayed frame independently of session cleanup.
+The Frames preview on Android and macOS enables video in `DecodedPlayback::Create()` with the same four-second AVC track
+for both modes. Video-only playback starts its monotonic clock at the first queued video PTS. The native codec
+test checks the original 24-frame H.264 fixture's exact presentation timestamps and durations.
+
+With PCM output enabled, the session starts audio when play is requested and video is queued or sealed. The video
+scheduler reads device snapshots and waits for the audio position to advance beyond the first accepted sample PTS.
+A paused or buffering clock holds the picture. After confirmed audio drain, the clock continues from the final
+audio position using caller-provided monotonic time. Pausing also freezes this continuation.
+
+The scheduler holds up to two decoded video frames. A successor allows it to discard an expired frame before EOS.
+It preserves the final frame even if it arrives late. When video ends first, the last texture remains visible while
+audio drains. Ended requires confirmed audio drain, video EOS, and a full active display interval measured from the
+return of the final publisher call. The preview measures lag between the scheduling position and the published frame PTS.
+
+`PresentVideo()` advances video scheduling and publishes through a synchronous callback on the caller's thread.
+The callback runs outside the state lock. Reset and Close wait for an admitted publication to return. Reset releases
+queued frames and returns a new epoch. Frames, EOS, and presentation requests tagged with a retired or foreign epoch
+are rejected. Close releases the queue and native
+audio cleanup completes independently. The texture and its last published frame belong to the presenter. The preview
+uses one texture per run and the composition scope retires playback and its decoders on unmount.
+
+Contract tests use a controlled clock to cover both track-end orders, pause during drain, late frames, queue bounds,
+and retirement. Native tests exercise the public video-only and A/V paths, including stale producer tokens and
+continuing video after the audio device drains. A texture contract test checks the preview's color conversion,
+crop and stride handling, and successive publications to one texture using synthetic NV12 and I420 frames.
+
+Both preview tracks use a four-second timeline with four flash and tone markers. The preview discards the complete
+AAC priming frame and slices tail padding before PCM submission. Audio drains at 192,000 ticks at 48 kHz.
 
 ## SDK reuse and open integration gates
 
@@ -621,8 +644,9 @@ Consumers use the public installed package; no SDK source checkout is required.
 The installed Android texture API exposes BitmapTexture and a GL_TEXTURE_2D copy path. Apple exposes retained
 PixelBufferTexture and Metal copies; Windows/Linux expose pixel/native texture paths. These are actual public contracts,
 not a generic promise that every codec output can be imported without conversion. The first CPU decoder milestone needs
-no new SDK interface. Renderer-compatible YUV/color conversion and import are a separate gate before a preview ships;
-unsupported import must be reported rather than disguised with an unrecognized ExternalTexture subclass.
+no new SDK interface. The Android and macOS previews convert SDR NV12 and I420 to RGB on the CPU, then use the
+public GL texture or pixel buffer path respectively. Unavailable color metadata in the AVC fixture preview uses
+BT.601 and limited range, with the applied fallback reported in the preview.
 
 A future native-frame optimization may require a generic renderer import capability, especially for Android native
 buffers or specific YUV/HDR layouts. Specify and test the exact missing resource, synchronization, and color contract

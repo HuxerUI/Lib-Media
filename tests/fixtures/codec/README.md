@@ -14,3 +14,12 @@ Regeneration with other encoder versions can produce different valid compressed 
 
 Run `python3 tests/fixtures/codec/generate.py` with FFmpeg and ffprobe on PATH to regenerate.
 The generator extracts packet boundaries from its temporary MP4 files. No container parser is included in Lib-Media.
+
+`generate_sync.py` produces the `sync-avc` and `sync-aac` tracks for the decoded A/V preview. The clip has 96
+video frames at 24 fps and stereo AAC-LC at 48 kHz. White flashes and 1 kHz tone bursts start at 0.5, 1.5,
+2.5, and 3.5 seconds, each lasting two video frame intervals. The preview trims one 1024-sample AAC priming
+frame and 512 samples of final padding to align the PCM and video endpoints at four seconds.
+
+Each `.config` stores decoder initialization bytes. Each `.bin` concatenates access units in decode order.
+The companion `.txt` rows store `offset size pts dts duration timescale key_frame`, with byte offsets into the
+matching `.bin`. Regenerate with `python3 tests/fixtures/codec/generate_sync.py` and FFmpeg/ffprobe on PATH.

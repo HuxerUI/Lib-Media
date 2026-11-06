@@ -6,6 +6,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <thread>
 
@@ -73,9 +74,10 @@ void WaitState(const DecodedPlayback& playback, PlaybackState state, const char*
 }
 
 void Synthetic(DecodedPlayback& playback, AudioFormat format) {
+  const auto epoch = playback.Epoch();
   const auto frame = Tone(format, 0, 12000);
-  Check(Require(playback.TrySubmitAudio(frame)) == SubmitStatus::Accepted, "Full-capacity PCM rejected");
-  Check(Require(playback.TrySubmitAudio(Tone(format, 12000, 1))) == SubmitStatus::WouldBlock,
+  Check(Require(playback.TrySubmitAudio(epoch, frame)) == SubmitStatus::Accepted, "Full-capacity PCM rejected");
+  Check(Require(playback.TrySubmitAudio(epoch, Tone(format, 12000, 1))) == SubmitStatus::WouldBlock,
         "Queue did not apply backpressure");
   Check(Read(playback).position->ticks == 0, "Submitting PCM moved the clock");
   Require(playback.Play());
@@ -92,24 +94,25 @@ void Synthetic(DecodedPlayback& playback, AudioFormat format) {
   Require(playback.Play());
   Wait([&] {
     const auto snapshot = Read(playback);
-    return snapshot.state == PlaybackState::Buffering && snapshot.underruns == 1;
+    return snapshot.state == PlaybackState::Buffering && snapshot.audio_underruns == 1;
   }, "Device did not report starvation after the last committed sample");
   Check(Read(playback).position->ticks == 12000, "Silence changed the media position");
   std::this_thread::sleep_for(50ms);
   Check(Read(playback).position->ticks == 12000, "Starved clock advanced");
 
-  Check(Require(playback.TrySubmitAudio(Tone(format, 12000, 1024))) == SubmitStatus::Accepted, "Short refill rejected");
-  Require(playback.FinishAudio());
+  Check(Require(playback.TrySubmitAudio(epoch, Tone(format, 12000, 1024))) == SubmitStatus::Accepted, "Short refill rejected");
+  Require(playback.FinishAudio(epoch));
   WaitState(playback, PlaybackState::Ended, "Short sealed refill did not drain");
-  Check(Read(playback).position->ticks == 13024 && Read(playback).buffered_duration.ticks == 0,
+  Check(Read(playback).position->ticks == 13024 && Read(playback).audio_buffered_duration.ticks == 0,
         "Short drain reported an incorrect final position");
   Require(playback.Reset());
   WaitState(playback, PlaybackState::Paused, "Reset did not reopen the device");
-  Check(!Read(playback).position && Read(playback).underruns == 0, "Old timeline survived Reset");
+  Check(!Read(playback).position && Read(playback).audio_underruns == 0, "Old timeline survived Reset");
   std::cout << "Synthetic PCM: capacity, pause, underrun, refill and short tail passed\n";
 }
 
 void DecodeAndPlay(DecodedPlayback& playback, AudioFormat format, const std::filesystem::path& root) {
+  const auto epoch = playback.Epoch();
   AudioDecoderConfig config;
   auto init = ReadBytes(root / "aac.config");
   config.initialization_data.assign(init.AsBytes().begin(), init.AsBytes().end());
@@ -146,7 +149,7 @@ void DecodeAndPlay(DecodedPlayback& playback, AudioFormat format, const std::fil
     }
     while (!playback_finished) {
       if (pending) {
-        if (Require(playback.TrySubmitAudio(*pending)) == SubmitStatus::WouldBlock) break;
+        if (Require(playback.TrySubmitAudio(epoch, *pending)) == SubmitStatus::WouldBlock) break;
         pending.reset();
         ++submitted;
       }
@@ -154,7 +157,7 @@ void DecodeAndPlay(DecodedPlayback& playback, AudioFormat format, const std::fil
       if (!output) break;
       if (auto* frame = std::get_if<AudioFrame>(&*output)) pending = std::move(*frame);
       else if (std::holds_alternative<EndOfStream>(*output)) {
-        Require(playback.FinishAudio());
+        Require(playback.FinishAudio(epoch));
         playback_finished = true;
         decoder.Close();
       }
@@ -171,6 +174,124 @@ void DecodeAndPlay(DecodedPlayback& playback, AudioFormat format, const std::fil
   Check(*decoder_cleaned == 1, "Decoder cleanup failed");
   std::cout << "AAC decode to PCM device: 13 frames, final position " << last->ticks << '/' << last->timescale << '\n';
 }
+
+VideoFrame Picture(std::int64_t pts, const std::shared_ptr<const Bytes>& bytes) {
+  const BufferReference pixels(*bytes, bytes);
+  return {.format = {.width = 2, .height = 2, .visible = {0, 0, 2, 2}}, .pts = {pts, 1000},
+          .duration = MediaTimestamp{40, 1000}, .planes = {{pixels.Slice(0, 4), 2, 1}, {pixels.Slice(4, 2), 2, 2}}};
+}
+
+void VideoOnly() {
+  auto playback = Require(DecodedPlayback::Create({.video = true}));
+  auto other = Require(DecodedPlayback::Create({.video = true}));
+  const auto retired = playback.Epoch();
+  auto bytes = std::make_shared<const Bytes>(6);
+  const std::weak_ptr<const Bytes> held = bytes;
+  Check(Require(playback.TrySubmitVideo(retired, Picture(0, bytes))) == SubmitStatus::Accepted, "Cannot submit video");
+  bytes.reset();
+  Check(!held.expired(), "Video input did not retain the plane owner");
+  const auto epoch = Require(playback.Reset());
+  Check(held.expired(), "Video reset retained old frame storage");
+  Check(epoch == playback.Epoch(), "Reset did not return the installed epoch");
+  bytes = std::make_shared<const Bytes>(6);
+  Check(retired != epoch && !playback.TrySubmitVideo(retired, Picture(0, bytes)).Succeeded() &&
+        !playback.TrySubmitVideo(other.Epoch(), Picture(0, bytes)).Succeeded() && !playback.FinishVideo(retired).Succeeded(),
+        "A retired or foreign video producer crossed Reset");
+  auto wrong = playback.PresentVideo(retired, [](const VideoFrame&) { throw std::runtime_error("Old frame presented"); });
+  Check(!wrong.Succeeded() && wrong.Error().code == PlaybackErrorCode::InvalidState, "Old presentation crossed Reset");
+  Check(Require(playback.TrySubmitVideo(epoch, Picture(-40, bytes))) == SubmitStatus::Accepted &&
+        Require(playback.TrySubmitVideo(epoch, Picture(0, bytes))) == SubmitStatus::Accepted &&
+        Require(playback.TrySubmitVideo(epoch, Picture(40, bytes))) == SubmitStatus::WouldBlock, "Video capacity was not bounded");
+  Require(playback.FinishVideo(epoch));
+  std::optional<VideoFrame> displayed;
+  const auto present = [&](const VideoFrame& frame) { displayed = frame; };
+  Check(!Require(playback.PresentVideo(epoch, present)).lag_ms, "Paused video published a frame");
+  Require(playback.Play());
+  Wait([&] {
+    Require(playback.PresentVideo(epoch, present));
+    return Read(playback).state == PlaybackState::Ended;
+  }, "Video-only playback did not end");
+  Check(displayed && displayed->pts == MediaTimestamp{0, 1000}, "Video-only playback lost its final frame");
+  playback.Close();
+  Check(displayed->Validate() && Read(playback).state == PlaybackState::Closed, "Close invalidated the published frame");
+  std::cout << "Video-only playback: queue, epoch retirement and retained final frame passed\n";
+}
+
+void PublicationBarrier(bool close) {
+  auto playback = Require(DecodedPlayback::Create({.video = true}));
+  const auto epoch = playback.Epoch();
+  auto pixels = std::make_shared<const Bytes>(6);
+  Check(Require(playback.TrySubmitVideo(epoch, Picture(0, pixels))) == SubmitStatus::Accepted, "Cannot queue video");
+  Require(playback.Play());
+  std::promise<void> entered, release, retiring;
+  auto can_finish = release.get_future();
+  auto presenting = std::async(std::launch::async, [&] {
+    return Require(playback.PresentVideo(epoch, [&](const VideoFrame& frame) {
+      entered.set_value();
+      can_finish.wait();
+      Check(Read(playback).state == PlaybackState::Playing && frame.Validate(), "Admitted frame retired during upload");
+    }));
+  });
+  entered.get_future().wait();
+  auto retirement = std::async(std::launch::async, [&] {
+    retiring.set_value();
+    if (!close) return Require(playback.Reset());
+    playback.Close();
+    return PlaybackEpoch{};
+  });
+  retiring.get_future().wait();
+  const bool waiting = retirement.wait_for(20ms) == std::future_status::timeout;
+  const auto submitted = playback.TrySubmitVideo(epoch, Picture(40, pixels));
+  release.set_value();
+  const auto published = presenting.get();
+  const auto next = retirement.get();
+  Check(waiting && published.lag_ms && Require(submitted) == SubmitStatus::Accepted,
+        "Upload blocked ordinary submission or failed to serialize retirement");
+  Check(!playback.TrySubmitVideo(epoch, Picture(0, pixels)).Succeeded() && next == playback.Epoch(),
+        "Old input crossed the publication barrier");
+  std::cout << (close ? "Close" : "Reset") << " serialized with upload while state access continued\n";
+}
+
+void AudioAndVideo(AudioPlaybackConfig config) {
+  auto cleaned = std::make_shared<std::atomic_int>(0);
+  config.cleanup_completed = [cleaned](PlaybackResult<void> result) { *cleaned = result.Succeeded() ? 1 : -1; };
+  auto playback = Require(DecodedPlayback::Create({.audio = config, .video = true}));
+  RetireSession retire{playback, *cleaned};
+  WaitState(playback, PlaybackState::Paused, "A/V device did not open");
+  const auto retired = playback.Epoch();
+  const auto epoch = Require(playback.Reset());
+  WaitState(playback, PlaybackState::Paused, "A/V device did not reopen");
+  auto audio = Tone(config.format, 0, 2400);
+  Check(!playback.TrySubmitAudio(retired, audio).Succeeded() && !playback.FinishAudio(retired).Succeeded(),
+        "An old audio producer crossed A/V Reset");
+  Check(Require(playback.TrySubmitAudio(epoch, audio)) == SubmitStatus::Accepted, "Cannot submit A/V audio");
+  Require(playback.FinishAudio(epoch));
+  Require(playback.Play());
+  std::optional<MediaTimestamp> shown;
+  const auto present = [&](const VideoFrame& frame) { shown = frame.pts; };
+  Check(Read(playback).state == PlaybackState::Buffering && Read(playback).position == MediaTimestamp{0, 48000},
+        "Audio started before video was ready");
+  auto bytes = std::make_shared<const Bytes>(6);
+  Check(Require(playback.TrySubmitVideo(epoch, Picture(0, bytes))) == SubmitStatus::Accepted &&
+        Require(playback.TrySubmitVideo(epoch, Picture(80, bytes))) == SubmitStatus::Accepted, "Cannot queue A/V video tail");
+  Require(playback.FinishVideo(epoch));
+  Wait([&] {
+    const auto snapshot = Read(playback);
+    return snapshot.position && snapshot.position->ticks > 0;
+  }, "Ready audio did not start before the first PresentVideo call");
+  Wait([&] {
+    Require(playback.PresentVideo(epoch, present));
+    return Read(playback).state == PlaybackState::Ended;
+  }, "A/V playback did not drain its video tail");
+  const auto ended = Read(playback);
+  Check(shown == MediaTimestamp{80, 1000} && ended.position && ended.position->Compare({120, 1000}) >= 0,
+        "A/V ended before the final video interval");
+  playback.Close();
+  Check(Read(playback).state == PlaybackState::Closed, "A/V close was not logical immediately");
+  Wait([&] { return *cleaned != 0; }, "A/V device cleanup did not complete");
+  Check(*cleaned == 1, "A/V device cleanup failed");
+  std::cout << "A/V playback: gated audio, stale producer, video tail and device cleanup passed\n";
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -179,7 +300,7 @@ int main(int argc, char** argv) {
     config.format = {48000, AudioSampleFormat::S16, AudioPacking::Interleaved, AudioChannelLayout::Stereo};
     auto cleaned = std::make_shared<std::atomic<int>>(0);
     config.cleanup_completed = [cleaned](PlaybackResult<void> result) { *cleaned = result.Succeeded() ? 1 : -1; };
-    auto playback = Require(DecodedPlayback::Create(config));
+    auto playback = Require(DecodedPlayback::Create({.audio = config}));
     RetireSession retire{playback, *cleaned};
     WaitState(playback, PlaybackState::Paused, "Playback device did not open");
     Synthetic(playback, config.format);
@@ -190,6 +311,10 @@ int main(int argc, char** argv) {
     Wait([&] { return cleaned->load() != 0; }, "Playback cleanup did not complete");
     Check(*cleaned == 1, "Playback cleanup failed");
     std::cout << "Playback cleanup passed\n";
+    VideoOnly();
+    PublicationBarrier(false);
+    PublicationBarrier(true);
+    AudioAndVideo(config);
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

@@ -29,7 +29,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Native image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
 | AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
-| Decoded PCM playback | First stage of [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android API 26+ and macOS | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
+| Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android and macOS (PCM on Android API 26+) | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | Audio/video encoding | Planned after the decoder foundation | No public encoder API yet |
 
 Native selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
@@ -311,16 +311,17 @@ platform requirements, and validation instructions.
 
 ## PCM playback
 
-`DecodedPlayback` accepts `AudioFrame` from a decoder or a PCM generator. Configure an exact interleaved S16 format
-with mono or stereo channels. The session opens asynchronously and starts paused. Submit contiguous timestamps on
-the configured sample grid. An accepted submission copies the frame so the producer can release its storage.
+`DecodedPlayback` accepts `AudioFrame` from a decoder or a PCM generator. Use `DecodedPlayback::Create({.audio = audio})`
+for an interleaved S16 mono or stereo session. The device opens asynchronously and starts paused. Capture `Epoch()`
+before starting the producer. Submit contiguous timestamps with `TrySubmitAudio(epoch, frame)`. An accepted
+submission copies the frame so the producer can release its storage.
 
 - Call `Play()` and retry the same frame after `WouldBlock` when playback returns capacity.
 - Read `Snapshot()` for device-observed position, outstanding media duration and underruns. Pause preserves pending
   media. During starvation the position freezes after the committed tail and playback resumes after refill. A frame
   blocked by capacity can trigger an earlier start.
-- Call `FinishAudio()` to seal input. `Ended` follows device confirmation of the final media sample and pause. Use `Reset()`
-  for a fresh timeline and `cleanup_completed` to observe release after logical `Close()`.
+- Call `FinishAudio(epoch)` to seal input. `Ended` follows device confirmation of the final media sample and pause.
+  `Reset()` returns the new token. Use `cleanup_completed` to observe device release after logical `Close()`.
 
 Android uses AAudio on API 26+ and macOS uses AVAudioEngine. Other platforms currently report `Unsupported`.
 The [native playback test](tests/playback_native.cpp) is a headless example that plays both generated PCM and the AAC
@@ -328,19 +329,44 @@ fixture through this API. With tests enabled, run `ctest --test-dir build/tests 
 on macOS. The same native executable runs against the fixture on Android hardware. See the
 [playback contract and device mappings](docs/codec-design.md#decoded-playback-boundary) for timing and lifecycle details.
 
+### Decoded video and synchronized playback
+
+Use `DecodedPlayback::Create({.video = true})` for video alone and
+`DecodedPlayback::Create({.audio = audio, .video = true})` for synchronized playback.
+Capture `Epoch()` before producing frames and use that token with `TrySubmitVideo()`, `TrySubmitAudio()` and each
+track's finish call. Restart the producer with the token returned by `Reset()`. Stale frames and EOS are rejected.
+
+Drive `PresentVideo()` from the presentation thread while the session is active. It publishes at most one due frame
+per call through a synchronous callback, which can upload the frame to a caller-owned `ExternalTexture`. Keep pumping
+through drain until `Snapshot()` reports `Ended`. A session retains up to two video frames, and `WouldBlock` leaves the
+submitted frame with its producer. Pause, Ended, Reset, and Close preserve any already published image. Replace the
+texture on a source change if the new epoch should start blank. Synchronized audio starts after `Play()` and the
+first accepted video frame or video EOS, subject to normal audio buffering.
+
 ## Preview, builds, and validation
 
-The [preview](examples/preview) exercises the library through three tabs:
+The [preview](examples/preview) exercises the library through four tabs.
 
 | Tab | Coverage |
 | --- | --- |
 | Video | Local/reference/URL sources, playback controls, progress, seeking, volume, looping, and video fitting |
 | Music | Audio playback using the same player API without a video surface |
 | Library | Native image/video/mixed selection, capability-aware multi-select, retained references, and publication |
+| Frames | Video-only and synchronized decoded playback on Android and macOS |
 
 The Library tab disables multi-select when the maximum is below two; otherwise it requests up to three items within
 the native limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
 FilePicker explicitly to obtain a source. Switching tabs unmounts the previous session and cancels its pending work.
+
+“Play video” and “Play A/V sync” share a four-second clip. Video-only playback uses its H.264 track. Synchronized
+playback pairs its flashes with AAC tone bursts and uses the PCM device position as the video clock. Both modes
+support pause and resume and publish to one `ExternalTexture` per run. The result reports published and dropped
+frames, maximum video lag at texture publication, and any fallback for unknown color metadata. Switching tabs
+retires the session and its decoders.
+
+The [texture contract test](tests/frame_texture_contract.cpp) checks cropped, padded NV12 and I420 color bars and
+successive publications to one texture. The [native decoder test](tests/codec_native.cpp) checks the 24-frame
+H.264 fixture's exact presentation timestamps and durations.
 
 ### Build and run
 

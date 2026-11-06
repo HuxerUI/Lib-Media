@@ -164,7 +164,7 @@ public:
   /// @return An owning decoder handle on success. Initialization may still be pending, in which case TrySubmit()
   /// returns WouldBlock. A synchronous Failure returns a CodecError and schedules no callbacks.
   /// @see Probe(), TryRead(), AudioDecoderConfig::wakeup
-  [[nodiscard]] static CodecResult<AudioDecoder> Create(const AudioDecoderConfig& config);
+  static CodecResult<AudioDecoder> Create(const AudioDecoderConfig& config);
 
   /// @brief Tests the configuration asynchronously by initializing and releasing an independent native codec.
   ///
@@ -194,7 +194,7 @@ public:
   /// Closed after retirement or on a moved-from handle, or the recorded operational error after fatal failure.
   /// A packet rejected by synchronous validation leaves the decoder available for valid input.
   /// @see EncodedPacket, SubmitStatus, TryRead()
-  [[nodiscard]] CodecResult<SubmitStatus> TrySubmit(const EncodedPacket& packet);
+  CodecResult<SubmitStatus> TrySubmit(const EncodedPacket& packet);
 
   /// @brief Removes the next output event without waiting for native decoding.
   ///
@@ -218,7 +218,7 @@ public:
   ///   }
   /// }
   /// @endcode
-  [[nodiscard]] CodecResult<std::optional<AudioDecodeOutput>> TryRead();
+  CodecResult<std::optional<AudioDecodeOutput>> TryRead();
 
   /// @brief Seals input and starts an asynchronous drain of accepted packets.
   ///
@@ -226,7 +226,7 @@ public:
   /// is released. Further submissions return InvalidState while draining or ended. The session remains open for Reset().
   /// @return Success when the drain is requested, already pending, or complete. InvalidState during startup or
   /// reset or after a fatal error. Closed after retirement or on a moved-from handle.
-  [[nodiscard]] CodecResult<void> Finish();
+  CodecResult<void> Finish();
 
   /// @brief Discards pending input and output and schedules a fresh stream with the same configuration.
   ///
@@ -235,7 +235,7 @@ public:
   /// until native recreation finishes. Read any recreation error with TryRead(). Use Create() for a new configuration.
   /// @return Success when the reset is accepted or already pending. InvalidState during startup or after a fatal
   /// error. Closed after retirement or on a moved-from handle.
-  [[nodiscard]] CodecResult<void> Reset();
+  CodecResult<void> Reset();
 
   /// @brief Immediately retires the session and schedules asynchronous teardown.
   ///
@@ -263,7 +263,7 @@ public:
   /// @return An owning decoder handle on success. TrySubmit() can return WouldBlock while initialization is pending.
   /// A synchronous Failure returns a CodecError and schedules no callbacks.
   /// @see Probe(), TryRead(), VideoDecoderConfig::wakeup
-  [[nodiscard]] static CodecResult<VideoDecoder> Create(const VideoDecoderConfig& config);
+  static CodecResult<VideoDecoder> Create(const VideoDecoderConfig& config);
 
   /// @brief Tests native initialization and release for the supplied AVC configuration asynchronously.
   /// @param config Configuration to probe. The wakeup and cleanup_completed fields are ignored.
@@ -291,14 +291,14 @@ public:
   /// or input capacity is exhausted. Failure reports packet rejection, InvalidState while draining or ended,
   /// Closed after retirement or on a moved-from handle, or the recorded operational error after fatal failure.
   /// @see EncodedPacket, SubmitStatus, AudioDecoder::TrySubmit()
-  [[nodiscard]] CodecResult<SubmitStatus> TrySubmit(const EncodedPacket& packet);
+  CodecResult<SubmitStatus> TrySubmit(const EncodedPacket& packet);
 
   /// @brief Removes the next output event without waiting for native decoding or reordering.
   /// @return Failure with the recorded operational error or Closed. On success, std::nullopt means no event is
   /// available. An engaged value carries one VideoFormat, VideoFrame, or EndOfStream. Format events precede
   /// their dependent frames. EndOfStream is delivered once per successful drain, then reads are empty.
   /// @see VideoDecodeOutput, VideoFrame, AudioDecoder::TryRead()
-  [[nodiscard]] CodecResult<std::optional<VideoDecodeOutput>> TryRead();
+  CodecResult<std::optional<VideoDecodeOutput>> TryRead();
 
   /// @brief Seals input and asynchronously drains native and reordered frames before EndOfStream.
   ///
@@ -306,7 +306,7 @@ public:
   /// @return Success when the drain is requested, already pending, or complete. InvalidState during startup or
   /// reset or after a fatal error. Closed after retirement or on a moved-from handle.
   /// @see AudioDecoder::Finish()
-  [[nodiscard]] CodecResult<void> Finish();
+  CodecResult<void> Finish();
 
   /// @brief Discards pending input and output and schedules a fresh AVC stream with the same configuration.
   ///
@@ -315,7 +315,7 @@ public:
   /// @return Success when the reset is accepted or already pending. InvalidState during startup or after a fatal
   /// error. Closed after retirement or on a moved-from handle.
   /// @see AudioDecoder::Reset()
-  [[nodiscard]] CodecResult<void> Reset();
+  CodecResult<void> Reset();
 
   /// @brief Immediately retires the session and schedules asynchronous teardown.
   ///

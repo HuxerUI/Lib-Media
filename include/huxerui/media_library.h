@@ -130,7 +130,7 @@ public:
   /// @return A Task yielding a result containing MediaLibraryCapabilities, or MediaLibraryError on query failure.
   /// On unsupported desktop and Web platforms, an attached session returns a zero selection limit and can_save = false.
   /// @pre Call and run the Task on the owning UI thread after committed attachment.
-  [[nodiscard]] Task<MediaLibraryResult<MediaLibraryCapabilities>> CapabilitiesAsync() const;
+  Task<MediaLibraryResult<MediaLibraryCapabilities>> CapabilitiesAsync() const;
 
   /// @brief Presents the native picker and obtains access to selected images or videos.
   ///
@@ -159,7 +159,7 @@ public:
   /// @throws std::invalid_argument If filter is invalid or selection_limit is zero, synchronously before returning
   /// the Task, including when the session is unavailable.
   /// @see CapabilitiesAsync(), MediaPickerOptions, UseMediaPicker()
-  [[nodiscard]] Task<MediaLibraryResult<std::vector<FileReference>>> PickAsync(MediaPickerOptions options = {}) const;
+  Task<MediaLibraryResult<std::vector<FileReference>>> PickAsync(MediaPickerOptions options = {}) const;
 
 private:
   explicit MediaPicker(std::shared_ptr<detail::MediaLibraryState> state) : state_(std::move(state)) {}
@@ -197,7 +197,7 @@ public:
   /// @return A Task yielding a result containing MediaLibraryCapabilities, or MediaLibraryError on query failure.
   /// Unsupported desktop and Web platforms return a zero selection limit and can_save = false while attached.
   /// @pre Call and run the Task on the owning UI thread after committed attachment.
-  [[nodiscard]] Task<MediaLibraryResult<MediaLibraryCapabilities>> CapabilitiesAsync() const;
+  Task<MediaLibraryResult<MediaLibraryCapabilities>> CapabilitiesAsync() const;
 
   /// @brief Publishes a local image as a new asset in the system photo library.
   ///
@@ -211,7 +211,7 @@ public:
   /// No separate gallery scan is required. Cancellation delivers no result and may leave a committed asset.
   /// @pre Call and run the Task on the owning UI thread from UI events or committed Lifecycle work.
   /// @see MediaLibrary for permissions, lifecycle, source ownership, and publication cancellation semantics.
-  [[nodiscard]] Task<MediaLibraryResult<void>> SaveImageAsync(File source) const;
+  Task<MediaLibraryResult<void>> SaveImageAsync(File source) const;
 
   /// @brief Publishes a local video as a new asset in the system photo library.
   ///
@@ -225,7 +225,7 @@ public:
   /// Cancellation delivers no result; an already submitted or committed native publication may still finish.
   /// @pre Call and run the Task on the owning UI thread from UI events or committed Lifecycle work.
   /// @see SaveImageAsync(), MediaLibrary
-  [[nodiscard]] Task<MediaLibraryResult<void>> SaveVideoAsync(File source) const;
+  Task<MediaLibraryResult<void>> SaveVideoAsync(File source) const;
 
 private:
   explicit MediaLibrary(std::shared_ptr<detail::MediaLibraryState> state) : state_(std::move(state)) {}
