@@ -5,8 +5,8 @@
 #include <iostream>
 #include <limits>
 
-#include "detail/mediaplayer_internal.h"
-#include "detail/video_geometry.h"
+#include "player/state.h"
+#include "player/video_geometry.h"
 
 using namespace huxerui;
 using namespace huxerui::media;
@@ -29,13 +29,13 @@ template <class Error, class Function> void Throws(Function function) {
   throw std::runtime_error("Expected exception was not thrown");
 }
 
-class FakePlayer final : public NativePlayer {
+class FakePlayer final : public PlayerBackend {
 public:
   std::uint64_t generation = 0;
   std::uint64_t seek_id = 0;
   int plays = 0, pauses = 0, clears = 0, seeks = 0;
   MediaTime target;
-  NativeSnapshot snapshot{
+  PlayerSnapshot snapshot{
       .progress = {MediaTime(0), MediaTime(10), std::vector<MediaTimeRange>{{MediaTime(0), MediaTime(10)}}},
       .seekability = MediaSeekability::Seekable,
       .has_audio = true,
@@ -59,9 +59,9 @@ public:
   }
   void SetVolume(double, bool) override {}
   void Poll() override {
-    Send(NativeEventKind::Update);
+    Send(PlayerEventKind::Update);
   }
-  void Send(NativeEventKind kind) {
+  void Send(PlayerEventKind kind) {
     emit({.generation = generation, .kind = kind, .snapshot = snapshot, .seek_id = seek_id});
   }
 };
@@ -71,7 +71,7 @@ struct Fixture {
   std::shared_ptr<PlayerState> state =
       std::make_shared<PlayerState>([this](std::function<void()> callback) { queue.push_back(std::move(callback)); });
   MediaPlayer player = PlayerAccess::Create(state);
-  std::shared_ptr<FakePlayer> native = std::make_shared<FakePlayer>();
+  std::shared_ptr<FakePlayer> backend = std::make_shared<FakePlayer>();
   void Drain() {
     int iterations = 0;
     while (!queue.empty()) {
@@ -86,11 +86,11 @@ struct Fixture {
   }
   void Ready() {
     Load();
-    native->Send(NativeEventKind::Ready);
+    backend->Send(PlayerEventKind::Ready);
     Drain();
   }
   Fixture() {
-    state->Attach(native);
+    state->Attach(backend);
     Drain();
   }
   ~Fixture() {
@@ -118,41 +118,41 @@ int main() {
       Throws<std::invalid_argument>([&] { return f.player.SeekTo(MediaTime(INFINITY)); });
       f.Load();
       Check(f.player.Play(), "Loading player rejected Play");
-      Check(f.native->plays == 0, "Playback started before readiness");
+      Check(f.backend->plays == 0, "Playback started before readiness");
       Check(f.player.Pause(), "Loading player rejected Pause");
-      f.native->Send(NativeEventKind::Ready);
+      f.backend->Send(PlayerEventKind::Ready);
       f.Drain();
-      Check(f.native->plays == 0, "Pause did not cancel play intention");
+      Check(f.backend->plays == 0, "Pause did not cancel play intention");
       Check(f.player.Snapshot().status == MediaPlayerStatus::Ready, "Load did not reach Ready");
       Check(f.player.Play(), "Ready player rejected Play");
-      f.native->Send(NativeEventKind::Playing);
+      f.backend->Send(PlayerEventKind::Playing);
       f.Drain();
-      Check(f.player.Snapshot().status == MediaPlayerStatus::Playing, "Native playback did not update state");
+      Check(f.player.Snapshot().status == MediaPlayerStatus::Playing, "Platform playback did not update state");
     }
     {
       Fixture f;
       f.Ready();
       Check(f.player.SeekTo(MediaTime(3)), "Seek rejected");
-      auto first = f.native->seek_id;
+      auto first = f.backend->seek_id;
       Check(f.player.SeekTo(MediaTime(5)), "Second seek rejected");
       Check(f.player.SeekTo(MediaTime(8)), "Third seek rejected");
-      Check(f.native->seeks == 1, "Intermediate seeks were not coalesced");
-      f.native->snapshot.progress.position = MediaTime(3);
-      f.native->Send(NativeEventKind::Seeked);
+      Check(f.backend->seeks == 1, "Intermediate seeks were not coalesced");
+      f.backend->snapshot.progress.position = MediaTime(3);
+      f.backend->Send(PlayerEventKind::Seeked);
       f.Drain();
-      Check(f.native->seeks == 2 && f.native->target == MediaTime(8), "Latest seek target was lost");
+      Check(f.backend->seeks == 2 && f.backend->target == MediaTime(8), "Latest seek target was lost");
       Check(f.player.Snapshot().is_seeking, "Intermediate seek reported completion");
-      f.state->Receive({.generation = f.native->generation,
-                        .kind = NativeEventKind::Seeked,
-                        .snapshot = f.native->snapshot,
+      f.state->Receive({.generation = f.backend->generation,
+                        .kind = PlayerEventKind::Seeked,
+                        .snapshot = f.backend->snapshot,
                         .seek_id = first});
       Check(f.player.Snapshot().is_seeking, "Stale seek callback completed a newer seek");
-      f.native->snapshot.progress.position = MediaTime(8);
-      f.native->Send(NativeEventKind::Seeked);
+      f.backend->snapshot.progress.position = MediaTime(8);
+      f.backend->Send(PlayerEventKind::Seeked);
       f.Drain();
       Check(!f.player.Snapshot().is_seeking && f.player.Snapshot().progress.position == MediaTime(8),
             "Seek completion was not published");
-      Check(f.player.SeekTo(MediaTime(20)) && f.native->target == MediaTime(10), "Seek was not clamped to duration");
+      Check(f.player.SeekTo(MediaTime(20)) && f.backend->target == MediaTime(10), "Seek was not clamped to duration");
     }
     {
       Fixture f;
@@ -160,12 +160,12 @@ int main() {
       int ended = 0;
       f.state->ended_handlers.emplace(1, [&] { ++ended; });
       Check(f.player.Play(), "Play rejected");
-      f.native->Send(NativeEventKind::Ended);
-      f.native->Send(NativeEventKind::Ended);
+      f.backend->Send(PlayerEventKind::Ended);
+      f.backend->Send(PlayerEventKind::Ended);
       f.Drain();
       Check(ended == 1, "Ended was duplicated");
       Check(f.player.Snapshot().status == MediaPlayerStatus::Ended, "Ended state missing");
-      Check(f.player.Play() && f.native->target == MediaTime(0), "Replay did not seek to start");
+      Check(f.player.Play() && f.backend->target == MediaTime(0), "Replay did not seek to start");
     }
     {
       Fixture f;
@@ -173,12 +173,12 @@ int main() {
       int ended = 0;
       f.state->ended_handlers.emplace(1, [&] { ++ended; });
       Check(f.player.SetLooping(true) && f.player.Play(), "Loop setup rejected");
-      f.native->Send(NativeEventKind::Ended);
+      f.backend->Send(PlayerEventKind::Ended);
       f.Drain();
       Check(ended == 0 && f.player.Snapshot().is_seeking, "Loop emitted Ended");
-      f.native->Send(NativeEventKind::Seeked);
+      f.backend->Send(PlayerEventKind::Seeked);
       f.Drain();
-      Check(f.native->plays == 2, "Loop did not resume");
+      Check(f.backend->plays == 2, "Loop did not resume");
     }
     {
       Fixture f;
@@ -188,11 +188,11 @@ int main() {
         Check(!error.fatal, "Unsupported loop was fatal");
         ++errors;
       });
-      f.native->snapshot.seekability = MediaSeekability::NotSeekable;
-      f.native->Send(NativeEventKind::Update);
+      f.backend->snapshot.seekability = MediaSeekability::NotSeekable;
+      f.backend->Send(PlayerEventKind::Update);
       f.Drain();
       Check(f.player.SetLooping(true), "Loop preference rejected");
-      f.native->Send(NativeEventKind::Update);
+      f.backend->Send(PlayerEventKind::Update);
       f.Drain();
       Check(errors == 1, "Unsupported loop warning duplicated");
       Check(!f.player.SeekTo(MediaTime(1)), "Nonseekable source accepted Seek");
@@ -200,15 +200,15 @@ int main() {
     {
       Fixture f;
       f.Ready();
-      const auto old_generation = f.native->generation;
+      const auto old_generation = f.backend->generation;
       f.Load();
-      f.state->Receive({.generation = old_generation, .kind = NativeEventKind::Ended, .snapshot = f.native->snapshot});
+      f.state->Receive({.generation = old_generation, .kind = PlayerEventKind::Ended, .snapshot = f.backend->snapshot});
       Check(f.player.Snapshot().status == MediaPlayerStatus::Loading, "Old source callback changed the new source");
       int errors = 0;
       f.state->error_handlers.emplace(1, [&](const MediaError&) { ++errors; });
       const MediaError error{MediaErrorCode::Decode, "decode failed", {}, true};
-      f.state->Receive({.generation = f.native->generation, .kind = NativeEventKind::Error, .error = error});
-      f.state->Receive({.generation = f.native->generation, .kind = NativeEventKind::Error, .error = error});
+      f.state->Receive({.generation = f.backend->generation, .kind = PlayerEventKind::Error, .error = error});
+      f.state->Receive({.generation = f.backend->generation, .kind = PlayerEventKind::Error, .error = error});
       f.Drain();
       Check(errors == 1 && f.player.Snapshot().error == error, "Fatal error was not retained exactly once");
       Check(!f.player.Play(), "Failed source accepted implicit retry");
@@ -230,24 +230,24 @@ int main() {
         Check(f.player.Snapshot().status == MediaPlayerStatus::Empty, "Stale listener ran after source replacement");
         ++empty_callbacks;
       });
-      f.native->snapshot.progress.position = MediaTime(2);
-      f.native->Send(NativeEventKind::Update);
-      f.native->snapshot.progress.position = MediaTime(3);
-      f.native->Send(NativeEventKind::Update);
+      f.backend->snapshot.progress.position = MediaTime(2);
+      f.backend->Send(PlayerEventKind::Update);
+      f.backend->snapshot.progress.position = MediaTime(3);
+      f.backend->Send(PlayerEventKind::Update);
       f.Drain();
       Check(callbacks == 2 && empty_callbacks == 1, "Progress did not coalesce or repeated Clear did not converge");
     }
     {
       Fixture f;
       f.Ready();
-      Check(f.player.Play() && f.player.Play() && f.native->plays == 1, "Repeated Play was not idempotent");
+      Check(f.player.Play() && f.player.Play() && f.backend->plays == 1, "Repeated Play was not idempotent");
       f.state->progress_handlers.emplace(1, [&](const MediaProgress&) {
         Check(f.player.Pause(), "Pause from a progress callback was rejected");
       });
-      f.native->snapshot.progress.position = MediaTime(2);
-      f.native->Send(NativeEventKind::Update);
+      f.backend->snapshot.progress.position = MediaTime(2);
+      f.backend->Send(PlayerEventKind::Update);
       f.Drain();
-      Check(f.native->pauses == 1, "Repeated Pause did not converge");
+      Check(f.backend->pauses == 1, "Repeated Pause did not converge");
     }
     {
       Fixture f;
@@ -259,11 +259,11 @@ int main() {
         ++errors;
       });
       Check(f.player.SetLooping(true) && f.player.Play(), "Loop setup rejected");
-      f.native->Send(NativeEventKind::Ended);
+      f.backend->Send(PlayerEventKind::Ended);
       f.Drain();
-      f.state->Receive({.generation = f.native->generation,
-                        .kind = NativeEventKind::Error,
-                        .seek_id = f.native->seek_id,
+      f.state->Receive({.generation = f.backend->generation,
+                        .kind = PlayerEventKind::Error,
+                        .seek_id = f.backend->seek_id,
                         .error = {MediaErrorCode::SeekFailed, "seek failed", {}, false}});
       f.Drain();
       Check(ended == 1 && errors == 1 && f.player.Snapshot().status == MediaPlayerStatus::Ended &&
@@ -278,7 +278,7 @@ int main() {
       Check(f.player.Snapshot().volume == 0.4 && f.player.Snapshot().muted && f.player.Snapshot().looping,
             "Load discarded preferences");
       int binds = 0;
-      f.state->Bind([&](const std::shared_ptr<NativePlayer>& player) { binds += player ? 1 : -1; });
+      f.state->Bind([&](const std::shared_ptr<PlayerBackend>& player) { binds += player ? 1 : -1; });
       Throws<std::logic_error>([&] { f.state->Bind([](const auto&) {}); });
       f.state->Unbind();
       Check(binds == 0 && f.player.IsConnected(), "Unbinding video destroyed playback");
@@ -289,12 +289,12 @@ int main() {
     {
       Fixture f;
       f.Ready();
-      const auto old_emit = f.native->emit;
-      const auto old_generation = f.native->generation;
+      const auto old_emit = f.backend->emit;
+      const auto old_generation = f.backend->generation;
       f.state->Detach();
-      f.state->Attach(f.native);
+      f.state->Attach(f.backend);
       f.Load();
-      old_emit({.generation = old_generation, .kind = NativeEventKind::Ended});
+      old_emit({.generation = old_generation, .kind = PlayerEventKind::Ended});
       f.Drain();
       Check(f.player.Snapshot().status == MediaPlayerStatus::Loading,
             "Detached adapter callback escaped its attachment epoch");

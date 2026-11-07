@@ -4,7 +4,7 @@
 /// @brief Exact media timestamps, compressed access units, and CPU audio and video frames.
 ///
 /// Include <huxerui/media_format.h> and link HuxerUI::Media. These values can be used in headless code.
-/// Use <huxerui/media_codec.h> to submit compressed packets and receive validated CPU frames.
+/// Use <huxerui/media_codec.h> to decode compressed packets or encode PCM through bounded, headless sessions.
 /// When constructing frames yourself, call Validate() before using their format, timing, and planes.
 
 #include <cstdint>
@@ -73,7 +73,8 @@ enum class AudioChannelLayout {
 /// @brief PCM sample rate, representation, packing, and ordered channel layout.
 ///
 /// Derive channel count and bytes per channel sample with ChannelCount() and BytesPerSample(). Set a positive
-/// sample_rate before using a default-constructed format in an AudioFrame or AudioDecoderConfig.
+/// sample_rate before using a default-constructed format in an AudioFrame, AudioDecoderConfig, or AudioEncoderConfig.
+/// AudioEncoderConfig additionally requires S16 representation and interleaved packing.
 struct AudioFormat {
   /// Positive sample rate in samples per second per channel. The default zero is unset.
   std::uint32_t sample_rate = 0;
@@ -93,6 +94,7 @@ struct AudioFormat {
   [[nodiscard]] std::uint32_t BytesPerSample() const noexcept;
 
   /// @brief Compares all four PCM format fields.
+  /// @return True if the rate, sample representation, packing, and channel layout are equal, otherwise false.
   bool operator==(const AudioFormat&) const = default;
 };
 
@@ -110,10 +112,14 @@ enum class SubmitStatus {
 /// address-stable and unchanged throughout TrySubmit(). BufferReference retains the backing owner, which may still
 /// be mutable. Accepted packets are copied before TrySubmit() returns, so the caller can then reuse the source bytes.
 /// Keep a packet available for retry when submission returns SubmitStatus::WouldBlock.
-/// Supplied timing must fit in signed 64-bit microseconds after rescaling. A native adapter may impose a smaller range.
-/// @see AudioDecoder::TrySubmit(), VideoDecoder::TrySubmit()
+/// Supplied timing must fit in signed 64-bit microseconds after rescaling. A platform adapter may impose a smaller range.
+///
+/// AudioEncoder output owns immutable bytes that remain readable after Reset(), Close(), and cleanup completion.
+/// Retaining a packet, its data, or an arbitrary slice keeps its full output reservation in the originating encoder,
+/// including across resets. Release all byte references to return that reservation.
+/// @see AudioDecoder::TrySubmit(), VideoDecoder::TrySubmit(), AudioEncoder::TryRead()
 struct EncodedPacket {
-  /// Nonempty access-unit bytes in the representation selected by the decoder configuration.
+  /// Nonempty access-unit bytes in the representation selected by the codec configuration.
   BufferReference data;
   /// Required presentation timestamp with a positive timescale. Negative preroll is allowed.
   /// AVC packets can arrive with reordered presentation timestamps.
@@ -123,6 +129,7 @@ struct EncodedPacket {
   /// Optional nonnegative duration with a positive timescale. An absent duration and a zero duration are distinct.
   std::optional<MediaTimestamp> duration;
   /// Marks a random-access unit. The first AVC packet after Create() or Reset() must contain an IDR and set this flag.
+  /// AudioEncoder output always sets this flag.
   bool key_frame = false;
 };
 
@@ -132,7 +139,9 @@ struct EncodedPacket {
 /// Copies share the plane buffers. Retaining a plane or any slice of it holds the frame's output reservation in the
 /// originating decoder across resets. Release all plane references to return that reservation.
 /// For application-provided planes, keep their storage stable and synchronize writes with readers.
-/// @see AudioFormat, BufferReference
+/// AudioEncoder copies the used PCM bytes on Accepted; its input must match AudioEncoderConfig::input and follow
+/// the previously accepted frame on the configured sample grid.
+/// @see AudioFormat, BufferReference, AudioEncoder::TrySubmit()
 struct AudioFrame {
   /// Complete format of these samples.
   AudioFormat format;
@@ -169,7 +178,7 @@ enum class VideoPixelFormat {
   NV12
 };
 
-/// @brief Color primaries reported by the stream or native decoder.
+/// @brief Color primaries reported by the stream or platform decoder.
 enum class ColorPrimaries {
   /// Primaries were unavailable or could not be mapped to a supported value.
   Unknown,
@@ -235,9 +244,16 @@ enum class VideoRotation {
 
 /// @brief A crop rectangle in coded luma pixels.
 struct VideoRectangle {
-  /// The x and y offsets select the first column and row. The width and height are positive extents.
-  std::uint32_t x = 0, y = 0, width = 0, height = 0;
+  /// Horizontal offset of the first visible column in coded luma pixels.
+  std::uint32_t x = 0;
+  /// Vertical offset of the first visible row in coded luma pixels.
+  std::uint32_t y = 0;
+  /// Positive horizontal extent in coded luma pixels. The default zero is unset.
+  std::uint32_t width = 0;
+  /// Positive vertical extent in coded luma pixels. The default zero is unset.
+  std::uint32_t height = 0;
   /// @brief Compares the crop origin and extents.
+  /// @return True if both offsets and both extents are equal, otherwise false.
   bool operator==(const VideoRectangle&) const = default;
 };
 
@@ -246,14 +262,18 @@ struct VideoRectangle {
 /// Size the planes using the coded dimensions, then use visible, pixel aspect ratio, and rotation for display.
 /// Unavailable color metadata remains Unknown so the consumer can choose its own fallback.
 struct VideoFormat {
-  /// Positive coded width and height in luma pixels, including pixels outside the visible crop.
-  std::uint32_t width = 0, height = 0;
+  /// Positive coded width in luma pixels, including columns outside the visible crop.
+  std::uint32_t width = 0;
+  /// Positive coded height in luma pixels, including rows outside the visible crop.
+  std::uint32_t height = 0;
   /// Nonempty crop within the coded image, expressed before presentation rotation.
   VideoRectangle visible;
   /// Plane count, order, and sample layout. Use the frame's strides to address the planes.
   VideoPixelFormat pixel_format = VideoPixelFormat::NV12;
   /// Pixel width and height in the same units. Both must be positive. The default 1:1 describes square pixels.
-  std::uint32_t aspect_width = 1, aspect_height = 1;
+  std::uint32_t aspect_width = 1;
+  /// Positive pixel height in the same units as aspect_width. The default pair 1:1 describes square pixels.
+  std::uint32_t aspect_height = 1;
   /// Color primaries for interpreting the coded samples.
   ColorPrimaries primaries = ColorPrimaries::Unknown;
   /// Transfer characteristic for interpreting the coded samples.
@@ -272,6 +292,7 @@ struct VideoFormat {
   [[nodiscard]] bool Validate() const noexcept;
 
   /// @brief Compares all geometry, layout, and presentation fields, including the stored aspect ratio terms.
+  /// @return True if all stored format fields are equal, otherwise false.
   bool operator==(const VideoFormat&) const = default;
 };
 
@@ -302,7 +323,7 @@ struct VideoFrame {
   /// Required presentation timestamp with a positive timescale. Decoder output preserves the associated packet's
   /// exact rational PTS, including negative preroll.
   MediaTimestamp pts;
-  /// Optional nonnegative display duration with a positive timescale. Packet duration takes precedence over native
+  /// Optional nonnegative display duration with a positive timescale. Packet duration takes precedence over platform
   /// duration. An empty value means duration is unknown.
   std::optional<MediaTimestamp> duration;
   /// Y, U, V planes for I420. For NV12, a Y plane followed by one interleaved U/V plane.

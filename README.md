@@ -1,6 +1,6 @@
 # Lib-Media
 
-Lib-Media is the media library for [HuxerUI](https://github.com/HuxerUI/HuxerUI). It brings media playback, native
+Lib-Media is the media library for [HuxerUI](https://github.com/HuxerUI/HuxerUI). It brings media playback, platform
 image/video selection, saving to the system photo library, headless AAC-LC/H.264 decoding, and decoded PCM output
 into one C++ library.
 
@@ -26,31 +26,31 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Capability | Current status | Public entry points |
 | --- | --- | --- |
 | Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`media_player.h`](include/huxerui/media_player.h) |
-| Native image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
+| Platform image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
 | AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
-| Audio/video encoding | Planned after the decoder foundation | No public encoder API yet |
+| AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; Apple encoder validation remains pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
 
-Native selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
+Platform selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
 SDK `FileReference` values, which can be retained for reading, imported to local files, or passed to `MediaSource` for
 playback of supported audio/video content. Saving takes a readable local `File` and creates a new system-library asset.
 
 ## Platform support
 
-| Platform | Playback backend / video output | Native selection | Saving | Headless decoder |
+| Platform | Playback backend / video output | Platform selection | Saving | Headless decoder |
 | --- | --- | --- | --- | --- |
 | Android | Media3 ExoPlayer / TextureView | System Photo Picker; legacy `ACTION_PICK` gallery fallback | MediaStore on Android 10+ | NDK MediaCodec |
 | iOS | AVFoundation / AVPlayerLayer | PHPicker on iOS 15+ | Photos add-only access on iOS 15+ | AudioConverter / VideoToolbox |
 | macOS | AVFoundation / AVPlayerLayer | Unavailable | Unavailable | AudioConverter / VideoToolbox |
 | Windows | Media Foundation MediaEngine / D3D11 frame server and HWND swap chain | Unavailable | Unavailable | Media Foundation transforms (experimental) |
 | Linux | GtkMediaFile / GdkTexture through HuxerUI ExternalTexture | Unavailable | Unavailable | GStreamer with installed plugins |
-| Web | HTMLMediaElement / native video element | Unavailable | Unavailable | WebCodecs |
+| Web | HTMLMediaElement / HTML video element | Unavailable | Unavailable | WebCodecs |
 
 Android's library minimum is API 23; playback uses Media3 `1.9.3` resolved by Gradle. Linux builds require GTK 4.14+,
 libpulse, and GStreamer 1.24+ app/audio/video development packages. Linux file/URL playback needs a working GTK media
 backend. Windows playback needs Media Foundation components and
-D3D11-capable hardware. Playback container, codec, and streaming-protocol support follows the native backend.
+D3D11-capable hardware. Playback container, codec, and streaming-protocol support follows the platform backend.
 Applications own network permissions, transport-security policy, browser CORS/mixed-content rules, and any background
 playback or audio-session configuration.
 
@@ -61,8 +61,8 @@ its own adapter. See [selection limits and compatibility](#selection-limits-and-
 ## Integration
 
 Lib-Media uses C++20 and the public HuxerUI SDK. Playback and photo-library access use `ApplicationContext`,
-`AppOptions::application_hooks`, and window platform factories. Native photo-library access also uses the SDK's
-shared `Result` type, callback-to-Task bridge, native file-reference factories, and window presentation coordination
+`AppOptions::application_hooks`, and window platform factories. System photo-library access also uses the SDK's
+shared `Result` type, callback-to-Task bridge, platform file-reference factories, and window presentation coordination
 listed in the [SDK integration guide](docs/medialibrary.md#sdk-integration).
 
 Clone the library beside your application:
@@ -106,7 +106,7 @@ Obtain `UseMediaPlayer()`, `UseMediaPicker()`, and `UseMediaLibrary()` during co
 owning composition scope and UI thread; retaining a copy does not keep its session active after unmount. Start commands
 from UI events or committed Lifecycle work. Run asynchronous operations through a `TaskScope` on the owning UI thread.
 
-Playback commands return `bool` for acceptance and report subsequent native state through snapshots and events.
+Playback commands return `bool` for acceptance and report subsequent platform state through snapshots and events.
 Selection and saving return Tasks yielding `MediaLibraryResult<T>`, the SDK's `Result<T, MediaLibraryError>`. Check
 `Succeeded()` before reading `Value()` or `Error()`; reading the wrong branch throws `std::logic_error`.
 
@@ -156,7 +156,7 @@ Web files. A network source is `MediaSource(MediaHttpSource{"https://your-server
 - `Snapshot()` observes `MediaPlayerState`, including lifecycle status, progress, seekability, buffering/seeking flags,
   metadata, preferences, and fatal errors. Time values use `MediaTime`, a duration in double-precision seconds.
   Missing duration or metadata means unknown; an empty reported buffer list means no buffered ranges are reported.
-- `SeekTo()` requires known seekability and clamps to a known duration. One native seek runs at a time; subsequent
+- `SeekTo()` requires known seekability and clamps to a known duration. One platform seek runs at a time; subsequent
   requests collapse to the latest target. Position comes from the backend. Looping requires a finite, seekable source.
 - `OnProgress`, `OnEnded`, and `OnError` are composition-bound subscriptions and allow multiple subscribers. Extra
   arguments are Lifecycle dependencies. Capture stable State handles when no dependencies are supplied.
@@ -176,8 +176,8 @@ mounted surface; mounting a second is rejected. Removing the surface does not pa
 while unmounting the player's owning scope disconnects the session. `VideoSurfaceProperties` supports `ImageFit` and
 horizontal/vertical `Start`, `Center`, or `End` alignment; `Stretch` is invalid for content alignment.
 
-The player retains its source while the backend uses it. Android uses native URIs; Web creates object URLs from native
-Files; desktop and Apple adapters use `AsFile()` while retaining the reference. Sources without a native-readable
+The player retains its source while the backend uses it. Android uses platform URIs; Web creates object URLs from browser
+`File` objects; desktop and Apple adapters use `AsFile()` while retaining the reference. Sources without a platform-readable
 location return `Unsupported`. Raw sequential streams and custom stream providers are not accepted.
 
 Custom HTTP headers currently return `Unsupported` on every adapter. Android includes progressive ExoPlayer playback,
@@ -190,7 +190,7 @@ and [DecodedPlayback](#pcm-playback) to play its PCM frames.
 
 ## Media selection and saving
 
-`MediaPicker` opens native image/video selection UI. `MediaLibrary` publishes local images and videos to the system
+`MediaPicker` opens platform image/video selection UI. `MediaLibrary` publishes local images and videos to the system
 photo library. They can be used independently of each other and of `MediaPlayer`.
 
 ### Selecting media
@@ -237,12 +237,12 @@ references do not promise access after process restart. Prefer `OpenReadAsync()`
 ### Selection limits and compatibility
 
 Query `CapabilitiesAsync()` on either handle when preparing controls. `MediaLibraryCapabilities::CanPick()` derives
-availability from a positive `max_selection_count`; zero means no native selection is available. `can_save` is separate
+availability from a positive `max_selection_count`; zero means no platform selection is available. `can_save` is separate
 and can be true even when selection is unavailable. A capability snapshot does not grant permission or reserve UI.
 
 | Selection path | Behavior and limits |
 | --- | --- |
-| Android system Photo Picker | Preferred on Android 13+, or Android 11/12 with R SDK extension 2+ and an available picker. Images, videos, and mixed selection use the native maximum. |
+| Android system Photo Picker | Preferred on Android 13+, or Android 11/12 with R SDK extension 2+ and an available picker. Images, videos, and mixed selection use the platform maximum. |
 | Android legacy `ACTION_PICK` | Opens an installed image or video gallery. Reports `max_selection_count = 1` and accepts single selection only. |
 | iOS PHPicker | Supports images, videos, and mixed selection with the requested positive count limit. |
 
@@ -252,7 +252,7 @@ even when another kind has a handler. No document-picker fallback is implicit, a
 multi-select extras are assumed.
 
 `selection_limit` defaults to one; zero is invalid. Larger limits enable multiple selection only where supported.
-Requests above native capability return `Unsupported` before presentation, and returned types/counts are validated.
+Requests above platform capability return `Unsupported` before presentation, and returned types/counts are validated.
 The library does not silently reduce limits or truncate selections. Selection requests no broad photo-library or
 storage-read permission. Applications can explicitly offer the SDK FilePicker as a separate document-selection action.
 
@@ -279,9 +279,9 @@ Info.plist and requests Photos add-only authorization. Missing configuration ret
 
 ### Cancellation and ownership
 
-Unmount cancels pending native requests and retires the session. A surviving application Task receives `Unavailable`,
-while Task cancellation suppresses delivery. A native picker or permission prompt may remain visible until the system
-closes it. Native selection shares the SDK's window presentation coordination with FilePicker.
+Unmount cancels pending platform requests and retires the session. A surviving application Task receives `Unavailable`,
+while Task cancellation suppresses delivery. A platform picker or permission prompt may remain visible until the system
+closes it. Platform selection shares the SDK's window presentation coordination with FilePicker.
 
 Canceling a save cannot undo committed publication. Android attempts to delete an unfinished pending entry, subject to
 provider cleanup failures. Once an iOS Photos transaction is submitted, it may finish after cancellation; its staged
@@ -300,9 +300,9 @@ or demuxer: raw AAC-LC with AudioSpecificConfig produces mono/stereo S16 or F32 
 - `TryRead()` returns a format, frame, or `EndOfStream` event on success. An empty optional means no output is ready yet.
 - `Finish()` drains accepted input and emits one `EndOfStream`. `Reset()` discards queued work and restarts decoding.
 - `Close()` and destruction retire the session immediately. The optional `cleanup_completed` callback reports teardown
-  after admitted wakeups return. On native platforms, it also follows worker exit.
+  after admitted wakeups return. On desktop and mobile platforms, it also follows worker exit.
 
-Each native session and probe has its own worker. Web sessions run on the event loop that created them. Linux uses
+Each desktop or mobile session and probe has its own worker. Web sessions run on the event loop that created them. Linux uses
 GStreamer 1.24+ with installed AAC/H.264 parser and decoder plugins.
 
 AAC/H.264 fixture decoding passed on an Android 12 device, an iOS simulator, Apple Silicon macOS, Windows 11,
@@ -333,7 +333,7 @@ the default render endpoint; the system audio engine converts the PCM rate and c
 Its playhead follows `IAudioClock`, while endpoint padding only controls writes. An exhausted device run accepts no
 further PCM and is recreated after its media tail is confirmed, so underrun silence does not advance media time.
 Linux uses libpulse with an installed PulseAudio-compatible server. Cork acknowledgements preserve queued PCM across
-pause. The playhead uses native stream timing without wall-clock interpolation, and a starved stream is retired after its drain and
+pause. The playhead uses platform stream timing without wall-clock interpolation, and a starved stream is retired after its drain and
 final media position are confirmed. A lost connection or output route fails the session even while paused.
 Video-only sessions do not require an audio server.
 The [native playback test](tests/playback_native.cpp) is a headless example that plays both generated PCM and the AAC
@@ -389,11 +389,11 @@ The [preview](examples/preview) exercises the library through four tabs.
 | --- | --- |
 | Video | Local/reference/URL sources, playback controls, progress, seeking, volume, looping, and video fitting |
 | Music | Audio playback using the same player API without a video surface |
-| Library | Native image/video/mixed selection, capability-aware multi-select, retained references, and publication |
+| Library | Platform image/video/mixed selection, capability-aware multi-select, retained references, and publication |
 | Frames | Video-only and synchronized decoded playback on Android, iOS, macOS, Windows, Linux, and Web |
 
 The Library tab disables multi-select when the maximum is below two; otherwise it requests up to three items within
-the native limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
+the platform limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
 FilePicker explicitly to obtain a source. Switching tabs unmounts the previous session and cancels its pending work.
 
 “Play video” and “Play A/V sync” share a four-second clip. Video-only playback uses its H.264 track. Synchronized
@@ -442,32 +442,40 @@ ctest --test-dir build/tests --output-on-failure
 Tests cover playback state transitions, coalesced seeking/progress, looping, stale callbacks, preferences, surface
 ownership, and media-library result validation, cancellation, late replies, and session retirement. When Node and the
 SDK Web registry are available, CTest also exercises the Web adapter with simulated media elements. Codec tests use
-generated AAC/H.264 fixtures and cover queue backpressure, native worker isolation, cleanup ordering, and late WebCodecs
+generated AAC/H.264 fixtures and cover queue backpressure, session worker isolation, cleanup ordering, and late WebCodecs
 callbacks. See the [codec validation instructions](docs/mediacodec.md#validation) for standalone and browser runs.
 
 Windows adds WASAPI underrun/clock tests at 48 kHz stereo and 44.1 kHz mono, decoded PCM/video/A/V tests, texture
-publication tests, native muted audio smoke tests, and video geometry tests. To check frame transfer and presentation against
+publication tests, platform muted audio smoke tests, and video geometry tests. To check frame transfer and presentation against
 a real source, run `build/tests/tests/media_windows_video.exe /path/to/video.mp4` with a short clip under 20 seconds.
 It uses an off-screen window, resizes the surface, and waits for natural completion without modifying the source.
 
 Linux Release tests passed on Ubuntu 24.04 under WSL with GStreamer 1.24.2, libpulse 16.1, and WSLg's PulseAudio server.
-They cover native AAC/AVC decoding, PCM/AAC playback, video/A/V scheduling, texture publication, 48 kHz stereo and
+They cover platform AAC/AVC decoding, PCM/AAC playback, video/A/V scheduling, texture publication, 48 kHz stereo and
 44.1 kHz mono cork/drain boundaries, and missing-server cleanup. The full Linux preview also builds with the installed
 SDK. Physical Linux output routes, PipeWire's PulseAudio service, and measured display/audio synchronization remain
 device acceptance work.
 
 Device acceptance should cover local/reference/HTTPS playback, seek/end/loop, source replacement, fitting, and platform
-interruptions; image/video/mixed selection, native count limits, dismissal, and reading retained references; and
+interruptions; image/video/mixed selection, platform count limits, dismissal, and reading retained references; and
 image/video publication, denied access, invalid sources, and cancellation. Exercise both legacy Android gallery routes
-and the mixed chooser. Automated contract tests do not replace native device or browser verification.
+and the mixed chooser. Automated contract tests do not replace platform device or browser verification.
 
 ## Repository layout
+
+`src` contains feature directories only. Each feature keeps its public `media_*.cpp` implementations beside its
+private state, validation, and backend contracts. Shared worker execution lives outside the codec and playback modules.
 
 | Path | Contents |
 | --- | --- |
 | [`include/huxerui/`](include/huxerui) | Public APIs and their full contracts |
-| [`src/`](src) | Shared session state, validation, and platform routing |
-| [`platform/`](platform) | Native adapters and platform package integration |
+| [`src/format/`](src/format) | `media_format.h` implementation: timestamps, PCM/YUV descriptions, and frame validation |
+| [`src/player/`](src/player) | `media_player.h` implementation, player state, platform backend contract, channel transport, and video geometry |
+| [`src/library/`](src/library) | `media_library.h` implementation, request state, platform transport contract, and payload validation |
+| [`src/codec/`](src/codec) | `media_codec.h` implementations, shared AAC utilities, and separate decoder/encoder internals |
+| [`src/decoded_playback/`](src/decoded_playback) | `media_playback.h` implementation, audio session, device contract, and video scheduling |
+| [`src/execution/`](src/execution) | Desktop and mobile session workers, post-exit cleanup dispatch, and Web event-loop scheduling |
+| [`platform/`](platform) | Platform adapters and platform package integration |
 | [`examples/preview/`](examples/preview) | Consumer application for playback and photo-library access |
 | [`tests/`](tests) | Shared contracts, codec fixtures, and platform checks |
 | [`docs/medialibrary.md`](docs/medialibrary.md) | Photo-library integration and lifecycle details |
@@ -481,8 +489,8 @@ lifecycle contract, and delivery order. The AAC/AVC decoding milestone is now im
 validation called out in the [decoding guide](docs/mediacodec.md).
 
 The next stages of decoded playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) expand device and
-synchronization measurements. Encoding and broader codec discovery remain later
-stages of [#20](https://github.com/HuxerUI/HuxerUI/issues/20).
+synchronization measurements. AAC-LC audio encoding has an initial implementation; remaining encoder platform
+validation, video encoding, and broader codec discovery are later stages of [#20](https://github.com/HuxerUI/HuxerUI/issues/20).
 
-Existing file/URL playback continues to use native players. HuxerUI owns general file, task, window, and texture
+Existing file/URL playback continues to use platform players. HuxerUI owns general file, task, window, and texture
 facilities; media-specific behavior stays in Lib-Media.

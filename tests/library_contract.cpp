@@ -1,4 +1,5 @@
-#include "detail/media_library.h"
+#include "library/state.h"
+#include "library/payload.h"
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -13,7 +14,7 @@ void Check(bool condition, const char* message) {
 }
 template <class Function> void Invalid(Function function) {
   try { function(); } catch (const std::exception&) { return; }
-  throw std::runtime_error("Expected an invalid native result or argument to be rejected");
+  throw std::runtime_error("Expected an invalid platform result or argument to be rejected");
 }
 }
 
@@ -24,14 +25,14 @@ int main() {
     Invalid([] { ValidatePickerOptions({static_cast<MediaPickerFilter>(99), 1}); });
     const auto selection = [](const PlatformPayload& payload) { return DecodeSelection(payload, 1); };
     auto dismissal = DecodeLibraryReply<std::vector<FileReference>>(PlatformPayload{}, selection);
-    Check(dismissal.Succeeded() && dismissal.Value().empty(), "Native dismissal must be a successful empty selection");
+    Check(dismissal.Succeeded() && dismissal.Value().empty(), "Platform dismissal must be a successful empty selection");
     auto denied = DecodeLibraryReply<std::vector<FileReference>>(
         PlatformError{"media/permission", "denied", {}}, selection);
     Check(!denied.Succeeded() && denied.Error().code == MediaLibraryErrorCode::PermissionDenied,
           "Denied selection must remain a failure rather than an empty success");
     auto malformed = DecodeLibraryReply<std::vector<FileReference>>(PlatformPayload::List{}, selection);
     Check(!malformed.Succeeded() && malformed.Error().platform_code == "media/invalid-result",
-          "An invalid native empty list must not be mistaken for user dismissal");
+          "An invalid platform empty list must not be mistaken for user dismissal");
     Invalid([] { DecodeSelection(PlatformPayload::List{}, 1); });
     Invalid([] { DecodeSelection(PlatformPayload::List{1, 2}, 1); });
     Invalid([] { DecodeSelection(PlatformPayload::List{1}, 1); });
@@ -41,21 +42,21 @@ int main() {
           "Selection and saving availability must remain independent");
     auto supported = DecodeCapabilities(PlatformPayload::Object{{"maxSelectionCount", 3}, {"canSave", false}});
     Check(supported.CanPick() && supported.max_selection_count == 3 && !supported.can_save,
-          "The native selection count must determine picker support without a separate flag");
+          "The platform selection count must determine picker support without a separate flag");
     Invalid([] { DecodeCapabilities(PlatformPayload::Object{
         {"maxSelectionCount", -1}, {"canSave", true}}); });
     Invalid([] { DecodeCapabilities(PlatformPayload::Object{
         {"maxSelectionCount", std::int64_t{std::numeric_limits<std::uint32_t>::max()} + 1}, {"canSave", true}}); });
     Invalid([] { DecodeCapabilities(PlatformPayload::Object{{"canSave", true}}); });
     auto published = DecodeLibraryReply<void>(PlatformPayload{}, DecodeSave);
-    Check(published.Succeeded(), "Native publication confirmation must produce void success");
+    Check(published.Succeeded(), "Platform publication confirmation must produce void success");
     published.Value();
     auto failed_save = DecodeLibraryReply<void>(PlatformError{"media/io", "publication failed", {}}, DecodeSave);
     Check(!failed_save.Succeeded() && failed_save.Error().code == MediaLibraryErrorCode::Io,
-          "Native publication failure must preserve its error with a void result");
+          "Platform publication failure must preserve its error with a void result");
     auto invalid_save = DecodeLibraryReply<void>(PlatformPayload(true), DecodeSave);
     Check(!invalid_save.Succeeded() && invalid_save.Error().platform_code == "media/invalid-result",
-          "Unexpected native save payloads must not report publication success");
+          "Unexpected platform save payloads must not report publication success");
     Check(LibraryError({"media/permission", "denied", {}}).code == MediaLibraryErrorCode::PermissionDenied,
           "Permission denial must be distinguishable");
     Check(LibraryError({"media/unsupported", "unsupported", {}}).code == MediaLibraryErrorCode::Unsupported,
@@ -69,7 +70,7 @@ int main() {
       return [&] { ++canceled; };
     }, [&] { ++closed; });
     auto cancel = state->Request("pick", {}, [&](LibraryReply result) {
-      Check(std::holds_alternative<PlatformPayload>(result), "Successful native reply was lost");
+      Check(std::holds_alternative<PlatformPayload>(result), "Successful platform reply was lost");
       ++completed;
     });
     reply(PlatformPayload{});
@@ -92,7 +93,7 @@ int main() {
     auto late = reply;
     state->Detach();
     late(PlatformPayload{});
-    Check(completed == 2 && canceled == 2 && closed == 1, "Retirement must close native work without late delivery");
+    Check(completed == 2 && canceled == 2 && closed == 1, "Retirement must close platform work without late delivery");
     state->Request("pick", {}, [&](LibraryReply result) {
       Check(std::holds_alternative<PlatformError>(result), "A retired handle must reject new work");
       ++completed;
@@ -112,7 +113,7 @@ int main() {
       return [&] { ++canceled; };
     });
     state->Request("pick", {}, [&](LibraryReply) { ++completed; });
-    Check(completed == 5 && canceled == 3, "Retirement during startup must cancel the returned native operation");
+    Check(completed == 5 && canceled == 3, "Retirement during startup must cancel the returned platform operation");
     std::cout << "Media library contract checks passed\n";
     return 0;
   } catch (const std::exception& error) {

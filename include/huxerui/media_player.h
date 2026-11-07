@@ -1,11 +1,11 @@
 #pragma once
 
 /// @file
-/// @brief Native audio/video playback, observable state, and an optional video view for HuxerUI.
+/// @brief Platform audio/video playback, observable state, and an optional video view for HuxerUI.
 ///
 /// Include <huxerui/media_player.h> and link HuxerUI::Media. Register Install() through the application's
 /// application hooks before creating a session with UseMediaPlayer(). Applications own playback controls and platform
-/// permissions; supported codecs and network protocols depend on the native backend.
+/// permissions; supported codecs and network protocols depend on the platform backend.
 
 #include <chrono>
 #include <functional>
@@ -50,7 +50,7 @@ struct MediaHttpSource {
   std::string url;
   /// Request headers. Names must be nonempty HTTP tokens; values must not contain NUL, CR, or LF.
   /// Malformed headers are rejected when wrapped in MediaSource. Nonempty headers currently produce an Unsupported
-  /// playback error on every adapter when loaded; they are never silently dropped. Use an empty map for native requests.
+  /// playback error on every adapter when loaded; they are never silently dropped. Use an empty map for platform requests.
   std::map<std::string, std::string, std::less<>> headers;
 };
 
@@ -58,7 +58,7 @@ struct MediaHttpSource {
 ///
 /// The loaded source is retained while the backend uses it. FileReference preserves the original access capability;
 /// use it for picker results and browser files rather than extracting a path and losing access permissions.
-/// Android uses the native URI, Web uses an object URL, and desktop/iOS adapters require an accessible file location.
+/// Android uses the platform URI, Web uses an object URL, and desktop/iOS adapters require an accessible file location.
 /// References without a backend-readable location report Unsupported. Raw byte streams are not media inputs here.
 ///
 /// Wrapping an HTTP source validates its URL and header syntax and throws std::invalid_argument on invalid input.
@@ -91,7 +91,7 @@ enum class MediaPlayerStatus {
   Playing,
   /// The backend has reported a pause, or playback was denied by platform policy.
   Paused,
-  /// A native interruption prevents intended playback; resumption remains subject to platform policy.
+  /// A platform interruption prevents intended playback; resumption remains subject to platform policy.
   Interrupted,
   /// Natural completion of the current source. Successful looping does not enter this state.
   Ended,
@@ -214,16 +214,16 @@ struct MediaPlayerState {
 /// @brief A UI-thread handle to a session owned by the UseMediaPlayer() composition lifetime.
 ///
 /// Handles referring to the same session share state, source, and preferences. Retaining a handle does not keep the
-/// native player active after its owning composition unmounts. Audio playback does not require a VideoSurface.
+/// platform player active after its owning composition unmounts. Audio playback does not require a VideoSurface.
 ///
 /// All access belongs on the owning UI thread; this is not a thread-safe control interface. State reads and commands
 /// other than IsConnected() check thread ownership and throw std::logic_error on misuse.
-/// Command bool results indicate acceptance, not asynchronous native success. Disconnected commands return false
+/// Command bool results indicate acceptance, not asynchronous platform success. Disconnected commands return false
 /// and are not queued. Observe Snapshot(), OnProgress(), OnEnded(), and OnError() for subsequent results.
 /// @see UseMediaPlayer(), VideoSurface()
 class MediaPlayer final {
 public:
-  /// @brief Tests whether the session is currently attached to its native player.
+  /// @brief Tests whether the session is currently attached to its platform player.
   /// @return True while attached, regardless of whether a source is loaded or has failed; false before attachment
   /// or after the owning composition is unmounted. A false result is not a pending-command queue.
   /// @note Call on the owning UI thread even though this query does not enforce the thread check.
@@ -247,7 +247,7 @@ public:
   /// or network access succeeded; use OnError() and Snapshot() to observe preparation.
   /// @throws std::logic_error If called from a different thread.
   /// @see MediaSource, Play(), Clear()
-  [[nodiscard]] bool Load(MediaSource source) const;
+  bool Load(MediaSource source) const;
 
   /// @brief Releases the source, cancels pending seeks and playback intent, and returns to Empty.
   ///
@@ -255,29 +255,29 @@ public:
   /// preserved. Clearing an already empty, connected session is successful and does not emit OnEnded().
   /// @return True if connected, including an already empty session; false if disconnected.
   /// @throws std::logic_error If called from a different thread.
-  [[nodiscard]] bool Clear() const;
+  bool Clear() const;
 
   /// @brief Requests playback or records playback intent while the source is loading.
   ///
   /// Repeated requests are idempotent. From Ended, playback seeks to the beginning before restarting, requiring a
   /// finite duration and known seekability. During a seek, playback resumes after seek completion if intent remains set.
-  /// Native notifications determine Playing; interruption and browser policy may still prevent playback.
+  /// Platform notifications determine Playing; interruption and browser policy may still prevent playback.
   /// @return True if accepted or already requested; false if disconnected, Empty, Failed, or unable to replay Ended.
   /// @throws std::logic_error If called from a different thread.
-  [[nodiscard]] bool Play() const;
+  bool Play() const;
 
   /// @brief Cancels playback intent and requests a pause without clearing the source or position.
   ///
   /// During loading this only cancels the pending play intent. It does not cancel an in-flight seek. Calling Pause()
-  /// when play intent is already false succeeds without issuing another native pause.
+  /// when play intent is already false succeeds without issuing another platform pause.
   /// @return True if accepted or already paused in intent; false if disconnected, Empty, or Failed.
   /// @throws std::logic_error If called from a different thread.
-  [[nodiscard]] bool Pause() const;
+  bool Pause() const;
 
   /// @brief Requests a seek on a prepared source with known seekability.
   ///
-  /// At most one native seek runs at a time; later requests replace the pending target with the latest value.
-  /// The published position is updated from native completion, not optimistically from the request. A paused player
+  /// At most one platform seek runs at a time; later requests replace the pending target with the latest value.
+  /// The published position is updated from platform completion, not optimistically from the request. A paused player
   /// stays paused unless Play() is requested; seeking from Ended leaves that state after completion.
   /// @param position Finite, nonnegative seconds from the media timeline origin; clamped to a known duration.
   /// @return True if accepted; false if disconnected, Loading, Failed, or not known to be seekable.
@@ -289,7 +289,7 @@ public:
   ///   if (!player.SeekTo(huxerui::media::MediaTime{30.0})) notice = "Seeking is unavailable.";
   /// });
   /// @endcode
-  [[nodiscard]] bool SeekTo(MediaTime position) const;
+  bool SeekTo(MediaTime position) const;
 
   /// @brief Sets the requested automatic replay preference, preserved across source changes.
   ///
@@ -298,24 +298,24 @@ public:
   /// @param looping True to request replay from the beginning at natural completion; false to disable future loops.
   /// @return True if the preference was accepted; false if disconnected. True does not guarantee loop support.
   /// @throws std::logic_error If called from a different thread.
-  [[nodiscard]] bool SetLooping(bool looping) const;
+  bool SetLooping(bool looping) const;
 
   /// @brief Sets the requested playback volume without changing the mute preference.
   /// @param volume Finite normalized volume in [0, 1], where 0 is silent and 1 is full player volume.
   /// @return True if connected and accepted; false if disconnected. The value survives Load() and Clear().
   /// @throws std::invalid_argument If volume is nonfinite or outside [0, 1], even when disconnected.
   /// @throws std::logic_error If called from a different thread.
-  [[nodiscard]] bool SetVolume(double volume) const;
+  bool SetVolume(double volume) const;
 
   /// @brief Sets muting without losing the requested volume.
   /// @param muted True to silence output; false to restore output at the stored volume.
   /// @return True if connected and accepted; false if disconnected. The preference survives Load() and Clear().
   /// @throws std::logic_error If called from a different thread.
-  [[nodiscard]] bool SetMuted(bool muted) const;
+  bool SetMuted(bool muted) const;
 
   /// @brief Subscribes to progress for the declaring composition lifetime.
   ///
-  /// Delivers an initial snapshot when connected, then progress from native polling about every 250 ms and significant
+  /// Delivers an initial snapshot when connected, then progress from platform polling about every 250 ms and significant
   /// transitions such as load, clear, pause, seek completion, and end. Unchanged polling need not emit a callback;
   /// queued bursts may coalesce. This is neither a precise timer nor a video-frame callback.
   ///
@@ -401,7 +401,7 @@ private:
 
 /// @brief Creates or retrieves a media session retained by the current composition scope.
 ///
-/// The native player attaches through Lifecycle and is cleared and disconnected when the owning scope unmounts.
+/// The platform player attaches through Lifecycle and is cleared and disconnected when the owning scope unmounts.
 /// Retaining a handle elsewhere does not extend that active lifetime. Callback subscriptions do not create players.
 /// Register Install() first; issue playback commands from UI events or mounted lifecycle work rather than as
 /// unconditional composition side effects. A newly declared session may not yet be connected during composition.
@@ -458,7 +458,7 @@ struct VideoSurfaceProperties {
 /// Supply bounded layout; the view has no portable intrinsic size, playback controls, autoplay, or fullscreen behavior.
 /// At most one surface can be mounted for a player. Removing only the surface neither pauses playback nor releases
 /// the source, so audio can continue; unmounting the scope that owns UseMediaPlayer() still disconnects the session.
-/// Changing properties updates presentation without loading the source again. Native composition limits vary by platform.
+/// Changing properties updates presentation without loading the source again. Composition limits vary by platform.
 /// @param player Session whose video output is displayed; it must belong to the same owning UI thread.
 /// @param properties Fit and content alignment; defaults to centered Contain.
 /// @return A declarative View to place in the HuxerUI layout.

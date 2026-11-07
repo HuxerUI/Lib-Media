@@ -206,16 +206,16 @@ void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
   const auto bytes = emscripten::val(emscripten::typed_memory_view(
       pixels.size(), reinterpret_cast<const unsigned char*>(pixels.data())));
   const auto visible = frame.format.visible;
-  auto native = emscripten::val::take_ownership(
+  auto video_frame = emscripten::val::take_ownership(
       CreatePreviewVideoFrame(bytes.as_handle(), visible.width, visible.height, double(timestamp->ticks)));
-  if (native.isNull()) throw std::runtime_error("Cannot create the Web preview VideoFrame");
+  if (video_frame.isNull()) throw std::runtime_error("Cannot create the Web preview VideoFrame");
   try {
-    static_cast<web::VideoFrameTexture&>(texture).Publish(native);
+    static_cast<web::VideoFrameTexture&>(texture).Publish(video_frame);
   } catch (...) {
-    native.call<void>("close");
+    video_frame.call<void>("close");
     throw;
   }
-  native.call<void>("close");
+  video_frame.call<void>("close");
 }
 #elif defined(_WIN32) || defined(__linux__)
 #if defined(_WIN32)

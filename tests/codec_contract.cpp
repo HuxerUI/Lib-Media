@@ -1,5 +1,5 @@
-#include "codec/session.h"
-#include "codec/copy.h"
+#include "codec/decoder/session.h"
+#include "codec/decoder/copy.h"
 
 #include <atomic>
 #include <chrono>
@@ -173,7 +173,7 @@ void AllocationFailureReturnsCredit() {
   state->Close();
   Eventually([&] { return control->cleaned == 1; }, "Cleanup did not complete after allocation failure");
 }
-void NativeTimestampRounding() {
+void PlatformTimestampRounding() {
   auto control = std::make_shared<Control>();
   control->presentation_timescale = 10000000;
   auto state = Create(control); Ready(control);
@@ -183,7 +183,7 @@ void NativeTimestampRounding() {
   Check(result.Succeeded() && result.Value() == SubmitStatus::Accepted, "Timestamp test input not accepted");
   const auto frame = ReadFrame(state);
   Check(frame.pts.ticks == packet.pts.ticks && frame.pts.timescale == packet.pts.timescale,
-        "Native 100 ns output did not preserve the original PTS");
+        "Media Foundation 100 ns output did not preserve the original PTS");
   state->Close();
   Eventually([&] { return control->cleaned == 1; }, "Timestamp test did not clean up");
 }
@@ -204,18 +204,18 @@ void IndependentWorkerCleanup() {
   {
     std::unique_lock lock(blocked->mutex);
     Check(blocked->changed.wait_for(lock, std::chrono::seconds(3), [&] { return blocked->close_entered; }),
-          "First session did not start native cleanup");
+          "First session did not start platform cleanup");
   }
 
   auto independent = std::make_shared<Control>();
   auto second = Create(independent); Ready(independent);
   auto result = second->Submit(Packet(0));
   Check(result.Succeeded() && result.Value() == SubmitStatus::Accepted, "Second session could not accept input");
-  Check(ReadFrame(second).Validate(), "Second session could not decode during native cleanup");
+  Check(ReadFrame(second).Validate(), "Second session could not decode during platform cleanup");
   auto probed = std::make_shared<std::atomic<bool>>(false);
   AudioDecoder::Probe({}, [probed](CodecResult<void>) { *probed = true; });
-  Eventually([&] { return probed->load(); }, "Probe waited for unrelated native cleanup");
-  Check(blocked->cleaned == 0, "Cleanup completed during a blocked native Close");
+  Eventually([&] { return probed->load(); }, "Probe waited for unrelated platform cleanup");
+  Check(blocked->cleaned == 0, "Cleanup completed during a blocked platform Close");
 
   const auto close_second = [&] {
     second->Close();
@@ -269,7 +269,7 @@ void RetainedBudgetAndCopy() {
     if (result.Value()) if (auto* frame = std::get_if<AudioFrame>(&*result.Value())) held.push_back(*frame);
     return held.size() == 4;
   }, "Did not produce frames");
-  Check(control->submitted == 4, "Unexpected native input count");
+  Check(control->submitted == 4, "Unexpected platform input count");
   Check(control->byte == 7, "Accepted input did not preserve its copied bytes");
   { std::lock_guard lock(control->mutex); control->block_close = true; }
   Check(state->Reset().Succeeded(), "Reset failed");
@@ -281,7 +281,7 @@ void RetainedBudgetAndCopy() {
   auto empty = state->Read();
   Check(empty.Succeeded() && !empty.Value(), "Old output crossed the reset barrier");
   { std::lock_guard lock(control->mutex); control->block_close = false; control->changed.notify_all(); }
-  Eventually([&] { return control->opened == 2; }, "Native reset did not complete");
+  Eventually([&] { return control->opened == 2; }, "Platform reset did not complete");
   Eventually([&] {
     auto result = state->Submit(Packet(0));
     Check(result.Succeeded(), "Post-reset submission failed");
@@ -335,7 +335,7 @@ void CleanupFailureAndPending() {
   }
   auto failed = state->Read();
   Check(!failed.Succeeded() && failed.Error().code == CodecErrorCode::InvalidData, "Operational error was lost");
-  Check(control->cleaned == 0, "Stuck native release was reported complete");
+  Check(control->cleaned == 0, "Stuck platform release was reported complete");
   state->Close();
   { std::lock_guard lock(control->mutex); control->block_close = false; control->changed.notify_all(); }
   Eventually([&] { return control->cleaned == 1; }, "Cleanup failure not delivered");
@@ -397,7 +397,7 @@ void Values() {
 } // namespace
 int main() {
   try {
-    Values(); AllocationFailureReturnsCredit(); NativeTimestampRounding();
+    Values(); AllocationFailureReturnsCredit(); PlatformTimestampRounding();
 #ifndef __EMSCRIPTEN__
     IndependentWorkerCleanup();
 #endif

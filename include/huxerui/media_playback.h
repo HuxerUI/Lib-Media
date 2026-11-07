@@ -37,19 +37,19 @@ enum class PlaybackErrorCode {
   InvalidState,
   /// The session could not allocate playback storage or start its worker.
   ResourceExhausted,
-  /// A native operation failed or the route stopped providing reliable presentation progress.
+  /// A platform operation failed or the route stopped providing reliable presentation progress.
   DeviceFailure,
   /// The session is retired or the handle has been moved from.
   Closed
 };
 
-/// @brief A playback error with optional native diagnostic information.
+/// @brief A playback error with optional platform diagnostic information.
 struct PlaybackError {
   /// Portable category for application error handling.
   PlaybackErrorCode code = PlaybackErrorCode::DeviceFailure;
   /// Human-readable diagnostic for the failed operation.
   std::string message;
-  /// Native error identifier when available. Empty when the backend supplies none.
+  /// Platform error identifier when available. Empty when the backend supplies none.
   std::string platform_code;
 };
 
@@ -76,7 +76,7 @@ enum class PlaybackState {
   Resetting,
   /// An operational failure is available in the snapshot. Cleanup starts automatically.
   Failed,
-  /// The handle is retired. Native cleanup may still be pending.
+  /// The handle is retired. Platform cleanup may still be pending.
   Closed
 };
 
@@ -97,13 +97,13 @@ struct AudioPlaybackConfig {
 
   /// Optional coalesced signal that state, position or input capacity may have changed.
   /// Read Snapshot() or schedule the producer to retry pending input. The session invokes this callback on
-  /// its native worker or the owning browser event loop, outside session locks. Native delivery may race Create(),
+  /// its session worker or the owning browser event loop, outside session locks. Worker delivery may race Create(),
   /// so capture independently owned or weak state. The callback may call Close(). Return promptly without
   /// throwing or waiting for cleanup.
   std::function<void()> wakeup;
 
   /// Optional final result delivered once after Close(), destruction or an operational failure.
-  /// Delivery follows device release, the return of admitted wakeups and, on native platforms, worker exit.
+  /// Delivery follows device release, the return of admitted wakeups and, on desktop and mobile platforms, worker exit.
   /// On Web, delivery follows asynchronous AudioContext close on the owning event loop. Success confirms release.
   /// Failure describes a release error independently of any operational error. Delivery remains pending while
   /// unsafe device work is still outstanding. The callback runs off the caller's stack.
@@ -176,8 +176,8 @@ struct VideoPresentation {
 /// drive PresentVideo() on the presentation thread. Seal each enabled track and use Snapshot() to observe Ended.
 /// Reset() retires the timeline for another stream or seek.
 ///
-/// On native platforms, controls, submission and snapshots may run concurrently on a live handle. Concurrent
-/// submissions are ordered by acceptance. Move or destroy the handle after its callers stop. Each native session
+/// On desktop and mobile platforms, controls, submission and snapshots may run concurrently on a live handle. Concurrent
+/// submissions are ordered by acceptance. Move or destroy the handle after its callers stop. Each desktop or mobile session
 /// serializes device work on its worker. On Web, use the session on the browser window event loop that created it.
 /// Audio controls acquire locks and submission copies bytes. Call outside real-time render callbacks.
 /// @see AudioPlaybackConfig, AudioFrame, PlaybackSnapshot
@@ -186,7 +186,7 @@ public:
   /// @brief Create a session for the enabled tracks and open any configured PCM device asynchronously.
   ///
   /// Video-only sessions begin in Paused. With audio, the initial state is Starting. Device open errors publish
-  /// Failed and initiate cleanup. On native platforms, opening and wakeups can race Create(). Confirmed audio position
+  /// Failed and initiate cleanup. On desktop and mobile platforms, opening and wakeups can race Create(). Confirmed audio position
   /// drives synchronized video until audio drains. Video-only playback and a video tail after audio drain use
   /// monotonic time. Drive PresentVideo() periodically when video is enabled, including during drain.
   /// On iOS, configure and activate the application-owned AVAudioSession before enabling audio. An interruption,
@@ -275,7 +275,7 @@ public:
 
   /// @brief Clear play intent and request a pause while keeping queued media.
   ///
-  /// Paused reports that the native pause took effect and the published position is frozen. Device progress
+  /// Paused reports that the platform pause took effect and the published position is frozen. Device progress
   /// already admitted may still advance before that boundary. During opening or reset, this clears pending play intent.
   /// A pending device start can be superseded by pause while retaining submitted audio.
   /// @return Success when pause is requested or already intended. Ended returns InvalidState. Failed and closed
@@ -338,12 +338,12 @@ public:
   /// @see PlaybackSnapshot, AudioPlaybackConfig::wakeup
   [[nodiscard]] PlaybackSnapshot Snapshot() const;
 
-  /// @brief Retire the session and schedule native discard and release.
+  /// @brief Retire the session and schedule platform discard and release.
   ///
   /// Safe to repeat or call from wakeup. Close waits for an admitted video upload to return. Retirement then
   /// ends admission of new input, controls and wakeups.
   /// A previously admitted wakeup may finish after return. Device samples already committed may still play
-  /// until native stop takes effect. Observe cleanup_completed before retiring state used by wakeups.
+  /// until platform stop takes effect. Observe cleanup_completed before retiring state used by wakeups.
   /// @see AudioPlaybackConfig::cleanup_completed
   void Close() noexcept;
 

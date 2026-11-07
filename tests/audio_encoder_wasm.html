@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lib-Media C++ WASM AAC encoder test</title>
+<pre>Running C++ AAC encoder sessions…</pre>
+<script type="module">
+import create from './media_audio_encoder_web_native.js';
+try {
+  const module = await create({noInitialRun: true, huxeruiStorageKey: 'org.huxerui.media.encoder.test'});
+  module._main();
+} catch (error) { document.body.textContent = 'FAIL: ' + error.message; }
+</script>

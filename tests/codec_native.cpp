@@ -1,7 +1,7 @@
 #include <huxerui/media_codec.h>
 
 #ifdef MEDIA_CODEC_TEST_GSTREAMER
-#include "codec/backend.h"
+#include "codec/decoder/backend.h"
 #endif
 #ifdef __ANDROID__
 #include <media/NdkMediaCodec.h>
@@ -153,12 +153,12 @@ void Decode(Config config, const std::vector<EncodedPacket>& packets, std::size_
         if (auto* frame = std::get_if<Frame>(&*read.Value())) {
           Check(formats > 0, "Frame preceded its format");
           Check(frame->Validate(), "Invalid decoded frame");
-          Check(frames < presentation_order.size(), "Native adapter produced an extra frame");
+          Check(frames < presentation_order.size(), "Platform adapter produced an extra frame");
           const auto& packet = presentation_order[frames];
           Check(packet.pts.ticks == frame->pts.ticks && packet.pts.timescale == frame->pts.timescale,
-                "Native adapter changed the expected PTS sequence");
+                "Platform adapter changed the expected PTS sequence");
           if constexpr (std::is_same_v<Frame, VideoFrame>)
-            Check(frame->duration == packet.duration, "Native adapter changed the video frame duration");
+            Check(frame->duration == packet.duration, "Platform adapter changed the video frame duration");
           for (const auto& plane : frame->planes) {
             const auto data = [&] {
               if constexpr (std::is_same_v<Frame, AudioFrame>) return plane.AsBytes();
@@ -228,7 +228,7 @@ int main(int argc, char** argv) {
     }
     const auto retired_by = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (*retirement != 2 && std::chrono::steady_clock::now() < retired_by) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    Check(*retirement == 2, "Move assignment/destruction failed to retire both native sessions");
+    Check(*retirement == 2, "Move assignment/destruction failed to retire both platform sessions");
     auto aac = Packets(root, "aac");
 #if defined(__APPLE__) || defined(MEDIA_CODEC_TEST_GSTREAMER)
     const auto largest = std::max_element(aac.begin(), aac.end(), [](const auto& a, const auto& b) {

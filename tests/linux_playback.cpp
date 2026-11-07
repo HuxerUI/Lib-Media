@@ -1,4 +1,4 @@
-#include "playback/device.h"
+#include "decoded_playback/device.h"
 
 #include <chrono>
 #include <iostream>
@@ -27,7 +27,7 @@ template<class Test> void Wait(Test test, const char* message) {
   }
 }
 
-void NativeOutput(AudioFormat format) {
+void PulseOutput(AudioFormat format) {
   auto device = MakePlaybackDevice();
   Wait([&] { return Require(device->Open(format, format.sample_rate / 4, {})); }, "PulseAudio did not open");
   const std::vector<std::int16_t> samples((format.sample_rate / 10 + 1) * format.ChannelCount());
@@ -80,8 +80,8 @@ int main(int argc, char** argv) {
       MissingServer();
       return 0;
     }
-    NativeOutput({48000, AudioSampleFormat::S16, AudioPacking::Interleaved, AudioChannelLayout::Stereo});
-    NativeOutput({44100, AudioSampleFormat::S16, AudioPacking::Interleaved, AudioChannelLayout::Mono});
+    PulseOutput({48000, AudioSampleFormat::S16, AudioPacking::Interleaved, AudioChannelLayout::Stereo});
+    PulseOutput({44100, AudioSampleFormat::S16, AudioPacking::Interleaved, AudioChannelLayout::Mono});
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;

@@ -4,9 +4,30 @@
 [codec issue #20](https://github.com/HuxerUI/HuxerUI/issues/20). Link `HuxerUI::Media` with the installed public SDK.
 No `Install()`, View, Runtime, window, or application Task is needed. Existing MediaPlayer and photo-library APIs are unchanged.
 
-This stage decodes raw AAC-LC access units to CPU PCM and length-prefixed AVC access units to CPU YUV.
-It does not encode, demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
+This guide covers raw AAC-LC access units decoded to CPU PCM and length-prefixed AVC access units decoded to CPU YUV.
+The public codec header also documents the separate `AudioEncoder` API for raw AAC-LC encoding. Codec sessions do not
+demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
+
+## Implementation layout
+
+The public declarations remain in [`media_codec.h`](../include/huxerui/media_codec.h). Decoder and audio encoder
+implementations use separate translation units, so decoder consumers do not acquire an encoder dependency.
+
+| Files | Responsibility |
+| --- | --- |
+| [`src/codec/media_codec_decoder.cpp`](../src/codec/media_codec_decoder.cpp) | Public `AudioDecoder` and `VideoDecoder` handles and probes |
+| [`src/codec/media_codec_encoder.cpp`](../src/codec/media_codec_encoder.cpp) | Public `AudioEncoder` handle and probe |
+| [`src/codec/common.h`](../src/codec/common.h), [`common.cpp`](../src/codec/common.cpp) | Shared codec errors, owned byte storage, and AAC initialization parsing |
+| [`src/execution/executor.h`](../src/execution/executor.h), [`executor.cpp`](../src/execution/executor.cpp) | Workers and event-loop scheduling shared by codec and decoded playback sessions |
+| [`src/codec/decoder/`](../src/codec/decoder) | Decoder `backend.h`, paired `format.h/.cpp`, `copy.h/.cpp`, and `session.h/.cpp` |
+| [`src/codec/encoder/`](../src/codec/encoder) | Audio encoder `backend.h`, paired `format.h/.cpp` and `session.h/.cpp` |
+| [`platform/`](../platform) | `media_codec_decoder_<platform>.cpp/.mm` and `media_codec_encoder_<platform>.cpp/.mm` implement the selected platform backend contracts |
+| [`platform/web/`](../platform/web) | `media_codec_decoder.js` and `media_codec_encoder.js` implement the corresponding browser bridges |
+
+Backend headers declare platform interfaces; the selected platform source defines their factories. Format validation
+and frame-copy declarations have matching implementation files. Encoder code depends on common AAC utilities rather
+than decoder internals. iOS and macOS keep independent platform implementations.
 
 ## Platform status
 
@@ -15,22 +36,22 @@ It does not encode, demux MP4, load URLs/files, play PCM, or publish textures. A
 | Android API 23+ | NDK MediaCodec, no Activity/JNI requirement; standard CPU I420/NV12 buffers | AAC/AVC fixtures ran on a Huawei Android 12 device; full preview builds for arm64/x86_64 |
 | macOS | AudioConverter for AAC and VideoToolbox with CoreMedia for H.264 | Headless AAC/AVC fixture tests on Apple Silicon and a full preview build |
 | iOS 15+ | AudioConverter for AAC and VideoToolbox with CoreMedia for H.264 | Simulator preview build and AAC/AVC fixture tests. Device decoding remains unvalidated. |
-| Windows | System synchronous Media Foundation AAC/H.264 transforms, COM/MF owned on the codec worker | Windows 11 installed-SDK builds and native AAC/AVC fixtures, including the longer synchronization fixtures with tight output pools |
+| Windows | System synchronous Media Foundation AAC/H.264 transforms, COM/MF owned on the codec worker | Windows 11 installed-SDK builds and platform AAC/AVC fixtures, including the longer synchronization fixtures with tight output pools |
 | Linux | GStreamer appsrc/parser/installed decoder/converter/appsink pipeline | Headless installed-SDK tests on Ubuntu 24.04 under WSL with GStreamer 1.24.2, including the longer AAC/AVC synchronization fixtures and appsrc backpressure |
 | Web | WebCodecs on the owning JS event loop | Full WASM build and real Chrome C++ decoder/bridge fixture tests; simulated late probe/copy/flush retirement tests |
 
-Availability depends on the requested configuration and installed native media components. `Probe(config, completion)`
+Availability depends on the requested configuration and installed platform media components. `Probe(config, completion)`
 initializes, negotiates, and releases a decoder asynchronously. Probe success is neither a resource reservation nor a
 promise that a subsequent access unit is valid. Decode-time output negotiation can still fail. Config callbacks are not
-used by Probe. A native probe uses its own worker and dispatches completion after it exits. Web dispatches
+used by Probe. A desktop or mobile probe uses its own worker and dispatches completion after it exits. Web dispatches
 completion on the owning event loop. There is no UI dispatcher.
 
 Windows currently uses the system synchronous transforms, without DXVA or third-party asynchronous MFT enumeration.
 The AVC transform uses `MF_LOW_LATENCY` to keep startup buffering within the shared output reservation bound.
-Its native output allocation and CPU-copy scratch are bounded by the larger of four configured frames and 64 KiB;
+Its platform output allocation and CPU-copy scratch are bounded by the larger of four configured frames and 64 KiB;
 the system AAC transform requests 48 KiB even for mono/stereo AAC-LC. Normalized output still uses the configured
 single-frame reservation. AAC output must contain exactly 1024 samples and match the next accepted timestamp within
-one native 100 ns tick; that native truncation is normalized before restoring the original exact packet timestamp.
+one 100 ns Media Foundation tick; that Media Foundation truncation is normalized before restoring the original exact packet timestamp.
 Android rejects opaque/vendor CPU layouts it cannot interpret safely. Apple/Android/Web actual fixture tests do not
 validate every hardware model or supported profile/level. Hardware selection/classification is not exposed in this stage.
 
@@ -52,14 +73,14 @@ cleanup and final callback dispatch. There is no blocking proxy to another event
   the source/container layer owns any trim metadata.
 - AVC uses avcC and its 1-, 2-, or 4-byte NAL lengths. The initial subset is progressive 8-bit 4:2:0 Baseline/Main/High,
   no frame-number gaps, at most 16 reference pictures. SPS dimensions and in-band SPS updates are validated against
-  configured coded bounds, up to 8192×8192; native codec limits may be lower. Initialization data is limited to 64 KiB.
+  configured coded bounds, up to 8192×8192; platform codec limits may be lower. Initialization data is limited to 64 KiB.
   Start with a key-marked IDR and do so again after Reset. Submit one complete picture access unit in decode order.
 - Video output is tightly copied CPU I420/NV12 with coded dimensions, visible rectangle, strides, pixel aspect ratio,
-  and mapped color metadata. Unsupported/unreported color facts stay Unknown. Native bottom/row padding is excluded
-  where the adapter can copy the configured picture region. No implicit RGB conversion or native surface lease exists.
+  and mapped color metadata. Unsupported/unreported color facts stay Unknown. Platform bottom/row padding is excluded
+  where the adapter can copy the configured picture region. No implicit RGB conversion or platform surface lease exists.
 - `MediaTimestamp` stores signed ticks and a positive timescale. `Rescale` uses nearest rounding, ties away from zero,
   and rejects overflow. `Compare` compares rational values without floating-point loss. Input PTS can be nonmonotonic;
-  output PTS is presentation-ordered and restored to the original packet's exact rational value. Native timestamps
+  output PTS is presentation-ordered and restored to the original packet's exact rational value. Platform timestamps
   must match an accepted input after rounding to the adapter's matching timescale (100 ns on Windows, microseconds
   elsewhere). DTS and duration are optional; duration cannot be negative.
 - Platform conversion can impose smaller time ranges: Web uses safe-integer microseconds; Windows uses signed 100 ns;
@@ -81,51 +102,51 @@ cleanup and final callback dispatch. There is no blocking proxy to another event
 
 `TrySubmit()` returns Accepted after copying a complete packet, or WouldBlock without consuming it. Queues include
 queued and adapter-retained input copies, plus output reservations for in-flight conversion. Copied-input credit is returned
-when its last byte owner releases it; after native submission the session keeps only timing and the output reservation.
+when its last byte owner releases it; after platform submission the session keeps only timing and the output reservation.
 Oversized packets and impossible configurations fail rather than blocking
 forever. Calls copy bounded data and take short locks; they are not hard-real-time audio callbacks.
 
 Both decoders require at least two copied-input slots. Audio requires at least four output slots and enough output bytes
-for four 1024-sample frames: Android native decoding can require more than two units before returning its first PCM frame.
-Video conservatively requires 34 output slots and maximum-frame byte reservations: up to 16 native delayed frames, 16 presentation-order
+for four 1024-sample frames: Android MediaCodec decoding can require more than two units before returning its first PCM frame.
+Video conservatively requires 34 output slots and maximum-frame byte reservations: up to 16 platform delayed frames, 16 presentation-order
 slots, and progress headroom. The initial implementation retains a 16-frame presentation window until Finish, even for
 low-delay streams. This is a deliberate conservative bound for the decoding milestone, not a low-latency playback claim.
 Defaults are 48 input/output slots, 8 MiB compressed input, and 192 MiB retained output; bytes are reserved lazily.
 
 Retained user frames share the same output pool across Reset. They can stall conversion after a reset until released;
-Reset cannot replenish their credit. Bounded adapter scratch copies and native codec allocations are additional to the
+Reset cannot replenish their credit. Bounded adapter scratch copies and platform codec allocations are additional to the
 pool counters: temporary Annex B conversion is at most four times one packet, and CPU normalization uses a bounded
-frame copy. These counters are not a promise of a fixed process RSS or physical driver allocation size. No native frame
+frame copy. These counters are not a promise of a fixed process RSS or physical driver allocation size. No platform frame
 is deliberately dropped to relieve queue pressure; unexplained missing/extra output fails the session.
 
 | Operation | Immediate effect | Later observation |
 | --- | --- | --- |
 | Create | Validate and allocate a Starting session | Initialization wakes readiness or records an error |
 | Finish | Seal accepted input, enter Draining | Read remaining output, then one EndOfStream; session stays open |
-| Reset | Discard barrier, enter Resetting | Native recreation completes, then wakeup; input is WouldBlock until ready |
-| Close / destructor | Closed barrier, no new wakeup admission | Optional cleanup_completed reports actual native release/quiescence |
+| Reset | Discard barrier, enter Resetting | Platform recreation completes, then wakeup; input is WouldBlock until ready |
+| Close / destructor | Closed barrier, no new wakeup admission | Optional cleanup_completed reports actual platform release/quiescence |
 
 Finish is idempotent while draining/ended. Pending resets coalesce. Close takes precedence over initialization/reset,
-can run inside wakeup, and never waits for native disposal or an admitted callback. An admitted wakeup may finish after
+can run inside wakeup, and never waits for platform disposal or an admitted callback. An admitted wakeup may finish after
 Close returns. A fatal error remains readable in Failed while automatically cleaning up; later Close changes it to
 Closed without another completion.
 
 Configure optional `wakeup` and `cleanup_completed` callbacks at creation. They are serialized, run outside locks,
-and are never inline on API calls. Each native session runs codec work and wakeups on its own worker. Another
-session's blocked native call does not occupy that worker. Callbacks may run before the initiating call returns.
+and are never inline on API calls. Each desktop or mobile session runs codec work and wakeups on its own worker. Another
+session's blocked platform call does not occupy that worker. Callbacks may run before the initiating call returns.
 Capture independently owned/weak application state. Wakeups can coalesce; drain output and retry input until empty/full.
 Callbacks must not throw or block on codec work. A returned CPU frame's final release only signals readiness; it does not
 invoke application callbacks on the releasing thread.
 
-Cleanup completion occurs exactly once after Close, destruction, or fatal failure. Success means library/API-level native
-resources have been released, admitted wakeups have returned, and the native session's worker has exited. It does not
+Cleanup completion occurs exactly once after Close, destruction, or fatal failure. Success means library/API-level platform
+resources have been released, admitted wakeups have returned, and the desktop or mobile session's worker has exited. It does not
 certify physical driver/browser cache reclamation. Retained CPU output does not delay it. Release errors report Failure
-after application callbacks are quiescent; unsafe stuck native work leaves completion pending. A timeout is never
+after application callbacks are quiescent; unsafe stuck platform work leaves completion pending. A timeout is never
 fabricated as success. On Web, retired promise/copy handlers retain only inert JS-side state and cannot call WASM or
 restore an application callback.
 
 After observing completion, allow its dispatch to return. Module unload or worker termination additionally needs the host's
-fence over every session and executor. Canceling an application's observation does not cancel native cleanup.
+fence over every session and executor. Canceling an application's observation does not cancel platform cleanup.
 
 ## Reading output
 
@@ -151,12 +172,12 @@ CodecResult<bool> DrainAudio(AudioDecoder& decoder,
 ```
 
 The consumer must arrange its own scheduling and lifetime. Do not capture a reference to a local decoder in config
-callbacks and assume Create has returned; native callbacks may race that assignment. A format event is useful for
+callbacks and assume Create has returned; platform callbacks may race that assignment. A format event is useful for
 reconfiguring a consumer, and each frame also carries its complete format. No PCM device or texture is created here.
 
 ## Validation
 
-With `HUXERUI_MEDIA_BUILD_TESTS=ON`, native CTest adds `media_codec_contract` and, on enabled native codec platforms,
+With `HUXERUI_MEDIA_BUILD_TESTS=ON`, CTest adds `media_codec_contract` and, on enabled desktop and mobile codec platforms,
 `media_codec_native`. Node adds `media_codec_web_contract`. The native executable is a non-UI installed-SDK consumer:
 
 ```sh
@@ -167,7 +188,7 @@ The generated fixtures and provenance are in [tests/fixtures/codec](../tests/fix
 time conversion/overflow, invalid plane ranges, input snapshots, retained output budgets across reset, logical barriers,
 close during initialization/from wakeup, pending/failed cleanup, actual AAC sample/frame counts, B-frame presentation
 order, format events, EOS, repeated reset, move/destructor retirement, and CPU data retained through cleanup. Regression
-cases exercise allocation failures, matching 100 ns PTS, native worker isolation and exit, tight Apple AAC input
+cases exercise allocation failures, matching 100 ns PTS, session worker isolation and exit, tight Apple AAC input
 credit, legacy Android output metadata, and appsrc backpressure when GStreamer tests are enabled.
 
 For the browser bridge, serve the repository over localhost and open
@@ -177,10 +198,10 @@ its generated `tests/codec_wasm.html` beside the JS/WASM/data files. That test i
 VideoDecoder APIs, decodes both fixtures, resets both sessions, and observes cleanup while retaining CPU output.
 The separate Node test injects late support, flush, and copy completions after retirement. Controlled worker shutdown
 still needs dedicated validation. Physical iOS devices, Linux hardware/plugin diversity, stress/RSS, and release-failure injection
-in native platform APIs remain validation work; shared fake-backend failure tests do not replace those checks.
+in platform APIs remain validation work; shared fake-backend failure tests do not replace those checks.
 
 A local Apple Silicon Release archive comparison against the pre-codec commit grew from approximately 0.54 MiB to
 1.04 MiB (about 0.50 MiB). These figures exclude system frameworks and vary by toolchain. The existing macOS preview,
-which does not call a codec API, contains no decoder/session/native codec entry-point symbols. Web includes the small
+which does not call a codec API, contains no decoder/session/platform codec entry-point symbols. Web includes the small
 codec JS bridge as a pre-JS resource even when C++ codec objects are not linked. Address/undefined-behavior sanitizer
 runs of the shared contract and macOS native decoder tests passed; this is not a process-RSS or driver-memory benchmark.

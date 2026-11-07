@@ -84,14 +84,14 @@ View PlaybackControls(MediaPlayer player, State<std::string> error_message) {
       && state.progress.duration && state.progress.duration->count() > 0;
   const float duration = can_seek ? static_cast<float>(state.progress.duration->count()) : 1.0F;
   const float position = std::clamp(
-      seek_draft.Get().value_or(static_cast<float>(state.progress.position.count())), 0.0F, duration);
+      seek_draft->value_or(static_cast<float>(state.progress.position.count())), 0.0F, duration);
 
   return Column {
     Row {
       Text(state.is_seeking ? "Seeking..." : state.is_buffering ? "Buffering..." : StatusLabel(state.status), TextRole::Label)
           .With(Foreground(colors.primary)),
       Spacer(),
-      Text(TimeLabel(seek_draft.Get() ? MediaTime(position) : state.progress.position) + " / "
+      Text(TimeLabel(seek_draft->has_value() ? MediaTime(position) : state.progress.position) + " / "
           + (state.progress.duration ? TimeLabel(*state.progress.duration) : "--:--"), TextRole::Label)
           .With(Foreground(colors.on_surface_variant)),
     }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Center)),
@@ -157,7 +157,7 @@ View Diagnostics(MediaPlayer player) {
   auto progress_events = UseState(0);
   player.OnProgress([progress_events](const MediaProgress&) { progress_events += 1; });
   View details = Column {};
-  if (expanded.Get()) {
+  if (expanded) {
     const auto state = player.Snapshot();
     details = Column {
       Text::Format("Progress callbacks: {}", progress_events),
@@ -168,8 +168,8 @@ View Diagnostics(MediaPlayer player) {
     }.With(Spacing(8.0F), Padding(12.0F));
   }
   return Column {
-    SecondaryAction(Button(expanded.Get() ? "Hide diagnostics" : "Show diagnostics")
-        .OnClick([expanded] { expanded = !expanded.Get(); })),
+    SecondaryAction(Button(expanded ? "Hide diagnostics" : "Show diagnostics")
+        .OnClick([expanded] { expanded = !expanded; })),
     details,
   }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Start));
 }
@@ -184,6 +184,7 @@ View MediaPage(bool music) {
   auto error_message = UseState(std::string{});
   auto show_link = UseState(false);
   auto source_revision = UseState(0);
+  const int revision = source_revision;
   const auto& colors = UseTheme().colors;
   const bool compact = UseViewportClass() == ViewportClass::Compact;
 
@@ -201,7 +202,7 @@ View MediaPage(bool music) {
   });
 
   View link_editor = Column {};
-  if (show_link.Get()) {
+  if (show_link) {
     link_editor = Column {
       TextField(address)
           .Placeholder(music ? "https://example.com/audio.mp3" : "https://example.com/video.mp4")
@@ -223,11 +224,12 @@ View MediaPage(bool music) {
 
   View artwork = Column {};
   if (music) {
+    const std::string& source_label = source_name;
     artwork = Column {
       Image(app::images::album).Fit(ImageFit::Contain)
           .With(Frame{.width = compact ? 176.0F : 240.0F, .height = compact ? 176.0F : 240.0F}),
       Text("MUSIC", TextRole::Label).With(Foreground(colors.primary)),
-      Text(source_name->empty() ? "Your next favorite track" : source_name.Get(), TextRole::Title)
+      Text(source_label.empty() ? "Your next favorite track" : source_label, TextRole::Title)
           .Align(TextAlign::Center),
       Text(source_name->empty() ? "Open an audio file and settle in." : "Audio playback", TextRole::Label)
           .Align(TextAlign::Center).With(Foreground(colors.on_surface_variant)),
@@ -264,8 +266,8 @@ View MediaPage(bool music) {
           } catch (const std::exception& error) { error_message = error.what(); }
         });
       }).With(Enabled{picker->CanOpenFiles()}),
-      SecondaryAction(Button(show_link.Get() ? "Hide link" : "Open link")
-          .OnClick([show_link] { show_link = !show_link.Get(); })),
+      SecondaryAction(Button(show_link ? "Hide link" : "Open link")
+          .OnClick([show_link] { show_link = !show_link; })),
       SecondaryAction(Button("Unload").OnClick([player, source_name, error_message, source_revision] {
         if (!player.Clear()) {
           error_message = "The current media could not be unloaded.";
@@ -279,13 +281,13 @@ View MediaPage(bool music) {
     link_editor,
     Column {
       artwork,
-      PlaybackControls(player, error_message).Key(source_revision.Get()),
+      PlaybackControls(player, error_message).Key(revision),
     }.With(Padding(compact ? 16.0F : 24.0F), Spacing(24.0F), CrossAlign(CrossAxisAlignment::Stretch),
         Background(colors.surface_container), CornerRadius(24.0F)),
     error_message->empty() ? View(Column {})
         : Text(error_message).With(Padding(16.0F), Foreground(colors.error),
             Border{colors.error, 1.0F}, CornerRadius(12.0F)),
-    Diagnostics(player).Key(source_revision.Get()),
+    Diagnostics(player).Key(revision),
   }.With(Spacing(16.0F), CrossAlign(CrossAxisAlignment::Stretch));
 }
 
@@ -299,7 +301,7 @@ View LibraryPage() {
   auto busy = UseState(false);
   auto multiple = UseState(false);
   auto capabilities = UseState(MediaLibraryCapabilities{});
-  auto notice = UseState(std::string("Checking native media support..."));
+  auto notice = UseState(std::string("Checking platform media support..."));
   auto selection = UseState(std::make_shared<std::vector<FileReference>>());
   auto temporary = UseApplication().Directories().temporary_directory;
   Lifecycle([tasks, picker, capabilities, notice] {
@@ -308,8 +310,8 @@ View LibraryPage() {
       if (!result.Succeeded()) notice = result.Error().message;
       else {
         capabilities = result.Value();
-        if (!capabilities.Get().CanPick()) notice = "The native media picker is unavailable on this device.";
-        else if (capabilities.Get().max_selection_count == 1) {
+        if (!capabilities->CanPick()) notice = "The platform media picker is unavailable on this device.";
+        else if (capabilities->max_selection_count == 1) {
           notice = "Choose one photo or video. Multiple selection is unavailable on this device.";
         }
         else notice = "Choose photos or videos from your library.";
@@ -317,11 +319,11 @@ View LibraryPage() {
     });
     return [task] { task.Cancel(); };
   });
-  const auto multiple_limit = std::min(3u, capabilities.Get().max_selection_count);
+  const auto multiple_limit = std::min(3u, capabilities->max_selection_count);
   auto pick = [=](MediaPickerFilter filter) {
     busy = true;
     current = tasks.Launch([=]() -> Task<void> {
-      auto result = co_await picker.PickAsync({filter, multiple.Get() ? multiple_limit : 1u});
+      auto result = co_await picker.PickAsync({filter, multiple ? multiple_limit : 1u});
       if (!result.Succeeded()) notice = result.Error().message;
       else {
         auto chosen = std::move(result).Value();
@@ -361,17 +363,18 @@ View LibraryPage() {
     });
   };
   std::string names;
-  for (const auto& file : *selection.Get()) {
+  const std::shared_ptr<std::vector<FileReference>>& selected_files = selection;
+  for (const auto& file : *selected_files) {
     if (!names.empty()) names += "\n";
     names += file.Name();
   }
-  const bool can_pick = capabilities.Get().CanPick() && !busy.Get();
-  const bool can_save = capabilities.Get().can_save && documents->CanOpenFiles() && !busy.Get();
+  const bool can_pick = capabilities->CanPick() && !busy;
+  const bool can_save = capabilities->can_save && documents->CanOpenFiles() && !busy;
   return Column {
     Text("Photos & videos", TextRole::Title),
-    Button(multiple.Get() ? "Multiple selection (up to " + std::to_string(multiple_limit) + ")" :
+    Button(multiple ? "Multiple selection (up to " + std::to_string(multiple_limit) + ")" :
         "Single selection")
-        .OnClick([multiple] { multiple = !multiple.Get(); }).With(Enabled{can_pick && multiple_limit > 1}),
+        .OnClick([multiple] { multiple = !multiple; }).With(Enabled{can_pick && multiple_limit > 1}),
     Flow {
       Button("Choose images").OnClick([pick] { pick(MediaPickerFilter::Images); }).With(Enabled{can_pick}),
       Button("Choose videos").OnClick([pick] { pick(MediaPickerFilter::Videos); }).With(Enabled{can_pick}),
@@ -379,24 +382,25 @@ View LibraryPage() {
     }.With(Spacing(12.0F)),
     Text(names.empty() ? "No media selected." : names),
     Button("Save first selection").OnClick([save, selection, notice] {
-      const auto& file = selection.Get()->front();
+      const std::shared_ptr<std::vector<FileReference>>& files = selection;
+      const auto& file = files->front();
       const auto type = file.ContentType().value_or("");
       if (!type.starts_with("image/") && !type.starts_with("video/")) {
         notice = "The selected item's media type is unknown. Use Save image or Save video instead.";
         return;
       }
       save(type.starts_with("video/"), file);
-    }).With(Enabled{capabilities.Get().can_save && !busy.Get() && !selection.Get()->empty()}),
+    }).With(Enabled{capabilities->can_save && !busy && !selected_files->empty()}),
     Text("Save a local file", TextRole::Title),
     Text("Choose a file to copy into the system photo library. Each save creates a new item.", TextRole::Label),
     Flow {
       Button("Save image...").OnClick([save] { save(false); }).With(Enabled{can_save}),
       Button("Save video...").OnClick([save] { save(true); }).With(Enabled{can_save}),
       Button("Cancel operation").OnClick([current, busy, notice] {
-        current.Get().Cancel();
+        current->Cancel();
         busy = false;
         notice = "Operation canceled. A save already committed by the system may still complete.";
-      }).With(Enabled{busy.Get()}),
+      }).With(Enabled{busy}),
     }.With(Spacing(12.0F)),
     Text(notice),
   }.With(Spacing(16.0F), CrossAlign(CrossAxisAlignment::Stretch));
@@ -412,31 +416,31 @@ View FramesPage() {
   auto tasks = UseTaskScope();
   auto resources = UseService<Resources>();
   auto play = [texture, playing, paused, tasks, resources, notice](bool with_audio) {
-    if (!media_preview::frame_texture_supported || playing.Get()) return;
+    if (!media_preview::frame_texture_supported || playing) return;
     playing = true;
     paused = false;
     notice = with_audio ? "Playing A/V sync clip..." : "Playing video clip...";
     tasks.Launch([texture, playing, paused, resources, notice, with_audio]() -> Task<void> {
       try {
         texture = media_preview::MakeFrameTexture({240, 180});
-        notice = co_await media_preview::PlayDecodedClip(resources, texture.Get(), with_audio,
-                                                         [paused] { return paused.Get(); });
+        notice = co_await media_preview::PlayDecodedClip(resources, texture, with_audio,
+                                                         [paused]() -> bool { return paused; });
       } catch (const std::exception& error) {
         notice = error.what();
       }
       playing = false;
     });
   };
-  const auto image = texture.Get();
-  const bool can_play = media_preview::frame_texture_supported && !playing.Get();
+  const std::shared_ptr<ExternalTexture> image = texture;
+  const bool can_play = media_preview::frame_texture_supported && !playing;
   return Column {
     Text("Decoded playback", TextRole::Title),
     (image ? Image(image).Fit(ImageFit::Contain).With(Frame{.width = 300.0F, .height = 180.0F}) : View{}),
     Flow {
       Button("Play video").OnClick([play] { play(false); }).With(Enabled{can_play}),
       Button("Play A/V sync").OnClick([play] { play(true); }).With(Enabled{can_play}),
-      Button(playing.Get() && paused.Get() ? "Resume" : "Pause")
-          .OnClick([paused] { paused = !paused.Get(); }).With(Enabled{playing.Get()}),
+      Button(playing && paused ? "Resume" : "Pause")
+          .OnClick([paused] { paused = !paused; }).With(Enabled{playing}),
     }.With(Spacing(10.0F)),
     Text(notice),
   }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));
@@ -445,14 +449,15 @@ View FramesPage() {
 [[huxerui::composable]]
 View MediaContent() {
   auto selected = UseState(std::size_t{0});
+  const std::size_t page = selected;
   const bool compact = UseViewportClass() == ViewportClass::Compact;
   return Column {
     TopAppBar("Media"),
     ScrollView(Column {
       Text("HUXERUI / MEDIA PREVIEW", TextRole::Label).With(Foreground(UseTheme().colors.on_surface_variant)),
       Tabs({"Video", "Music", "Library", "Frames"}, selected).OnChanged([selected](std::size_t index) { selected = index; }),
-      (selected.Get() == 3 ? FramesPage() :
-       selected.Get() == 2 ? LibraryPage() : MediaPage(selected.Get() == 1)).Key(selected.Get()),
+      (page == 3 ? FramesPage() :
+       page == 2 ? LibraryPage() : MediaPage(page == 1)).Key(page),
       Text("Switching pages stops playback and clears the current source.", TextRole::Label)
           .With(Foreground(UseTheme().colors.on_surface_variant)),
     }.With(Frame{.max_width = 1000.0F}, Padding(compact ? 16.0F : 32.0F),

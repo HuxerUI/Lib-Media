@@ -8,10 +8,10 @@
 #include <fstream>
 #include <iostream>
 
-#include "detail/mediaplayer_internal.h"
+#include "player/state.h"
 
 namespace huxerui::media::detail {
-std::shared_ptr<NativePlayer> CreateWindowsPlayer();
+std::shared_ptr<PlayerBackend> CreateWindowsPlayer();
 }
 
 using namespace huxerui::media;
@@ -94,7 +94,7 @@ int main() {
     std::filesystem::remove(file);
     if (failed || !ended || !progressed || !sought || !resumed || !snapshot.progress.duration || snapshot.has_audio != true)
       throw std::runtime_error("Windows audio playback smoke failed or timed out");
-    std::cout << "Windows native audio load/play/pause/seek/resume/progress/end/disposal passed\n";
+    std::cout << "Windows platform audio load/play/pause/seek/resume/progress/end/disposal passed\n";
     return 0;
   } catch (const std::exception& error) {
     std::filesystem::remove(file);

@@ -1,4 +1,4 @@
-#include "mediaplayer_windows.h"
+#include "media_player_windows.h"
 
 #include <array>
 #include <chrono>
@@ -104,9 +104,9 @@ void Playback(const std::filesystem::path& file) {
         callback();
       }
       state->Poll();
-      // Render clears dirty only after both native frame transfer and presentation succeed.
+      // Render clears dirty only after both platform frame transfer and presentation succeed.
       if (!view->dirty && rendered < fits.size()) {
-        std::cout << "Native frame transfer/presentation passed for fit " << static_cast<int>(fits[rendered]) << '\n';
+        std::cout << "Platform frame transfer/presentation passed for fit " << static_cast<int>(fits[rendered]) << '\n';
         ++rendered;
         if (rendered < fits.size()) {
           factory.update(*view, {.fit = fits[rendered]});
@@ -117,9 +117,9 @@ void Playback(const std::filesystem::path& file) {
       MsgWaitForMultipleObjectsEx(0, nullptr, 16, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
     }
     Check(!failed && ended && rendered == fits.size() && player.Snapshot().has_video == true,
-          "Native video playback did not render every fit and finish naturally");
+          "Platform video playback did not render every fit and finish naturally");
     cleanup();
-    std::cout << "Windows native video playback, resized output, and natural end passed\n";
+    std::cout << "Windows platform video playback, resized output, and natural end passed\n";
   } catch (...) {
     cleanup();
     throw;

@@ -1,3 +1,3 @@
--keep public class org.huxerui.lib.media.NativeMediaPlayer$Factory { public *; }
--keep public class org.huxerui.lib.media.NativeVideoSurface$Factory { public *; }
--keep public class org.huxerui.lib.media.NativeMediaLibrary$Factory { public *; }
+-keep public class org.huxerui.lib.media.MediaPlayerModule$Factory { public *; }
+-keep public class org.huxerui.lib.media.VideoSurfaceView$Factory { public *; }
+-keep public class org.huxerui.lib.media.MediaLibraryModule$Factory { public *; }

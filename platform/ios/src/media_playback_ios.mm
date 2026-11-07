@@ -1,4 +1,4 @@
-#include "playback/device.h"
+#include "decoded_playback/device.h"
 
 #import <AVFoundation/AVFoundation.h>
 
@@ -42,7 +42,7 @@ PlaybackError OutputError(OutputLoss reason) {
   return {PlaybackErrorCode::DeviceFailure, message, {}};
 }
 
-PlaybackError NativeFailure(NSException* error) {
+PlaybackError AudioEngineError(NSException* error) {
   const auto* message = error.reason.UTF8String;
   const auto* name = error.name.UTF8String;
   return {PlaybackErrorCode::DeviceFailure, message ? message : "The iOS audio engine failed", name ? name : ""};
@@ -79,7 +79,7 @@ public:
         quantum_ = std::max(1u, format.sample_rate / 50);
         return CheckOutput();
       } @catch (NSException* error) {
-        return PlaybackResult<bool>::Failure(NativeFailure(error));
+        return PlaybackResult<bool>::Failure(AudioEngineError(error));
       }
     }
   }
@@ -114,7 +114,7 @@ public:
         written_ += count;
         return R::Success(count);
       } @catch (NSException* error) {
-        return R::Failure(NativeFailure(error));
+        return R::Failure(AudioEngineError(error));
       }
     }
   }
@@ -127,7 +127,7 @@ public:
         [player_ play];
         return CheckOutput();
       } @catch (NSException* error) {
-        return PlaybackResult<bool>::Failure(NativeFailure(error));
+        return PlaybackResult<bool>::Failure(AudioEngineError(error));
       }
     }
   }
@@ -140,7 +140,7 @@ public:
         [player_ pause];
         return CheckOutput();
       } @catch (NSException* error) {
-        return PlaybackResult<bool>::Failure(NativeFailure(error));
+        return PlaybackResult<bool>::Failure(AudioEngineError(error));
       }
     }
   }
@@ -169,7 +169,7 @@ public:
         [player_ stop];
         [engine_ stop];
       } @catch (NSException* error) {
-        result = PlaybackResult<bool>::Failure(NativeFailure(error));
+        result = PlaybackResult<bool>::Failure(AudioEngineError(error));
       }
       buffers_.clear();
       player_ = nil;

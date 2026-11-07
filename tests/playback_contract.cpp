@@ -1,4 +1,4 @@
-#include "playback/session.h"
+#include "decoded_playback/audio_session.h"
 
 #include <atomic>
 #include <chrono>

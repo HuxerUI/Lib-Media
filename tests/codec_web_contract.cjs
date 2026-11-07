@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
-const source = fs.readFileSync(path.join(__dirname, '../platform/web/codec.js'), 'utf8');
+const source = fs.readFileSync(path.join(__dirname, '../platform/web/media_codec_decoder.js'), 'utf8');
 const turn = () => new Promise(resolve => setImmediate(resolve));
 function environment() {
   const probes = [], decoders = [];
@@ -58,7 +58,7 @@ async function run() {
   decoders[1].resolveFlush();
   copied([{offset: 0, stride: 4}, {offset: 16, stride: 4}]);
   await turn();
-  assert.equal(frameClosed, true, 'Retired asynchronous copy leaked its native frame');
+  assert.equal(frameClosed, true, 'Retired asynchronous copy leaked its platform frame');
   assert.equal(decoders[1].closed, 1);
   assert.equal(api.close(video), '');
   console.log('Web codec pending-probe, copy, flush, and late-callback retirement contracts passed');
