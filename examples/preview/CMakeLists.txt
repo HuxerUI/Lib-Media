@@ -58,7 +58,7 @@ huxerui_use_library(example_media
 )
 
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
-    if (ANDROID OR APPLE OR EMSCRIPTEN)
+    if (ANDROID OR APPLE OR EMSCRIPTEN OR WIN32)
         set(PREVIEW_FIXTURE_ROOT "${CMAKE_CURRENT_BINARY_DIR}/sync-fixture")
         set(CODEC_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fixtures/codec")
         file(GLOB PREVIEW_FIXTURE_FILES CONFIGURE_DEPENDS

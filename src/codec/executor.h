@@ -39,8 +39,10 @@ private:
   bool signaled_ = false, finished_ = false;
   std::function<void(bool)> work_;
   std::variant<CodecCompletion, std::function<void()>> completion_{std::in_place_index<1>};
+#ifndef _WIN32
   std::promise<void> exit_;
   std::future<void> exited_ = exit_.get_future();
+#endif
   std::thread thread_;
   std::shared_ptr<CodecWorker> retired_next_;
 };

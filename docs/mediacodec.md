@@ -6,7 +6,7 @@ No `Install()`, View, Runtime, window, or application Task is needed. Existing M
 
 This stage decodes raw AAC-LC access units to CPU PCM and length-prefixed AVC access units to CPU YUV.
 It does not encode, demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
-[decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) remains the next separate consumer.
+[decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
 
 ## Platform status
 
@@ -15,7 +15,7 @@ It does not encode, demux MP4, load URLs/files, play PCM, or publish textures. A
 | Android API 23+ | NDK MediaCodec, no Activity/JNI requirement; standard CPU I420/NV12 buffers | AAC/AVC fixtures ran on a Huawei Android 12 device; full preview builds for arm64/x86_64 |
 | macOS | AudioConverter for AAC and VideoToolbox with CoreMedia for H.264 | Headless AAC/AVC fixture tests on Apple Silicon and a full preview build |
 | iOS 15+ | AudioConverter for AAC and VideoToolbox with CoreMedia for H.264 | Simulator preview build and AAC/AVC fixture tests. Device decoding remains unvalidated. |
-| Windows | System synchronous Media Foundation AAC/H.264 transforms, COM/MF owned on the codec worker | Implemented but not compiled or run on this host; treat as experimental until Windows validation |
+| Windows | System synchronous Media Foundation AAC/H.264 transforms, COM/MF owned on the codec worker | Windows 11 installed-SDK builds and native AAC/AVC fixtures, including the longer synchronization fixtures with tight output pools |
 | Linux | Optional GStreamer appsrc/parser/installed decoder/converter/appsink pipeline | Implemented but not compiled or run on this host; treat as experimental until Linux validation |
 | Web | WebCodecs on the owning JS event loop | Full WASM build and real Chrome C++ decoder/bridge fixture tests; simulated late probe/copy/flush retirement tests |
 
@@ -26,6 +26,11 @@ used by Probe. A native probe uses its own worker and dispatches completion afte
 completion on the owning event loop. There is no UI dispatcher.
 
 Windows currently uses the system synchronous transforms, without DXVA or third-party asynchronous MFT enumeration.
+The AVC transform uses `MF_LOW_LATENCY` to keep startup buffering within the shared output reservation bound.
+Its native output allocation and CPU-copy scratch are bounded by the larger of four configured frames and 64 KiB;
+the system AAC transform requests 48 KiB even for mono/stereo AAC-LC. Normalized output still uses the configured
+single-frame reservation. AAC output must contain exactly 1024 samples and match the next accepted timestamp within
+one native 100 ns tick; that native truncation is normalized before restoring the original exact packet timestamp.
 Android rejects opaque/vendor CPU layouts it cannot interpret safely. Apple/Android/Web actual fixture tests do not
 validate every hardware model or supported profile/level. Hardware selection/classification is not exposed in this stage.
 
@@ -171,7 +176,7 @@ checks CPU copies/counts/EOS, and releases the codecs. With Web tests enabled, b
 its generated `tests/codec_wasm.html` beside the JS/WASM/data files. That test invokes the C++ AudioDecoder and
 VideoDecoder APIs, decodes both fixtures, resets both sessions, and observes cleanup while retaining CPU output.
 The separate Node test injects late support, flush, and copy completions after retirement. Controlled worker shutdown
-still needs dedicated validation. iOS-device, Windows, Linux, hardware diversity, stress/RSS, and release-failure injection
+still needs dedicated validation. iOS-device, Linux, hardware diversity, stress/RSS, and release-failure injection
 in native platform APIs remain validation work; shared fake-backend failure tests do not replace those checks.
 
 A local Apple Silicon Release archive comparison against the pre-codec commit grew from approximately 0.54 MiB to

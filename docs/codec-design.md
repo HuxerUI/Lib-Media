@@ -1,6 +1,6 @@
 # Codec and decoded-playback design
 
-The shared CPU media values, first AAC/AVC decoder milestone and first Android/macOS PCM playback milestone are
+The shared CPU media values, first AAC/AVC decoder milestone and Android/iOS/macOS/Windows/Web PCM playback are
 implemented. The [decoding guide](mediacodec.md) records decoder validation. The
 [PCM acceptance section](#first-implementation-and-acceptance) records playback validation and the remaining work.
 
@@ -534,14 +534,14 @@ before completion. Application callbacks run outside session locks and may reque
 
 ### Six platform mappings
 
-Android, iOS, macOS, and Web implement the PCM contract. The Windows and Linux rows describe planned device paths.
+Android, iOS, macOS, Windows, and Web implement the PCM contract. The Linux row describes a planned device path.
 
 | Platform | Clock and underrun | Drain | Pause, reset and cleanup |
 | --- | --- | --- | --- |
 | Android | AAudio shared output on API 26+. Map fresh `getTimestamp(CLOCK_MONOTONIC)` observations to the current device run. Use nonblocking writes during startup and refill. Keep the clock observable at a starved tail with bounded silence ranges. | A fresh timestamp must cross the end of the last media range. Treat `STOPPED` and the post-stop read count as control observations. | Acknowledge the native pause state and freeze the public clock. Refill can open a fresh stream after a confirmed starved tail. Reset or Close retires the run before discard and release on the worker. |
 | macOS | `AVAudioEngine` and `AVAudioPlayerNode` with bounded PCM buffers. Advance by the contiguous prefix of current-run `dataPlayedBack` completions. The empty queue enters Buffering when that prefix reaches the last media frame. | The last buffer's normal `dataPlayedBack` completion confirms the tail. Check engine and route validity before accounting for completions. | Pause and resume the player node. On reset or close, retire callbacks, stop the node and engine, and release buffers and observers on the worker. |
 | iOS | Advance through contiguous `dataPlayedBack` completions in its own engine/player-node adapter. Interruption, output loss, engine reconfiguration and media-service loss invalidate the run. | Confirm the final contiguous completed buffer while the run and route are valid. | Pause the node for ordinary suspension. Retire callbacks and remove observers before stopping and releasing the node and engine. The app configures and activates `AVAudioSession`. |
-| Windows | WASAPI shared render on the owning COM worker. Normalize `IAudioClock::GetPosition` using `GetFrequency`. Map endpoint ranges to committed media, including any silence inserted at underrun. Use padding for writes. | Require the device position to cover the final mapped media range. | `IAudioClient::Stop` and Start implement pause and resume. Stop, Reset, release render and clock interfaces, then release COM on retirement. |
+| Windows | WASAPI shared render on the owning COM worker. Normalize `IAudioClock::GetPosition` using `GetFrequency`. Each run contains contiguous media; stop accepting input when its endpoint queue empties. Use padding for writes. | Require the device position to cover the final submitted media range before retiring a starved run. | `IAudioClient::Stop` and Start preserve pending PCM across pause. Session disconnection wakes the worker even while paused. Unregister notifications, Stop, Reset, release native interfaces, then release COM on retirement. |
 | Linux | An optional libpulse adapter uses the installed PulseAudio-compatible server. Map valid stream timing and latency to media ranges. Reconcile read/write indices across starvation and keep cork/refill under session control. | Combine a successful `pa_stream_drain` with timing that covers the final range at the output boundary. | Cork preserves pending audio. Flush discards it. Cancel outstanding operations, remove callbacks, disconnect and release owned stream and mainloop resources. |
 | Web | A bounded AudioWorklet queue reports which context frame ranges carried media. Intersect those reports with `AudioContext.getOutputTimestamp().contextTime` to advance the playhead through media only. Start or resume from a browser-allowed context. | Confirm drain when the output timestamp reaches the end of the final reported media range. | Suspend and resume the owned context. Retire the old node and port on reset. Close the context asynchronously, settle or safely detach pending work, and release the JS/WASM bridge on its owner. |
 
@@ -608,6 +608,24 @@ and [output route changes](https://developer.apple.com/documentation/avfaudio/av
 The iOS preview holds its audio session through the playback cleanup callback. It deactivates the session on the
 main queue once the last preview audio user releases it, including any loaded Video or Music source.
 
+The Windows adapter opens the default render endpoint in shared mode with interleaved S16 PCM and system rate/channel
+conversion. It requests up to 100 ms of endpoint buffering; the audio engine can round that request to its processing
+period. The shared media capacity still counts every accepted sample until presentation. Padding only determines
+writable space. Clock positions are converted with integer arithmetic and rounded down, then capped at the last
+submitted media frame. An empty endpoint queue seals the run before another write can cross an untracked silence gap.
+After its tail is confirmed, refill opens a fresh stream at the same media position. Pause preserves queued PCM.
+Five seconds without confirming outstanding media fails the run; elapsed wall time never advances the playhead.
+Session-disconnected events signal the worker and invalidate playback, including while paused. Other native endpoint
+or service failures are reported when an operation observes them. Restoring a lost route requires a fresh session.
+
+Windows 11 native tests cover 48 kHz stereo and 44.1 kHz mono output, underrun retirement, pause/resume, short-tail
+drain, generated PCM, AAC output, epoch reset, video-only and A/V playback, and cleanup. The Frames preview completed
+the 96-frame video fixture with zero dropped frames and 19 ms maximum publication lag in one observed run.
+This measures texture publication against the scheduling clock, not physical display latency. Physical device removal,
+endpoint reconfiguration and audio-service loss still require device acceptance. Worker cleanup checks the native thread
+handle so completion follows TLS destruction. Windows serializes TLS destructors under its loader lock; the contract
+test verifies independent native release before deliberately blocking TLS teardown.
+
 The Web adapter uses the shared PCM queue and transport state machine on the browser window event loop. An
 AudioWorklet consumes copied interleaved S16 input from a fixed-capacity ring. The worklet reports media ranges in
 AudioContext frames. The bridge intersects those ranges with `getOutputTimestamp().contextTime`, converted to the
@@ -626,7 +644,7 @@ render-to-output mapping, including a silence gap and a late callback after reti
 
 ### Video scheduling
 
-The Frames preview on Android, iOS, macOS, and Web enables video in `DecodedPlayback::Create()` with the same four-second AVC track
+The Frames preview on Android, iOS, macOS, Windows, and Web enables video in `DecodedPlayback::Create()` with the same four-second AVC track
 for both modes. Video-only playback starts its monotonic clock at the first queued video PTS. The native codec
 test checks the original 24-frame H.264 fixture's exact presentation timestamps and durations.
 
@@ -670,8 +688,9 @@ Consumers use the public installed package; no SDK source checkout is required.
 The installed Android texture API exposes BitmapTexture and a GL_TEXTURE_2D copy path. Apple exposes retained
 PixelBufferTexture and Metal copies; Windows/Linux expose pixel/native texture paths. These are actual public contracts,
 not a generic promise that every codec output can be imported without conversion. The first CPU decoder milestone needs
-no new SDK interface. The Android, iOS, macOS, and Web previews convert SDR NV12 and I420 to RGB on the CPU. Android
-uses the public GL texture path. iOS and macOS each publish to their platform's pixel buffer texture. Web creates
+no new SDK interface. The Android, iOS, macOS, Windows, and Web previews convert SDR NV12 and I420 to RGB on the CPU. Android
+uses the public GL texture path. iOS and macOS each publish to their platform's pixel buffer texture. Windows publishes
+copied RGBA rows through `windows::PixelTexture`. Web creates
 a browser RGBA VideoFrame from the visible pixels and publishes it through the SDK's VideoFrameTexture. The texture
 retains its own clone, and the uploader closes the original after publication. The AVC fixture preview uses
 BT.601 and limited range when color metadata is unavailable and reports the fallback.

@@ -60,6 +60,22 @@ std::vector<EncodedPacket> Packets(const std::filesystem::path& root, const std:
   Check(!packets.empty(), "No fixture packets");
   return packets;
 }
+std::vector<EncodedPacket> PackedPackets(const std::filesystem::path& root, const std::string& name) {
+  auto bytes = std::make_shared<const Bytes>(Read(root / (name + ".bin")));
+  const BufferReference data(*bytes, bytes);
+  std::ifstream manifest(root / (name + ".txt"));
+  std::vector<EncodedPacket> packets;
+  std::size_t offset, size;
+  std::int64_t pts, dts, duration;
+  std::uint32_t scale;
+  bool key;
+  while (manifest >> offset >> size >> pts >> dts >> duration >> scale >> key)
+    packets.push_back({data.Slice(offset, size), {pts, scale}, MediaTimestamp{dts, scale},
+                       MediaTimestamp{duration, scale}, key});
+  Check(!packets.empty(), "No packed fixture packets");
+  return packets;
+}
+
 #ifdef MEDIA_CODEC_TEST_GSTREAMER
 void AppSrcBackpressure(const AudioDecoderConfig& defaults, const EncodedPacket& access_unit) {
   for (bool limit_bytes : {false, true}) {
@@ -230,6 +246,11 @@ int main(int argc, char** argv) {
     audio.output.packing = AudioPacking::Planar;
     audio.output.sample_format = AudioSampleFormat::S16;
     Decode<AudioDecoder, AudioDecoderConfig, AudioFrame>(audio, aac, aac.size());
+    audio.initialization_data = Read(root / "sync-aac.config");
+    audio.output.packing = AudioPacking::Interleaved;
+    audio.limits = {4, 8 * 1024 * 1024, 4, 4 * 1024 * 4};
+    auto sync_aac = PackedPackets(root, "sync-aac");
+    Decode<AudioDecoder, AudioDecoderConfig, AudioFrame>(audio, sync_aac, sync_aac.size());
     VideoDecoderConfig video;
     video.initialization_data = Read(root / "avc.config");
     video.width = 64; video.height = 48;
@@ -237,6 +258,13 @@ int main(int argc, char** argv) {
     Decode<VideoDecoder, VideoDecoderConfig, VideoFrame>(video, avc, avc.size());
     video.output = VideoPixelFormat::I420;
     Decode<VideoDecoder, VideoDecoderConfig, VideoFrame>(video, avc, avc.size());
+    video.initialization_data = Read(root / "sync-avc.config");
+    video.output = VideoPixelFormat::NV12;
+    video.limits.input_items = 4;
+    video.limits.output_items = 34;
+    video.limits.output_bytes = video.limits.output_items * video.width * video.height * 3 / 2;
+    auto sync_avc = PackedPackets(root, "sync-avc");
+    Decode<VideoDecoder, VideoDecoderConfig, VideoFrame>(video, sync_avc, sync_avc.size());
     std::cout << "AAC/AVC native decode, format, EOS, reset, retained output, and cleanup passed\n";
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

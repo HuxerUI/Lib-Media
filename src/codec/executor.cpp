@@ -2,6 +2,8 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 
 namespace huxerui::media::detail {
@@ -45,6 +47,15 @@ public:
     queue->changed.notify_one();
   }
 private:
+  static bool Exited(CodecWorker& worker) {
+#ifdef _WIN32
+    // The native handle is signaled after thread-local resource destruction.
+    return WaitForSingleObject(worker.thread_.native_handle(), 0) == WAIT_OBJECT_0;
+#else
+    return worker.exited_.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready;
+#endif
+  }
+
   static void Complete(std::shared_ptr<CodecWorker> worker) {
     worker->thread_.join();
     auto completion = std::move(worker->completion_);
@@ -62,7 +73,7 @@ private:
     while (!queue.stopping) {
       auto* next = &queue.retired;
       // An exiting worker may still be releasing thread-local native resources.
-      while (*next && (*next)->exited_.wait_for(0ms) != std::future_status::ready)
+      while (*next && !Exited(**next))
         next = &(*next)->retired_next_;
       if (!*next) {
         if (queue.retired) queue.changed.wait_for(lock, 1ms);
@@ -96,7 +107,9 @@ std::shared_ptr<CodecWorker> CodecWorker::Start(std::function<void(bool)> work) 
   worker->thread_ = std::thread([worker, queue = reaper.GetQueue()]() mutable {
     worker->Run();
     worker->work_ = {};
+#ifndef _WIN32
     worker->exit_.set_value_at_thread_exit();
+#endif
     CodecReaper::Retire(queue, std::move(worker));
   });
   return worker;

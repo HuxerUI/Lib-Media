@@ -217,6 +217,16 @@ void IndependentWorkerCleanup() {
   Eventually([&] { return probed->load(); }, "Probe waited for unrelated native cleanup");
   Check(blocked->cleaned == 0, "Cleanup completed during a blocked native Close");
 
+  const auto close_second = [&] {
+    second->Close();
+    Eventually([&] { return independent->cleaned == 1; }, "Second session's cleanup waited for an unrelated worker");
+    Check(independent->cleanup_after_exit, "Cleanup was reported before the worker exited");
+  };
+#ifdef _WIN32
+  // Windows serializes TLS destructors under its loader lock. Check independent release before entering TLS teardown.
+  close_second();
+#endif
+
   {
     std::unique_lock lock(blocked->mutex);
     blocked->block_close = false;
@@ -224,9 +234,9 @@ void IndependentWorkerCleanup() {
     Check(blocked->changed.wait_for(lock, std::chrono::seconds(3), [&] { return blocked->exit_entered; }),
           "Closed session did not begin releasing worker resources");
   }
-  second->Close();
-  Eventually([&] { return independent->cleaned == 1; }, "Second session's cleanup waited for a blocked worker exit");
-  Check(independent->cleanup_after_exit, "Cleanup was reported before the worker exited");
+#ifndef _WIN32
+  close_second();
+#endif
   Check(blocked->cleaned == 0, "Cleanup completed during a blocked worker exit");
   {
     std::lock_guard lock(blocked->mutex);

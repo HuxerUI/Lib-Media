@@ -29,7 +29,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Native image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
 | AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
-| Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
+| Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | Audio/video encoding | Planned after the decoder foundation | No public encoder API yet |
 
 Native selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
@@ -304,9 +304,9 @@ or demuxer: raw AAC-LC with AudioSpecificConfig produces mono/stereo S16 or F32 
 Each native session and probe has its own worker. Web sessions run on the event loop that created them. On Linux, enable
 `-DHUXERUI_MEDIA_GSTREAMER=ON` with GStreamer 1.24+ development packages and installed AAC/H.264 parser and decoder plugins.
 
-AAC/H.264 fixture decoding passed on an Android 12 device, an iOS simulator, Apple Silicon macOS, and Chrome through the
-C++/WASM API. Windows timestamp matching has a simulated regression test. Native decoder validation is pending on
-Windows, Linux, and physical iOS devices. See the [decoding guide](docs/mediacodec.md) for examples, queue limits,
+AAC/H.264 fixture decoding passed on an Android 12 device, an iOS simulator, Apple Silicon macOS, Windows 11, and Chrome
+through the C++/WASM API. Windows also checks the longer synchronization fixtures with tight output pools.
+Native decoder validation is pending on Linux and physical iOS devices. See the [decoding guide](docs/mediacodec.md) for examples, queue limits,
 platform requirements, and validation instructions.
 
 ## PCM playback
@@ -327,10 +327,14 @@ Android uses AAudio on API 26+. iOS 15+ and macOS use AVAudioEngine. On iOS, con
 application's `AVAudioSession` before creating a playback session with audio. Restore it and create a fresh
 playback session after an interruption or invalidated output route. On Web, use the owning browser window event
 loop and call `Play()` from a user gesture. The browser must support `AudioWorklet`, `getOutputTimestamp()`, the
-requested PCM rate, and the bundled worklet's blob URL in a secure context. Windows and Linux PCM output are planned.
+requested PCM rate, and the bundled worklet's blob URL in a secure context. Windows uses WASAPI shared output and
+the default render endpoint; the system audio engine converts the PCM rate and channel layout to its mix format.
+Its playhead follows `IAudioClock`, while endpoint padding only controls writes. An exhausted device run accepts no
+further PCM and is recreated after its media tail is confirmed, so underrun silence does not advance media time.
+Linux PCM output remains planned.
 The [native playback test](tests/playback_native.cpp) is a headless example that plays both generated PCM and the AAC
 fixture through this API. With tests enabled, run `ctest --test-dir build/tests -R media_playback --output-on-failure`
-on macOS. The native executable also runs against the fixture on Android hardware and the iOS Simulator. The iOS
+on macOS or Windows. The native executable also runs against the fixture on Android hardware and the iOS Simulator. The iOS
 test injects interruption and output-route notifications during playback and while paused. Physical iOS route and
 interruption validation is pending. See the
 [playback contract and device mappings](docs/codec-design.md#decoded-playback-boundary) for timing and lifecycle details.
@@ -359,6 +363,7 @@ submitted frame with its producer. Pause, Ended, Reset, and Close preserve any a
 texture on a source change if the new epoch should start blank. Synchronized audio starts after `Play()` and the
 first accepted video frame or video EOS, subject to normal audio buffering.
 
+The Windows Frames preview publishes copied RGBA rows through the SDK's `windows::PixelTexture`.
 The Web Frames preview uses WebCodecs in a secure context and publishes through the SDK's `VideoFrameTexture`.
 
 ## Preview, builds, and validation
@@ -370,7 +375,7 @@ The [preview](examples/preview) exercises the library through four tabs.
 | Video | Local/reference/URL sources, playback controls, progress, seeking, volume, looping, and video fitting |
 | Music | Audio playback using the same player API without a video surface |
 | Library | Native image/video/mixed selection, capability-aware multi-select, retained references, and publication |
-| Frames | Video-only and synchronized decoded playback on Android, iOS, macOS, and Web |
+| Frames | Video-only and synchronized decoded playback on Android, iOS, macOS, Windows, and Web |
 
 The Library tab disables multi-select when the maximum is below two; otherwise it requests up to three items within
 the native limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
@@ -425,7 +430,8 @@ SDK Web registry are available, CTest also exercises the Web adapter with simula
 generated AAC/H.264 fixtures and cover queue backpressure, native worker isolation, cleanup ordering, and late WebCodecs
 callbacks. See the [codec validation instructions](docs/mediacodec.md#validation) for standalone and browser runs.
 
-Windows adds native muted audio smoke tests and video geometry tests. To check frame transfer and presentation against
+Windows adds WASAPI underrun/clock tests at 48 kHz stereo and 44.1 kHz mono, decoded PCM/video/A/V tests, texture
+publication tests, native muted audio smoke tests, and video geometry tests. To check frame transfer and presentation against
 a real source, run `build/tests/tests/media_windows_video.exe /path/to/video.mp4` with a short clip under 20 seconds.
 It uses an off-screen window, resizes the surface, and waits for natural completion without modifying the source.
 
@@ -453,8 +459,8 @@ The [codec and decoded-playback design](docs/codec-design.md) records the shared
 lifecycle contract, and delivery order. The AAC/AVC decoding milestone is now implemented, with remaining platform
 validation called out in the [decoding guide](docs/mediacodec.md).
 
-The next stages of decoded playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) extend PCM support and
-use the playback clock to schedule `VideoFrame` presentation. Encoding and broader codec discovery remain later
+The next stages of decoded playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) extend PCM support to Linux
+and expand device and synchronization measurements. Encoding and broader codec discovery remain later
 stages of [#20](https://github.com/HuxerUI/HuxerUI/issues/20).
 
 Existing file/URL playback continues to use native players. HuxerUI owns general file, task, window, and texture

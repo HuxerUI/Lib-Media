@@ -48,6 +48,9 @@ public:
         Require(input->SetBlob(MF_MT_USER_DATA, cookie.data(), static_cast<UINT32>(cookie.size())), "Cannot set AAC initialization data");
       } else {
         const auto& video = std::get<VideoDecoderConfig>(config_);
+        ComPtr<IMFAttributes> attributes;
+        Require(decoder_->GetAttributes(&attributes), "Cannot configure AVC buffering");
+        Require(attributes->SetUINT32(MF_LOW_LATENCY, TRUE), "Cannot bound AVC startup buffering");
         Require(MFSetAttributeSize(input.Get(), MF_MT_FRAME_SIZE, video.width, video.height), "Cannot set AVC dimensions");
         const auto avc = ParseAvc(video.initialization_data).Value();
         length_size_ = avc.length_size;
@@ -93,6 +96,7 @@ public:
       const auto status = decoder_->ProcessInput(0, sample.Get(), 0);
       if (status == MF_E_NOTACCEPTING) return SubmitStatus::WouldBlock;
       Require(status, "Decoder rejected access unit");
+      if (std::holds_alternative<AudioDecoderConfig>(config_)) audio_timing_.push_back(pts->ticks);
       first_ = false;
       return SubmitStatus::Accepted;
     });
@@ -104,8 +108,10 @@ public:
       Require(decoder_->GetOutputStreamInfo(0, &info), "Cannot query decoder output requirements");
       ComPtr<IMFSample> sample;
       if (!(info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
-        const auto maximum = ValidateConfig(config_).Value();
-        if (info.cbSize > maximum * 4) throw MfFailure{Error(CodecErrorCode::ResourceExhausted, "Native output allocation exceeds configured frame bound")};
+        // The system AAC MFT requests 48 KiB even for one mono/stereo AAC-LC frame.
+        const auto maximum = std::max<std::size_t>(ValidateConfig(config_).Value() * 4, 64 * 1024);
+        if (info.cbSize > maximum) throw MfFailure{Error(CodecErrorCode::ResourceExhausted,
+            "Native output allocation exceeds configured frame bound", std::to_string(info.cbSize) + "/" + std::to_string(maximum))};
         ComPtr<IMFMediaBuffer> buffer;
         Require(MFCreateAlignedMemoryBuffer(info.cbSize, info.cbAlignment ? info.cbAlignment - 1 : 0, &buffer), "Cannot allocate decoder output");
         Require(MFCreateSample(&sample), "Cannot allocate decoded sample");
@@ -144,6 +150,7 @@ public:
       record(decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0), "Decoder end-streaming failed during cleanup");
       output_type_.Reset(); decoder_.Reset();
     }
+    audio_timing_.clear();
     if (mf_) { record(MFShutdown(), "Media Foundation release failed"); mf_ = false; }
     if (com_) { CoUninitialize(); com_ = false; }
     return error ? CodecResult<void>::Failure(*error) : CodecResult<void>::Success();
@@ -185,6 +192,8 @@ private:
     Require(sample->ConvertToContiguousBuffer(&buffer), "Cannot access decoded CPU bytes");
     DWORD size;
     Require(buffer->GetCurrentLength(&size), "Cannot query decoded buffer size");
+    if (size > std::max<std::size_t>(ValidateConfig(config_).Value() * 4, 64 * 1024))
+      throw MfFailure{Error(CodecErrorCode::ResourceExhausted, "Native CPU output exceeds the bounded copy capacity")};
     Bytes bytes(size);
     BYTE* source = nullptr;
     Require(buffer->Lock(&source, nullptr, nullptr), "Cannot map decoded CPU bytes");
@@ -194,9 +203,15 @@ private:
     if (const auto* audio = std::get_if<AudioDecoderConfig>(&config_)) {
       auto format = audio->output; format.packing = AudioPacking::Interleaved;
       const auto stride = format.BytesPerSample() * format.ChannelCount();
-      if (size % stride || size / stride > 1024) throw MfFailure{Error(CodecErrorCode::InvalidData, "Unexpected AAC output count")};
-      auto result = CopyAudio({format, pts, size / stride, {data}}, audio->output);
+      if (size % stride || size / stride != 1024 || audio_timing_.empty())
+        throw MfFailure{Error(CodecErrorCode::InvalidData, "Unexpected AAC output count")};
+      const auto expected = audio_timing_.front();
+      // The AAC MFT can truncate a drained timestamp by one 100 ns tick.
+      if (time != expected && !(time < INT64_MAX && time + 1 == expected) && !(time > INT64_MIN && time - 1 == expected))
+        throw MfFailure{Error(CodecErrorCode::InvalidData, "AAC output timing does not match the accepted access unit")};
+      auto result = CopyAudio({format, {expected, PresentationTimescale()}, size / stride, {data}}, audio->output);
       if (!result.Succeeded()) throw MfFailure{result.Error()};
+      audio_timing_.pop_front();
       return DecodedFrame{std::move(result).Value()};
     }
     VideoFormat format;
@@ -238,6 +253,7 @@ private:
   ComPtr<IMFTransform> decoder_;
   ComPtr<IMFMediaType> output_type_;
   Bytes parameters_;
+  std::deque<LONGLONG> audio_timing_;
   unsigned length_size_ = 4;
   bool com_ = false, mf_ = false, first_ = true, finished_ = false, eos_ = false;
 };
