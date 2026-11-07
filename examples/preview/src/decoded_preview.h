@@ -8,7 +8,7 @@
 #include <huxerui/task.h>
 
 namespace media_preview {
-#if defined(__ANDROID__) || defined(MEDIA_PREVIEW_MACOS) || defined(MEDIA_PREVIEW_IOS) || defined(__EMSCRIPTEN__) || defined(_WIN32)
+#if defined(__ANDROID__) || defined(MEDIA_PREVIEW_MACOS) || defined(MEDIA_PREVIEW_IOS) || defined(__EMSCRIPTEN__) || defined(_WIN32) || defined(__linux__)
 inline constexpr bool frame_texture_supported = true;
 #else
 inline constexpr bool frame_texture_supported = false;

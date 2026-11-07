@@ -406,7 +406,7 @@ View LibraryPage() {
 View FramesPage() {
   auto texture = UseState(std::shared_ptr<ExternalTexture>{});
   auto notice = UseState(std::string(media_preview::frame_texture_supported
-      ? "Choose video-only or synchronized playback." : "Frame preview is available on Android, iOS, macOS, Windows, and Web."));
+      ? "Choose video-only or synchronized playback." : "Frame preview is unavailable on this platform."));
   auto playing = UseState(false);
   auto paused = UseState(false);
   auto tasks = UseTaskScope();

@@ -16,13 +16,15 @@
 #include <huxerui/web/external_texture.h>
 #elif defined(_WIN32)
 #include <huxerui/windows/external_texture.h>
+#elif defined(__linux__)
+#include <huxerui/linux/external_texture.h>
 #endif
 
 using namespace huxerui;
 using namespace huxerui::media;
 
 namespace media_preview {
-#if defined(__ANDROID__) || defined(MEDIA_PREVIEW_MACOS) || defined(MEDIA_PREVIEW_IOS) || defined(__EMSCRIPTEN__) || defined(_WIN32)
+#if defined(__ANDROID__) || defined(MEDIA_PREVIEW_MACOS) || defined(MEDIA_PREVIEW_IOS) || defined(__EMSCRIPTEN__) || defined(_WIN32) || defined(__linux__)
 namespace {
 
 unsigned Sample(const VideoPlane& plane, unsigned x, unsigned y, unsigned component = 0) {
@@ -215,18 +217,24 @@ void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
   }
   native.call<void>("close");
 }
-#elif defined(_WIN32)
+#elif defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32)
+namespace pixel_platform = huxerui::windows;
+#else
+namespace pixel_platform = huxerui::linux;
+#endif
+
 std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size) {
-  return std::make_shared<windows::PixelTexture>(size);
+  return std::make_shared<pixel_platform::PixelTexture>(size);
 }
 
 void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
   const auto pixels = ConvertFramePixels(frame);
   const auto visible = frame.format.visible;
-  static_cast<windows::PixelTexture&>(texture).Publish({
+  static_cast<pixel_platform::PixelTexture&>(texture).Publish({
       .pixel_width = int(visible.width), .pixel_height = int(visible.height),
       .bytes_per_row = std::size_t(visible.width) * 4,
-      .format = windows::PixelFormat::Rgba8888, .pixels = pixels});
+      .format = pixel_platform::PixelFormat::Rgba8888, .pixels = pixels});
 }
 #elif !defined(MEDIA_PREVIEW_IOS)
 std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size) { return {}; }

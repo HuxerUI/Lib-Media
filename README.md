@@ -29,7 +29,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Native image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
 | AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
-| Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
+| Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | Audio/video encoding | Planned after the decoder foundation | No public encoder API yet |
 
 Native selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
@@ -44,11 +44,12 @@ playback of supported audio/video content. Saving takes a readable local `File` 
 | iOS | AVFoundation / AVPlayerLayer | PHPicker on iOS 15+ | Photos add-only access on iOS 15+ | AudioConverter / VideoToolbox |
 | macOS | AVFoundation / AVPlayerLayer | Unavailable | Unavailable | AudioConverter / VideoToolbox |
 | Windows | Media Foundation MediaEngine / D3D11 frame server and HWND swap chain | Unavailable | Unavailable | Media Foundation transforms (experimental) |
-| Linux | GtkMediaFile / GdkTexture through HuxerUI ExternalTexture | Unavailable | Unavailable | GStreamer (opt-in, experimental) |
+| Linux | GtkMediaFile / GdkTexture through HuxerUI ExternalTexture | Unavailable | Unavailable | GStreamer with installed plugins |
 | Web | HTMLMediaElement / native video element | Unavailable | Unavailable | WebCodecs |
 
 Android's library minimum is API 23; playback uses Media3 `1.9.3` resolved by Gradle. Linux builds require GTK 4.14+,
-and Linux playback needs a working GTK media backend. Windows playback needs Media Foundation components and
+libpulse, and GStreamer 1.24+ app/audio/video development packages. Linux file/URL playback needs a working GTK media
+backend. Windows playback needs Media Foundation components and
 D3D11-capable hardware. Playback container, codec, and streaming-protocol support follows the native backend.
 Applications own network permissions, transport-security policy, browser CORS/mixed-content rules, and any background
 playback or audio-session configuration.
@@ -301,12 +302,12 @@ or demuxer: raw AAC-LC with AudioSpecificConfig produces mono/stereo S16 or F32 
 - `Close()` and destruction retire the session immediately. The optional `cleanup_completed` callback reports teardown
   after admitted wakeups return. On native platforms, it also follows worker exit.
 
-Each native session and probe has its own worker. Web sessions run on the event loop that created them. On Linux, enable
-`-DHUXERUI_MEDIA_GSTREAMER=ON` with GStreamer 1.24+ development packages and installed AAC/H.264 parser and decoder plugins.
+Each native session and probe has its own worker. Web sessions run on the event loop that created them. Linux uses
+GStreamer 1.24+ with installed AAC/H.264 parser and decoder plugins.
 
-AAC/H.264 fixture decoding passed on an Android 12 device, an iOS simulator, Apple Silicon macOS, Windows 11, and Chrome
-through the C++/WASM API. Windows also checks the longer synchronization fixtures with tight output pools.
-Native decoder validation is pending on Linux and physical iOS devices. See the [decoding guide](docs/mediacodec.md) for examples, queue limits,
+AAC/H.264 fixture decoding passed on an Android 12 device, an iOS simulator, Apple Silicon macOS, Windows 11,
+Ubuntu 24.04 under WSL, and Chrome through the C++/WASM API. Windows and Linux also check the longer synchronization
+fixtures with tight output pools. Physical iOS decoding remains unvalidated. See the [decoding guide](docs/mediacodec.md) for examples, queue limits,
 platform requirements, and validation instructions.
 
 ## PCM playback
@@ -331,13 +332,26 @@ requested PCM rate, and the bundled worklet's blob URL in a secure context. Wind
 the default render endpoint; the system audio engine converts the PCM rate and channel layout to its mix format.
 Its playhead follows `IAudioClock`, while endpoint padding only controls writes. An exhausted device run accepts no
 further PCM and is recreated after its media tail is confirmed, so underrun silence does not advance media time.
-Linux PCM output remains planned.
+Linux uses libpulse with an installed PulseAudio-compatible server. Cork acknowledgements preserve queued PCM across
+pause. The playhead uses native stream timing without wall-clock interpolation, and a starved stream is retired after its drain and
+final media position are confirmed. A lost connection or output route fails the session even while paused.
+Video-only sessions do not require an audio server.
 The [native playback test](tests/playback_native.cpp) is a headless example that plays both generated PCM and the AAC
 fixture through this API. With tests enabled, run `ctest --test-dir build/tests -R media_playback --output-on-failure`
-on macOS or Windows. The native executable also runs against the fixture on Android hardware and the iOS Simulator. The iOS
+on macOS, Windows, or Linux.
+The native executable also runs against the fixture on Android hardware and the iOS Simulator. The iOS
 test injects interruption and output-route notifications during playback and while paused. Physical iOS route and
 interruption validation is pending. See the
 [playback contract and device mappings](docs/codec-design.md#decoded-playback-boundary) for timing and lifecycle details.
+
+For Linux decoded playback and its native tests:
+
+```sh
+cmake -G Ninja -S . -B build/linux-tests -DHUXERUI_HOME=/path/to/sdk \
+  -DHUXERUI_MEDIA_BUILD_TESTS=ON
+cmake --build build/linux-tests
+ctest --test-dir build/linux-tests --output-on-failure
+```
 
 To try the Web playback sample with the installed SDK, build the WASM test target and serve the build directory
 over localhost. Open `http://127.0.0.1:8000/tests/playback_wasm.html` in Chrome and click **Play generated PCM**.
@@ -363,7 +377,8 @@ submitted frame with its producer. Pause, Ended, Reset, and Close preserve any a
 texture on a source change if the new epoch should start blank. Synchronized audio starts after `Play()` and the
 first accepted video frame or video EOS, subject to normal audio buffering.
 
-The Windows Frames preview publishes copied RGBA rows through the SDK's `windows::PixelTexture`.
+The Windows and Linux Frames previews publish copied RGBA rows through the SDK's platform `PixelTexture`.
+The Linux preview uses the installed AAC/H.264 parser and decoder plugins for its decoded A/V sample.
 The Web Frames preview uses WebCodecs in a secure context and publishes through the SDK's `VideoFrameTexture`.
 
 ## Preview, builds, and validation
@@ -375,7 +390,7 @@ The [preview](examples/preview) exercises the library through four tabs.
 | Video | Local/reference/URL sources, playback controls, progress, seeking, volume, looping, and video fitting |
 | Music | Audio playback using the same player API without a video surface |
 | Library | Native image/video/mixed selection, capability-aware multi-select, retained references, and publication |
-| Frames | Video-only and synchronized decoded playback on Android, iOS, macOS, Windows, and Web |
+| Frames | Video-only and synchronized decoded playback on Android, iOS, macOS, Windows, Linux, and Web |
 
 The Library tab disables multi-select when the maximum is below two; otherwise it requests up to three items within
 the native limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
@@ -435,6 +450,12 @@ publication tests, native muted audio smoke tests, and video geometry tests. To 
 a real source, run `build/tests/tests/media_windows_video.exe /path/to/video.mp4` with a short clip under 20 seconds.
 It uses an off-screen window, resizes the surface, and waits for natural completion without modifying the source.
 
+Linux Release tests passed on Ubuntu 24.04 under WSL with GStreamer 1.24.2, libpulse 16.1, and WSLg's PulseAudio server.
+They cover native AAC/AVC decoding, PCM/AAC playback, video/A/V scheduling, texture publication, 48 kHz stereo and
+44.1 kHz mono cork/drain boundaries, and missing-server cleanup. The full Linux preview also builds with the installed
+SDK. Physical Linux output routes, PipeWire's PulseAudio service, and measured display/audio synchronization remain
+device acceptance work.
+
 Device acceptance should cover local/reference/HTTPS playback, seek/end/loop, source replacement, fitting, and platform
 interruptions; image/video/mixed selection, native count limits, dismissal, and reading retained references; and
 image/video publication, denied access, invalid sources, and cancellation. Exercise both legacy Android gallery routes
@@ -459,8 +480,8 @@ The [codec and decoded-playback design](docs/codec-design.md) records the shared
 lifecycle contract, and delivery order. The AAC/AVC decoding milestone is now implemented, with remaining platform
 validation called out in the [decoding guide](docs/mediacodec.md).
 
-The next stages of decoded playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) extend PCM support to Linux
-and expand device and synchronization measurements. Encoding and broader codec discovery remain later
+The next stages of decoded playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) expand device and
+synchronization measurements. Encoding and broader codec discovery remain later
 stages of [#20](https://github.com/HuxerUI/HuxerUI/issues/20).
 
 Existing file/URL playback continues to use native players. HuxerUI owns general file, task, window, and texture

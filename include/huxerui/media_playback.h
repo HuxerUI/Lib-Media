@@ -7,11 +7,11 @@
 /// submit AudioFrame values from a decoder or another producer. The session owns the output device and the
 /// playback timeline. The producer owns source loading, decoding, seeking and any input format conversion.
 ///
-/// PCM playback is available on Android API 26+, iOS 15+, macOS, Windows, and supported browsers. Availability depends on
-/// the output route, PCM format, and browser capabilities.
+/// PCM playback is available on Android API 26+, iOS 15+, macOS, Windows, Linux, and supported browsers.
+/// Availability depends on the output route, PCM format, and browser capabilities.
 /// Use the API independently of a View, Runtime or window. The application manages audio focus and background
 /// playback policy. See AudioPlaybackConfig for supported formats and callback delivery. Enable video in
-/// DecodedPlaybackConfig to add a caller-driven presenter on Android, iOS, macOS, Windows, or Web.
+/// DecodedPlaybackConfig to add a caller-driven presenter on Android, iOS, macOS, Windows, Linux, or Web.
 
 #include <chrono>
 #include <functional>
@@ -113,8 +113,9 @@ struct AudioPlaybackConfig {
 
 /// @brief Enabled tracks for one decoded playback session.
 ///
-/// Enable at least one track. Audio is supported on Android API 26+, iOS 15+, macOS, Windows, and supported browsers.
-/// Video is supported on Android, iOS, macOS, Windows, and Web. Submit both enabled tracks from the same timeline.
+/// Enable at least one track. Audio is supported on Android API 26+, iOS 15+, macOS, Windows, Linux, and supported browsers.
+/// Video is supported on Android, iOS, macOS, Windows, Linux, and Web.
+/// Submit both enabled tracks from the same timeline.
 struct DecodedPlaybackConfig {
   /// PCM device configuration. Leave empty for video-only playback.
   std::optional<AudioPlaybackConfig> audio;
@@ -193,6 +194,8 @@ public:
   /// session before creating a fresh playback session.
   /// On Windows, audio uses the default render endpoint in WASAPI shared mode. Session disconnection fails
   /// the run and wakes the worker even while paused. Create a fresh session after restoring the output route.
+  /// On Linux, audio uses libpulse with a PulseAudio-compatible server. A lost connection or output route fails
+  /// the run, including while paused. Video-only sessions do not require an audio server.
   /// On Web, enabling audio requires a secure context with AudioWorklet and output timestamp support.
   /// @param config Enabled tracks and PCM settings, copied into the session.
   /// @return An owning handle, or a synchronous Unsupported, InvalidArgument or ResourceExhausted error.

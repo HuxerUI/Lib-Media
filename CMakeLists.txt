@@ -98,14 +98,11 @@ endif ()
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(MEDIA_GTK REQUIRED IMPORTED_TARGET "gtk4>=4.14")
-    target_link_libraries(huxerui_media PRIVATE PkgConfig::MEDIA_GTK)
-    option(HUXERUI_MEDIA_GSTREAMER "Enable Linux AAC/AVC codecs using installed GStreamer plugins" OFF)
-    if (HUXERUI_MEDIA_GSTREAMER)
-        pkg_check_modules(MEDIA_GSTREAMER REQUIRED IMPORTED_TARGET
-                "gstreamer-app-1.0>=1.24" "gstreamer-audio-1.0>=1.24" "gstreamer-video-1.0>=1.24")
-        target_link_libraries(huxerui_media PRIVATE PkgConfig::MEDIA_GSTREAMER)
-        target_compile_definitions(huxerui_media PRIVATE HUXERUI_MEDIA_GSTREAMER=1)
-    endif ()
+    pkg_check_modules(MEDIA_PULSEAUDIO REQUIRED IMPORTED_TARGET libpulse)
+    pkg_check_modules(MEDIA_GSTREAMER REQUIRED IMPORTED_TARGET
+            "gstreamer-app-1.0>=1.24" "gstreamer-audio-1.0>=1.24" "gstreamer-video-1.0>=1.24")
+    target_link_libraries(huxerui_media PRIVATE
+            PkgConfig::MEDIA_GTK PkgConfig::MEDIA_PULSEAUDIO PkgConfig::MEDIA_GSTREAMER)
 endif ()
 
 if (EMSCRIPTEN)

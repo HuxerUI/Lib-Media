@@ -2,16 +2,13 @@
 #include "codec/copy.h"
 #include <limits>
 
-#ifdef HUXERUI_MEDIA_GSTREAMER
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 #include <gst/audio/audio.h>
 #include <gst/video/video.h>
-#endif
 
 namespace huxerui::media::detail {
 namespace {
-#ifdef HUXERUI_MEDIA_GSTREAMER
 struct BufferMapping {
   GstBuffer* buffer;
   GstMapInfo info{};
@@ -250,18 +247,6 @@ private:
   std::optional<std::uint64_t> time_offset_;
   bool finished_ = false, eos_ = false;
 };
-#else
-class GstreamerDecoder final : public DecoderBackend {
-public:
-  CodecResult<void> Open(const DecoderConfig&) override {
-    return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Build with HUXERUI_MEDIA_GSTREAMER=ON to enable Linux codecs"));
-  }
-  CodecResult<SubmitStatus> Submit(const EncodedPacket&) override { return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::Unsupported, "GStreamer codecs are disabled")); }
-  CodecResult<std::optional<BackendOutput>> Poll() override { return CodecResult<std::optional<BackendOutput>>::Success(std::nullopt); }
-  CodecResult<SubmitStatus> Finish() override { return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::Unsupported, "GStreamer codecs are disabled")); }
-  CodecResult<void> Close() override { return CodecResult<void>::Success(); }
-};
-#endif
 } // namespace
 std::unique_ptr<DecoderBackend> MakeDecoderBackend() { return std::make_unique<GstreamerDecoder>(); }
 } // namespace huxerui::media::detail

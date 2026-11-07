@@ -16,7 +16,7 @@ It does not encode, demux MP4, load URLs/files, play PCM, or publish textures. A
 | macOS | AudioConverter for AAC and VideoToolbox with CoreMedia for H.264 | Headless AAC/AVC fixture tests on Apple Silicon and a full preview build |
 | iOS 15+ | AudioConverter for AAC and VideoToolbox with CoreMedia for H.264 | Simulator preview build and AAC/AVC fixture tests. Device decoding remains unvalidated. |
 | Windows | System synchronous Media Foundation AAC/H.264 transforms, COM/MF owned on the codec worker | Windows 11 installed-SDK builds and native AAC/AVC fixtures, including the longer synchronization fixtures with tight output pools |
-| Linux | Optional GStreamer appsrc/parser/installed decoder/converter/appsink pipeline | Implemented but not compiled or run on this host; treat as experimental until Linux validation |
+| Linux | GStreamer appsrc/parser/installed decoder/converter/appsink pipeline | Headless installed-SDK tests on Ubuntu 24.04 under WSL with GStreamer 1.24.2, including the longer AAC/AVC synchronization fixtures and appsrc backpressure |
 | Web | WebCodecs on the owning JS event loop | Full WASM build and real Chrome C++ decoder/bridge fixture tests; simulated late probe/copy/flush retirement tests |
 
 Availability depends on the requested configuration and installed native media components. `Probe(config, completion)`
@@ -34,8 +34,8 @@ one native 100 ns tick; that native truncation is normalized before restoring th
 Android rejects opaque/vendor CPU layouts it cannot interpret safely. Apple/Android/Web actual fixture tests do not
 validate every hardware model or supported profile/level. Hardware selection/classification is not exposed in this stage.
 
-Linux codecs are disabled by default. Enable `-DHUXERUI_MEDIA_GSTREAMER=ON` with GStreamer app/audio/video development
-packages 1.24+ and installed AAC/H.264 parser/decoder plugins. Dependencies are explicit; Lib-Media does not install
+Linux builds require GStreamer app/audio/video development packages 1.24+. Decoding uses installed AAC/H.264
+parser/decoder plugins. Dependencies are explicit; Lib-Media does not install
 packages or bundle FFmpeg. GTK remains a dependency of the existing playback target, but the codec adapter never
 initializes GTK or creates a display connection. The adapter checks appsrc item and byte capacity before each
 nonblocking push so the codec worker can continue draining appsink. GStreamer is not globally deinitialized on close.
@@ -176,7 +176,7 @@ checks CPU copies/counts/EOS, and releases the codecs. With Web tests enabled, b
 its generated `tests/codec_wasm.html` beside the JS/WASM/data files. That test invokes the C++ AudioDecoder and
 VideoDecoder APIs, decodes both fixtures, resets both sessions, and observes cleanup while retaining CPU output.
 The separate Node test injects late support, flush, and copy completions after retirement. Controlled worker shutdown
-still needs dedicated validation. iOS-device, Linux, hardware diversity, stress/RSS, and release-failure injection
+still needs dedicated validation. Physical iOS devices, Linux hardware/plugin diversity, stress/RSS, and release-failure injection
 in native platform APIs remain validation work; shared fake-backend failure tests do not replace those checks.
 
 A local Apple Silicon Release archive comparison against the pre-codec commit grew from approximately 0.54 MiB to

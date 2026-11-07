@@ -1,11 +1,11 @@
 # Codec and decoded-playback design
 
-The shared CPU media values, first AAC/AVC decoder milestone and Android/iOS/macOS/Windows/Web PCM playback are
+The shared CPU media values, first AAC/AVC decoder milestone and six-platform PCM playback are
 implemented. The [decoding guide](mediacodec.md) records decoder validation. The
 [PCM acceptance section](#first-implementation-and-acceptance) records playback validation and the remaining work.
 
 The current implementation uses concrete asynchronous Probe calls, without hardware selection/classification. Windows
-starts with synchronous system MFTs; Linux is an explicit optional GStreamer dependency. Video reserves a conservative
+starts with synchronous system MFTs; Linux requires GStreamer. Video reserves a conservative
 34-frame capacity and a 16-frame presentation window. Low-latency tuning, asynchronous MFT enumeration, hardware policy,
 and native optimizations remain later milestones. Runtime acceptance is recorded separately for each platform.
 
@@ -380,7 +380,7 @@ added. Discovery must not create an application-wide registry, and successful pr
 | Android | MediaCodec through NDK where its public API suffices; narrow JNI only for capabilities/formats unavailable through the NDK | AAC-LC/H.264, CPU plane layout/crop, EOS/reset, bounded in-flight work on real hardware |
 | iOS/macOS | AudioConverter for audio; VideoToolbox and CoreMedia for video | AAC configuration, PCM packing, AVC configuration, CVPixelBuffer planes, reordered/delayed output |
 | Windows | Media Foundation transforms | COM worker ownership, sync/async MFT differences, negotiation and stream changes |
-| Linux | Optional GStreamer codec pipeline with appsrc/appsink | Explicit dependencies and installed plugins; all library and pipeline queues bounded |
+| Linux | GStreamer codec pipeline with appsrc/appsink | Explicit dependencies and installed plugins; all library and pipeline queues bounded |
 | Web | WebCodecs adapter | Secure-context/worker availability, promise-based probes, event-loop cleanup, browser resource reclamation |
 
 ### Platform scope and execution
@@ -391,7 +391,7 @@ added. Discovery must not create an application-wide registry, and successful pr
 | iOS | AudioConverter/VideoToolbox workers and native callbacks; decoding alone does not install playback audio-session policy. | Real-device decoding in addition to simulator builds, interruptions/resource loss, and output lifetime |
 | macOS | Maintain the native adapter in the macOS platform sources and run headless desktop tests. | Intel/Apple Silicon support where tested, native format negotiation, resource release, and CPU output access |
 | Windows | Initialize COM and Media Foundation on controlled workers; adapt both synchronous and asynchronous transforms. | Installed media components, software/hardware transforms, stream changes, delayed output, and native resource lifetime |
-| Linux | Explicit optional GStreamer dependency; resolve installed codec elements without silently installing plugins or bundling a universal fallback. | Plugin discovery, missing-plugin errors, appsrc/appsink and internal queue bounds, and headless execution without GTK initialization |
+| Linux | Required GStreamer dependency; resolve installed codec elements without silently installing plugins or bundling a universal fallback. | Plugin discovery, missing-plugin errors, appsrc/appsink and internal queue bounds, and headless execution without GTK initialization |
 | Web | WebCodecs in a supported secure browser context, preferably a DedicatedWorker; no blocking waits on its owning event loop. | Promise-based configuration probes, callback ordering, queue limits, browser reclamation, reset/close races, and independent audio/video codec availability |
 
 The library's existing GTK playback dependency is not itself a codec implementation. Linux codec support needs its own
@@ -534,7 +534,7 @@ before completion. Application callbacks run outside session locks and may reque
 
 ### Six platform mappings
 
-Android, iOS, macOS, Windows, and Web implement the PCM contract. The Linux row describes a planned device path.
+Android, iOS, macOS, Windows, Linux, and Web implement the PCM contract. Linux builds require libpulse.
 
 | Platform | Clock and underrun | Drain | Pause, reset and cleanup |
 | --- | --- | --- | --- |
@@ -542,7 +542,7 @@ Android, iOS, macOS, Windows, and Web implement the PCM contract. The Linux row 
 | macOS | `AVAudioEngine` and `AVAudioPlayerNode` with bounded PCM buffers. Advance by the contiguous prefix of current-run `dataPlayedBack` completions. The empty queue enters Buffering when that prefix reaches the last media frame. | The last buffer's normal `dataPlayedBack` completion confirms the tail. Check engine and route validity before accounting for completions. | Pause and resume the player node. On reset or close, retire callbacks, stop the node and engine, and release buffers and observers on the worker. |
 | iOS | Advance through contiguous `dataPlayedBack` completions in its own engine/player-node adapter. Interruption, output loss, engine reconfiguration and media-service loss invalidate the run. | Confirm the final contiguous completed buffer while the run and route are valid. | Pause the node for ordinary suspension. Retire callbacks and remove observers before stopping and releasing the node and engine. The app configures and activates `AVAudioSession`. |
 | Windows | WASAPI shared render on the owning COM worker. Normalize `IAudioClock::GetPosition` using `GetFrequency`. Each run contains contiguous media; stop accepting input when its endpoint queue empties. Use padding for writes. | Require the device position to cover the final submitted media range before retiring a starved run. | `IAudioClient::Stop` and Start preserve pending PCM across pause. Session disconnection wakes the worker even while paused. Unregister notifications, Stop, Reset, release native interfaces, then release COM on retirement. |
-| Linux | An optional libpulse adapter uses the installed PulseAudio-compatible server. Map valid stream timing and latency to media ranges. Reconcile read/write indices across starvation and keep cork/refill under session control. | Combine a successful `pa_stream_drain` with timing that covers the final range at the output boundary. | Cork preserves pending audio. Flush discards it. Cancel outstanding operations, remove callbacks, disconnect and release owned stream and mainloop resources. |
+| Linux | libpulse on a per-session threaded mainloop. Explicit timing updates and `pa_stream_get_time` account for output latency without wall-clock interpolation. Positive prebuffering stops the read index at starvation; the run then stops accepting media. | Require native time to cover the final media range. A successful `pa_stream_drain` plus the final read index confirms any fractional sample lost to microsecond rounding. | Await uncork/trigger and cork acknowledgements. Cork preserves pending PCM. On retirement cancel operations, detach callbacks, disconnect/unref the stream and context, then stop/join and free the mainloop. |
 | Web | A bounded AudioWorklet queue reports which context frame ranges carried media. Intersect those reports with `AudioContext.getOutputTimestamp().contextTime` to advance the playhead through media only. Start or resume from a browser-allowed context. | Confirm drain when the output timestamp reaches the end of the final reported media range. | Suspend and resume the owned context. Retire the old node and port on reset. Close the context asynchronously, settle or safely detach pending work, and release the JS/WASM bridge on its owner. |
 
 Gate Android PCM availability on the AAudio library and entry points at runtime to preserve the library's API 23
@@ -554,7 +554,7 @@ run only after its media boundary is confirmed. A fresh run starts at the same m
 origin. Validate each timestamp against the run's start or resume time and the mapped sample ranges. Bound queued
 padding, total padding for one tail and the time spent awaiting a valid observation.
 
-Gate the Linux adapter on an explicit dependency and server availability. If a route loses the evidence needed
+Linux PCM output requires a PulseAudio-compatible server. If a route loses the evidence needed
 to establish progress or a normal drain, hold progress until an observation resumes or report a device error.
 Record the buffer and timing limits for each validated route.
 
@@ -626,6 +626,26 @@ endpoint reconfiguration and audio-service loss still require device acceptance.
 handle so completion follows TLS destruction. Windows serializes TLS destructors under its loader lock; the contract
 test verifies independent native release before deliberately blocking TLS teardown.
 
+The Linux adapter uses libpulse and is included in every Linux build. It uses
+interleaved S16 mono/stereo and the server's default sink without spawning a server. A stream starts corked and
+requests up to 100 ms of target latency, with its maximum buffer bounded by the session's media capacity. The server
+can round those requests. Positive prebuffering prevents starvation from advancing the native read index into a
+future write; an explicit trigger also starts short sealed input. Each underrun seals the native run. Once its media
+tail is confirmed, the shared worker retires the stream and opens a new run for refill at the same media position.
+If starvation stops the read index before output latency clears, bounded S16 silence keeps native timing observable.
+Padding is limited to 500 ms per run and stops when the media tail is confirmed. It never extends the media timeline.
+Only native timing with valid read/write indices advances the playhead. Five seconds without confirming outstanding
+PCM fails the run. Connection failure, stream termination or a moved route wakes the worker and invalidates the run,
+including while paused; the stream disallows automatic movement. Reset and Close release owned resources on the worker.
+
+Installed-SDK Release tests passed on Ubuntu 24.04 under WSL with GStreamer 1.24.2, libpulse 16.1, and WSLg's PulseAudio
+server. They cover 48 kHz stereo and 44.1 kHz mono cork/resume, native presentation, short tails, underrun retirement,
+missing-server Unsupported and cleanup, generated PCM, AAC-to-PCM, reset, video-only and A/V scheduling, and texture
+publication. AAC playback reached exactly 12,288 ticks at 48 kHz from all 13 access units with negative initial PTS.
+The longer synchronization fixtures also passed native decoder tests, and the full Linux Frames preview builds.
+Physical output-route loss, PipeWire's PulseAudio implementation and measured display/audio synchronization remain
+device acceptance work; WSLg timing is not a physical Linux hardware measurement.
+
 The Web adapter uses the shared PCM queue and transport state machine on the browser window event loop. An
 AudioWorklet consumes copied interleaved S16 input from a fixed-capacity ring. The worklet reports media ranges in
 AudioContext frames. The bridge intersects those ranges with `getOutputTimestamp().contextTime`, converted to the
@@ -644,7 +664,7 @@ render-to-output mapping, including a silence gap and a late callback after reti
 
 ### Video scheduling
 
-The Frames preview on Android, iOS, macOS, Windows, and Web enables video in `DecodedPlayback::Create()` with the same four-second AVC track
+The Frames preview on Android, iOS, macOS, Windows, Linux, and Web enables video in `DecodedPlayback::Create()` with the same four-second AVC track
 for both modes. Video-only playback starts its monotonic clock at the first queued video PTS. The native codec
 test checks the original 24-frame H.264 fixture's exact presentation timestamps and durations.
 
@@ -688,9 +708,9 @@ Consumers use the public installed package; no SDK source checkout is required.
 The installed Android texture API exposes BitmapTexture and a GL_TEXTURE_2D copy path. Apple exposes retained
 PixelBufferTexture and Metal copies; Windows/Linux expose pixel/native texture paths. These are actual public contracts,
 not a generic promise that every codec output can be imported without conversion. The first CPU decoder milestone needs
-no new SDK interface. The Android, iOS, macOS, Windows, and Web previews convert SDR NV12 and I420 to RGB on the CPU. Android
-uses the public GL texture path. iOS and macOS each publish to their platform's pixel buffer texture. Windows publishes
-copied RGBA rows through `windows::PixelTexture`. Web creates
+no new SDK interface. All six previews convert SDR NV12 and I420 to RGB on the CPU. Android
+uses the public GL texture path. iOS and macOS each publish to their platform's pixel buffer texture. Windows and Linux
+publish copied RGBA rows through their platform's `PixelTexture`. Web creates
 a browser RGBA VideoFrame from the visible pixels and publishes it through the SDK's VideoFrameTexture. The texture
 retains its own clone, and the uploader closes the original after publication. The AVC fixture preview uses
 BT.601 and limited range when color metadata is unavailable and reports the fallback.

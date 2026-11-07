@@ -51,6 +51,9 @@ huxerui_add_app(example_media
 )
 
 huxerui_configure_project_app(example_media)
+if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
+    set_target_properties(example_media PROPERTIES CXX_EXTENSIONS OFF)
+endif ()
 
 huxerui_use_library(example_media
         TARGET HuxerUI::Media
@@ -58,7 +61,7 @@ huxerui_use_library(example_media
 )
 
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
-    if (ANDROID OR APPLE OR EMSCRIPTEN OR WIN32)
+    if (ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
         set(PREVIEW_FIXTURE_ROOT "${CMAKE_CURRENT_BINARY_DIR}/sync-fixture")
         set(CODEC_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fixtures/codec")
         file(GLOB PREVIEW_FIXTURE_FILES CONFIGURE_DEPENDS
