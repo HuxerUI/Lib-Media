@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lib-Media C++ WASM codec capability queries</title>
+<pre>Running codec capability queries…</pre>
+<script type="module">
+import create from './media_codec_capabilities_tests.js';
+try {
+  const output = document.querySelector('pre');
+  const module = await create({noInitialRun: true,
+    print: text => { output.textContent += '\n' + text; },
+    printErr: text => { output.textContent += '\n' + text; }});
+  module.callMain();
+} catch (error) { document.body.textContent = 'FAIL: ' + error.message; }
+</script>

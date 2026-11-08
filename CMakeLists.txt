@@ -110,11 +110,13 @@ if (EMSCRIPTEN)
             "${CMAKE_CURRENT_SOURCE_DIR}/platform/web/media.js"
             "${CMAKE_CURRENT_SOURCE_DIR}/platform/web/media_codec_decoder.js"
             "${CMAKE_CURRENT_SOURCE_DIR}/platform/web/media_codec_encoder.js"
+            "${CMAKE_CURRENT_SOURCE_DIR}/platform/web/media_codec_capabilities.js"
             "${CMAKE_CURRENT_SOURCE_DIR}/platform/web/playback.js")
     target_link_options(huxerui_media INTERFACE
             "SHELL:--pre-js \"${CMAKE_CURRENT_SOURCE_DIR}/platform/web/media.js\""
             "SHELL:--pre-js \"${CMAKE_CURRENT_SOURCE_DIR}/platform/web/media_codec_decoder.js\""
             "SHELL:--pre-js \"${CMAKE_CURRENT_SOURCE_DIR}/platform/web/media_codec_encoder.js\""
+            "SHELL:--pre-js \"${CMAKE_CURRENT_SOURCE_DIR}/platform/web/media_codec_capabilities.js\""
             "SHELL:--pre-js \"${CMAKE_CURRENT_SOURCE_DIR}/platform/web/playback.js\""
             "--bind"
     )

@@ -138,7 +138,7 @@ struct VideoDecoderConfig {
   std::function<void(CodecResult<void>)> cleanup_completed;
 };
 
-/// @brief H.264 profiles supported by the CPU video encoder.
+/// @brief H.264 profiles described by the CPU video codec APIs.
 enum class H264Profile {
   /// Baseline or Constrained Baseline, without B pictures.
   Baseline,
@@ -146,6 +146,186 @@ enum class H264Profile {
   Main,
   /// Eight-bit 4:2:0 High profile with optional B pictures.
   High
+};
+
+/// @brief Knowledge about an individual codec capability at query time.
+///
+/// Supported means the option is admitted by the adapter or advertised by a matching platform component for
+/// at least one configuration. It does not imply that independently listed options can be combined arbitrarily.
+/// Unknown must not be treated as Unsupported. Probe the complete configuration before creating a session.
+enum class CodecSupport {
+  /// The platform did not expose enough information to decide.
+  Unknown,
+  /// The library rejects the option or a required platform facility is definitely unavailable.
+  Unsupported,
+  /// The option is admitted or advertised, subject to configuration and resource checks.
+  Supported
+};
+
+/// @brief One library-supported candidate value and the knowledge available about its platform support.
+/// @tparam T Audio/video representation, sample rate, channel layout, or H.264 profile value.
+template<class T> struct CodecCapability {
+  /// Candidate value. Query results include the library's candidates even when platform information is unknown.
+  T value{};
+  /// Individual support information; it is not a promise about combinations with other candidates.
+  CodecSupport support = CodecSupport::Unknown;
+};
+
+/// @brief Inclusive unsigned bounds and a reported increment for a codec property.
+///
+/// Values are bounding information rather than a complete list of valid configurations. A valid value is within
+/// [minimum, maximum] and follows minimum + n * step, but other codec constraints can still reject it.
+struct CodecUIntRange {
+  /// Smallest reported value.
+  std::uint32_t minimum = 0;
+  /// Largest reported value, at least minimum.
+  std::uint32_t maximum = 0;
+  /// Positive reported increment. One means no narrower increment is known.
+  std::uint32_t step = 1;
+};
+
+/// @brief Audio property bounds reported by library validation or a platform component.
+///
+/// An empty field means unknown or unreported. In particular, zero is never substituted for an unknown maximum.
+/// Sample-rate bounds do not replace the discrete sample_rates candidates or the AAC initialization contract.
+struct CodecAudioLimits {
+  /// Sample-rate bounds in samples per second per channel, when known.
+  std::optional<CodecUIntRange> sample_rate;
+  /// Channel-count bounds, when known. The library currently admits mono and stereo only.
+  std::optional<CodecUIntRange> channels;
+  /// Average bitrate bounds in bits per second, when known.
+  std::optional<CodecUIntRange> bitrate;
+};
+
+/// @brief Video property bounds reported by library validation or a platform component.
+///
+/// Bounds can depend on profile, dimensions, frame rate, and other settings. They do not describe a Cartesian
+/// product of supported configurations. An empty field is unknown; use Probe() to validate a selected combination.
+struct CodecVideoLimits {
+  /// Coded luma width bounds, when known.
+  std::optional<CodecUIntRange> width;
+  /// Coded luma height bounds, when known.
+  std::optional<CodecUIntRange> height;
+  /// Required width multiple, independently of the reported width interval, when known.
+  std::optional<std::uint32_t> width_alignment;
+  /// Required height multiple, independently of the reported height interval, when known.
+  std::optional<std::uint32_t> height_alignment;
+  /// Maximum reported frames per second, when known; positive input frame rates remain required for encoding.
+  std::optional<double> maximum_frame_rate;
+  /// Average bitrate bounds in bits per second, when known.
+  std::optional<CodecUIntRange> bitrate;
+};
+
+/// @brief Discovery snapshot for the current AAC-LC decoder adapter.
+///
+/// Availability describes discovery of a suitable component, not successful decoding or a resource reservation.
+/// Library limits and platform limits are separate: an absent platform bound must not be replaced by a library
+/// maximum and presented as a device limit. These snapshots own their values and can be retained independently.
+/// @see AudioDecoder::QueryCapabilities(), AudioDecoder::Probe(), CodecSupport
+struct AudioDecoderCapabilities {
+  /// Whether the adapter discovered a suitable component. Unknown allows a later concrete Probe().
+  CodecSupport availability = CodecSupport::Unknown;
+  /// Whether the current adapter can use hardware acceleration for some configuration, when reliably known.
+  /// This does not identify the implementation selected by a later Create().
+  CodecSupport hardware_acceleration = CodecSupport::Unknown;
+  /// Optional diagnostic explaining unavailable or incomplete discovery; not a stable machine-readable code.
+  std::string diagnostic;
+  /// Candidate PCM sample representations at the library output boundary.
+  std::vector<CodecCapability<AudioSampleFormat>> sample_formats;
+  /// Candidate PCM packing modes at the library output boundary.
+  std::vector<CodecCapability<AudioPacking>> packings;
+  /// Candidate channel layouts; decoding preserves the stream's channel layout.
+  std::vector<CodecCapability<AudioChannelLayout>> channel_layouts;
+  /// Candidate AAC sample rates; decoding preserves the stream's rate.
+  std::vector<CodecCapability<std::uint32_t>> sample_rates;
+  /// Fixed bounds imposed by this library.
+  CodecAudioLimits library_limits;
+  /// Bounds actually reported by the platform for matching components, where available.
+  CodecAudioLimits platform_limits;
+};
+
+/// @brief Discovery snapshot for the current AAC-LC encoder adapter.
+///
+/// Support has the evidence and combination semantics of AudioDecoderCapabilities. Query success can report
+/// Unsupported availability; a failed result instead means the discovery operation itself failed.
+/// @see AudioEncoder::QueryCapabilities(), AudioEncoder::Probe(), CodecSupport
+struct AudioEncoderCapabilities {
+  /// Discovery of a suitable AAC-LC encoder component.
+  CodecSupport availability = CodecSupport::Unknown;
+  /// Hardware acceleration availability, when reliably known; not a later session's implementation identity.
+  CodecSupport hardware_acceleration = CodecSupport::Unknown;
+  /// Optional diagnostic about unavailable or incomplete discovery.
+  std::string diagnostic;
+  /// Candidate input sample representations.
+  std::vector<CodecCapability<AudioSampleFormat>> sample_formats;
+  /// Candidate input packing modes.
+  std::vector<CodecCapability<AudioPacking>> packings;
+  /// Candidate input channel layouts.
+  std::vector<CodecCapability<AudioChannelLayout>> channel_layouts;
+  /// Candidate input sample rates.
+  std::vector<CodecCapability<std::uint32_t>> sample_rates;
+  /// Fixed bounds imposed by this library.
+  CodecAudioLimits library_limits;
+  /// Bounds actually reported by the platform, where available.
+  CodecAudioLimits platform_limits;
+};
+
+/// @brief Discovery snapshot for the current progressive eight-bit 4:2:0 H.264 decoder adapter.
+/// @see VideoDecoder::QueryCapabilities(), VideoDecoder::Probe(), AudioDecoderCapabilities
+struct VideoDecoderCapabilities {
+  /// Discovery of a suitable H.264 decoder component.
+  CodecSupport availability = CodecSupport::Unknown;
+  /// Hardware acceleration availability, when reliably known; not a later session's implementation identity.
+  CodecSupport hardware_acceleration = CodecSupport::Unknown;
+  /// Optional diagnostic about unavailable or incomplete discovery.
+  std::string diagnostic;
+  /// Candidate CPU output layouts. Actual output negotiation remains part of decoding.
+  std::vector<CodecCapability<VideoPixelFormat>> pixel_formats;
+  /// Candidate stream profiles, subject to coded bounds and valid initialization data.
+  std::vector<CodecCapability<H264Profile>> profiles;
+  /// Fixed coded-picture bounds imposed by this library.
+  CodecVideoLimits library_limits;
+  /// Bounds actually reported by the platform, where available.
+  CodecVideoLimits platform_limits;
+};
+
+/// @brief H.264 encoder profile and independently described B-picture control policies.
+///
+/// A supported policy does not require the encoder to produce B pictures. Profile and all selected controls must
+/// still pass a concrete Probe(). The library's maximum numeric B bound is 16; platform limits can be smaller.
+struct H264EncoderProfileCapabilities {
+  /// Requested stream profile.
+  H264Profile profile = H264Profile::Baseline;
+  /// Knowledge about the profile independently of a particular size/rate/control combination.
+  CodecSupport support = CodecSupport::Unknown;
+  /// Ability to request max_b_frames = 0 for this profile.
+  CodecSupport no_b_frames = CodecSupport::Unknown;
+  /// Ability to request max_b_frames = std::nullopt for this profile.
+  CodecSupport automatic_b_frames = CodecSupport::Unknown;
+  /// Ability to request a positive numeric consecutive B-picture upper bound for this profile.
+  CodecSupport bounded_b_frames = CodecSupport::Unknown;
+  /// Known ceiling usable by this adapter, including its policy limits. Zero means no positive bound is usable.
+  /// An empty value means the ceiling is unknown, independently of bounded_b_frames.
+  std::optional<std::uint32_t> maximum_b_frames;
+};
+
+/// @brief Discovery snapshot for the current CPU H.264 encoder adapter.
+/// @see VideoEncoder::QueryCapabilities(), VideoEncoder::Probe(), AudioDecoderCapabilities
+struct VideoEncoderCapabilities {
+  /// Discovery of a suitable H.264 encoder component.
+  CodecSupport availability = CodecSupport::Unknown;
+  /// Hardware acceleration availability, when reliably known; not a later session's implementation identity.
+  CodecSupport hardware_acceleration = CodecSupport::Unknown;
+  /// Optional diagnostic about unavailable or incomplete discovery.
+  std::string diagnostic;
+  /// Candidate CPU input layouts. Layout conversion does not change the configured color values.
+  std::vector<CodecCapability<VideoPixelFormat>> pixel_formats;
+  /// Candidate profiles and their separate B-picture policies.
+  std::vector<H264EncoderProfileCapabilities> profiles;
+  /// Fixed input-picture, rate, and bitrate bounds imposed by this library.
+  CodecVideoLimits library_limits;
+  /// Bounds actually reported by the platform, where available.
+  CodecVideoLimits platform_limits;
 };
 
 /// @brief Fixed configuration for encoding CPU I420 or NV12 frames to H.264 access units.
@@ -355,6 +535,17 @@ public:
   /// It must return promptly without throwing or waiting for decoder work.
   static void Probe(const AudioDecoderConfig& config, std::function<void(CodecResult<void>)> completion);
 
+  /// @brief Asynchronously discovers the current adapter's AAC-LC decoding capabilities without decoding input.
+  /// @param completion Optional callback invoked once with an owned snapshot or a query error. It runs after the
+  /// independent native worker exits, or asynchronously on the creating Web event loop. Return promptly without
+  /// throwing or waiting. No Runtime, window, Install(), or live decoder is required.
+  /// A successful query may report Unsupported or Unknown availability. Unknown fields remain unknown; supported
+  /// options and bounds do not guarantee a combined configuration or reserve resources for Create().
+  /// @throws std::bad_alloc If query-state allocation fails before scheduling; no callback is scheduled.
+  /// @throws std::system_error If a native worker cannot start; no callback is scheduled.
+  /// @see AudioDecoderCapabilities, Probe(), CodecSupport
+  static void QueryCapabilities(std::function<void(CodecResult<AudioDecoderCapabilities>)> completion);
+
   /// @brief Transfers ownership of the session and its callbacks. The source handle then behaves as closed.
   AudioDecoder(AudioDecoder&&) noexcept;
   /// @brief Retires the destination's previous session and takes ownership of the source session.
@@ -453,6 +644,12 @@ public:
   /// @see AudioDecoder::Probe()
   static void Probe(const VideoDecoderConfig& config, std::function<void(CodecResult<void>)> completion);
 
+  /// @brief Asynchronously discovers the current adapter's H.264 decoding capabilities without decoding input.
+  /// @param completion Optional owned-snapshot or query-error callback with the execution, lifetime, and exception
+  /// contract of AudioDecoder::QueryCapabilities(). Input still requires valid avcC and complete access units.
+  /// @see VideoDecoderCapabilities, Probe(), AudioDecoder::QueryCapabilities()
+  static void QueryCapabilities(std::function<void(CodecResult<VideoDecoderCapabilities>)> completion);
+
   /// @brief Transfers ownership of the session and its callbacks. The source handle then behaves as closed.
   VideoDecoder(VideoDecoder&&) noexcept;
   /// @brief Retires the destination's previous session and takes ownership of the source session.
@@ -544,6 +741,12 @@ public:
   /// It must return promptly without throwing or waiting for encoder work.
   /// @see Create(), AudioEncoderConfig
   static void Probe(const AudioEncoderConfig& config, std::function<void(CodecResult<void>)> completion);
+
+  /// @brief Asynchronously discovers the current adapter's AAC-LC encoding capabilities without encoding input.
+  /// @param completion Optional owned-snapshot or query-error callback with the execution, lifetime, and exception
+  /// contract of AudioDecoder::QueryCapabilities(). Probe the selected format and bitrate together before Create().
+  /// @see AudioEncoderCapabilities, Probe(), AudioDecoder::QueryCapabilities()
+  static void QueryCapabilities(std::function<void(CodecResult<AudioEncoderCapabilities>)> completion);
 
   /// @brief Transfers ownership of the session and its callbacks. The source handle then behaves as closed.
   AudioEncoder(AudioEncoder&&) noexcept;
@@ -656,6 +859,12 @@ public:
   /// It must return promptly without throwing or waiting for encoder work.
   /// @see Create(), VideoEncoderConfig
   static void Probe(const VideoEncoderConfig& config, std::function<void(CodecResult<void>)> completion);
+
+  /// @brief Asynchronously discovers the current adapter's CPU H.264 encoding capabilities without encoding input.
+  /// @param completion Optional owned-snapshot or query-error callback with the execution, lifetime, and exception
+  /// contract of AudioDecoder::QueryCapabilities(). Probe profile, B policy, input geometry, rate, and bitrate together.
+  /// @see VideoEncoderCapabilities, Probe(), AudioDecoder::QueryCapabilities()
+  static void QueryCapabilities(std::function<void(CodecResult<VideoEncoderCapabilities>)> completion);
 
   /// @brief Transfers ownership of the session and its callbacks. The source handle then behaves as closed.
   VideoEncoder(VideoEncoder&&) noexcept;

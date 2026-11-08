@@ -18,16 +18,70 @@ implementations use separate translation units, so decoder consumers do not acqu
 | --- | --- |
 | [`src/codec/media_codec_decoder.cpp`](../src/codec/media_codec_decoder.cpp) | Public `AudioDecoder` and `VideoDecoder` handles and probes |
 | [`src/codec/media_codec_encoder.cpp`](../src/codec/media_codec_encoder.cpp) | Public `AudioEncoder` and `VideoEncoder` handles and probes |
+| [`src/codec/media_codec_capabilities.cpp`](../src/codec/media_codec_capabilities.cpp), [`capabilities.h/.cpp`](../src/codec/capabilities.h) | Four typed public queries, initial library constraints, and one-shot discovery scheduling |
 | [`src/codec/common.h`](../src/codec/common.h), [`common.cpp`](../src/codec/common.cpp) | Shared codec errors, owned byte storage, and AAC/AVC initialization parsing |
 | [`src/execution/executor.h`](../src/execution/executor.h), [`executor.cpp`](../src/execution/executor.cpp) | Workers and event-loop scheduling shared by codec and decoded playback sessions |
 | [`src/codec/decoder/`](../src/codec/decoder) | Decoder `backend.h`, paired `format.h/.cpp`, `copy.h/.cpp`, and `session.h/.cpp` |
 | [`src/codec/encoder/`](../src/codec/encoder) | Audio/video encoder `backend.h`, paired `format.h/.cpp` and `session.h/.cpp` |
-| [`platform/`](../platform) | `media_codec_decoder_<platform>.cpp/.mm` and `media_codec_encoder_<platform>.cpp/.mm` implement the selected platform backend contracts |
-| [`platform/web/`](../platform/web) | `media_codec_decoder.js` and `media_codec_encoder.js` implement the corresponding browser bridges |
+| [`platform/`](../platform) | `media_codec_decoder_<platform>.cpp/.mm`, `media_codec_encoder_<platform>.cpp/.mm`, and `media_codec_capabilities_<platform>.cpp/.mm` implement the selected backend contracts |
+| [`platform/web/`](../platform/web) | `media_codec_decoder.js`, `media_codec_encoder.js`, and `media_codec_capabilities.js` implement the corresponding browser bridges |
 
 Backend headers declare platform interfaces; the selected platform source defines their factories. Format validation
 and frame-copy declarations have matching implementation files. Encoder code depends on common initialization utilities rather
 than decoder internals. iOS and macOS keep independent platform implementations.
+
+## Capability queries
+
+`AudioDecoder`, `VideoDecoder`, `AudioEncoder`, and `VideoEncoder` each provide a static asynchronous
+`QueryCapabilities(completion)` and a corresponding typed snapshot. Discovery covers the current AAC-LC/H.264
+adapter, without an application-wide codec registry, backend-selection policy, or active session.
+
+```cpp
+VideoEncoder::QueryCapabilities([](CodecResult<VideoEncoderCapabilities> result) {
+  if (!result.Succeeded()) {
+    ReportError(result.Error());
+    return;
+  }
+  const auto capabilities = std::move(result).Value();
+  PrepareVideoEncoderChoices(capabilities);
+});
+```
+
+`ReportError` and `PrepareVideoEncoderChoices` are application functions. Native completion runs after the query's
+worker, temporary platform objects, and thread-local cleanup have finished. Web completion is asynchronous on the
+creating event loop. Neither path needs a window, Runtime, or `Install()`; applications marshal UI updates themselves
+and keep callback captures alive. No session callback, wakeup, or output queue is involved.
+
+- `Supported` means the adapter admits an option, a matching component advertises it, or a reference configuration
+  establishes positive evidence. Independent fields do not guarantee that their complete combination will work.
+- `Unsupported` means the adapter rejects the option or the required platform facility is definitely absent.
+  A successfully returned snapshot can report unavailable codecs; discovery errors use a failed `CodecResult`.
+- `Unknown` means discovery cannot decide. It does not disable a later concrete `Probe()`.
+- `library_limits` contains fixed validation/adapter constraints. `platform_limits` contains only reported platform
+  bounds. Empty optionals stay unknown; no library maximum is presented as a device maximum. Intervals are bounds,
+  may contain holes, and can depend on other settings; discrete candidates and complete probes remain necessary.
+- `hardware_acceleration` reports whether this adapter can use hardware for some configuration when reliably known.
+  It does not identify the implementation a future `Create()` will select. No hardware preference API is added.
+- Video encoder profiles expose `no_b_frames`, `automatic_b_frames`, and `bounded_b_frames` separately.
+  `maximum_b_frames = 0` means no positive numeric bound is usable; an empty value means the ceiling is unknown.
+  A supported automatic policy neither requires B pictures nor implies numeric control.
+
+Query to prepare choices, call `Probe(config, completion)` with the selected combination, then `Create(config)`.
+Neither discovery nor Probe reserves resources. Stream validity and decode-time CPU output negotiation are still
+checked during processing. Snapshots own their candidate vectors and can outlive the query independently.
+
+| Platform | Discovery evidence and limits |
+| --- | --- |
+| Windows | The same synchronous system MFT CLSIDs used by sessions; advertised media types, ICodecAPI values/defaults and parameter ranges. Missing metadata remains unknown; no third-party or asynchronous MFT enumeration. |
+| Linux | Required installed pipeline elements, the decoder selected by the existing factory-rank/filter rule, or the exact avenc_aac/x264enc encoder; static pad caps and property ranges. No GTK initialization or plugin installation. |
+| Android | The component chosen by NDK MediaCodec; API 36 metadata is loaded dynamically when available. Older systems retain unknown detailed limits; the library minimum remains API 23 and video encoding still requires API 28. No Activity or JNI requirement. |
+| iOS | AudioToolbox format lists/encode ranges, VideoToolbox encoder discovery, hardware decoder discovery, and positive encoder profile/control checks using small reference sessions. Software-only decoder availability and unreported limits remain unknown. |
+| macOS | An independent platform implementation using AudioToolbox/VideoToolbox discovery with the same conservative evidence rules. |
+| Web | Four AAC or three H.264 reference configuration checks on the owning event loop. Failed/rejected reference checks remain unknown; missing required APIs are unsupported. Global numeric limits and hardware use are unknown. |
+
+Apple/Web reference-session or configuration dimensions are not published as platform size limits. Apple cannot
+enforce positive numeric B bounds, and Web cannot enforce numeric Main/High B bounds; discovery reflects those
+existing adapter restrictions. Platform compilation and runtime validation are recorded separately below.
 
 ## Decoder platform status
 
@@ -53,7 +107,8 @@ the system AAC transform requests 48 KiB even for mono/stereo AAC-LC. Normalized
 single-frame reservation. AAC output must contain exactly 1024 samples and match the next accepted timestamp within
 one 100 ns Media Foundation tick; that Media Foundation truncation is normalized before restoring the original exact packet timestamp.
 Android rejects opaque/vendor CPU layouts it cannot interpret safely. Apple/Android/Web actual fixture tests do not
-validate every hardware model or supported profile/level. Hardware selection/classification is not exposed in this stage.
+validate every hardware model or supported profile/level. Discovery reports hardware facts only where reliably known;
+session implementation identity and hardware selection remain unexposed.
 
 Linux builds require GStreamer app/audio/video development packages 1.24+. Decoding uses installed AAC/H.264
 parser/decoder plugins. Dependencies are explicit; Lib-Media does not install
@@ -339,3 +394,12 @@ For Web, build `media_video_encoder_web_native` and serve its generated `tests/v
 the JS/WASM files over localhost. The C++ test exercises all available requested profiles and decoder round trips.
 Node tests separately cover bounded progress flushes, late callbacks/promises, unsupported controls and malformed
 output. Android compilation and static Apple review do not replace device runs; those encoder validations remain pending.
+
+Capability discovery adds `media_codec_capabilities`, `media_codec_capabilities_contract` on native targets, and
+`media_codec_capabilities_web_contract` when Node is available. The public API test queries all four codecs without
+Runtime or Install. Shared tests cover unknown versus unavailable evidence, independent workers, capture cleanup,
+post-TLS completion, and discovery failures. Node checks bounded reference queries, unchanged configuration evidence,
+and promise retirement. Run the subset with `ctest --test-dir <build> -R media_codec_capabilities --output-on-failure`.
+For a browser, build `media_codec_capabilities_tests` and serve the generated `tests/codec_capabilities_wasm.html`.
+Windows/Linux native queries and Android/Web compilation are validated. Apple capability compilation and device
+validation remain pending; prior codec-session validation does not validate the new discovery adapter.

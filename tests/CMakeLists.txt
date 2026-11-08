@@ -81,7 +81,30 @@ target_include_directories(media_codec_contract_tests PRIVATE "${PROJECT_SOURCE_
 add_test(NAME media_codec_contract COMMAND media_codec_contract_tests)
 set_tests_properties(media_codec_contract PROPERTIES TIMEOUT 30)
 
+add_executable(media_codec_capabilities_tests codec_capabilities.cpp)
+target_link_libraries(media_codec_capabilities_tests PRIVATE huxerui_media ${MEDIA_TEST_FRAMEWORK})
+target_compile_features(media_codec_capabilities_tests PRIVATE cxx_std_20)
+if (EMSCRIPTEN)
+    target_link_options(media_codec_capabilities_tests PRIVATE "-sASYNCIFY=1" "-sASSERTIONS=1"
+            "-sALLOW_MEMORY_GROWTH=1" "-sEXPORTED_FUNCTIONS=['_main']"
+            "-sEXPORTED_RUNTIME_METHODS=['callMain']")
+    set_target_properties(media_codec_capabilities_tests PROPERTIES SUFFIX ".js")
+    configure_file(codec_capabilities_wasm.html "${CMAKE_CURRENT_BINARY_DIR}/codec_capabilities_wasm.html" COPYONLY)
+else ()
+    add_test(NAME media_codec_capabilities COMMAND media_codec_capabilities_tests)
+    set_tests_properties(media_codec_capabilities PROPERTIES TIMEOUT 35)
+
+    add_executable(media_codec_capabilities_contract_tests codec_capabilities_contract.cpp)
+    target_link_libraries(media_codec_capabilities_contract_tests PRIVATE huxerui_media ${MEDIA_TEST_FRAMEWORK})
+    target_compile_features(media_codec_capabilities_contract_tests PRIVATE cxx_std_20)
+    target_include_directories(media_codec_capabilities_contract_tests PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    add_test(NAME media_codec_capabilities_contract COMMAND media_codec_capabilities_contract_tests)
+    set_tests_properties(media_codec_capabilities_contract PROPERTIES TIMEOUT 25)
+endif ()
+
 if (MEDIA_NODE_EXECUTABLE)
+    add_test(NAME media_codec_capabilities_web_contract
+            COMMAND "${MEDIA_NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/codec_capabilities_web_contract.cjs")
     add_test(NAME media_video_encoder_web_contract
             COMMAND "${MEDIA_NODE_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/video_encoder_web_contract.cjs")
     add_test(NAME media_audio_encoder_web_contract

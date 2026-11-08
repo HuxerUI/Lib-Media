@@ -4,7 +4,9 @@ The shared CPU media values, AAC/AVC decoders, AAC-LC/H.264 encoders, and six-pl
 implemented. The [codec guide](mediacodec.md) records platform validation and the encoder limitations. The
 [PCM acceptance section](#first-implementation-and-acceptance) records playback validation and the remaining work.
 
-The current implementation uses concrete asynchronous Probe calls, without hardware selection/classification. Windows
+The current implementation provides typed asynchronous capability snapshots and concrete asynchronous Probe calls.
+Discovery distinguishes supported, unsupported, and unknown facts, with separate library/platform bounds and independent
+H.264 B-picture policies. It reports hardware availability only when reliably knowable, without hardware selection. Windows
 starts with synchronous system MFTs; Linux requires GStreamer. Video decoding reserves a conservative
 34-frame capacity and a 16-frame presentation window. Low-latency tuning, asynchronous MFT enumeration, hardware policy,
 and platform optimizations remain later milestones. Runtime acceptance is recorded separately for each platform.
@@ -370,10 +372,17 @@ rules. Neither platform group permits blocking the control lane while awaiting r
 
 ## Capabilities and platform adapters
 
-Probe a concrete operation/configuration, not just a codec name. The response includes supported packet layout,
-profiles/limits, actual raw output formats, and hardware/software classification when knowable. Hardware-only selection
-must fail if unavailable; default selection may use a system-provided software codec. No bundled FFmpeg fallback is
-added. Discovery must not create an application-wide registry, and successful probing does not guarantee later creation.
+Use `QueryCapabilities()` on each codec class to prepare candidates, `Probe()` for the complete chosen configuration,
+and `Create()` to allocate a session. The implemented snapshots cover AAC-LC and H.264 through the currently selected
+adapters. Library constraints and platform-reported bounds are separate; absent bounds and incomplete evidence remain
+unknown. Profile support, no-B control, automatic B policy, and positive numeric B bounds are independent facts.
+No Cartesian combination guarantee, application-wide registry, alternate-backend policy, or bundled fallback is added.
+Queries own their native worker or Web promise observation lifetime independently of existing sessions. See the
+[query contract and platform evidence](mediacodec.md#capability-queries) for the implemented scope.
+
+Hardware availability is reported only from reliable platform evidence and is not the identity of a later session.
+Hardware-only selection remains a future extension; if introduced, it must fail when unavailable. A successful
+discovery snapshot or concrete probe does not reserve resources or guarantee later creation.
 
 | Platform | Proposed codec implementation | Validation gate |
 | --- | --- | --- |
@@ -400,8 +409,10 @@ or open a display, even if the complete library's build also includes its existi
 GStreamer version is selected after checking the queue-control APIs used by the implementation.
 
 Web support is probed per operation and configuration; the presence of VideoDecoder does not establish AudioDecoder or
-encoder support, and AAC/AVC availability is not guaranteed across browsers. Capability failure and missing APIs are
-explicit Unsupported results. There is no hidden WASM codec download. Platform hardware/software classification is only
+encoder support, and AAC/AVC availability is not guaranteed across browsers. Missing required APIs are explicitly
+unsupported. Failed reference configurations do not establish global codec/profile absence and remain unknown in
+discovery; complete configuration probes retain their existing error contract. There is no hidden WASM codec download.
+Platform hardware/software classification is only
 reported when a platform can establish it; preference hints are not proof that hardware was selected.
 
 All six targets implement the same logical Close barrier and separate cleanup_completed result described above.

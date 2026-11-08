@@ -33,6 +33,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; Apple encoder validation remains pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; Apple build/device validation remains pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
+| Codec capability discovery | Typed AAC-LC/H.264 snapshots for the current adapter; unreported platform facts remain unknown | `QueryCapabilities()` on the four codec classes in [`media_codec.h`](include/huxerui/media_codec.h) |
 
 Platform selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
 SDK `FileReference` values, which can be retained for reading, imported to local files, or passed to `MediaSource` for
@@ -296,7 +297,8 @@ See the [media library guide](docs/medialibrary.md) and [`media_library.h`](incl
 or demuxer: raw AAC-LC with AudioSpecificConfig produces mono/stereo S16 or F32 PCM, and length-prefixed H.264 with
 `avcC` produces I420 or NV12 video. Returned frames own immutable CPU storage and remain readable after reset and close.
 
-- `Probe(config, completion)` checks a configuration by opening and releasing a temporary decoder.
+- `QueryCapabilities(completion)` discovers candidates and known limits; see [capability queries](docs/mediacodec.md#capability-queries).
+  `Probe(config, completion)` checks a complete configuration by opening and releasing a temporary decoder.
   `Create()` starts a session asynchronously.
 - `TrySubmit()` copies an accepted packet. On `WouldBlock`, keep the packet and retry when the session can accept input.
 - `TryRead()` returns a format, frame, or `EndOfStream` event on success. An empty optional means no output is ready yet.
@@ -332,6 +334,12 @@ Linux H.264 encoding requires the installed `x264enc` and `h264parse` plugins. A
 Main/High numeric B-picture bounds require API 29+. Apple supports zero or automatic B pictures and has independent
 iOS/macOS implementations. See the [encoding guide](docs/mediacodec.md#h264-video-encoding) for the platform matrix,
 queue limits, timing contract, and a bounded producer/consumer example.
+
+All four codec classes expose asynchronous `QueryCapabilities(completion)`. The typed value snapshots separate
+library limits from platform-reported limits, describe independent H.264 B-picture policies, and use
+`CodecSupport::Unknown` for facts the platform cannot establish. Use discovery to prepare choices, `Probe()` to
+check their complete combination, and `Create()` to allocate a session. Discovery does not require a Runtime,
+window, or `Install()`, and does not reserve resources or select a different backend.
 
 ## PCM playback
 
@@ -499,7 +507,7 @@ private state, validation, and backend contracts. Shared worker execution lives 
 | [`src/format/`](src/format) | `media_format.h` implementation: timestamps, PCM/YUV descriptions, and frame validation |
 | [`src/player/`](src/player) | `media_player.h` implementation, player state, platform backend contract, channel transport, and video geometry |
 | [`src/library/`](src/library) | `media_library.h` implementation, request state, platform transport contract, and payload validation |
-| [`src/codec/`](src/codec) | `media_codec.h` implementations, shared AAC/AVC initialization utilities, and separate decoder/encoder internals |
+| [`src/codec/`](src/codec) | `media_codec.h` implementations, capability discovery, shared AAC/AVC initialization utilities, and separate decoder/encoder internals |
 | [`src/decoded_playback/`](src/decoded_playback) | `media_playback.h` implementation, audio session, device contract, and video scheduling |
 | [`src/execution/`](src/execution) | Desktop and mobile session workers, post-exit cleanup dispatch, and Web event-loop scheduling |
 | [`platform/`](platform) | Platform adapters and platform package integration |
@@ -517,7 +525,8 @@ validation called out in the [decoding guide](docs/mediacodec.md).
 
 The next stages of decoded playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) expand device and
 synchronization measurements. AAC-LC audio encoding and H.264 video encoding have initial implementations; remaining
-encoder platform validation and broader codec discovery are later stages of [#20](https://github.com/HuxerUI/HuxerUI/issues/20).
+encoder platform validation and additional codecs are later stages of [#20](https://github.com/HuxerUI/HuxerUI/issues/20).
+Capability discovery now covers the currently implemented AAC-LC and H.264 adapters.
 
 Existing file/URL playback continues to use platform players. HuxerUI owns general file, task, window, and texture
 facilities; media-specific behavior stays in Lib-Media.
