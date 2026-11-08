@@ -77,4 +77,104 @@ private:
 };
 } // namespace
 std::unique_ptr<AudioEncoderBackend> MakeAudioEncoderBackend() { return std::make_unique<WebAudioEncoder>(); }
+
+namespace {
+class WebVideoEncoder final : public VideoEncoderBackend {
+public:
+  CodecResult<void> Open(const VideoEncoderConfig& config) override {
+    config_ = config; config_.wakeup = {}; config_.cleanup_completed = {};
+    auto options = val::object();
+    options.set("width", config.input.width); options.set("height", config.input.height);
+    options.set("rateNumerator", config.frame_rate_numerator); options.set("rateDenominator", config.frame_rate_denominator);
+    options.set("bitrate", config.bitrate); options.set("keyInterval", config.key_frame_interval);
+    options.set("maximum", static_cast<unsigned>(config.max_packet_bytes));
+    options.set("window", static_cast<unsigned>(VideoEncoderWindow(config)));
+    options.set("profile", config.profile == H264Profile::Baseline ? 66 : config.profile == H264Profile::Main ? 77 : 100);
+    options.set("maxB", config.max_b_frames ? val(*config.max_b_frames) : val::null());
+    options.set("layout", config.input.pixel_format == VideoPixelFormat::NV12 ? "NV12" : "I420");
+    auto color = val::object();
+    if (config.input.primaries != ColorPrimaries::Unknown)
+      color.set("primaries", config.input.primaries == ColorPrimaries::BT709 ? "bt709" :
+          config.input.primaries == ColorPrimaries::BT601_525 ? "smpte170m" : "bt470bg");
+    if (config.input.transfer != ColorTransfer::Unknown)
+      color.set("transfer", config.input.transfer == ColorTransfer::BT709 ? "bt709" :
+          config.input.transfer == ColorTransfer::SRGB ? "iec61966-2-1" : "linear");
+    if (config.input.matrix != ColorMatrix::Unknown)
+      color.set("matrix", config.input.matrix == ColorMatrix::BT709 ? "bt709" : "smpte170m");
+    if (config.input.range != ColorRange::Unknown) color.set("fullRange", config.input.range == ColorRange::Full);
+    options.set("color", color);
+    id_ = bridge_.call<unsigned>("open", options);
+    return CodecResult<void>::Success();
+  }
+  CodecResult<bool> Ready() override {
+    const auto error = ErrorText();
+    return error.empty() ? CodecResult<bool>::Success(bridge_.call<bool>("ready", id_)) :
+        CodecResult<bool>::Failure(Error(CodecErrorCode::Unsupported, error, "WebCodecs"));
+  }
+  CodecResult<SubmitStatus> Submit(const VideoFrame& frame) override {
+    using R = CodecResult<SubmitStatus>;
+    const auto duration = frame.duration ? frame.duration->Rescale(1000000) : std::optional<MediaTimestamp>{};
+    if (frame.pts.ticks > 9007199254740991LL ||
+        (frame.duration && (!duration || duration->ticks > 9007199254740991LL)))
+      return R::Failure(Error(CodecErrorCode::InvalidData, "Video timing exceeds the WebCodecs safe integer range"));
+    Bytes pixels(std::size_t(config_.input.width) * config_.input.height * 3 / 2);
+    CopyVideoEncoderPixels(frame, config_.input.pixel_format, pixels);
+    const auto accepted = bridge_.call<bool>("submit", id_, Uint8(pixels), double(frame.pts.ticks),
+        duration ? val(double(duration->ticks)) : val::null());
+    auto result = Check();
+    return result.Succeeded() ? R::Success(accepted ? SubmitStatus::Accepted : SubmitStatus::WouldBlock) : R::Failure(result.Error());
+  }
+  CodecResult<std::optional<VideoEncoderBackendOutput>> Poll() override {
+    using R = CodecResult<std::optional<VideoEncoderBackendOutput>>;
+    auto checked = Check();
+    if (!checked.Succeeded()) return R::Failure(checked.Error());
+    auto value = bridge_.call<val>("poll", id_);
+    if (value.isNull()) {
+      if (!eos_ && bridge_.call<bool>("ended", id_)) { eos_ = true; return R::Success(VideoEncoderEnd{}); }
+      return R::Success(std::nullopt);
+    }
+    if (value["kind"].as<std::string>() == "format") {
+      const auto size = value["description"]["length"].as<unsigned>();
+      if (!size || size > 65536) return R::Failure(Error(CodecErrorCode::ResourceExhausted, "H.264 configuration exceeds 64 KiB"));
+      auto bytes = Copy(value["description"]);
+      auto parsed = ParseAvc(bytes);
+      if (!parsed.Succeeded()) return R::Failure(parsed.Error());
+      length_size_ = parsed.Value().length_size;
+      auto format = ReadVideoEncodeFormat(bytes, config_);
+      return format.Succeeded() ? R::Success(std::move(format).Value()) : R::Failure(format.Error());
+    }
+    const auto size = value["data"]["length"].as<unsigned>();
+    if (!size || size > config_.max_packet_bytes)
+      return R::Failure(Error(CodecErrorCode::ResourceExhausted, "WebCodecs H.264 access unit exceeds the packet bound"));
+    auto bytes = Copy(value["data"]);
+    auto normalized = NormalizeVideoEncoderPacket(bytes, length_size_, config_.max_packet_bytes);
+    if (!normalized.Succeeded()) return R::Failure(normalized.Error());
+    return R::Success(EncodedPacket{Own(std::move(normalized).Value()),
+        {static_cast<std::int64_t>(value["pts"].as<double>()), 1000000}, std::nullopt, std::nullopt, false});
+  }
+  CodecResult<void> RequestKeyFrame() override { bridge_.call<void>("requestKeyFrame", id_); return Check(); }
+  CodecResult<void> FlushPending() override { bridge_.call<void>("progress", id_); return Check(); }
+  CodecResult<SubmitStatus> Finish() override {
+    bridge_.call<void>("finish", id_);
+    auto result = Check();
+    return result.Succeeded() ? CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted) : CodecResult<SubmitStatus>::Failure(result.Error());
+  }
+  CodecResult<void> Close() override {
+    if (!id_) return CodecResult<void>::Success();
+    const auto error = bridge_.call<std::string>("close", id_); id_ = 0;
+    return error.empty() ? CodecResult<void>::Success() : CodecResult<void>::Failure(Error(CodecErrorCode::PlatformFailure, error, "WebCodecs.close"));
+  }
+private:
+  std::string ErrorText() { return bridge_.call<std::string>("error", id_); }
+  CodecResult<void> Check() {
+    const auto error = ErrorText();
+    return error.empty() ? CodecResult<void>::Success() : CodecResult<void>::Failure(Error(CodecErrorCode::PlatformFailure, error, "WebCodecs"));
+  }
+  val bridge_ = val::global("HuxerMediaVideoEncoder");
+  VideoEncoderConfig config_;
+  unsigned id_ = 0, length_size_ = 4;
+  bool eos_ = false;
+};
+}
+std::unique_ptr<VideoEncoderBackend> MakeVideoEncoderBackend() { return std::make_unique<WebVideoEncoder>(); }
 } // namespace huxerui::media::detail

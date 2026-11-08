@@ -1,6 +1,9 @@
 #include "codec/encoder/backend.h"
 
 #include <cstring>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <sys/system_properties.h>
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 
@@ -157,4 +160,217 @@ private:
 };
 } // namespace
 std::unique_ptr<AudioEncoderBackend> MakeAudioEncoderBackend() { return std::make_unique<AndroidAudioEncoder>(); }
+
+namespace {
+class AndroidVideoEncoder final : public VideoEncoderBackend {
+public:
+  CodecResult<void> Open(const VideoEncoderConfig& config) override {
+    config_ = config; config_.wakeup = {}; config_.cleanup_completed = {};
+    char version[PROP_VALUE_MAX]{};
+    __system_property_get("ro.build.version.sdk", version);
+    const auto api = std::strtol(version, nullptr, 10);
+    input_format_ = reinterpret_cast<AMediaFormat* (*)(AMediaCodec*)>(dlsym(RTLD_DEFAULT, "AMediaCodec_getInputFormat"));
+    set_parameters_ = reinterpret_cast<media_status_t (*)(AMediaCodec*, const AMediaFormat*)>(dlsym(RTLD_DEFAULT, "AMediaCodec_setParameters"));
+    if (api < 28 || !input_format_ || !set_parameters_)
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "CPU H.264 encoding requires Android API 28 or later"));
+    if (api < 29 && config.profile != H264Profile::Baseline && config.max_b_frames)
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "A numeric Main/High B-picture bound requires Android API 29 or later"));
+    codec_ = AMediaCodec_createEncoderByType("video/avc");
+    if (!codec_) return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "No Android H.264 encoder"));
+    auto* format = AMediaFormat_new();
+    if (!format) return CodecResult<void>::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot allocate H.264 MediaFormat"));
+    std::unique_ptr<AMediaFormat, decltype(&AMediaFormat_delete)> owner(format, AMediaFormat_delete);
+    AMediaFormat_setString(format, "mime", "video/avc");
+    AMediaFormat_setInt32(format, "width", config.input.width); AMediaFormat_setInt32(format, "height", config.input.height);
+    AMediaFormat_setInt32(format, "color-format", 21);
+    AMediaFormat_setInt32(format, "stride", config.input.width); AMediaFormat_setInt32(format, "slice-height", config.input.height);
+    AMediaFormat_setInt32(format, "bitrate", config.bitrate);
+    AMediaFormat_setFloat(format, "frame-rate", float(config.frame_rate_numerator) / config.frame_rate_denominator);
+    AMediaFormat_setFloat(format, "i-frame-interval", float(config.key_frame_interval) * config.frame_rate_denominator / config.frame_rate_numerator);
+    AMediaFormat_setInt32(format, "profile", config.profile == H264Profile::Baseline ? 1 : config.profile == H264Profile::Main ? 2 : 8);
+    frame_bytes_ = std::size_t(config.input.width) * config.input.height * 3 / 2;
+    AMediaFormat_setInt32(format, "max-input-size", static_cast<std::int32_t>(frame_bytes_));
+    if (config.profile != H264Profile::Baseline) {
+      if (api >= 29) AMediaFormat_setInt32(format, "max-bframes", VideoEncoderBFrames(config));
+      else AMediaFormat_setInt32(format, "latency", config.max_b_frames ? 1 : static_cast<std::int32_t>(VideoEncoderWindow(config) - 1));
+    }
+    if (config.input.range != ColorRange::Unknown)
+      AMediaFormat_setInt32(format, "color-range", config.input.range == ColorRange::Full ? 1 : 2);
+    if (config.input.primaries != ColorPrimaries::Unknown || config.input.matrix != ColorMatrix::Unknown) {
+      const auto standard = config.input.primaries == ColorPrimaries::BT601_525 ? 4 :
+          config.input.primaries == ColorPrimaries::BT601_625 ? 2 :
+          config.input.matrix == ColorMatrix::BT601 ? 4 : 1;
+      AMediaFormat_setInt32(format, "color-standard", standard);
+    }
+    if (config.input.transfer != ColorTransfer::Unknown) {
+      if (config.input.transfer == ColorTransfer::SRGB)
+        return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Android H.264 cannot request exact sRGB transfer signaling"));
+      AMediaFormat_setInt32(format, "color-transfer", config.input.transfer == ColorTransfer::Linear ? 1 : 3);
+    }
+    auto status = AMediaCodec_configure(codec_, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
+    if (status != AMEDIA_OK)
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Android rejected H.264 configuration", std::to_string(status)));
+    auto* actual = input_format_(codec_);
+    if (!actual) return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidData, "Android H.264 input format is missing"));
+    std::unique_ptr<AMediaFormat, decltype(&AMediaFormat_delete)> actual_owner(actual, AMediaFormat_delete);
+    std::int32_t layout = 0, stride = config.input.width, rows = config.input.height;
+    AMediaFormat_getInt32(actual, "stride", &stride); AMediaFormat_getInt32(actual, "slice-height", &rows);
+    if (!AMediaFormat_getInt32(actual, "color-format", &layout) || (layout != 19 && layout != 21) ||
+        stride != std::int32_t(config.input.width) || rows != std::int32_t(config.input.height))
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Android H.264 input requires an identifiable packed I420/NV12 layout"));
+    layout_ = layout == 19 ? VideoPixelFormat::I420 : VideoPixelFormat::NV12;
+    std::int32_t latency = 0, max_b = 0;
+    if (AMediaFormat_getInt32(actual, "latency", &latency) && latency >= std::int32_t(VideoEncoderWindow(config)))
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Android encoder delay exceeds the output window"));
+    if (config.max_b_frames && *config.max_b_frames && (!AMediaFormat_getInt32(actual, "max-bframes", &max_b) ||
+        max_b < 0 || std::uint32_t(max_b) > *config.max_b_frames))
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Android did not confirm the requested B-picture bound"));
+    status = AMediaCodec_start(codec_);
+    if (status != AMEDIA_OK) return CodecResult<void>::Failure(MediaCodecError(status, "Cannot start H.264 encoder"));
+    started_ = true;
+    return CodecResult<void>::Success();
+  }
+  CodecResult<SubmitStatus> Submit(const VideoFrame& frame) override {
+    using R = CodecResult<SubmitStatus>;
+    const auto duration = frame.duration ? frame.duration->Rescale(1000000) :
+        MediaTimestamp{config_.frame_rate_denominator, config_.frame_rate_numerator}.Rescale(1000000);
+    if (!duration || duration->ticks <= 0 || frame.pts.ticks > INT64_MAX - duration->ticks)
+      return R::Failure(Error(CodecErrorCode::InvalidData, "Android H.264 input timing exceeds signed bounds"));
+    const auto index = AMediaCodec_dequeueInputBuffer(codec_, 0);
+    if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER) return R::Success(SubmitStatus::WouldBlock);
+    if (index < 0) return R::Failure(MediaCodecError(static_cast<media_status_t>(index), "Cannot dequeue H.264 input"));
+    std::size_t capacity = 0;
+    auto* bytes = AMediaCodec_getInputBuffer(codec_, index, &capacity);
+    if (!bytes || capacity < frame_bytes_)
+      return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Android H.264 input buffer is too small"));
+    CopyVideoEncoderPixels(frame, layout_, {reinterpret_cast<std::byte*>(bytes), frame_bytes_});
+    const auto status = AMediaCodec_queueInputBuffer(codec_, index, 0, frame_bytes_, std::uint64_t(frame.pts.ticks), 0);
+    if (status != AMEDIA_OK) return R::Failure(MediaCodecError(status, "Cannot queue H.264 input"));
+    input_end_ = frame.pts.ticks + duration->ticks;
+    return R::Success(SubmitStatus::Accepted);
+  }
+  CodecResult<std::optional<VideoEncoderBackendOutput>> Poll() override {
+    using R = CodecResult<std::optional<VideoEncoderBackendOutput>>;
+    if (pending_) { auto packet = std::move(*pending_); pending_.reset(); return R::Success(std::move(packet)); }
+    if (eos_) return R::Success(std::nullopt);
+    if (pending_eos_) { eos_ = true; return R::Success(VideoEncoderEnd{}); }
+    AMediaCodecBufferInfo info{};
+    const auto index = AMediaCodec_dequeueOutputBuffer(codec_, &info, 0);
+    if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER || index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED)
+      return R::Success(std::nullopt);
+    if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+      auto described = ReadFormat();
+      if (!described.Succeeded()) return R::Failure(described.Error());
+      if (!format_) { format_ = std::move(described).Value(); return R::Success(*format_); }
+      if (*format_ != described.Value()) return R::Failure(Error(CodecErrorCode::Unsupported, "Android H.264 configuration changed"));
+      return R::Success(std::nullopt);
+    }
+    if (index < 0) return R::Failure(MediaCodecError(static_cast<media_status_t>(index), "Cannot dequeue H.264 output"));
+    auto result = R::Success(std::nullopt);
+    if (info.size < 0 || std::size_t(info.size) > config_.max_packet_bytes)
+      result = R::Failure(Error(CodecErrorCode::ResourceExhausted, "Android H.264 output exceeds the access-unit bound"));
+    else if (info.size && !(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG)) {
+      const auto* data = AMediaCodec_getOutputBuffer(codec_, index, nullptr);
+      if (!data) result = R::Failure(Error(CodecErrorCode::InvalidData, "Android H.264 output data is missing"));
+      else {
+        if (!partial_.empty() && info.presentationTimeUs != partial_pts_)
+          result = R::Failure(Error(CodecErrorCode::InvalidData, "Android H.264 fragments have different presentation times"));
+        else if (std::size_t(info.size) > config_.max_packet_bytes - partial_.size())
+          result = R::Failure(Error(CodecErrorCode::ResourceExhausted, "Android H.264 fragments exceed the access-unit bound"));
+        else {
+          partial_pts_ = info.presentationTimeUs;
+          const auto* first = reinterpret_cast<const std::byte*>(data);
+          partial_.insert(partial_.end(), first, first + info.size);
+          if (!(info.flags & AMEDIACODEC_BUFFER_FLAG_PARTIAL_FRAME)) {
+            auto normalized = NormalizeVideoEncoderPacket(partial_, 0, config_.max_packet_bytes); partial_.clear();
+            if (!normalized.Succeeded()) result = R::Failure(normalized.Error());
+            else {
+              auto described = ReadFormat();
+              if (!described.Succeeded()) result = R::Failure(described.Error());
+              else if (format_ && *format_ != described.Value()) result = R::Failure(Error(CodecErrorCode::Unsupported, "Android H.264 configuration changed"));
+              else {
+                EncodedPacket packet{Own(std::move(normalized).Value()), {info.presentationTimeUs, 1000000}, std::nullopt, std::nullopt, false};
+                if (!format_) { format_ = std::move(described).Value(); pending_ = std::move(packet); result = R::Success(*format_); }
+                else result = R::Success(std::move(packet));
+              }
+            }
+          }
+        }
+      }
+    }
+    const auto released = AMediaCodec_releaseOutputBuffer(codec_, index, false);
+    if (released != AMEDIA_OK) return R::Failure(MediaCodecError(released, "Cannot release H.264 output"));
+    if (!result.Succeeded()) return result;
+    if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
+      if (!partial_.empty()) return R::Failure(Error(CodecErrorCode::InvalidData, "Android H.264 ended during a partial access unit"));
+      pending_eos_ = true;
+    }
+    return result;
+  }
+  CodecResult<void> RequestKeyFrame() override {
+    auto* format = AMediaFormat_new();
+    if (!format) return CodecResult<void>::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot allocate key-picture parameters"));
+    AMediaFormat_setInt32(format, "request-sync", 0);
+    const auto status = set_parameters_(codec_, format), deleted = AMediaFormat_delete(format);
+    if (status != AMEDIA_OK) return CodecResult<void>::Failure(MediaCodecError(status, "Android rejected the key-picture request"));
+    if (deleted != AMEDIA_OK) return CodecResult<void>::Failure(MediaCodecError(deleted, "Cannot release key-picture parameters"));
+    return CodecResult<void>::Success();
+  }
+  CodecResult<SubmitStatus> Finish() override {
+    const auto index = AMediaCodec_dequeueInputBuffer(codec_, 0);
+    if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER) return CodecResult<SubmitStatus>::Success(SubmitStatus::WouldBlock);
+    if (index < 0) return CodecResult<SubmitStatus>::Failure(MediaCodecError(static_cast<media_status_t>(index), "Cannot dequeue H.264 EOS input"));
+    const auto status = AMediaCodec_queueInputBuffer(codec_, index, 0, 0, std::uint64_t(input_end_), AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+    if (status != AMEDIA_OK) return CodecResult<SubmitStatus>::Failure(MediaCodecError(status, "Android rejected H.264 EOS"));
+    return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
+  }
+  CodecResult<void> Close() override {
+    std::optional<CodecError> failure;
+    if (codec_) {
+      if (started_) {
+        const auto status = AMediaCodec_stop(codec_);
+        if (status != AMEDIA_OK) failure = MediaCodecError(status, "Cannot stop H.264 encoder");
+      }
+      const auto status = AMediaCodec_delete(codec_); codec_ = nullptr;
+      if (status != AMEDIA_OK) failure = MediaCodecError(status, "Cannot delete H.264 encoder");
+    }
+    pending_.reset(); Bytes{}.swap(partial_);
+    return failure ? CodecResult<void>::Failure(*failure) : CodecResult<void>::Success();
+  }
+private:
+  CodecResult<VideoEncodeFormat> ReadFormat() {
+    using R = CodecResult<VideoEncodeFormat>;
+    auto* format = AMediaCodec_getOutputFormat(codec_);
+    if (!format) return R::Failure(Error(CodecErrorCode::InvalidData, "Android H.264 output format is missing"));
+    std::unique_ptr<AMediaFormat, decltype(&AMediaFormat_delete)> owner(format, AMediaFormat_delete);
+    std::int32_t actual = 0;
+    if ((AMediaFormat_getInt32(format, "bitrate", &actual) && actual != std::int32_t(config_.bitrate)) ||
+        (config_.max_b_frames && AMediaFormat_getInt32(format, "output-reorder-depth", &actual) &&
+            (actual < 0 || std::uint32_t(actual) > *config_.max_b_frames)))
+      return R::Failure(Error(CodecErrorCode::Unsupported, "Android changed H.264 rate or reordering controls"));
+    Bytes description;
+    for (const char* key : {"csd-0", "csd-1"}) {
+      void* data = nullptr; std::size_t size = 0;
+      if (!AMediaFormat_getBuffer(format, key, &data, &size)) continue;
+      if (!data || size > 65536 - description.size())
+        return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Android H.264 parameter sets exceed 64 KiB"));
+      const auto* first = static_cast<const std::byte*>(data);
+      description.insert(description.end(), first, first + size);
+    }
+    return ReadVideoEncodeFormat(description, config_);
+  }
+  VideoEncoderConfig config_;
+  AMediaCodec* codec_ = nullptr;
+  AMediaFormat* (*input_format_)(AMediaCodec*) = nullptr;
+  media_status_t (*set_parameters_)(AMediaCodec*, const AMediaFormat*) = nullptr;
+  VideoPixelFormat layout_ = VideoPixelFormat::NV12;
+  std::size_t frame_bytes_ = 0;
+  std::int64_t input_end_ = 0, partial_pts_ = 0;
+  Bytes partial_;
+  std::optional<VideoEncodeFormat> format_;
+  std::optional<EncodedPacket> pending_;
+  bool started_ = false, eos_ = false, pending_eos_ = false;
+};
+}
+std::unique_ptr<VideoEncoderBackend> MakeVideoEncoderBackend() { return std::make_unique<AndroidVideoEncoder>(); }
 } // namespace huxerui::media::detail

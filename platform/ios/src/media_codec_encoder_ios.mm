@@ -2,7 +2,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <type_traits>
 #import <AudioToolbox/AudioToolbox.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 namespace huxerui::media::detail {
 namespace {
@@ -139,4 +143,240 @@ private:
 };
 } // namespace
 std::unique_ptr<AudioEncoderBackend> MakeAudioEncoderBackend() { return std::make_unique<IOSAudioEncoder>(); }
+namespace {
+struct VideoToolboxFailure { CodecError error; };
+void VideoStatus(OSStatus status, const char* text, CodecErrorCode code = CodecErrorCode::PlatformFailure) {
+  if (status) throw VideoToolboxFailure{Error(code, text, std::to_string(status))};
+}
+template<class T, class F> CodecResult<T> VideoGuard(F work) {
+  try {
+    if constexpr (std::is_void_v<T>) { work(); return CodecResult<void>::Success(); }
+    else return CodecResult<T>::Success(work());
+  } catch (const VideoToolboxFailure& failure) { return CodecResult<T>::Failure(failure.error); }
+}
+class IOSVideoEncoder final : public VideoEncoderBackend {
+public:
+  CodecResult<void> Open(const VideoEncoderConfig& config) override {
+    return VideoGuard<void>([&] {
+      config_ = config; config_.wakeup = {}; config_.cleanup_completed = {};
+      if (config.max_b_frames.value_or(0))
+        throw VideoToolboxFailure{Error(CodecErrorCode::Unsupported, "VideoToolbox cannot enforce a numeric consecutive B-picture bound")};
+      VideoStatus(VTCompressionSessionCreate(kCFAllocatorDefault, config.input.width, config.input.height,
+          kCMVideoCodecType_H264, nullptr, nullptr, nullptr, Output, this, &session_),
+          "Cannot create H.264 compression session", CodecErrorCode::Unsupported);
+      const auto profile = config.profile == H264Profile::Baseline ? kVTProfileLevel_H264_Baseline_AutoLevel :
+          config.profile == H264Profile::Main ? kVTProfileLevel_H264_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel;
+      Property(kVTCompressionPropertyKey_ProfileLevel, profile);
+      const bool reorder = config.profile != H264Profile::Baseline && !config.max_b_frames;
+      Property(kVTCompressionPropertyKey_AllowFrameReordering, reorder ? kCFBooleanTrue : kCFBooleanFalse);
+      Property(kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
+      Integer(kVTCompressionPropertyKey_AverageBitRate, config.bitrate);
+      Integer(kVTCompressionPropertyKey_MaxKeyFrameInterval, config.key_frame_interval);
+      Integer(kVTCompressionPropertyKey_MaxFrameDelayCount, static_cast<std::int32_t>(VideoEncoderWindow(config) - 1));
+      const double rate = double(config.frame_rate_numerator) / config.frame_rate_denominator;
+      auto number = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &rate);
+      if (!number) throw std::bad_alloc();
+      const auto status = VTSessionSetProperty(session_, kVTCompressionPropertyKey_ExpectedFrameRate, number);
+      CFRelease(number);
+      VideoStatus(status, "Cannot configure H.264 frame rate", CodecErrorCode::Unsupported);
+      if (config.input.primaries != ColorPrimaries::Unknown)
+        Property(kVTCompressionPropertyKey_ColorPrimaries, Primaries(config.input.primaries));
+      if (config.input.transfer != ColorTransfer::Unknown)
+        Property(kVTCompressionPropertyKey_TransferFunction, Transfer(config.input.transfer));
+      if (config.input.matrix != ColorMatrix::Unknown)
+        Property(kVTCompressionPropertyKey_YCbCrMatrix, Matrix(config.input.matrix));
+      CFTypeRef actual = nullptr;
+      VideoStatus(VTSessionCopyProperty(session_, kVTCompressionPropertyKey_AverageBitRate, kCFAllocatorDefault, &actual),
+          "Cannot verify H.264 bitrate", CodecErrorCode::Unsupported);
+      std::int64_t bitrate = 0;
+      const bool matches = actual && CFGetTypeID(actual) == CFNumberGetTypeID() &&
+          CFNumberGetValue(static_cast<CFNumberRef>(actual), kCFNumberSInt64Type, &bitrate) && bitrate == config.bitrate;
+      if (actual) CFRelease(actual);
+      if (!matches) throw VideoToolboxFailure{Error(CodecErrorCode::Unsupported, "VideoToolbox changed the requested bitrate")};
+      VideoStatus(VTCompressionSessionPrepareToEncodeFrames(session_), "Cannot prepare H.264 compression", CodecErrorCode::Unsupported);
+      scratch_.resize(std::size_t(config.input.width) * config.input.height * 3 / 2);
+    });
+  }
+  CodecResult<SubmitStatus> Submit(const VideoFrame& frame) override {
+    return VideoGuard<SubmitStatus>([&] {
+      {
+        std::lock_guard lock(output_mutex_);
+        if (failure_) throw VideoToolboxFailure{*failure_};
+        if (pending_frames_ >= VideoEncoderWindow(config_)) return SubmitStatus::WouldBlock;
+      }
+      CVPixelBufferRef pixel = nullptr;
+      const auto type = config_.input.range == ColorRange::Full ?
+          kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+      auto surface = CFDictionaryCreate(kCFAllocatorDefault, nullptr, nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+      if (!surface) throw std::bad_alloc();
+      const void* keys[]{kCVPixelBufferIOSurfacePropertiesKey};
+      const void* values[]{surface};
+      auto attributes = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+      if (surface) CFRelease(surface);
+      if (!attributes) throw std::bad_alloc();
+      const auto created = CVPixelBufferCreate(kCFAllocatorDefault, config_.input.width, config_.input.height, type, attributes, &pixel);
+      if (attributes) CFRelease(attributes);
+      VideoStatus(created, "Cannot allocate H.264 NV12 input");
+      std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)> owner(pixel, CVPixelBufferRelease);
+      VideoStatus(CVPixelBufferLockBaseAddress(pixel, 0), "Cannot map H.264 NV12 input");
+      CopyVideoEncoderPixels(frame, VideoPixelFormat::NV12, scratch_);
+      bool valid = CVPixelBufferGetPlaneCount(pixel) == 2;
+      for (std::size_t plane = 0; valid && plane < 2; ++plane) {
+        auto* target = static_cast<std::byte*>(CVPixelBufferGetBaseAddressOfPlane(pixel, plane));
+        const auto stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, plane);
+        const auto rows = plane ? config_.input.height / 2 : config_.input.height;
+        valid = target && stride >= config_.input.width && CVPixelBufferGetHeightOfPlane(pixel, plane) >= rows;
+        if (valid) for (std::size_t y = 0; y < rows; ++y)
+          std::memcpy(target + y * stride, scratch_.data() + (plane ? std::size_t(config_.input.width) * config_.input.height : 0) +
+              y * config_.input.width, config_.input.width);
+      }
+      VideoStatus(CVPixelBufferUnlockBaseAddress(pixel, 0), "Cannot unmap H.264 NV12 input");
+      if (!valid) throw VideoToolboxFailure{Error(CodecErrorCode::Unsupported, "VideoToolbox returned an unsupported input plane layout")};
+      if (config_.input.primaries != ColorPrimaries::Unknown)
+        CVBufferSetAttachment(pixel, kCVImageBufferColorPrimariesKey, Primaries(config_.input.primaries), kCVAttachmentMode_ShouldPropagate);
+      if (config_.input.transfer != ColorTransfer::Unknown)
+        CVBufferSetAttachment(pixel, kCVImageBufferTransferFunctionKey, Transfer(config_.input.transfer), kCVAttachmentMode_ShouldPropagate);
+      if (config_.input.matrix != ColorMatrix::Unknown)
+        CVBufferSetAttachment(pixel, kCVImageBufferYCbCrMatrixKey, Matrix(config_.input.matrix), kCVAttachmentMode_ShouldPropagate);
+      CFDictionaryRef properties = nullptr;
+      if (key_requested_) {
+        const void* option_keys[]{kVTEncodeFrameOptionKey_ForceKeyFrame};
+        const void* option_values[]{kCFBooleanTrue};
+        properties = CFDictionaryCreate(kCFAllocatorDefault, option_keys, option_values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        if (!properties) throw std::bad_alloc();
+      }
+      const auto duration = frame.duration ? frame.duration->Rescale(1000000) : std::optional<MediaTimestamp>{};
+      {
+        std::lock_guard lock(output_mutex_); ++pending_frames_;
+      }
+      VTEncodeInfoFlags flags = 0;
+      const auto status = VTCompressionSessionEncodeFrame(session_, pixel, CMTimeMake(frame.pts.ticks, 1000000),
+          duration ? CMTimeMake(duration->ticks, 1000000) : kCMTimeInvalid, properties, nullptr, &flags);
+      if (properties) CFRelease(properties);
+      if (status) {
+        std::lock_guard lock(output_mutex_);
+        if (pending_frames_) --pending_frames_;
+        throw VideoToolboxFailure{Error(CodecErrorCode::PlatformFailure, "VideoToolbox rejected a picture", std::to_string(status))};
+      }
+      if (flags & kVTEncodeInfo_FrameDropped)
+        throw VideoToolboxFailure{Error(CodecErrorCode::InvalidData, "VideoToolbox dropped an accepted picture")};
+      key_requested_ = false;
+      return SubmitStatus::Accepted;
+    });
+  }
+  CodecResult<std::optional<VideoEncoderBackendOutput>> Poll() override {
+    std::lock_guard lock(output_mutex_);
+    using R = CodecResult<std::optional<VideoEncoderBackendOutput>>;
+    if (failure_) return R::Failure(*failure_);
+    if (!output_.empty()) { auto value = std::move(output_.front()); output_.pop_front(); return R::Success(std::move(value)); }
+    if (finished_ && !pending_frames_ && !eos_) { eos_ = true; return R::Success(VideoEncoderEnd{}); }
+    return R::Success(std::nullopt);
+  }
+  CodecResult<void> RequestKeyFrame() override { key_requested_ = true; return CodecResult<void>::Success(); }
+  CodecResult<SubmitStatus> Finish() override {
+    const auto status = VTCompressionSessionCompleteFrames(session_, kCMTimeInvalid);
+    if (status) return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot drain H.264 compression", std::to_string(status)));
+    finished_ = true;
+    return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
+  }
+  CodecResult<void> Close() override {
+    OSStatus status = noErr;
+    {
+      std::lock_guard lock(output_mutex_); closing_ = true;
+    }
+    if (session_) {
+      status = VTCompressionSessionCompleteFrames(session_, kCMTimeInvalid);
+      VTCompressionSessionInvalidate(session_); CFRelease(session_); session_ = nullptr;
+    }
+    {
+      std::lock_guard lock(output_mutex_); output_.clear(); pending_frames_ = 0;
+    }
+    Bytes{}.swap(scratch_);
+    return status ? CodecResult<void>::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot retire H.264 compression", std::to_string(status))) :
+        CodecResult<void>::Success();
+  }
+private:
+  void Property(CFStringRef key, CFTypeRef value) {
+    VideoStatus(VTSessionSetProperty(session_, key, value), "VideoToolbox rejected a requested H.264 control", CodecErrorCode::Unsupported);
+  }
+  void Integer(CFStringRef key, std::int32_t value) {
+    auto number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &value);
+    if (!number) throw std::bad_alloc();
+    const auto status = VTSessionSetProperty(session_, key, number); CFRelease(number);
+    VideoStatus(status, "VideoToolbox rejected a numeric H.264 control", CodecErrorCode::Unsupported);
+  }
+  static CFStringRef Primaries(ColorPrimaries value) {
+    return value == ColorPrimaries::BT709 ? kCVImageBufferColorPrimaries_ITU_R_709_2 :
+        value == ColorPrimaries::BT601_525 ? kCVImageBufferColorPrimaries_SMPTE_C : kCVImageBufferColorPrimaries_EBU_3213;
+  }
+  static CFStringRef Transfer(ColorTransfer value) {
+    return value == ColorTransfer::BT709 ? kCVImageBufferTransferFunction_ITU_R_709_2 :
+        value == ColorTransfer::SRGB ? kCVImageBufferTransferFunction_sRGB : kCVImageBufferTransferFunction_Linear;
+  }
+  static CFStringRef Matrix(ColorMatrix value) {
+    return value == ColorMatrix::BT709 ? kCVImageBufferYCbCrMatrix_ITU_R_709_2 : kCVImageBufferYCbCrMatrix_ITU_R_601_4;
+  }
+  static void Output(void* context, void*, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sample) {
+    auto& self = *static_cast<IOSVideoEncoder*>(context);
+    std::lock_guard lock(self.output_mutex_);
+    if (self.pending_frames_) --self.pending_frames_;
+    if (self.closing_ || self.failure_) return;
+    try {
+      if (status || !sample || (flags & kVTEncodeInfo_FrameDropped) || CMSampleBufferGetNumSamples(sample) != 1)
+        throw VideoToolboxFailure{Error(CodecErrorCode::InvalidData, "VideoToolbox returned a failed, dropped, or incomplete picture", std::to_string(status))};
+      if (self.output_.size() >= VideoEncoderWindow(self.config_) + 1)
+        throw VideoToolboxFailure{Error(CodecErrorCode::ResourceExhausted, "VideoToolbox exceeded reserved output slots")};
+      auto description = CMSampleBufferGetFormatDescription(sample);
+      const std::uint8_t* parameter = nullptr; std::size_t size = 0, count = 0; int length = 0;
+      VideoStatus(CMVideoFormatDescriptionGetH264ParameterSetAtIndex(description, 0, &parameter, &size, &count, &length), "Cannot read H.264 parameter sets");
+      if (!count || count > 286) throw VideoToolboxFailure{Error(CodecErrorCode::InvalidData, "Unbounded H.264 parameter set count")};
+      Bytes configuration;
+      for (std::size_t i = 0; i < count; ++i) {
+        VideoStatus(CMVideoFormatDescriptionGetH264ParameterSetAtIndex(description, i, &parameter, &size, nullptr, nullptr), "Cannot read H.264 parameter set");
+        if (!parameter || !size || configuration.size() > 65532 || size > 65532 - configuration.size())
+          throw VideoToolboxFailure{Error(CodecErrorCode::ResourceExhausted, "VideoToolbox H.264 configuration exceeds 64 KiB")};
+        configuration.insert(configuration.end(), {std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}});
+        const auto* first = reinterpret_cast<const std::byte*>(parameter);
+        configuration.insert(configuration.end(), first, first + size);
+      }
+      auto described = ReadVideoEncodeFormat(configuration, self.config_);
+      if (!described.Succeeded()) throw VideoToolboxFailure{described.Error()};
+      if (self.format_ && *self.format_ != described.Value())
+        throw VideoToolboxFailure{Error(CodecErrorCode::Unsupported, "VideoToolbox H.264 configuration changed")};
+      auto buffer = CMSampleBufferGetDataBuffer(sample);
+      const auto bytes = buffer ? CMBlockBufferGetDataLength(buffer) : 0;
+      if (!bytes || bytes > self.config_.max_packet_bytes)
+        throw VideoToolboxFailure{Error(CodecErrorCode::ResourceExhausted, "VideoToolbox H.264 access unit exceeds the packet bound")};
+      Bytes data(bytes);
+      VideoStatus(CMBlockBufferCopyDataBytes(buffer, 0, bytes, data.data()), "Cannot copy H.264 output");
+      auto normalized = NormalizeVideoEncoderPacket(data, static_cast<unsigned>(length), self.config_.max_packet_bytes);
+      if (!normalized.Succeeded()) throw VideoToolboxFailure{normalized.Error()};
+      auto timestamp = [](CMTime value) -> std::optional<MediaTimestamp> {
+        if (!CMTIME_IS_NUMERIC(value) || value.timescale <= 0) return std::nullopt;
+        return MediaTimestamp{value.value, static_cast<std::uint32_t>(value.timescale)}.Rescale(1000000);
+      };
+      const auto pts = timestamp(CMSampleBufferGetPresentationTimeStamp(sample));
+      const auto raw_dts = CMSampleBufferGetDecodeTimeStamp(sample);
+      const auto dts = timestamp(raw_dts);
+      if (!pts || (CMTIME_IS_NUMERIC(raw_dts) && !dts))
+        throw VideoToolboxFailure{Error(CodecErrorCode::InvalidData, "VideoToolbox returned invalid H.264 timing")};
+      if (!self.format_) {
+        self.format_ = std::move(described).Value(); self.output_.push_back(*self.format_);
+      }
+      self.output_.push_back(EncodedPacket{Own(std::move(normalized).Value()), *pts, dts, std::nullopt, false});
+    } catch (const VideoToolboxFailure& failure) { self.failure_ = failure.error; }
+    catch (const std::exception& error) { self.failure_ = Error(CodecErrorCode::ResourceExhausted, error.what()); }
+  }
+  VideoEncoderConfig config_;
+  VTCompressionSessionRef session_ = nullptr;
+  std::mutex output_mutex_;
+  std::deque<VideoEncoderBackendOutput> output_;
+  std::optional<VideoEncodeFormat> format_;
+  std::optional<CodecError> failure_;
+  Bytes scratch_;
+  std::size_t pending_frames_ = 0;
+  bool key_requested_ = false, finished_ = false, eos_ = false, closing_ = false;
+};
+}
+std::unique_ptr<VideoEncoderBackend> MakeVideoEncoderBackend() { return std::make_unique<IOSVideoEncoder>(); }
 } // namespace huxerui::media::detail

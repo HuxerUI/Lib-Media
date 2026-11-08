@@ -150,10 +150,11 @@ struct PlaybackSnapshot {
 /// retire it immediately. Tokens from another session are invalid even if its playback position matches.
 class PlaybackEpoch {
 public:
-  /// Creates an invalid token. Use DecodedPlayback::Epoch() to capture a live generation.
+  /// @brief Creates an invalid token. Use DecodedPlayback::Epoch() to capture a live generation.
   PlaybackEpoch() = default;
 
-  /// Compares the identity of two generations. A retired token remains comparable.
+  /// @brief Compares the identity of two generations. A retired token remains comparable.
+  /// @return True if both tokens retain the same generation identity, including two default invalid tokens.
   bool operator==(const PlaybackEpoch&) const = default;
 
 private:
@@ -243,6 +244,7 @@ public:
   PlaybackResult<SubmitStatus> TrySubmitVideo(const PlaybackEpoch& epoch, const VideoFrame& frame);
 
   /// @brief Seal video input for this generation and preserve the final queued frame through presentation.
+  /// @param epoch Current token from Epoch(). Retired and foreign tokens return InvalidState.
   /// @return Success when sealed or already sealed. Disabled video and retired or foreign epochs return InvalidState.
   /// @see FinishAudio(), PresentVideo(), Snapshot()
   PlaybackResult<void> FinishVideo(const PlaybackEpoch& epoch);

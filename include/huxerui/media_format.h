@@ -4,7 +4,7 @@
 /// @brief Exact media timestamps, compressed access units, and CPU audio and video frames.
 ///
 /// Include <huxerui/media_format.h> and link HuxerUI::Media. These values can be used in headless code.
-/// Use <huxerui/media_codec.h> to decode compressed packets or encode PCM through bounded, headless sessions.
+/// Use <huxerui/media_codec.h> to decode compressed packets or encode PCM/CPU video through bounded, headless sessions.
 /// When constructing frames yourself, call Validate() before using their format, timing, and planes.
 
 #include <cstdint>
@@ -114,10 +114,11 @@ enum class SubmitStatus {
 /// Keep a packet available for retry when submission returns SubmitStatus::WouldBlock.
 /// Supplied timing must fit in signed 64-bit microseconds after rescaling. A platform adapter may impose a smaller range.
 ///
-/// AudioEncoder output owns immutable bytes that remain readable after Reset(), Close(), and cleanup completion.
+/// AudioEncoder and VideoEncoder emit immutable bytes that remain readable after Reset(), Close(), and cleanup
+/// completion.
 /// Retaining a packet, its data, or an arbitrary slice keeps its full output reservation in the originating encoder,
 /// including across resets. Release all byte references to return that reservation.
-/// @see AudioDecoder::TrySubmit(), VideoDecoder::TrySubmit(), AudioEncoder::TryRead()
+/// @see AudioDecoder::TrySubmit(), VideoDecoder::TrySubmit(), AudioEncoder::TryRead(), VideoEncoder::TryRead()
 struct EncodedPacket {
   /// Nonempty access-unit bytes in the representation selected by the codec configuration.
   BufferReference data;
@@ -129,7 +130,7 @@ struct EncodedPacket {
   /// Optional nonnegative duration with a positive timescale. An absent duration and a zero duration are distinct.
   std::optional<MediaTimestamp> duration;
   /// Marks a random-access unit. The first AVC packet after Create() or Reset() must contain an IDR and set this flag.
-  /// AudioEncoder output always sets this flag.
+  /// AudioEncoder output always sets this flag; VideoEncoder derives it from actual IDR syntax.
   bool key_frame = false;
 };
 
@@ -178,7 +179,7 @@ enum class VideoPixelFormat {
   NV12
 };
 
-/// @brief Color primaries reported by the stream or platform decoder.
+/// @brief Color primaries describing the coded samples.
 enum class ColorPrimaries {
   /// Primaries were unavailable or could not be mapped to a supported value.
   Unknown,
@@ -316,15 +317,18 @@ struct VideoPlane {
 /// Decoder output owns immutable plane bytes that survive Reset(), Close(), and cleanup completion. A copy,
 /// retained plane, or slice holds the frame's output reservation across resets until the last reference is released.
 /// For application-provided planes, keep their storage stable and synchronize writes with readers.
-/// @see VideoFormat, VideoPlane, BufferReference
+/// VideoEncoder copies active samples on Accepted; the frame must match VideoEncoderConfig::input and use strictly
+/// increasing PTS. A supplied encoder-input duration must be positive and representable after microsecond rounding.
+/// @see VideoFormat, VideoPlane, BufferReference, VideoEncoder::TrySubmit()
 struct VideoFrame {
   /// Complete coded geometry and presentation metadata for these pixels.
   VideoFormat format;
   /// Required presentation timestamp with a positive timescale. Decoder output preserves the associated packet's
   /// exact rational PTS, including negative preroll.
   MediaTimestamp pts;
-  /// Optional nonnegative display duration with a positive timescale. Packet duration takes precedence over platform
-  /// duration. An empty value means duration is unknown.
+  /// Optional nonnegative display duration with a positive timescale. For decoder output, packet duration takes
+  /// precedence over platform duration. An empty value means duration is unknown. VideoEncoder requires a positive
+  /// duration when supplied and restores it on the corresponding encoded packet.
   std::optional<MediaTimestamp> duration;
   /// Y, U, V planes for I420. For NV12, a Y plane followed by one interleaved U/V plane.
   /// Plane extents are based on the coded image.

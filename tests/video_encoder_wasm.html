@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lib-Media H.264 encoder</title>
+<body>Running C++ WASM H.264 encoding and roundtrip tests…</body>
+<script type="module">
+import create from './media_video_encoder_web_native.js';
+try {
+  const module = await create({noInitialRun: true, huxeruiStorageKey: 'org.huxerui.media.videoencoder.test'});
+  module._main();
+} catch (error) {
+  console.error(error.stack || error);
+  document.body.textContent = 'FAIL: ' + error.message;
+}
+</script>

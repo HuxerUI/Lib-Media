@@ -12,4 +12,10 @@ CodecError Error(CodecErrorCode code, std::string message, std::string platform 
 BufferReference Own(Bytes bytes);
 // Reads the shared two-byte AAC-LC description used by encoder output and decoder input.
 CodecResult<AacConfig> ParseAac(std::span<const std::byte> bytes);
+struct AvcConfig {
+  unsigned length_size;
+  std::vector<Bytes> parameters;
+};
+// Reads the shared bounded avcC description used by encoder output and decoder input.
+CodecResult<AvcConfig> ParseAvc(std::span<const std::byte> bytes);
 } // namespace huxerui::media::detail

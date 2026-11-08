@@ -20,4 +20,36 @@ CodecResult<AacConfig> ParseAac(std::span<const std::byte> bytes) {
     return R::Failure(Error(CodecErrorCode::Unsupported, "Only 1024-sample AAC-LC mono/stereo is supported"));
   return R::Success({rates[rate], channels});
 }
+CodecResult<AvcConfig> ParseAvc(std::span<const std::byte> bytes) {
+  using R = CodecResult<AvcConfig>;
+  auto invalid = [] { return R::Failure(Error(CodecErrorCode::InvalidArgument, "Malformed AVCDecoderConfigurationRecord")); };
+  auto u = [&](std::size_t i) { return std::to_integer<unsigned>(bytes[i]); };
+  if (bytes.size() < 7 || bytes.size() > 65536 || u(0) != 1 || (u(4) & 252) != 252 || (u(5) & 224) != 224) return invalid();
+  if (u(1) != 66 && u(1) != 77 && u(1) != 100)
+    return R::Failure(Error(CodecErrorCode::Unsupported, "Only 8-bit AVC Baseline, Main, and High profiles are supported"));
+  AvcConfig result{(u(4) & 3) + 1, {}};
+  if (result.length_size == 3) return invalid();
+  std::size_t position = 6;
+  auto read = [&](unsigned count, unsigned type) {
+    if (!count) return false;
+    for (unsigned i = 0; i < count; ++i) {
+      if (position + 2 > bytes.size()) return false;
+      const auto size = (u(position) << 8) | u(position + 1);
+      position += 2;
+      if (!size || size > bytes.size() - position || (u(position) & 31) != type) return false;
+      result.parameters.emplace_back(bytes.begin() + position, bytes.begin() + position + size);
+      position += size;
+    }
+    return true;
+  };
+  if (!read(u(5) & 31, 7) || position >= bytes.size()) return invalid();
+  const auto pps_count = u(position++);
+  if (!read(pps_count, 8)) return invalid();
+  if (position != bytes.size()) {
+    if (u(1) != 100 || bytes.size() - position != 4 || u(position) != 253
+        || u(position + 1) != 248 || u(position + 2) != 248 || u(position + 3) != 0)
+      return R::Failure(Error(CodecErrorCode::Unsupported, "Unsupported AVC chroma, depth, or configuration extension"));
+  }
+  return R::Success(std::move(result));
+}
 } // namespace huxerui::media::detail

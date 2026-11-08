@@ -1,11 +1,11 @@
 # Codec and decoded-playback design
 
-The shared CPU media values, first AAC/AVC decoder milestone and six-platform PCM playback are
-implemented. The [decoding guide](mediacodec.md) records decoder validation. The
+The shared CPU media values, AAC/AVC decoders, AAC-LC/H.264 encoders, and six-platform PCM playback are
+implemented. The [codec guide](mediacodec.md) records platform validation and the encoder limitations. The
 [PCM acceptance section](#first-implementation-and-acceptance) records playback validation and the remaining work.
 
 The current implementation uses concrete asynchronous Probe calls, without hardware selection/classification. Windows
-starts with synchronous system MFTs; Linux requires GStreamer. Video reserves a conservative
+starts with synchronous system MFTs; Linux requires GStreamer. Video decoding reserves a conservative
 34-frame capacity and a 16-frame presentation window. Low-latency tuning, asynchronous MFT enumeration, hardware policy,
 and platform optimizations remain later milestones. Runtime acceptance is recorded separately for each platform.
 
@@ -458,6 +458,32 @@ The mappings are grounded in the [Android NDK codec lifecycle](https://developer
 [GStreamer element states](https://gstreamer.freedesktop.org/documentation/gstreamer/gstelement.html), and
 [WebCodecs lifecycle algorithms](https://www.w3.org/TR/webcodecs/). They still require platform implementation tests;
 this design does not claim that every driver is bounded or that release cannot fail.
+
+## H.264 encoding boundary
+
+`VideoEncoder` shares the codec direction-based organization and lifecycle contract, with separate audio/video
+session implementations. CPU I420/NV12 input is copied before acceptance. Configuration remains fixed for a stream:
+progressive eight-bit 4:2:0 SDR, full visible source, square pixels, and no rotation or scaling.
+
+Baseline/Main/High selection is independent of B-picture policy. Zero forbids B pictures, positive values request
+an upper bound, and Auto permits platform selection. Unsupported exact controls fail. VideoToolbox's frame-delay
+limit bounds in-flight work and is not substituted for a B count; WebCodecs Main/High requires Auto. The
+[platform matrix](mediacodec.md#video-encoder-platform-limits) records concrete limits.
+
+Reserve one maximum access-unit slot before each platform submission. Match output by its presentation identity,
+preserve original PTS/duration, and emit complete four-byte-length AVC access units in decode order. Configuration
+precedes packets and contains the actual coded bounds and crop. Only actual IDR pictures are key-marked. DTS is
+optional and cannot be synthesized from PTS or output order. Windows uses an internal fixed picture clock to
+correlate B-picture output and suppresses its codec-clock DTS when variable input timing makes it unsuitable.
+
+Finish drains every accepted picture and emits EOS once. No pressure-driven input dropping is allowed. Web uses
+quality mode and bounded progress flushes. Reset is an immediate logical barrier followed by worker/event-loop
+recreation; held output slices retain their entire packet credit across the barrier. Cleanup follows platform
+callback quiescence and native worker exit independently of retained CPU packet bytes.
+
+Windows/Linux native tests cover real reordering, variable input timing, profile, IDR requests, crop/stride and
+decoder round trips. Chrome exercises the C++/WASM API and Node tests cover retirement and malformed bridge output.
+Android has compilation coverage; independent iOS/macOS encoder build and device validation remain pending.
 
 ## Decoded playback boundary
 

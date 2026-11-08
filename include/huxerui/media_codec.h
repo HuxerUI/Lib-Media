@@ -1,12 +1,13 @@
 #pragma once
 
 /// @file
-/// @brief Headless, bounded, asynchronous AAC-LC encoding and AAC-LC/H.264 decoding.
+/// @brief Headless, bounded, asynchronous AAC-LC/H.264 encoding and decoding.
 ///
 /// Include <huxerui/media_codec.h> and link HuxerUI::Media. Use these sessions directly from headless code.
 /// Decoders accept initialization data and complete compressed access units in decode order, then emit format
 /// events and retained CPU frames. The audio encoder accepts contiguous PCM and emits AAC configuration, retained
-/// raw access units, and sample accounting. A successful drain ends with one EndOfStream event.
+/// raw access units, and sample accounting. The video encoder accepts CPU YUV pictures and emits AVC configuration
+/// and retained access units in decode order. A successful drain ends with one EndOfStream event.
 
 #include <functional>
 #include <memory>
@@ -18,6 +19,7 @@ namespace huxerui::media {
 namespace detail {
 template<class Output> class DecoderState;
 class AudioEncoderState;
+class VideoEncoderState;
 }
 
 /// @brief Portable categories for configuration, encoding, decoding, and cleanup errors.
@@ -59,7 +61,7 @@ template<class T> using CodecResult = Result<T, CodecError>;
 
 /// @brief Limits on retained input and output reservations for one session.
 ///
-/// Input capacity counts copied compressed packets for decoding or PCM frames for encoding, including bytes still
+/// Input capacity counts copied compressed packets for decoding or PCM/CPU video frames for encoding, including bytes still
 /// retained by an adapter. It becomes available when the last owner releases the copied storage. Output capacity is
 /// reserved before platform conversion and covers in-flight, reordered, queued, and consumer-held frames or packets.
 /// Retaining a plane or slice keeps the entire originating output reservation, including across Reset(). Release
@@ -69,17 +71,18 @@ template<class T> using CodecResult = Result<T, CodecError>;
 /// slots sized for 1024 samples per channel. Video requires 34 output slots sized for the coded bounds and 4:2:0 planes.
 /// Count one byte per coded luma sample and two bytes per subsampled chroma position for each video slot.
 /// Both output limits must accommodate the required slots. Platform codec and adapter scratch allocations are separate.
-/// AudioEncoderConfig specifies the separate PCM input and compressed output minimums for encoding.
-/// @see AudioDecoderConfig::limits, VideoDecoderConfig::limits, AudioEncoderConfig::limits
+/// AudioEncoderConfig and VideoEncoderConfig specify their respective input and compressed output minimums.
+/// @see AudioDecoderConfig::limits, VideoDecoderConfig::limits, AudioEncoderConfig::limits, VideoEncoderConfig::limits
 struct QueueLimits {
-  /// Maximum number of copied input packets or PCM frames still retained. Defaults to 48.
+  /// Maximum number of copied input packets or uncompressed frames still retained. Defaults to 48.
   std::size_t input_items = 48;
-  /// Maximum total retained input bytes. A larger single packet or PCM frame is rejected. Defaults to 8 MiB.
+  /// Maximum total retained input bytes. A larger single packet, PCM frame, or CPU picture is rejected. Defaults to 8 MiB.
   std::size_t input_bytes = 8 * 1024 * 1024;
   /// Maximum number of output frame or packet reservations. Defaults to 48, subject to output_bytes.
   std::size_t output_items = 48;
   /// Maximum total bytes reserved for output. Decoders charge the maximum configured frame size per slot.
   /// Audio encoding reserves 64 KiB per pending packet, then reduces the charge to its actual payload size.
+  /// Video encoding reserves VideoEncoderConfig::max_packet_bytes per picture and reduces it after encoding.
   /// The default is 192 MiB; individual configurations can supply smaller defaults. Storage is allocated as needed.
   std::size_t output_bytes = 192 * 1024 * 1024;
 };
@@ -133,6 +136,80 @@ struct VideoDecoderConfig {
   std::function<void()> wakeup;
   /// Optional teardown callback with the resource and lifetime contract of AudioDecoderConfig::cleanup_completed.
   std::function<void(CodecResult<void>)> cleanup_completed;
+};
+
+/// @brief H.264 profiles supported by the CPU video encoder.
+enum class H264Profile {
+  /// Baseline or Constrained Baseline, without B pictures.
+  Baseline,
+  /// Main profile with optional B pictures.
+  Main,
+  /// Eight-bit 4:2:0 High profile with optional B pictures.
+  High
+};
+
+/// @brief Fixed configuration for encoding CPU I420 or NV12 frames to H.264 access units.
+///
+/// Supply even dimensions in [2, 8192], a full visible rectangle, square pixels, no rotation, and SDR color facts.
+/// Every submitted frame must match input; plane strides may differ. No scaling or color-space conversion occurs.
+/// Platform limits may be smaller. Probe the concrete profile, dimensions, rate, and B-picture policy.
+/// @see VideoEncoder::Create(), VideoEncoder::Probe(), VideoEncodeFormat
+struct VideoEncoderConfig {
+  /// Required CPU geometry, I420/NV12 layout, and color metadata. The default unset VideoFormat is invalid.
+  VideoFormat input;
+  /// Positive numerator of the expected frame rate. This guides rate control; input PTS remains authoritative.
+  std::uint32_t frame_rate_numerator = 30;
+  /// Positive denominator; 30000/1001 represents approximately 29.97 frames/second. The ratio cannot exceed 240 fps.
+  std::uint32_t frame_rate_denominator = 1;
+  /// Positive target average bits per second, at most INT32_MAX. This is not a per-packet size guarantee.
+  std::uint32_t bitrate = 4'000'000;
+  /// Requested stream profile. An unavailable profile is rejected rather than silently downgraded.
+  H264Profile profile = H264Profile::High;
+  /// Target distance in input pictures between random-access pictures, in [1, INT32_MAX]. Platforms may insert them earlier.
+  /// This is a rate-control request, not an exact frame boundary guarantee.
+  std::uint32_t key_frame_interval = 60;
+  /// Zero forbids B pictures; a positive value up to 16 bounds consecutive B pictures without requiring their use.
+  /// An empty value permits platform selection within the bounded processing window. Baseline rejects positive values.
+  /// Platforms that cannot enforce a requested numeric bound return Unsupported.
+  std::optional<std::uint32_t> max_b_frames = 0;
+  /// Hard bound in [1, INT32_MAX] on one access unit after normalization to four-byte NAL lengths. Defaults to 4 MiB.
+  /// Output storage is reserved before submission, then reduced to the actual packet size. Oversize output fails.
+  std::size_t max_packet_bytes = 4 * 1024 * 1024;
+  /// Maximum copied input and retained output. Input must fit one packed frame. Output needs at least two full
+  /// packet reservations, or max_b_frames + 2 when an explicit positive bound is requested. Platform delay may
+  /// require a larger window. Defaults: four inputs/64 MiB and eight outputs/32 MiB; allocations are demand-driven.
+  /// Returned slices retain their entire originating packet credit across resets. Platform storage is additional.
+  QueueLimits limits{4, 64 * 1024 * 1024, 8, 32 * 1024 * 1024};
+  /// Optional coalesced signal for readiness, output, returned capacity, or an asynchronous error.
+  /// Schedule application work to drain TryRead() and retry pending input until no further progress is possible.
+  /// This callback runs outside library locks and may call Close(). Return promptly without throwing or waiting.
+  /// Use owned or weak captures that remain safe if initialization runs before Create() returns.
+  std::function<void()> wakeup;
+  /// Optional final result after platform release, admitted wakeup return, and desktop/mobile worker exit.
+  /// On Web it runs on the owning event loop after retirement. Held packet bytes do not delay it. A cleanup failure
+  /// is separate from an encoding failure; unsafe outstanding platform work leaves completion pending.
+  /// Return promptly without throwing or waiting. Use owned or weak captures that survive retirement.
+  std::function<void(CodecResult<void>)> cleanup_completed;
+};
+
+/// @brief H.264 configuration emitted before its dependent access units.
+///
+/// Coded bounds may include macroblock padding beyond visible; use these bounds when configuring VideoDecoder.
+/// Coded geometry, crop, profile, and requested color signaling are validated against the configuration.
+/// Initialization data carries the platform-selected level; there is no separate level request in this API.
+/// @see VideoEncodeOutput, VideoDecoderConfig
+struct VideoEncodeFormat {
+  /// Actual coded luma width, including any padding outside the visible picture.
+  std::uint32_t width = 0;
+  /// Actual coded luma height, including any padding outside the visible picture.
+  std::uint32_t height = 0;
+  /// Visible input picture within the coded bounds.
+  VideoRectangle visible;
+  /// AVCDecoderConfigurationRecord of at most 64 KiB, containing SPS/PPS and a four-byte NAL length size.
+  Bytes initialization_data;
+  /// @brief Compares coded bounds, visible rectangle, and initialization data.
+  /// @return True when all stored fields match.
+  bool operator==(const VideoEncodeFormat&) const = default;
 };
 
 /// @brief Configuration for encoding interleaved S16 PCM to raw AAC-LC access units.
@@ -214,7 +291,7 @@ struct AudioEncodeSummary {
 ///
 /// A codec session emits this once after Finish() and all delayed output. An audio encoder emits its sample summary
 /// immediately before this event. The session remains open for Reset() or Close().
-/// @see AudioDecoder::Finish(), VideoDecoder::Finish(), AudioEncoder::Finish()
+/// @see AudioDecoder::Finish(), VideoDecoder::Finish(), AudioEncoder::Finish(), VideoEncoder::Finish()
 struct EndOfStream {};
 
 /// @brief One audio output event from TryRead().
@@ -237,6 +314,14 @@ using VideoDecodeOutput = std::variant<VideoFormat, VideoFrame, EndOfStream>;
 /// event can also be available if the platform encoder reports its configuration before receiving PCM.
 /// @see AudioEncoder::TryRead(), AudioEncodeSummary
 using AudioEncodeOutput = std::variant<AudioEncodeFormat, EncodedPacket, AudioEncodeSummary, EndOfStream>;
+
+/// @brief A video configuration, retained H.264 access unit, or successful end of the stream.
+///
+/// Format precedes dependent packets, including after Reset(). Each packet represents one input picture and uses
+/// four-byte big-endian NAL lengths. Packets are emitted in decode order; PTS may move backwards with B pictures.
+/// EndOfStream appears once after all accepted pictures. A failed or closed stream emits no successful end.
+/// @see VideoEncoder::TryRead(), VideoEncodeFormat
+using VideoEncodeOutput = std::variant<VideoEncodeFormat, EncodedPacket, EndOfStream>;
 
 /// @brief Move-only AAC-LC decoder with bounded queues and independently retained CPU output.
 ///
@@ -533,6 +618,126 @@ public:
 private:
   explicit AudioEncoder(std::shared_ptr<detail::AudioEncoderState> state);
   std::shared_ptr<detail::AudioEncoderState> state_;
+};
+
+/// @brief Move-only asynchronous H.264 encoder with bounded queues and independently retained packet bytes.
+///
+/// Submit CPU I420/NV12 pictures and drain H.264 access units through TryRead(). The returned handle owns the
+/// session. No Runtime, window, texture, or capture device is required.
+///
+/// On desktop and mobile platforms, queue and control calls may run concurrently on a live handle. On Web, use the
+/// JavaScript event loop that created the session. Move or destroy a handle only after its concurrent callers have
+/// stopped. Codec operations can copy pixels and acquire locks, so schedule them outside hard real-time callbacks.
+///
+/// Callbacks for one session are serialized and dispatched outside library locks. Each desktop or mobile session runs
+/// codec work and wakeups on its own worker; cleanup completion follows that worker's exit. On Web both callbacks
+/// run on the owning event loop. Callbacks may race the return of Create() or a control call.
+///
+/// An asynchronous initialization or encoding failure starts teardown. TryRead() and TrySubmit() report that
+/// failure until Close() changes the session to Closed. The optional cleanup callback reports teardown separately.
+/// @see VideoEncoderConfig, VideoEncodeOutput, AudioEncoder
+class VideoEncoder final {
+public:
+  /// @brief Validates the configuration and schedules platform initialization.
+  /// @param config Input format, encoding controls, queue limits, and optional callbacks, copied for the session.
+  /// @return An owning encoder handle on success. Platform initialization may still be pending, in which case
+  /// TrySubmit() returns WouldBlock. A synchronous Failure returns a CodecError and schedules no callbacks.
+  /// Platform capability or initialization errors are subsequently reported through TryRead() and TrySubmit().
+  /// @see Probe(), TryRead(), VideoEncoderConfig::wakeup
+  static CodecResult<VideoEncoder> Create(const VideoEncoderConfig& config);
+
+  /// @brief Tests the configuration asynchronously by initializing and releasing an independent platform encoder.
+  ///
+  /// Probe does not reserve resources for a later Create() or encode application pictures. Platform output
+  /// negotiation can still fail when a session starts processing input.
+  /// @param config Configuration to probe. The wakeup and cleanup_completed fields are ignored.
+  /// @param completion Optional callback invoked once when the probe finishes, with success or a CodecError.
+  /// On desktop and mobile platforms it is dispatched after the probe worker exits; on Web it runs on the owning event loop.
+  /// It must return promptly without throwing or waiting for encoder work.
+  /// @see Create(), VideoEncoderConfig
+  static void Probe(const VideoEncoderConfig& config, std::function<void(CodecResult<void>)> completion);
+
+  /// @brief Transfers ownership of the session and its callbacks. The source handle then behaves as closed.
+  VideoEncoder(VideoEncoder&&) noexcept;
+  /// @brief Retires the destination's previous session and takes ownership of the source session.
+  /// @return This handle. The source handle then behaves as closed.
+  VideoEncoder& operator=(VideoEncoder&&) noexcept;
+  VideoEncoder(const VideoEncoder&) = delete;
+  VideoEncoder& operator=(const VideoEncoder&) = delete;
+
+  /// @brief Retires the session as in Close(). Internal state remains alive through asynchronous teardown.
+  ~VideoEncoder();
+
+  /// @brief Queues one CPU picture without waiting for platform encoding.
+  /// @param frame Valid VideoFrame matching VideoEncoderConfig::input. Keep the used plane bytes unchanged until
+  /// return. PTS must increase strictly in exact time and after microsecond rounding. Platform conversion and range
+  /// limits are checked separately.
+  /// Optional duration must be positive and representable when present. Variable frame intervals are allowed.
+  /// @return Accepted after copying active samples. WouldBlock leaves pixels and timing unconsumed while startup
+  /// or reset is pending or copied-input capacity is exhausted. Failure reports invalid input, copy resource
+  /// exhaustion, InvalidState while draining or ended, Closed after retirement or on a moved-from handle, or the
+  /// recorded operational error after fatal failure. Synchronous rejection leaves the session usable for valid
+  /// input. Source planes can be reused as soon as Accepted returns.
+  /// @see VideoFrame::Validate(), SubmitStatus, TryRead()
+  CodecResult<SubmitStatus> TrySubmit(const VideoFrame& frame);
+
+  /// @brief Removes the next output event without waiting for platform encoding.
+  ///
+  /// Format precedes its dependent packets. Each packet contains one picture with four-byte NAL lengths and is
+  /// emitted in decode order; PTS may move backward with B pictures. The original input PTS and supplied duration
+  /// are restored to the corresponding picture. DTS uses reliable platform timing and remains absent when unavailable.
+  ///
+  /// Returned packet bytes are immutable and remain readable across Reset(), Close(), and cleanup completion.
+  /// Copies and arbitrary slices retain the entire originating packet reservation until the last reference is
+  /// released. Held packets can delay further encoding when the output pool is full.
+  /// @return Failure with the recorded operational error or Closed. On success, std::nullopt means no event is
+  /// available, including while a reset is pending. An engaged value carries one VideoEncodeFormat, EncodedPacket,
+  /// or EndOfStream. EndOfStream is consumed once per successful drain. Later reads return an empty optional until
+  /// a new stream starts or the session closes.
+  /// @see VideoEncodeOutput, VideoEncodeFormat, Finish()
+  CodecResult<std::optional<VideoEncodeOutput>> TryRead();
+
+  /// @brief Requests a new random-access picture as soon as the platform can produce one.
+  ///
+  /// Repeated pending requests may coalesce. The request does not promise a particular input frame or fixed
+  /// response distance. Observe actual packet key_frame values to identify IDR pictures.
+  /// @return Success when accepted in the running phase. Other phases report InvalidState, the recorded operational
+  /// error, or Closed. Platform rejection is subsequently reported through TryRead() and TrySubmit().
+  /// @see EncodedPacket::key_frame, VideoEncoderConfig::key_frame_interval
+  CodecResult<void> RequestKeyFrame();
+
+  /// @brief Seals input and drains all accepted and reordered pictures before one EndOfStream.
+  ///
+  /// Read remaining packets, then one EndOfStream. Held output can delay the drain until capacity is released.
+  /// An empty stream can end without a format event. Further submissions return InvalidState while draining or
+  /// ended. The session remains open for Reset().
+  /// @return Success when the drain is requested, already pending, or complete. InvalidState during startup or
+  /// reset, the recorded operational error after fatal failure, or Closed after retirement or on a moved-from handle.
+  /// @see VideoEncodeOutput, TryRead()
+  CodecResult<void> Finish();
+
+  /// @brief Discards pending input and output and schedules a fresh stream with the same configuration.
+  ///
+  /// Discard takes effect on acceptance, including during a drain. Returned packets retain storage and reservations
+  /// in the same output pool. TrySubmit() returns WouldBlock until platform recreation finishes; TryRead() returns
+  /// no stale events. The new stream starts with IDR and can use a different starting PTS. Use Create() to change
+  /// the input format, encoding controls, or queue limits.
+  /// @return Success when reset is accepted or already pending. InvalidState during startup or after a fatal
+  /// error. Closed after retirement or on a moved-from handle.
+  /// @see Create(), VideoEncoderConfig
+  CodecResult<void> Reset();
+
+  /// @brief Immediately retires the session and schedules asynchronous teardown.
+  ///
+  /// Safe to repeat or call from wakeup. Retirement ends further input, reads, and wakeup admission. A wakeup
+  /// admitted before retirement may still run after return. Use cleanup_completed to observe platform release and
+  /// callback quiescence before retiring state used by wakeup. Retained packet bytes do not delay completion.
+  /// Allow the final callback to return and fence all codec work before unloading the module or terminating its worker.
+  /// @see VideoEncoderConfig::cleanup_completed
+  void Close() noexcept;
+private:
+  explicit VideoEncoder(std::shared_ptr<detail::VideoEncoderState> state);
+  std::shared_ptr<detail::VideoEncoderState> state_;
 };
 
 } // namespace huxerui::media

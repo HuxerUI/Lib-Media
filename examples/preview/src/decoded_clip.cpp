@@ -1,6 +1,6 @@
 #include "decoded_preview.h"
 
-#if defined(MEDIA_PREVIEW_FRAMES)
+#if defined(__ANDROID__) || defined(__APPLE__) || defined(__EMSCRIPTEN__) || defined(_WIN32) || defined(__linux__)
 
 #include <fixture_resources.h>
 #include <huxerui/media_codec.h>
@@ -124,7 +124,7 @@ Task<std::string> PlayDecodedClip(std::shared_ptr<Resources> resources, std::sha
     audio = Require(AudioDecoder::Create(config));
     playback_config.emplace();
     playback_config->format = sync_audio;
-#if defined(MEDIA_PREVIEW_IOS)
+#if defined(__APPLE__) && TARGET_OS_IOS
     playback_config->cleanup_completed = [audio_use = RetainPreviewAudioSession(true)](PlaybackResult<void>) mutable {
       audio_use.reset();
     };
@@ -189,11 +189,101 @@ Task<std::string> PlayDecodedClip(std::shared_ptr<Resources> resources, std::sha
   if (range_fallback) result += " Unknown range uses limited range.";
   co_return result;
 }
+namespace {
+VideoFrame EncoderPicture(const VideoEncoderConfig& config, unsigned index) {
+  const auto width = config.input.width, height = config.input.height;
+  const auto luma = std::size_t(width) * height;
+  auto bytes = std::make_shared<Bytes>(luma * 3 / 2, std::byte{128});
+  for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x) {
+    const auto moving = (x + index * 5) % width;
+    (*bytes)[std::size_t(y) * width + x] = std::byte(32 + ((moving / 8 + y / 4) % 180));
+  }
+  for (std::size_t i = luma; i < bytes->size(); i += 2) {
+    (*bytes)[i] = std::byte{100}; (*bytes)[i + 1] = std::byte{160};
+  }
+  BufferReference pixels(*bytes, bytes);
+  return {config.input, {index, 30}, MediaTimestamp{1, 30},
+      {{pixels.Slice(0, luma), width, 1}, {pixels.Slice(luma, luma / 2), width, 2}}};
+}
+}
+Task<std::string> PlayEncodedClip(std::shared_ptr<ExternalTexture> texture, std::function<bool()> paused) {
+  VideoEncoderConfig config;
+  config.input = {.width = 320, .height = 180, .visible = {0, 0, 320, 180}, .pixel_format = VideoPixelFormat::NV12};
+  config.profile = H264Profile::High; config.max_b_frames = std::nullopt;
+  auto encoder = Require(VideoEncoder::Create(config));
+  std::optional<VideoDecoder> decoder;
+  std::optional<VideoFrame> input, picture;
+  std::optional<EncodedPacket> packet;
+  auto playback = Require(DecodedPlayback::Create({.video = true}));
+  const auto epoch = playback.Epoch();
+  Require(playback.Play());
+  unsigned next = 0, packets = 0, presented = 0, dropped = 0;
+  bool sealed = false, encoded_end = false, decoded_end = false, is_paused = false;
+  auto deadline = Clock::now() + 15s;
+  for (;;) {
+    while (next < 90) {
+      if (!input) input = EncoderPicture(config, next);
+      if (Require(encoder.TrySubmit(*input)) == SubmitStatus::WouldBlock) break;
+      input.reset(); ++next;
+    }
+    if (!sealed && next == 90) { Require(encoder.Finish()); sealed = true; }
+    while (!encoded_end) {
+      if (packet) {
+        if (Require(decoder->TrySubmit(*packet)) == SubmitStatus::WouldBlock) break;
+        packet.reset();
+      }
+      auto output = Require(encoder.TryRead());
+      if (!output) break;
+      if (auto* format = std::get_if<VideoEncodeFormat>(&*output)) {
+        VideoDecoderConfig decode;
+        decode.initialization_data = format->initialization_data;
+        decode.width = format->width; decode.height = format->height;
+        decode.limits.output_bytes = decode.limits.output_items * decode.width * decode.height * 3 / 2;
+        decoder.emplace(Require(VideoDecoder::Create(decode)));
+      } else if (auto* value = std::get_if<EncodedPacket>(&*output)) {
+        packet = std::move(*value); ++packets;
+      } else {
+        if (!decoder) throw std::runtime_error("H.264 ended without a video configuration");
+        Require(decoder->Finish()); encoded_end = true;
+      }
+    }
+    while (decoder && !decoded_end) {
+      if (picture) {
+        if (Require(playback.TrySubmitVideo(epoch, *picture)) == SubmitStatus::WouldBlock) break;
+        picture.reset();
+      }
+      auto output = Require(decoder->TryRead());
+      if (!output) break;
+      if (auto* value = std::get_if<VideoFrame>(&*output)) picture = std::move(*value);
+      else if (std::holds_alternative<EndOfStream>(*output)) {
+        Require(playback.FinishVideo(epoch)); decoded_end = true;
+      }
+    }
+    if (paused() != is_paused) {
+      is_paused = !is_paused; Require(is_paused ? playback.Pause() : playback.Play());
+    }
+    const auto update = Require(playback.PresentVideo(epoch, [&](const VideoFrame& frame) { PublishFrame(*texture, frame); }));
+    dropped += update.dropped;
+    if (update.lag_ms) ++presented;
+    const auto snapshot = playback.Snapshot();
+    if (snapshot.error) throw std::runtime_error(snapshot.error->message);
+    if (snapshot.state == PlaybackState::Ended) break;
+    if (is_paused) deadline = Clock::now() + 15s;
+    if (Clock::now() >= deadline) throw std::runtime_error("Timed out waiting for H.264 roundtrip playback");
+    co_await Delay(4ms);
+  }
+  co_return "H.264 roundtrip ended: " + std::to_string(packets) + " encoded pictures, " +
+      std::to_string(presented) + " published, " + std::to_string(dropped) + " dropped during playback.";
+}
 } // namespace media_preview
 #else
 huxerui::Task<std::string> media_preview::PlayDecodedClip(std::shared_ptr<huxerui::Resources>,
                                                          std::shared_ptr<huxerui::ExternalTexture>,
                                                          bool, std::function<bool()>) {
   co_return "Decoded frame playback is unavailable on this platform.";
+}
+huxerui::Task<std::string> media_preview::PlayEncodedClip(std::shared_ptr<huxerui::ExternalTexture>,
+                                                         std::function<bool()>) {
+  co_return "H.264 roundtrip playback is unavailable on this platform.";
 }
 #endif

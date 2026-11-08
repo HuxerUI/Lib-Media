@@ -410,21 +410,22 @@ View LibraryPage() {
 View FramesPage() {
   auto texture = UseState(std::shared_ptr<ExternalTexture>{});
   auto notice = UseState(std::string(media_preview::frame_texture_supported
-      ? "Choose video-only or synchronized playback." : "Frame preview is unavailable on this platform."));
+      ? "Choose decoded playback or an H.264 encoding roundtrip." : "Frame preview is unavailable on this platform."));
   auto playing = UseState(false);
   auto paused = UseState(false);
   auto tasks = UseTaskScope();
   auto resources = UseService<Resources>();
-  auto play = [texture, playing, paused, tasks, resources, notice](bool with_audio) {
+  auto play = [texture, playing, paused, tasks, resources, notice](bool with_audio, bool encode = false) {
     if (!media_preview::frame_texture_supported || playing) return;
     playing = true;
     paused = false;
-    notice = with_audio ? "Playing A/V sync clip..." : "Playing video clip...";
-    tasks.Launch([texture, playing, paused, resources, notice, with_audio]() -> Task<void> {
+    notice = encode ? "Encoding and playing H.264..." : with_audio ? "Playing A/V sync clip..." : "Playing video clip...";
+    tasks.Launch([texture, playing, paused, resources, notice, with_audio, encode]() -> Task<void> {
       try {
-        texture = media_preview::MakeFrameTexture({240, 180});
-        notice = co_await media_preview::PlayDecodedClip(resources, texture, with_audio,
-                                                         [paused]() -> bool { return paused; });
+        texture = media_preview::MakeFrameTexture(encode ? Size{320, 180} : Size{240, 180});
+        if (encode) notice = co_await media_preview::PlayEncodedClip(texture, [paused]() -> bool { return paused; });
+        else notice = co_await media_preview::PlayDecodedClip(resources, texture, with_audio,
+                                                              [paused]() -> bool { return paused; });
       } catch (const std::exception& error) {
         notice = error.what();
       }
@@ -439,6 +440,7 @@ View FramesPage() {
     Flow {
       Button("Play video").OnClick([play] { play(false); }).With(Enabled{can_play}),
       Button("Play A/V sync").OnClick([play] { play(true); }).With(Enabled{can_play}),
+      Button("Encode H.264").OnClick([play] { play(false, true); }).With(Enabled{can_play}),
       Button(playing && paused ? "Resume" : "Pause")
           .OnClick([paused] { paused = !paused; }).With(Enabled{playing}),
     }.With(Spacing(10.0F)),

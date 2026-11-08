@@ -1,11 +1,11 @@
 # Lib-Media
 
 Lib-Media is the media library for [HuxerUI](https://github.com/HuxerUI/HuxerUI). It brings media playback, platform
-image/video selection, saving to the system photo library, headless AAC-LC/H.264 decoding, and decoded PCM output
+image/video selection, saving to the system photo library, headless AAC-LC/H.264 encoding and decoding, and decoded PCM output
 into one C++ library.
 
 Link **`HuxerUI::Media`** and use APIs in **`huxerui::media`**. Register the **`Install`** application hook
-for file/URL playback and photo-library access. Decoding and PCM output can run independently of that hook,
+for file/URL playback and photo-library access. Codecs and PCM output can run independently of that hook,
 a UI runtime, or a window.
 
 Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
@@ -16,6 +16,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 - [Media playback](#media-playback)
 - [Media selection and saving](#media-selection-and-saving)
 - [Media decoding](#media-decoding)
+- [Media encoding](#media-encoding)
 - [PCM playback](#pcm-playback)
 - [Preview, builds, and validation](#preview-builds-and-validation)
 - [Repository layout](#repository-layout)
@@ -31,6 +32,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; Apple encoder validation remains pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
+| H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; Apple build/device validation remains pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
 
 Platform selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
 SDK `FileReference` values, which can be retained for reading, imported to local files, or passed to `MediaSource` for
@@ -310,6 +312,27 @@ Ubuntu 24.04 under WSL, and Chrome through the C++/WASM API. Windows and Linux a
 fixtures with tight output pools. Physical iOS decoding remains unvalidated. See the [decoding guide](docs/mediacodec.md) for examples, queue limits,
 platform requirements, and validation instructions.
 
+## Media encoding
+
+`AudioEncoder` accepts contiguous interleaved S16 mono/stereo PCM at 44.1 or 48 kHz and emits raw AAC-LC packets,
+AudioSpecificConfig, and a final sample summary. `VideoEncoder` accepts CPU I420/NV12 pictures and emits H.264
+access units with four-byte NAL lengths and a separate `avcC` description. Neither encoder writes a container.
+
+Video supports Baseline, Main, and High profiles, independently of its B-picture policy: `max_b_frames = 0` forbids B
+pictures, a positive value requests an upper bound, and `std::nullopt` allows platform selection. Defaults are High
+with zero B pictures. Unsupported controls return an error; Web Main/High requires `std::nullopt` because WebCodecs
+cannot enforce a numeric bound. Use `RequestKeyFrame()` to request a later IDR without promising an exact frame.
+
+Submit strictly increasing video PTS and drain output in decode order. With B pictures, output PTS can move backward;
+the encoder restores the corresponding input PTS and duration. DTS is present only when reliable platform timing is
+available. Accepted input is copied, and returned packet slices keep output credit across reset and close.
+Continue draining while submitting to avoid filling either bounded queue.
+
+Linux H.264 encoding requires the installed `x264enc` and `h264parse` plugins. Android video encoding requires API 28+;
+Main/High numeric B-picture bounds require API 29+. Apple supports zero or automatic B pictures and has independent
+iOS/macOS implementations. See the [encoding guide](docs/mediacodec.md#h264-video-encoding) for the platform matrix,
+queue limits, timing contract, and a bounded producer/consumer example.
+
 ## PCM playback
 
 `DecodedPlayback` accepts `AudioFrame` from a decoder or a PCM generator. Use `DecodedPlayback::Create({.audio = audio})`
@@ -390,7 +413,7 @@ The [preview](examples/preview) exercises the library through four tabs.
 | Video | Local/reference/URL sources, playback controls, progress, seeking, volume, looping, and video fitting |
 | Music | Audio playback using the same player API without a video surface |
 | Library | Platform image/video/mixed selection, capability-aware multi-select, retained references, and publication |
-| Frames | Video-only and synchronized decoded playback on Android, iOS, macOS, Windows, Linux, and Web |
+| Frames | Video-only and synchronized decoded playback, plus a generated H.264 encoding/decoding round trip |
 
 The Library tab disables multi-select when the maximum is below two; otherwise it requests up to three items within
 the platform limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
@@ -401,6 +424,10 @@ playback pairs its flashes with AAC tone bursts and uses the PCM device position
 support pause and resume and publish to one `ExternalTexture` per run. The result reports published and dropped
 frames, maximum video lag at texture publication, and any fallback for unknown color metadata. Switching tabs
 retires the session and its decoders.
+
+“Encode H.264” streams 90 generated 320×180 NV12 pictures through `VideoEncoder`, `VideoDecoder`, and video-only
+`DecodedPlayback` into one texture. It uses High with automatic B pictures, bounded pending input/output, and no
+packet archive. Pause/resume controls presentation; the result separates encoded pictures from playback drops.
 
 The [texture contract test](tests/frame_texture_contract.cpp) checks cropped, padded NV12 and I420 color bars and
 successive publications to one texture. The [native decoder test](tests/codec_native.cpp) checks the 24-frame
@@ -472,14 +499,14 @@ private state, validation, and backend contracts. Shared worker execution lives 
 | [`src/format/`](src/format) | `media_format.h` implementation: timestamps, PCM/YUV descriptions, and frame validation |
 | [`src/player/`](src/player) | `media_player.h` implementation, player state, platform backend contract, channel transport, and video geometry |
 | [`src/library/`](src/library) | `media_library.h` implementation, request state, platform transport contract, and payload validation |
-| [`src/codec/`](src/codec) | `media_codec.h` implementations, shared AAC utilities, and separate decoder/encoder internals |
+| [`src/codec/`](src/codec) | `media_codec.h` implementations, shared AAC/AVC initialization utilities, and separate decoder/encoder internals |
 | [`src/decoded_playback/`](src/decoded_playback) | `media_playback.h` implementation, audio session, device contract, and video scheduling |
 | [`src/execution/`](src/execution) | Desktop and mobile session workers, post-exit cleanup dispatch, and Web event-loop scheduling |
 | [`platform/`](platform) | Platform adapters and platform package integration |
 | [`examples/preview/`](examples/preview) | Consumer application for playback and photo-library access |
 | [`tests/`](tests) | Shared contracts, codec fixtures, and platform checks |
 | [`docs/medialibrary.md`](docs/medialibrary.md) | Photo-library integration and lifecycle details |
-| [`docs/mediacodec.md`](docs/mediacodec.md) | Decoder usage, ownership, platform limits, and validation |
+| [`docs/mediacodec.md`](docs/mediacodec.md) | Codec usage, ownership, platform limits, and validation |
 | [`docs/codec-design.md`](docs/codec-design.md) | Shared lifecycle design and remaining playback/encoding milestones |
 
 ## Roadmap
@@ -489,8 +516,8 @@ lifecycle contract, and delivery order. The AAC/AVC decoding milestone is now im
 validation called out in the [decoding guide](docs/mediacodec.md).
 
 The next stages of decoded playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) expand device and
-synchronization measurements. AAC-LC audio encoding has an initial implementation; remaining encoder platform
-validation, video encoding, and broader codec discovery are later stages of [#20](https://github.com/HuxerUI/HuxerUI/issues/20).
+synchronization measurements. AAC-LC audio encoding and H.264 video encoding have initial implementations; remaining
+encoder platform validation and broader codec discovery are later stages of [#20](https://github.com/HuxerUI/HuxerUI/issues/20).
 
 Existing file/URL playback continues to use platform players. HuxerUI owns general file, task, window, and texture
 facilities; media-specific behavior stays in Lib-Media.

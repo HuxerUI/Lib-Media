@@ -70,8 +70,17 @@ struct MediaHttpSource {
 /// @endcode
 class MediaSource final {
 public:
+  /// @brief Retains a local file path for playback without opening or inspecting its contents.
+  /// @param file Local file value copied or moved into the source.
   explicit MediaSource(huxerui::File file);
+
+  /// @brief Retains a file reference and its access capability for playback.
+  /// @param reference File reference copied or moved into the source; platform loading checks its readability.
   explicit MediaSource(huxerui::FileReference reference);
+
+  /// @brief Validates and retains an HTTP or HTTPS source without starting a request.
+  /// @param source Absolute URL and request headers copied or moved into the source.
+  /// @throws std::invalid_argument If the URL or header syntax violates MediaHttpSource's requirements.
   explicit MediaSource(MediaHttpSource source);
 
 private:
@@ -143,6 +152,9 @@ struct MediaTimeRange {
   MediaTime start{};
   /// End position of the interval, not its length; end is at or after start.
   MediaTime end{};
+
+  /// @brief Compares both stored interval endpoints.
+  /// @return True if both start values and both end values match, otherwise false.
   bool operator==(const MediaTimeRange&) const = default;
 };
 
@@ -158,6 +170,9 @@ struct MediaProgress {
   /// Backend-reported buffered intervals. Missing means unavailable; an empty vector means no reported intervals.
   /// Do not assume the intervals cover the entire source or form one continuous range.
   std::optional<std::vector<MediaTimeRange>> buffered_ranges;
+
+  /// @brief Compares the position, duration, and buffered intervals.
+  /// @return True if all stored fields are equal, including optional-value presence and interval order.
   bool operator==(const MediaProgress&) const = default;
 };
 
@@ -172,6 +187,9 @@ struct MediaError {
   /// True when playback enters Failed and the error is retained in MediaPlayerState::error.
   /// False for recoverable notifications; these are delivered through OnError() without setting the retained error.
   bool fatal = false;
+
+  /// @brief Compares the category, diagnostic text, platform code, and severity.
+  /// @return True if all four stored fields are equal, otherwise false.
   bool operator==(const MediaError&) const = default;
 };
 
@@ -208,6 +226,9 @@ struct MediaPlayerState {
   bool looping = false;
   /// Only the current source's fatal error. Load() and Clear() reset it; recoverable errors are callback-only.
   std::optional<MediaError> error;
+
+  /// @brief Compares all published state, metadata, and preference fields.
+  /// @return True if all stored snapshot fields are equal, otherwise false.
   bool operator==(const MediaPlayerState&) const = default;
 };
 
@@ -388,6 +409,8 @@ public:
               std::forward<Dependencies>(dependencies)...);
   }
 
+  /// @brief Compares the retained session identity of two handles.
+  /// @return True if both handles retain the same session state, otherwise false.
   bool operator==(const MediaPlayer&) const = default;
 
 private:
@@ -450,6 +473,9 @@ struct VideoSurfaceProperties {
   huxerui::HorizontalAlignment horizontal_alignment = huxerui::HorizontalAlignment::Center;
   /// Vertical content placement: Start, Center, or End. Stretch is invalid; Center is the default.
   huxerui::VerticalAlignment vertical_alignment = huxerui::VerticalAlignment::Center;
+
+  /// @brief Compares video fitting and both content alignments.
+  /// @return True if all three presentation properties are equal, otherwise false.
   bool operator==(const VideoSurfaceProperties&) const = default;
 };
 

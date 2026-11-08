@@ -94,3 +94,136 @@
     }
   };
 })(globalThis);
+
+// Video callbacks retain only JS session state. Output admission is reserved before encode().
+(function(root) {
+  'use strict';
+  const sessions = new Map();
+  let nextId = 1;
+  function fail(state, error) {
+    if (state.active) state.error = String(error && error.message || error);
+  }
+  function codec(options) {
+    const blocks = Math.ceil(options.width / 16) * Math.ceil(options.height / 16);
+    const rate = blocks * options.rateNumerator / options.rateDenominator;
+    const bitrate = options.bitrate / (options.profile === 100 ? 1.25 : 1);
+    const levels = [
+      [10, 1485, 99, 64000], [11, 3000, 396, 192000], [12, 6000, 396, 384000],
+      [13, 11880, 396, 768000], [20, 11880, 396, 2000000], [21, 19800, 792, 4000000],
+      [22, 20250, 1620, 4000000], [30, 40500, 1620, 10000000], [31, 108000, 3600, 14000000],
+      [32, 216000, 5120, 20000000], [40, 245760, 8192, 20000000], [41, 245760, 8192, 50000000],
+      [42, 522240, 8704, 50000000], [50, 589824, 22080, 135000000], [51, 983040, 36864, 240000000],
+      [52, 2073600, 36864, 240000000], [60, 4177920, 139264, 240000000],
+      [61, 8355840, 139264, 480000000], [62, 16711680, 139264, 800000000]
+    ];
+    const level = levels.find(value => rate <= value[1] && blocks <= value[2] && bitrate <= value[3]);
+    if (!level) throw new Error('H.264 geometry/rate/bitrate exceeds the supported level table');
+    return 'avc1.' + options.profile.toString(16).padStart(2, '0') +
+      (options.profile === 66 ? 'e0' : '00') + level[0].toString(16).padStart(2, '0');
+  }
+  function output(state, chunk, metadata) {
+    if (!state.active || state.error) return;
+    try {
+      if (!state.pending || !Number.isSafeInteger(chunk.timestamp) || !chunk.byteLength || chunk.byteLength > state.options.maximum)
+        throw new Error('H.264 output exceeds reserved capacity or timestamp range');
+      --state.pending;
+      const config = metadata && metadata.decoderConfig;
+      if (config) {
+        if (!config.description || !/^avc[13]\./i.test(config.codec))
+          throw new Error('WebCodecs did not provide AVC initialization data');
+        const source = config.description;
+        const description = ArrayBuffer.isView(source)
+          ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength) : new Uint8Array(source);
+        if (!description.length || description.length > 65536) throw new Error('H.264 initialization data exceeds 64 KiB');
+        if (state.description && (state.description.length !== description.length ||
+            state.description.some((value, i) => value !== description[i])))
+          throw new Error('WebCodecs H.264 configuration changed');
+        if (!state.description) {
+          state.description = description.slice();
+          state.output.push({kind: 'format', description: state.description});
+        }
+      }
+      if (!state.description) throw new Error('H.264 output preceded initialization data');
+      const data = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(data);
+      state.output.push({kind: 'packet', data, pts: chunk.timestamp});
+    } catch (error) { fail(state, error); }
+  }
+  function flush(state, final) {
+    if (final) state.finishing = true;
+    if (state.flushing || state.flushed || (!state.pending && !final)) return;
+    state.flushing = true;
+    try {
+      state.encoder.flush().then(() => {
+        if (!state.active) return;
+        state.flushing = false;
+        if (state.pending) throw new Error('WebCodecs flush lost accepted video pictures');
+        if (state.finishing) state.flushed = true;
+      }).catch(error => fail(state, error));
+    } catch (error) { fail(state, error); }
+  }
+  root.HuxerMediaVideoEncoder = {
+    open(options) {
+      const id = nextId++;
+      const state = {options, active: true, ready: false, error: '', output: [], pending: 0, submitted: 0,
+        first: true, keyRequested: false, flushing: false, finishing: false, flushed: false};
+      sessions.set(id, state);
+      try {
+        if (!root.VideoEncoder || !root.VideoFrame) throw new Error('WebCodecs VideoEncoder/VideoFrame is unavailable');
+        if (options.maxB !== null && (options.profile !== 66 || options.maxB !== 0))
+          throw new Error('WebCodecs cannot enforce a numeric B-picture bound for Main/High profiles');
+        const config = {codec: codec(options), width: options.width, height: options.height,
+          framerate: options.rateNumerator / options.rateDenominator, bitrate: options.bitrate,
+          latencyMode: 'quality', avc: {format: 'avc'}};
+        root.VideoEncoder.isConfigSupported(config).then(support => {
+          if (!state.active) return;
+          if (!support.supported || support.config.codec.toLowerCase() !== config.codec.toLowerCase() ||
+              support.config.width !== config.width || support.config.height !== config.height ||
+              support.config.bitrate !== config.bitrate || support.config.latencyMode !== 'quality' ||
+              support.config.avc?.format !== 'avc')
+            throw new Error('WebCodecs does not support the requested H.264 configuration');
+          state.encoder = new root.VideoEncoder({output: (chunk, metadata) => output(state, chunk, metadata),
+            error: error => fail(state, error)});
+          state.encoder.configure(config); state.ready = true;
+        }).catch(error => fail(state, error));
+      } catch (error) { fail(state, error); }
+      return id;
+    },
+    ready(id) { return !!sessions.get(id)?.ready; },
+    error(id) { return sessions.get(id)?.error || ''; },
+    submit(id, data, pts, duration) {
+      const state = sessions.get(id), options = state.options;
+      if (state.flushing || state.pending >= options.window || state.encoder.encodeQueueSize >= options.window) return false;
+      let frame;
+      try {
+        if (!Number.isSafeInteger(pts) || (duration !== null && (!Number.isSafeInteger(duration) || duration <= 0)))
+          throw new Error('Video timing exceeds the WebCodecs safe integer range');
+        const init = {format: options.layout, codedWidth: options.width, codedHeight: options.height,
+          timestamp: pts, colorSpace: options.color};
+        if (duration !== null) init.duration = duration;
+        frame = new root.VideoFrame(data, init);
+        const key = state.first || state.keyRequested || state.submitted % options.keyInterval === 0;
+        ++state.pending; ++state.submitted;
+        state.encoder.encode(frame, {keyFrame: key});
+        state.first = state.keyRequested = false;
+      } catch (error) { fail(state, error); }
+      finally { if (frame) frame.close(); }
+      return true;
+    },
+    poll(id) { return sessions.get(id).output.shift() || null; },
+    requestKeyFrame(id) { sessions.get(id).keyRequested = true; },
+    progress(id) { flush(sessions.get(id), false); },
+    finish(id) { flush(sessions.get(id), true); },
+    ended(id) { const state = sessions.get(id); return state.flushed && !state.output.length; },
+    close(id) {
+      const state = sessions.get(id);
+      if (!state) return '';
+      state.active = false; state.output.length = 0; state.description = null;
+      let error = '';
+      try { if (state.encoder && state.encoder.state !== 'closed') state.encoder.close(); }
+      catch (failure) { error = String(failure.message || failure); }
+      state.encoder = null; sessions.delete(id);
+      return error;
+    }
+  };
+})(globalThis);

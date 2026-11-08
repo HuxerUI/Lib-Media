@@ -8,7 +8,7 @@
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
 #include <huxerui/android/external_texture.h>
-#elif defined(MEDIA_PREVIEW_MACOS)
+#elif defined(__APPLE__) && TARGET_OS_OSX
 #include <CoreVideo/CoreVideo.h>
 #include <huxerui/macos/external_texture.h>
 #elif defined(__EMSCRIPTEN__)
@@ -24,7 +24,7 @@ using namespace huxerui;
 using namespace huxerui::media;
 
 namespace media_preview {
-#if defined(__ANDROID__) || defined(MEDIA_PREVIEW_MACOS) || defined(MEDIA_PREVIEW_IOS) || defined(__EMSCRIPTEN__) || defined(_WIN32) || defined(__linux__)
+#if defined(__ANDROID__) || defined(__APPLE__) || defined(__EMSCRIPTEN__) || defined(_WIN32) || defined(__linux__)
 namespace {
 
 unsigned Sample(const VideoPlane& plane, unsigned x, unsigned y, unsigned component = 0) {
@@ -66,7 +66,7 @@ Bytes ConvertFramePixels(const VideoFrame& frame) {
 }
 #endif
 
-#if defined(__ANDROID__) || defined(MEDIA_PREVIEW_MACOS)
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_OSX)
 namespace {
 #if defined(__ANDROID__)
 class UploadContext {
@@ -236,7 +236,7 @@ void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
       .bytes_per_row = std::size_t(visible.width) * 4,
       .format = pixel_platform::PixelFormat::Rgba8888, .pixels = pixels});
 }
-#elif !defined(MEDIA_PREVIEW_IOS)
+#elif !defined(__APPLE__) || !TARGET_OS_IOS
 std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size) { return {}; }
 #endif
 } // namespace media_preview

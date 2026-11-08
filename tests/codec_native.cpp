@@ -1,6 +1,6 @@
 #include <huxerui/media_codec.h>
 
-#ifdef MEDIA_CODEC_TEST_GSTREAMER
+#if defined(__linux__) && !defined(__ANDROID__)
 #include "codec/decoder/backend.h"
 #endif
 #ifdef __ANDROID__
@@ -76,7 +76,7 @@ std::vector<EncodedPacket> PackedPackets(const std::filesystem::path& root, cons
   return packets;
 }
 
-#ifdef MEDIA_CODEC_TEST_GSTREAMER
+#if defined(__linux__) && !defined(__ANDROID__)
 void AppSrcBackpressure(const AudioDecoderConfig& defaults, const EncodedPacket& access_unit) {
   for (bool limit_bytes : {false, true}) {
     auto config = defaults;
@@ -230,7 +230,7 @@ int main(int argc, char** argv) {
     while (*retirement != 2 && std::chrono::steady_clock::now() < retired_by) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     Check(*retirement == 2, "Move assignment/destruction failed to retire both platform sessions");
     auto aac = Packets(root, "aac");
-#if defined(__APPLE__) || defined(MEDIA_CODEC_TEST_GSTREAMER)
+#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
     const auto largest = std::max_element(aac.begin(), aac.end(), [](const auto& a, const auto& b) {
       return a.data.AsBytes().size() < b.data.AsBytes().size();
     });
@@ -239,7 +239,7 @@ int main(int argc, char** argv) {
     // Exercise converter progress with only enough byte credit for the largest access unit.
     audio.limits.input_bytes = largest->data.AsBytes().size();
 #endif
-#ifdef MEDIA_CODEC_TEST_GSTREAMER
+#if defined(__linux__) && !defined(__ANDROID__)
     AppSrcBackpressure(audio, *largest);
 #endif
     Decode<AudioDecoder, AudioDecoderConfig, AudioFrame>(audio, aac, aac.size());

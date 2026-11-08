@@ -1,35 +1,35 @@
-# Media decoding
+# Media codecs
 
 `<huxerui/media_format.h>` and `<huxerui/media_codec.h>` provide the first implementation stage of
 [codec issue #20](https://github.com/HuxerUI/HuxerUI/issues/20). Link `HuxerUI::Media` with the installed public SDK.
 No `Install()`, View, Runtime, window, or application Task is needed. Existing MediaPlayer and photo-library APIs are unchanged.
 
 This guide covers raw AAC-LC access units decoded to CPU PCM and length-prefixed AVC access units decoded to CPU YUV.
-The public codec header also documents the separate `AudioEncoder` API for raw AAC-LC encoding. Codec sessions do not
+The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264. Codec sessions do not
 demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
 
 ## Implementation layout
 
-The public declarations remain in [`media_codec.h`](../include/huxerui/media_codec.h). Decoder and audio encoder
+The public declarations remain in [`media_codec.h`](../include/huxerui/media_codec.h). Decoder and encoder
 implementations use separate translation units, so decoder consumers do not acquire an encoder dependency.
 
 | Files | Responsibility |
 | --- | --- |
 | [`src/codec/media_codec_decoder.cpp`](../src/codec/media_codec_decoder.cpp) | Public `AudioDecoder` and `VideoDecoder` handles and probes |
-| [`src/codec/media_codec_encoder.cpp`](../src/codec/media_codec_encoder.cpp) | Public `AudioEncoder` handle and probe |
-| [`src/codec/common.h`](../src/codec/common.h), [`common.cpp`](../src/codec/common.cpp) | Shared codec errors, owned byte storage, and AAC initialization parsing |
+| [`src/codec/media_codec_encoder.cpp`](../src/codec/media_codec_encoder.cpp) | Public `AudioEncoder` and `VideoEncoder` handles and probes |
+| [`src/codec/common.h`](../src/codec/common.h), [`common.cpp`](../src/codec/common.cpp) | Shared codec errors, owned byte storage, and AAC/AVC initialization parsing |
 | [`src/execution/executor.h`](../src/execution/executor.h), [`executor.cpp`](../src/execution/executor.cpp) | Workers and event-loop scheduling shared by codec and decoded playback sessions |
 | [`src/codec/decoder/`](../src/codec/decoder) | Decoder `backend.h`, paired `format.h/.cpp`, `copy.h/.cpp`, and `session.h/.cpp` |
-| [`src/codec/encoder/`](../src/codec/encoder) | Audio encoder `backend.h`, paired `format.h/.cpp` and `session.h/.cpp` |
+| [`src/codec/encoder/`](../src/codec/encoder) | Audio/video encoder `backend.h`, paired `format.h/.cpp` and `session.h/.cpp` |
 | [`platform/`](../platform) | `media_codec_decoder_<platform>.cpp/.mm` and `media_codec_encoder_<platform>.cpp/.mm` implement the selected platform backend contracts |
 | [`platform/web/`](../platform/web) | `media_codec_decoder.js` and `media_codec_encoder.js` implement the corresponding browser bridges |
 
 Backend headers declare platform interfaces; the selected platform source defines their factories. Format validation
-and frame-copy declarations have matching implementation files. Encoder code depends on common AAC utilities rather
+and frame-copy declarations have matching implementation files. Encoder code depends on common initialization utilities rather
 than decoder internals. iOS and macOS keep independent platform implementations.
 
-## Platform status
+## Decoder platform status
 
 | Platform | Adapter | Validation in this change |
 | --- | --- | --- |
@@ -72,7 +72,8 @@ cleanup and final callback dispatch. There is no blocking proxy to another event
   sample rate and channel layout must match initialization data. Decoder output includes untrimmed priming/padding;
   the source/container layer owns any trim metadata.
 - AVC uses avcC and its 1-, 2-, or 4-byte NAL lengths. The initial subset is progressive 8-bit 4:2:0 Baseline/Main/High,
-  no frame-number gaps, at most 16 reference pictures. SPS dimensions and in-band SPS updates are validated against
+  continuous complete input, at most 16 reference pictures. An SPS may declare frame-number gaps allowed; that flag
+  alone does not imply missing pictures or make incomplete input supported. SPS dimensions and in-band SPS updates are validated against
   configured coded bounds, up to 8192×8192; platform codec limits may be lower. Initialization data is limited to 64 KiB.
   Start with a key-marked IDR and do so again after Reset. Submit one complete picture access unit in decode order.
 - Video output is tightly copied CPU I420/NV12 with coded dimensions, visible rectangle, strides, pixel aspect ratio,
@@ -175,6 +176,123 @@ The consumer must arrange its own scheduling and lifetime. Do not capture a refe
 callbacks and assume Create has returned; platform callbacks may race that assignment. A format event is useful for
 reconfiguring a consumer, and each frame also carries its complete format. No PCM device or texture is created here.
 
+## H.264 video encoding
+
+`VideoEncoder` uses the same asynchronous creation, wakeup, reset barrier, retained-storage, and cleanup rules as
+the decoders. It accepts CPU I420/NV12, progressive eight-bit 4:2:0 SDR pictures. Dimensions must be positive, even,
+and at most 8192×8192, with a full visible rectangle, square pixels, and no rotation. Each input frame must match the
+configured format; row/pixel strides may vary. The library copies active samples before returning `Accepted`.
+No resizing, RGB conversion, HDR, GPU surface input, HEVC, muxing, or dynamic stream reconfiguration is included.
+
+Choose `H264Profile::Baseline`, `Main`, or `High`; the default is High. Profile and `max_b_frames` are independent:
+
+| B-picture value | Contract |
+| --- | --- |
+| `0` (default) | Forbid B pictures; unsupported controls fail rather than enabling them |
+| Positive, at most 16 | Bound consecutive B pictures without requiring any; Baseline rejects this configuration |
+| `std::nullopt` | Let the platform choose within the bounded processing window; Baseline still produces no B pictures |
+
+The expected frame rate is a positive rational at most 240 fps and guides compression/rate control. PTS and supplied
+positive duration remain authoritative, including variable frame intervals. PTS must increase strictly both as exact
+rational time and after microsecond rounding. Use a new session to change geometry, profile, bitrate, or color metadata.
+`key_frame_interval` is a target distance in pictures. `RequestKeyFrame()` coalesces requests for a future IDR; it does
+not identify a specific input picture. Packet `key_frame` is derived from actual IDR syntax.
+
+Output is `VideoEncodeFormat`, then complete `EncodedPacket` access units in decode order, then one `EndOfStream`.
+An empty stream can end without a format event. Each NAL uses a four-byte big-endian length; SPS/PPS are in `avcC`.
+Repeated SPS/PPS and access-unit delimiters are removed after validation. Optional AVC base-layer extension prefixes
+are validated and removed; extension-layer pictures are unsupported. `VideoEncodeFormat` reports actual coded bounds
+and the visible rectangle. For example, 1080 visible rows may need 1088 coded rows; use the reported coded dimensions
+and initialization data for `VideoDecoderConfig`.
+
+With B pictures, packet PTS can move backward. The session matches each output to its accepted picture and restores
+the original rational PTS and duration, rather than attaching timing in FIFO order. DTS is optional and only uses
+reliable platform timing. Android/Web leave it absent. Windows uses a bounded fixed codec clock to identify reordered
+pictures and omits DTS once variable input timing makes that clock unsuitable for the input timeline. Do not derive
+DTS from PTS or assume absent DTS means presentation order. A muxer must handle that limitation explicitly.
+
+The default video limits are four copied inputs/64 MiB and eight compressed outputs/32 MiB, with 4 MiB maximum per
+packet. Input must fit one packed picture. Output must fit at least two full maximum-packet reservations, or
+`max_b_frames + 2` for a positive bound. Adapter controls use a progress window of at most 32 pictures and may require
+more headroom. Reserve before platform submission, then reduce the byte charge to the actual payload. A one-byte
+slice still holds the entire originating packet credit. Reset does not replenish held credit, and oversized output
+fails with `ResourceExhausted`. Platform codec allocations and bounded conversion scratch are additional.
+
+### Video encoder platform limits
+
+| Platform | Backend and controls | Validation |
+| --- | --- | --- |
+| Windows | System synchronous H.264 MFT; Baseline/Main/High, numeric B bounds 0..2 and Auto | Native round trips, real B reordering, requested IDR, variable PTS, crop, padded input and cleanup on Windows 11 |
+| Linux | GStreamer `x264enc` + `h264parse`; Baseline/Main/High, numeric B bounds 0..16 and Auto; bitrate must be integral kbit/s | Headless native round trips and shared contracts on Ubuntu 24.04/WSL; no GTK initialization |
+| Android | NDK MediaCodec API 28+; Main/High numeric B bounds require API 29+, with codec confirmation for positive bounds; interpretable packed I420/NV12 input only | arm64 build; encoder hardware validation pending |
+| iOS | Independent VideoToolbox implementation; zero or Auto B pictures; positive numeric bounds return `Unsupported` | Build/device validation pending |
+| macOS | Independent VideoToolbox implementation with the same B-policy limitation | Build/device validation pending |
+| Web | WebCodecs quality mode; Baseline with zero/Auto, Main/High with Auto only | Chrome C++/WASM Baseline/Main/High round trips and Node bridge contracts |
+
+The library minimum on Android remains API 23; video encoding resolves newer NDK entry points at runtime and
+returns `Unsupported` below API 28. Linux requires installed x264/parser plugins and does not install them for the
+application. Apple `MaxFrameDelayCount` bounds retained work; it is not treated as a numeric B-picture bound.
+WebCodecs has no portable exact B control, so Main/High with the default zero policy returns `Unsupported`.
+Web uses quality mode because realtime mode permits dropped pictures. A nonterminal flush makes progress within
+the reserved window without discarding accepted input. Probe success does not guarantee later output negotiation.
+
+### Bounded encoding pump
+
+Configure a session from a supported `VideoFormat` and use a pending frame index or one pending source frame:
+
+```cpp
+VideoEncoderConfig config;
+config.input = format;
+config.profile = H264Profile::High;
+config.max_b_frames = std::nullopt;
+auto created = VideoEncoder::Create(config);
+if (!created.Succeeded()) return;
+auto encoder = std::move(created).Value();
+```
+
+This scheduled pump drains outputs while retrying input. `pictures` and all referenced session state must remain
+alive between calls. The consumer handles configuration and stores or forwards packets within its own capacity;
+it must not retain every packet against the encoder pool while waiting for EOS.
+
+```cpp
+CodecResult<bool> PumpVideo(VideoEncoder& encoder, std::span<const VideoFrame> pictures,
+    std::size_t& next, bool& finishing, const std::function<void(VideoEncodeOutput)>& consume) {
+  for (;;) {
+    auto read = encoder.TryRead();
+    if (!read.Succeeded()) return CodecResult<bool>::Failure(read.Error());
+    if (read.Value()) {
+      const bool ended = std::holds_alternative<EndOfStream>(*read.Value());
+      consume(std::move(*read.Value()));
+      if (ended) return CodecResult<bool>::Success(true);
+      continue;
+    }
+    if (next < pictures.size()) {
+      auto submitted = encoder.TrySubmit(pictures[next]);
+      if (!submitted.Succeeded()) return CodecResult<bool>::Failure(submitted.Error());
+      if (submitted.Value() == SubmitStatus::WouldBlock) return CodecResult<bool>::Success(false);
+      ++next;
+    } else {
+      if (!finishing) {
+        auto finish = encoder.Finish();
+        if (!finish.Succeeded()) {
+          if (finish.Error().code == CodecErrorCode::InvalidState) return CodecResult<bool>::Success(false);
+          return CodecResult<bool>::Failure(finish.Error());
+        }
+        finishing = true;
+      }
+      return CodecResult<bool>::Success(false);
+    }
+  }
+}
+```
+
+Initialize `next = 0` and `finishing = false`. Call from scheduled work after readiness, output, or capacity wakeups;
+do not busy-wait on the UI/event-loop thread. `true` means EOS was consumed and the pump should stop. `Finish()` seals
+input; keep draining until EOS. `Reset()` can discard a running/draining stream immediately, and `Close()` starts
+asynchronous cleanup. Use owned/weak callback captures and observe `cleanup_completed` when resource release matters.
+The Frames preview's [streaming round trip](../examples/preview/src/decoded_clip.cpp) retains at most one pending
+source frame, packet, and decoded picture rather than collecting a whole clip.
+
 ## Validation
 
 With `HUXERUI_MEDIA_BUILD_TESTS=ON`, CTest adds `media_codec_contract` and, on enabled desktop and mobile codec platforms,
@@ -205,3 +323,19 @@ A local Apple Silicon Release archive comparison against the pre-codec commit gr
 which does not call a codec API, contains no decoder/session/platform codec entry-point symbols. Web includes the small
 codec JS bridge as a pre-JS resource even when C++ codec objects are not linked. Address/undefined-behavior sanitizer
 runs of the shared contract and macOS native decoder tests passed; this is not a process-RSS or driver-memory benchmark.
+
+H.264 encoding adds `media_video_encoder_contract`, `media_video_encoder_native`, and, when Node is available,
+`media_video_encoder_web_contract`. The native test generates padded I420/NV12 input and checks Baseline/Main/High,
+real B pictures on Windows/Linux, exact PTS/duration through reordering, variable intervals, non-macroblock crop,
+requested IDR, short/empty drain, retained packets, and a decoder round trip with luma error tolerance. Shared tests
+inject bad output identity, oversized packets, backpressure, retained slices across reset, blocked startup, close from
+wakeup, and independent cleanup errors. Run the encoding subset with:
+
+```sh
+ctest --test-dir build/tests -R media_video_encoder --output-on-failure
+```
+
+For Web, build `media_video_encoder_web_native` and serve its generated `tests/video_encoder_wasm.html` beside
+the JS/WASM files over localhost. The C++ test exercises all available requested profiles and decoder round trips.
+Node tests separately cover bounded progress flushes, late callbacks/promises, unsupported controls and malformed
+output. Android compilation and static Apple review do not replace device runs; those encoder validations remain pending.

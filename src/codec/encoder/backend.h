@@ -23,4 +23,27 @@ public:
 };
 using AudioEncoderFactory = std::function<std::unique_ptr<AudioEncoderBackend>()>;
 std::unique_ptr<AudioEncoderBackend> MakeAudioEncoderBackend();
+
+struct VideoEncoderEnd {};
+using VideoEncoderBackendOutput = std::variant<VideoEncodeFormat, EncodedPacket, VideoEncoderEnd>;
+
+// Calls stay on the session lane. Each accepted CPU picture produces one access unit, in decode order.
+// Input PTS uses microseconds relative to the first accepted input. Output PTS and reported DTS use the same
+// timeline with their declared timescales. Submit copies pixels before returning Accepted. Platform callbacks
+// retain backend state only and never invoke application callbacks.
+class VideoEncoderBackend {
+public:
+  virtual ~VideoEncoderBackend() = default;
+  virtual CodecResult<void> Open(const VideoEncoderConfig& config) = 0;
+  virtual CodecResult<bool> Ready() { return CodecResult<bool>::Success(true); }
+  virtual CodecResult<SubmitStatus> Submit(const VideoFrame& frame) = 0;
+  virtual CodecResult<std::optional<VideoEncoderBackendOutput>> Poll() = 0;
+  virtual CodecResult<void> RequestKeyFrame() = 0;
+  // Requests nonterminal output progress at an admission boundary; never discards or seals input.
+  virtual CodecResult<void> FlushPending() { return CodecResult<void>::Success(); }
+  virtual CodecResult<SubmitStatus> Finish() = 0;
+  virtual CodecResult<void> Close() = 0;
+};
+using VideoEncoderFactory = std::function<std::unique_ptr<VideoEncoderBackend>()>;
+std::unique_ptr<VideoEncoderBackend> MakeVideoEncoderBackend();
 } // namespace huxerui::media::detail
