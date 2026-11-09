@@ -1,11 +1,11 @@
 # Lib-Media
 
 Lib-Media is the media library for [HuxerUI](https://github.com/HuxerUI/HuxerUI). It brings media playback, platform
-image/video selection, saving to the system photo library, headless AAC-LC/H.264 encoding and decoding, and decoded PCM output
-into one C++ library.
+image/video selection, saving to the system photo library, headless AAC-LC/H.264 encoding and decoding, container I/O,
+and decoded PCM output into one C++ library.
 
 Link **`HuxerUI::Media`** and use APIs in **`huxerui::media`**. Register the **`Install`** application hook
-for file/URL playback and photo-library access. Codecs and PCM output can run independently of that hook,
+for file/URL playback and photo-library access. Codecs, container I/O, and PCM output can run independently of that hook,
 a UI runtime, or a window.
 
 Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
@@ -17,6 +17,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 - [Media selection and saving](#media-selection-and-saving)
 - [Media decoding](#media-decoding)
 - [Media encoding](#media-encoding)
+- [Media containers](#media-containers)
 - [PCM playback](#pcm-playback)
 - [Preview, builds, and validation](#preview-builds-and-validation)
 - [Repository layout](#repository-layout)
@@ -34,6 +35,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; Apple encoder validation remains pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; Apple build/device validation remains pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | Codec capability discovery | Typed AAC-LC/H.264 snapshots for the current adapter; unreported platform facts remain unknown | `QueryCapabilities()` on the four codec classes in [`media_codec.h`](include/huxerui/media_codec.h) |
+| Container demuxing and muxing | AAC/AVC MP4 and fragmented MP4, PCM WAVE/RF64, and AAC ADTS | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
 
 Platform selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
 SDK `FileReference` values, which can be retained for reading, imported to local files, or passed to `MediaSource` for
@@ -341,6 +343,12 @@ library limits from platform-reported limits, describe independent H.264 B-pictu
 check their complete combination, and `Create()` to allocate a session. Discovery does not require a Runtime,
 window, or `Install()`, and does not reserve resources or select a different backend.
 
+## Media containers
+
+`MediaDemuxer` reads tracks and packets from SDK streams. `MediaMuxer` writes packets to a fresh stream and
+finalizes it through `Finish()`. Both sessions are synchronous. Use the [container guide](docs/mediacontainer.md)
+for format mappings, seek behavior, output requirements, and packet ownership.
+
 ## PCM playback
 
 `DecodedPlayback` accepts `AudioFrame` from a decoder or a PCM generator. Use `DecodedPlayback::Create({.audio = audio})`
@@ -508,6 +516,7 @@ private state, validation, and backend contracts. Shared worker execution lives 
 | [`src/player/`](src/player) | `media_player.h` implementation, player state, platform backend contract, channel transport, and video geometry |
 | [`src/library/`](src/library) | `media_library.h` implementation, request state, platform transport contract, and payload validation |
 | [`src/codec/`](src/codec) | `media_codec.h` implementations, capability discovery, shared AAC/AVC initialization utilities, and separate decoder/encoder internals |
+| [`src/container/`](src/container) | `media_container.h` implementations, SDK stream I/O, and format-specific readers and writers |
 | [`src/decoded_playback/`](src/decoded_playback) | `media_playback.h` implementation, audio session, device contract, and video scheduling |
 | [`src/execution/`](src/execution) | Desktop and mobile session workers, post-exit cleanup dispatch, and Web event-loop scheduling |
 | [`platform/`](platform) | Platform adapters and platform package integration |
@@ -515,6 +524,7 @@ private state, validation, and backend contracts. Shared worker execution lives 
 | [`tests/`](tests) | Shared contracts, codec fixtures, and platform checks |
 | [`docs/medialibrary.md`](docs/medialibrary.md) | Photo-library integration and lifecycle details |
 | [`docs/mediacodec.md`](docs/mediacodec.md) | Codec usage, ownership, platform limits, and validation |
+| [`docs/mediacontainer.md`](docs/mediacontainer.md) | Container mappings, I/O requirements, and packet contracts |
 | [`docs/codec-design.md`](docs/codec-design.md) | Shared lifecycle design and remaining playback/encoding milestones |
 
 ## Roadmap

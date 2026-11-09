@@ -13,7 +13,8 @@ Regeneration with other encoder versions can produce different valid compressed 
 - `aac.txt` / `avc.txt`: `filename pts dts duration timescale key_frame`, with integer timestamps.
 
 Run `python3 tests/fixtures/codec/generate.py` with FFmpeg and ffprobe on PATH to regenerate.
-The generator extracts packet boundaries from its temporary MP4 files. No container parser is included in Lib-Media.
+The generator extracts packet boundaries from its temporary MP4 files. Container contract tests use the same
+packets to verify sample bytes, timing, and seek behavior across a round trip.
 
 `generate_sync.py` produces the `sync-avc` and `sync-aac` tracks for the decoded A/V preview. The clip has 96
 video frames at 24 fps and stereo AAC-LC at 48 kHz. White flashes and 1 kHz tone bursts start at 0.5, 1.5,

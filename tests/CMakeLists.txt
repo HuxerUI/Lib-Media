@@ -4,6 +4,15 @@ else ()
     set(MEDIA_TEST_FRAMEWORK HuxerUI::huxerui_static)
 endif ()
 
+if (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR (APPLE AND NOT IOS))
+    add_executable(media_container_contract_tests container_contract.cpp)
+    target_link_libraries(media_container_contract_tests PRIVATE huxerui_media ${MEDIA_TEST_FRAMEWORK})
+    target_compile_features(media_container_contract_tests PRIVATE cxx_std_20)
+    target_compile_definitions(media_container_contract_tests PRIVATE
+            MEDIA_CODEC_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/codec")
+    add_test(NAME media_container_contract COMMAND media_container_contract_tests)
+endif ()
+
 add_executable(media_contract_tests contract.cpp)
 target_link_libraries(media_contract_tests PRIVATE huxerui_media ${MEDIA_TEST_FRAMEWORK})
 target_compile_features(media_contract_tests PRIVATE cxx_std_20)
