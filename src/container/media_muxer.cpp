@@ -27,7 +27,8 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
       ValidateAdts(tracks);
       return Requirement::SequentialWrite;
     case ContainerFormat::Mp4:
-      ValidateMp4(tracks, layout);
+    case ContainerFormat::Mov:
+      ValidateMp4(format, tracks, layout);
       return layout == ContainerLayout::Fragmented ? Requirement::SequentialWrite : Requirement::RandomWrite;
   }
   Fail(ContainerErrorCode::Unsupported, "Unsupported output container");
@@ -41,7 +42,8 @@ std::unique_ptr<ContainerWriter> OpenWriter(ContainerOutput output, ContainerFor
     case ContainerFormat::Wave:
     case ContainerFormat::Rf64: return OpenWaveWriter(std::move(output), format, tracks);
     case ContainerFormat::Adts: return OpenAdtsWriter(std::move(output), tracks);
-    case ContainerFormat::Mp4: return OpenMp4Writer(std::move(output), tracks, layout);
+    case ContainerFormat::Mp4:
+    case ContainerFormat::Mov: return OpenMp4Writer(std::move(output), format, tracks, layout);
   }
   Fail(ContainerErrorCode::Unsupported, "Unsupported output container");
 }

@@ -163,9 +163,9 @@ void ValidateWave(std::span<const MediaTrack> tracks);
 std::unique_ptr<ContainerReader> OpenAdtsReader(ContainerInput input);
 std::unique_ptr<ContainerWriter> OpenAdtsWriter(ContainerOutput output, std::span<const MediaTrack> tracks);
 void ValidateAdts(std::span<const MediaTrack> tracks);
-std::unique_ptr<ContainerReader> OpenMp4Reader(ContainerInput input);
-std::unique_ptr<ContainerWriter> OpenMp4Writer(ContainerOutput output, std::span<const MediaTrack> tracks,
-                                               ContainerLayout layout);
-void ValidateMp4(std::span<const MediaTrack> tracks, ContainerLayout layout);
+std::unique_ptr<ContainerReader> OpenMp4Reader(ContainerInput input, std::optional<ContainerFormat> hint);
+std::unique_ptr<ContainerWriter> OpenMp4Writer(ContainerOutput output, ContainerFormat format,
+                                               std::span<const MediaTrack> tracks, ContainerLayout layout);
+void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout);
 
 } // namespace huxerui::media::detail

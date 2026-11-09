@@ -11,8 +11,20 @@ constexpr auto WriteError = ContainerErrorCode::InvalidArgument;
 
 void Zero(Bytes& bytes, std::size_t size) { bytes.resize(bytes.size() + size); }
 
-void Matrix(Bytes& bytes) {
-  for (auto value : {0x10000u, 0u, 0u, 0u, 0x10000u, 0u, 0u, 0u, 0x40000000u}) Put(bytes, value);
+void Matrix(Bytes& bytes, VideoRotation rotation = VideoRotation::None,
+            std::uint32_t width = 0, std::uint32_t height = 0) {
+  constexpr std::int32_t unit = 0x10000;
+  const auto x = static_cast<std::int32_t>(width << 16);
+  const auto y = static_cast<std::int32_t>(height << 16);
+  std::array<std::int32_t, 9> matrix{unit, 0, 0, 0, unit, 0, 0, 0, 0x40000000};
+  // QuickTime stores a row-vector transform. Translate the rotated rectangle back to a zero origin.
+  switch (rotation) {
+    case VideoRotation::Clockwise90: matrix = {0, unit, 0, -unit, 0, 0, y, 0, 0x40000000}; break;
+    case VideoRotation::Clockwise180: matrix = {-unit, 0, 0, 0, -unit, 0, x, y, 0x40000000}; break;
+    case VideoRotation::Clockwise270: matrix = {0, -unit, 0, unit, 0, 0, 0, x, 0x40000000}; break;
+    case VideoRotation::None: break;
+  }
+  for (auto value : matrix) Put(bytes, value);
 }
 
 std::uint32_t MovieScale(std::span<const MediaTrack> tracks) {
@@ -37,33 +49,89 @@ Bytes Descriptor(std::uint8_t type, ByteView data) {
   return bytes;
 }
 
-void SampleDescription(Bytes& bytes, const MediaTrack& track) {
+std::string_view VideoEntry(const MediaTrack& track) {
+  if (!track.sample_entry.empty()) return track.sample_entry;
+  return track.codec == CodecId::Hevc ? "hvc1" : "avc1";
+}
+
+std::uint32_t PcmFrameSize(const MediaTrack& track) {
+  return (MovPcmBits(track.codec) / 8) * track.channel_count.value_or(0);
+}
+
+void PcmDescription(Bytes& bytes, const MediaTrack& track) {
+  Box(bytes, "lpcm", [&] {
+    Zero(bytes, 6);
+    Put<std::uint16_t>(bytes, 1);
+    Put<std::uint16_t>(bytes, 2);
+    Zero(bytes, 6);
+    Put<std::uint16_t>(bytes, 3);
+    Put<std::uint16_t>(bytes, 16);
+    Put<std::uint16_t>(bytes, 0xfffe);
+    Put<std::uint16_t>(bytes, 0);
+    Put(bytes, 0x10000u);
+    // The version-two fields describe one packed, interleaved PCM frame per QuickTime sample.
+    const auto bits = MovPcmBits(track.codec);
+    const bool floating = track.codec == CodecId::PcmF32Le || track.codec == CodecId::PcmF32Be;
+    const auto flags = 8u | (floating ? 1u : (bits > 8 ? 4u : 0u)) | (MovPcmBigEndian(track.codec) ? 2u : 0u);
+    Put(bytes, 72u);
+    Put(bytes, std::bit_cast<std::uint64_t>(static_cast<double>(*track.sample_rate)));
+    Put(bytes, *track.channel_count);
+    Put(bytes, 0x7f000000u);
+    Put(bytes, bits);
+    Put(bytes, flags);
+    Put(bytes, PcmFrameSize(track));
+    Put(bytes, 1u);
+  });
+}
+
+void SampleDescription(Bytes& bytes, const MediaTrack& track, bool mov) {
   FullBox(bytes, "stsd", 0, [&] {
     Put(bytes, 1u);
     if (track.codec == CodecId::Aac) {
       Box(bytes, "mp4a", [&] {
         Zero(bytes, 6);
         Put<std::uint16_t>(bytes, 1);
-        Zero(bytes, 8);
+        Put<std::uint16_t>(bytes, mov ? 1 : 0);
+        Zero(bytes, 6);
         Put<std::uint16_t>(bytes, static_cast<std::uint16_t>(*track.channel_count));
         Put<std::uint16_t>(bytes, 16);
-        Zero(bytes, 4);
+        Put<std::uint16_t>(bytes, mov ? 0xfffe : 0);
+        Put<std::uint16_t>(bytes, 0);
         Put(bytes, *track.sample_rate << 16);
-        FullBox(bytes, "esds", 0, [&] {
-          Bytes decoder{std::byte{0x40}, std::byte{0x15}};
-          Zero(decoder, 11);
-          Append(decoder, Descriptor(5, track.initialization_data));
-          Bytes es;
-          Put<std::uint16_t>(es, 0);
-          Put<std::uint8_t>(es, 0);
-          Append(es, Descriptor(4, decoder));
-          constexpr std::array sl{std::byte{2}};
-          Append(es, Descriptor(6, sl));
-          Append(bytes, Descriptor(3, es));
-        });
+        const auto descriptor = [&] {
+          FullBox(bytes, "esds", 0, [&] {
+            Bytes decoder{std::byte{0x40}, std::byte{0x15}};
+            Zero(decoder, 11);
+            Append(decoder, Descriptor(5, track.initialization_data));
+            Bytes es;
+            Put<std::uint16_t>(es, 0);
+            Put<std::uint8_t>(es, 0);
+            Append(es, Descriptor(4, decoder));
+            constexpr std::array sl{std::byte{2}};
+            Append(es, Descriptor(6, sl));
+            Append(bytes, Descriptor(3, es));
+          });
+        };
+        if (mov) {
+          Put(bytes, 1024u);
+          Zero(bytes, 8);
+          Put(bytes, 2u);
+          // QuickTime stores MPEG-4 audio decoder parameters inside the version-one wave extension.
+          Box(bytes, "wave", [&] {
+            Box(bytes, "frma", [&] { Put(bytes, Tag("mp4a")); });
+            Box(bytes, "mp4a", [&] { Put(bytes, 0u); });
+            descriptor();
+            Put(bytes, 8u);
+            Put(bytes, 0u);
+          });
+        } else {
+          descriptor();
+        }
       });
+    } else if (track.kind == TrackKind::Audio) {
+      PcmDescription(bytes, track);
     } else {
-      Box(bytes, "avc1", [&] {
+      Box(bytes, VideoEntry(track), [&] {
         Zero(bytes, 6);
         Put<std::uint16_t>(bytes, 1);
         Zero(bytes, 16);
@@ -76,7 +144,8 @@ void SampleDescription(Bytes& bytes, const MediaTrack& track) {
         Zero(bytes, 32);
         Put<std::uint16_t>(bytes, 24);
         Put<std::uint16_t>(bytes, 0xffff);
-        Box(bytes, "avcC", [&] { Append(bytes, track.initialization_data); });
+        if (track.codec == CodecId::H264 || track.codec == CodecId::Hevc)
+          Box(bytes, track.codec == CodecId::Hevc ? "hvcC" : "avcC", [&] { Append(bytes, track.initialization_data); });
         if (track.visible && *track.visible != VideoRectangle{0, 0, *track.coded_width, *track.coded_height}) {
           const auto rect = *track.visible;
           Box(bytes, "clap", [&] {
@@ -95,11 +164,25 @@ void SampleDescription(Bytes& bytes, const MediaTrack& track) {
   });
 }
 
-void SampleTable(Bytes& bytes, const MediaTrack& track, std::span<const Mp4Sample> samples) {
+void SampleTable(Bytes& bytes, const MediaTrack& track, std::span<const Mp4Sample> samples, bool mov) {
   Box(bytes, "stbl", [&] {
-    SampleDescription(bytes, track);
-    const auto count = static_cast<std::uint32_t>(samples.size());
+    SampleDescription(bytes, track, mov);
+    const auto frame_bytes = PcmFrameSize(track);
+    const auto chunk_count = static_cast<std::uint32_t>(samples.size());
+    std::uint32_t count = chunk_count;
+    if (frame_bytes) {
+      count = 0;
+      for (const auto& sample : samples) count += sample.size / frame_bytes;
+    }
     FullBox(bytes, "stts", 0, [&] {
+      if (frame_bytes) {
+        Put(bytes, count ? 1u : 0u);
+        if (count) {
+          Put(bytes, count);
+          Put(bytes, Mp4Scale(track) / *track.sample_rate);
+        }
+        return;
+      }
       const auto entries = bytes.size();
       Put(bytes, 0u);
       std::uint32_t runs = 0;
@@ -124,20 +207,31 @@ void SampleTable(Bytes& bytes, const MediaTrack& track, std::span<const Mp4Sampl
       });
     }
     FullBox(bytes, "stsc", 0, [&] {
-      Put(bytes, count ? 1u : 0u);
-      if (count) for (int field = 0; field < 3; ++field) Put(bytes, 1u);
+      const auto entries = bytes.size();
+      Put(bytes, 0u);
+      std::uint32_t runs = 0, previous = 0;
+      for (std::uint32_t i = 0; i < chunk_count; ++i) {
+        const auto frames = frame_bytes ? samples[i].size / frame_bytes : 1u;
+        if (frames == previous) continue;
+        Put(bytes, i + 1);
+        Put(bytes, frames);
+        Put(bytes, 1u);
+        ++runs;
+        previous = frames;
+      }
+      SetU32(bytes, entries, runs);
     });
     FullBox(bytes, "stsz", 0, [&] {
-      Put(bytes, 0u);
+      Put(bytes, frame_bytes);
       Put(bytes, count);
-      for (const auto& sample : samples) Put(bytes, sample.size);
+      if (!frame_bytes) for (const auto& sample : samples) Put(bytes, sample.size);
     });
     FullBox(bytes, "co64", 0, [&] {
-      Put(bytes, count);
+      Put(bytes, chunk_count);
       for (const auto& sample : samples) Put(bytes, sample.offset);
     });
     const auto sync_count = static_cast<std::uint32_t>(std::ranges::count(samples, true, &Mp4Sample::sync));
-    if (count && (track.kind == TrackKind::Video || sync_count != count)) {
+    if (!frame_bytes && count && (track.kind == TrackKind::Video || sync_count != count)) {
       FullBox(bytes, "stss", 0, [&] {
         Put(bytes, sync_count);
         for (std::uint32_t i = 0; i < count; ++i) if (samples[i].sync) Put(bytes, i + 1);
@@ -175,7 +269,7 @@ TrackEdit Edit(const MediaTrack& track, std::span<const Mp4Sample> samples, std:
           SubTime(AddTime(samples.back().dts, samples.back().duration), samples.front().dts)};
 }
 
-void TrackBox(Bytes& bytes, const MediaTrack& track, std::span<const Mp4Sample> samples, const TrackEdit& edit) {
+void TrackBox(Bytes& bytes, const MediaTrack& track, std::span<const Mp4Sample> samples, const TrackEdit& edit, bool mov) {
   const bool video = track.kind == TrackKind::Video;
   Box(bytes, "trak", [&] {
     FullBox(bytes, "tkhd", 0x01000007, [&] {
@@ -186,9 +280,11 @@ void TrackBox(Bytes& bytes, const MediaTrack& track, std::span<const Mp4Sample> 
       Zero(bytes, 12);
       Put<std::uint16_t>(bytes, video ? 0 : 0x100);
       Put<std::uint16_t>(bytes, 0);
-      Matrix(bytes);
-      Put(bytes, track.coded_width.value_or(0) << 16);
-      Put(bytes, track.coded_height.value_or(0) << 16);
+      const auto width = track.visible ? track.visible->width : track.coded_width.value_or(0);
+      const auto height = track.visible ? track.visible->height : track.coded_height.value_or(0);
+      Matrix(bytes, track.rotation, width, height);
+      Put(bytes, width << 16);
+      Put(bytes, height << 16);
     });
     if (!samples.empty()) {
       // An optional empty edit preserves the track's offset on the common presentation timeline.
@@ -214,19 +310,26 @@ void TrackBox(Bytes& bytes, const MediaTrack& track, std::span<const Mp4Sample> 
         Put(bytes, 0x55c40000u);
       });
       FullBox(bytes, "hdlr", 0, [&] {
-        Put(bytes, 0u);
+        Put(bytes, mov ? Tag("mhlr") : 0u);
         Put(bytes, Tag(video ? "vide" : "soun"));
         Zero(bytes, 13);
       });
       Box(bytes, "minf", [&] {
         FullBox(bytes, video ? "vmhd" : "smhd", video ? 1 : 0, [&] { Zero(bytes, video ? 8 : 4); });
+        if (mov) {
+          FullBox(bytes, "hdlr", 0, [&] {
+            Put(bytes, Tag("dhlr"));
+            Put(bytes, Tag("url "));
+            Zero(bytes, 13);
+          });
+        }
         Box(bytes, "dinf", [&] {
           FullBox(bytes, "dref", 0, [&] {
             Put(bytes, 1u);
             FullBox(bytes, "url ", 1, [] {});
           });
         });
-        SampleTable(bytes, track, samples);
+        SampleTable(bytes, track, samples, mov);
       });
     });
   });
@@ -234,18 +337,27 @@ void TrackBox(Bytes& bytes, const MediaTrack& track, std::span<const Mp4Sample> 
 
 class Mp4Writer final : public ContainerWriter {
 public:
-  Mp4Writer(ContainerOutput output, std::span<const MediaTrack> tracks, ContainerLayout layout)
-      : ContainerWriter(std::move(output), tracks), fragmented_(layout == ContainerLayout::Fragmented),
+  Mp4Writer(ContainerOutput output, ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout)
+      : ContainerWriter(std::move(output), tracks), mov_(format == ContainerFormat::Mov),
+        fragmented_(layout == ContainerLayout::Fragmented),
         movie_scale_(MovieScale(tracks)), states_(tracks.size()) {
     for (std::size_t i = 0; i < tracks.size(); ++i) {
       if (tracks[i].codec == CodecId::H264)
         states_[i].nal_length = ParseAvc(tracks[i].initialization_data).Value().length_size;
+      if (tracks[i].codec == CodecId::Hevc)
+        states_[i].nal_length = HevcNalLength(tracks[i].initialization_data, VideoEntry(tracks[i]) == "hvc1", WriteError);
     }
     Bytes header;
     Box(header, "ftyp", [&] {
-      Put(header, Tag(fragmented_ ? "iso6" : "isom"));
+      Put(header, Tag(mov_ ? "qt  " : (fragmented_ ? "iso6" : "isom")));
       Put(header, 512u);
-      for (auto brand : {"isom", "iso6", "mp41", "avc1"}) Put(header, Tag(brand));
+      if (mov_) {
+        Put(header, Tag("qt  "));
+      } else {
+        for (auto brand : {"isom", "iso6", "mp41"}) Put(header, Tag(brand));
+        if (std::ranges::any_of(tracks, [](const auto& track) { return track.codec == CodecId::H264; }))
+          Put(header, Tag("avc1"));
+      }
     });
     this->output.Write(header);
     if (fragmented_) {
@@ -274,12 +386,35 @@ public:
       Fail(ContainerErrorCode::LimitExceeded, "MP4 sample or fragment limit exceeded");
     const auto& track = tracks[index];
     const auto scale = Mp4Scale(track);
-    const bool audio = track.codec == CodecId::Aac;
-    const auto dts = packet.dts ? packet.dts : (audio ? packet.pts : std::nullopt);
-    if (!packet.pts || !dts || (!packet.duration && !audio))
+    const auto frame_bytes = PcmFrameSize(track);
+    const auto data = packet.data.AsBytes();
+    std::uint32_t frames = 0;
+    std::optional<MediaTimestamp> derived_duration;
+    auto pts = packet.pts;
+    auto dts = packet.dts;
+    if (frame_bytes) {
+      if (data.size() % frame_bytes) Fail(WriteError, "QuickTime PCM packet splits a sample frame");
+      frames = static_cast<std::uint32_t>(data.size() / frame_bytes);
+      if (frames > 0xffffffffu - state.pcm_frames)
+        Fail(ContainerErrorCode::LimitExceeded, "QuickTime PCM track exceeds the sample table count");
+      derived_duration = MediaTimestamp{frames, *track.sample_rate};
+      if (packet.duration && *packet.duration != *derived_duration)
+        Fail(WriteError, "QuickTime PCM packet duration does not match its frame count");
+      if (!pts) pts = dts.value_or(MediaTimestamp{state.next_dts.value_or(0), scale});
+      if (!dts) dts = pts;
+      if (pts != dts || packet.sync_sample == false)
+        Fail(WriteError, "QuickTime PCM requires one presentation/decode time and independent samples");
+    } else if (track.codec == CodecId::Aac) {
+      if (!dts) dts = pts;
+      derived_duration = MediaTimestamp{1024, *track.sample_rate};
+    } else if (track.codec == CodecId::ProRes && !dts) {
+      dts = pts;
+    }
+    const auto duration = packet.duration ? packet.duration : derived_duration;
+    if (!pts || !dts || !duration)
       Fail(ContainerErrorCode::MissingTiming, "MP4 requires PTS, decode timing, and a positive sample duration");
-    const auto pts_ticks = ExactTicks(*packet.pts, scale), dts_ticks = ExactTicks(*dts, scale);
-    const auto length = ExactTicks(packet.duration.value_or(MediaTimestamp{1024, track.sample_rate.value_or(1)}), scale);
+    const auto pts_ticks = ExactTicks(*pts, scale), dts_ticks = ExactTicks(*dts, scale);
+    const auto length = ExactTicks(*duration, scale);
     const auto composition = SubTime(pts_ticks, dts_ticks);
     if (length <= 0 || length > 0xffffffffu || composition < std::numeric_limits<std::int32_t>::min() ||
         composition > std::numeric_limits<std::int32_t>::max())
@@ -288,13 +423,19 @@ public:
       Fail(ContainerErrorCode::Unsupported, "MP4 requires a continuous decode grid and nonnegative fragment DTS");
     const auto next = AddTime(dts_ticks, length);
     AddTime(pts_ticks, length);
-    const auto data = packet.data.AsBytes();
-    const bool idr = audio || AvcIdr(data, state.nal_length, WriteError);
-    const bool sync = packet.sync_sample.value_or(idr);
+    bool independent = true;
+    if (track.codec == CodecId::H264) independent = AvcIdr(data, state.nal_length, WriteError);
+    if (track.codec == CodecId::Hevc)
+      independent = HevcIdr(data, state.nal_length, VideoEntry(track) == "hvc1", WriteError);
+    if (track.codec == CodecId::ProRes &&
+        (data.size() < 28 || Number<std::uint32_t>(data) != data.size() || Number<std::uint32_t>(data, 4) != Tag("icpf")))
+      Fail(WriteError, "Invalid ProRes frame header or size");
+    const bool sync = packet.sync_sample.value_or(independent);
     state.bytes.assign(data.begin(), data.end());
     state.pending = Mp4Sample{0, static_cast<std::uint32_t>(data.size()), pts_ticks, dts_ticks,
                              static_cast<std::uint32_t>(length), sync};
     state.next_dts = next;
+    state.pcm_frames += frames;
     ++samples_;
     Drain();
     return {};
@@ -317,6 +458,7 @@ public:
 private:
   struct TrackState {
     unsigned nal_length = 0;
+    std::uint32_t pcm_frames = 0;
     std::optional<std::int64_t> next_dts;
     std::optional<Mp4Sample> pending;
     Bytes bytes;
@@ -346,7 +488,7 @@ private:
         Zero(bytes, 24);
         Put(bytes, max_id + 1);
       });
-      for (std::size_t i = 0; i < tracks.size(); ++i) TrackBox(bytes, tracks[i], states_[i].index, edits[i]);
+      for (std::size_t i = 0; i < tracks.size(); ++i) TrackBox(bytes, tracks[i], states_[i].index, edits[i], mov_);
       if (fragmented_) {
         Box(bytes, "mvex", [&] {
           for (const auto& track : tracks) FullBox(bytes, "trex", 0, [&] {
@@ -414,6 +556,7 @@ private:
     output.Write(data);
   }
 
+  bool mov_;
   bool fragmented_;
   std::uint32_t movie_scale_;
   std::vector<TrackState> states_;
@@ -446,7 +589,7 @@ bool AvcIdr(ByteView bytes, unsigned length_size, ContainerErrorCode error) {
   return idr;
 }
 
-void ValidateMp4(std::span<const MediaTrack> tracks, ContainerLayout layout) {
+void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout) {
   MovieScale(tracks);
   for (const auto& track : tracks) {
     if (track.id == 0xffffffffu) Fail(WriteError, "MP4 track ID leaves no next track ID");
@@ -454,30 +597,51 @@ void ValidateMp4(std::span<const MediaTrack> tracks, ContainerLayout layout) {
       const auto config = ParseAac(track.initialization_data);
       if (!config.Succeeded()) Fail(ContainerErrorCode::Unsupported, config.Error().message);
       if (track.sample_rate != config.Value().sample_rate || track.channel_count != config.Value().channels ||
-          *track.sample_rate > 65535)
+          *track.sample_rate > 65535 || (!track.sample_entry.empty() && track.sample_entry != "mp4a"))
         Fail(WriteError, "MP4 AAC track metadata does not match AudioSpecificConfig");
       if (layout == ContainerLayout::Fragmented &&
           (track.priming_samples.value_or(0) || track.padding_samples.value_or(0)))
         Fail(ContainerErrorCode::Unsupported, "Fragmented MP4 cannot retain audio trim in this layout");
-    } else if (track.kind == TrackKind::Video && track.codec == CodecId::H264 &&
-               track.framing == PacketFraming::LengthPrefixedNals) {
-      const auto config = ParseAvc(track.initialization_data);
-      if (!config.Succeeded()) Fail(ContainerErrorCode::Unsupported, config.Error().message);
+    } else if (track.kind == TrackKind::Audio && format == ContainerFormat::Mov && MovPcmBits(track.codec)) {
+      const auto rate = track.sample_rate.value_or(0), channels = track.channel_count.value_or(0);
+      if (!rate || !channels || channels > 64 || Mp4Scale(track) % rate ||
+          track.framing != PacketFraming::CodecPacket || !track.initialization_data.empty() ||
+          !track.sample_entry.empty())
+        Fail(WriteError, "Invalid QuickTime PCM format or sample clock");
+    } else if (track.kind == TrackKind::Video) {
+      if (track.codec == CodecId::H264 && track.framing == PacketFraming::LengthPrefixedNals && VideoEntry(track) == "avc1") {
+        const auto config = ParseAvc(track.initialization_data);
+        if (!config.Succeeded()) Fail(ContainerErrorCode::Unsupported, config.Error().message);
+      } else if (track.codec == CodecId::Hevc && track.framing == PacketFraming::LengthPrefixedNals &&
+                 (VideoEntry(track) == "hvc1" || VideoEntry(track) == "hev1")) {
+        HevcNalLength(track.initialization_data, VideoEntry(track) == "hvc1", WriteError);
+      } else if (track.codec != CodecId::ProRes || format != ContainerFormat::Mov ||
+                 track.framing != PacketFraming::CodecPacket || track.sample_entry.size() != 4 ||
+                 !ProResEntry(Tag(track.sample_entry)) || !track.initialization_data.empty()) {
+        Fail(ContainerErrorCode::Unsupported, "Unsupported MP4 or QuickTime video sample entry");
+      }
       const auto width = track.coded_width.value_or(0), height = track.coded_height.value_or(0);
       if (!width || !height || width > 65535 || height > 65535 || track.priming_samples || track.padding_samples)
-        Fail(WriteError, "Invalid MP4 AVC track dimensions or trim");
+        Fail(WriteError, "Invalid video track dimensions or trim");
       if (track.visible && (!track.visible->width || !track.visible->height || track.visible->x >= width ||
           track.visible->y >= height || track.visible->width > width - track.visible->x ||
           track.visible->height > height - track.visible->y))
-        Fail(WriteError, "MP4 visible rectangle exceeds coded bounds");
+        Fail(WriteError, "Visible rectangle exceeds coded bounds");
+      if (track.rotation < VideoRotation::None || track.rotation > VideoRotation::Clockwise270 ||
+          (track.rotation != VideoRotation::None &&
+           ((track.visible ? track.visible->width : width) > 32767 ||
+            (track.visible ? track.visible->height : height) > 32767)))
+        Fail(WriteError, "Video rotation cannot be represented by the track matrix");
     } else {
-      Fail(ContainerErrorCode::Unsupported, "MP4 supports raw AAC-LC and length-prefixed AVC tracks");
+      Fail(ContainerErrorCode::Unsupported, "Unsupported MP4 or QuickTime audio sample entry");
     }
+    if (track.kind != TrackKind::Video && track.rotation != VideoRotation::None)
+      Fail(WriteError, "Presentation rotation requires a video track");
   }
 }
 
-std::unique_ptr<ContainerWriter> OpenMp4Writer(ContainerOutput output, std::span<const MediaTrack> tracks,
-                                               ContainerLayout layout) {
-  return std::make_unique<Mp4Writer>(std::move(output), tracks, layout);
+std::unique_ptr<ContainerWriter> OpenMp4Writer(ContainerOutput output, ContainerFormat format,
+                                               std::span<const MediaTrack> tracks, ContainerLayout layout) {
+  return std::make_unique<Mp4Writer>(std::move(output), format, tracks, layout);
 }
 } // namespace huxerui::media::detail

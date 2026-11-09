@@ -20,13 +20,15 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
   if (!recognized && prefix.size() >= 2 && (Number<std::uint16_t>(prefix) & 0xfff6) == 0xfff0)
     recognized = ContainerFormat::Adts;
 
-  if (!recognized || (hint && *recognized != *hint))
+  if (!recognized || (hint && *recognized != *hint &&
+      !(*recognized == ContainerFormat::Mp4 && *hint == ContainerFormat::Mov)))
     Fail(ContainerErrorCode::UnrecognizedFormat, "Input bytes do not identify the requested or a supported container");
   switch (*recognized) {
     case ContainerFormat::Wave:
     case ContainerFormat::Rf64: return OpenWaveReader(std::move(input), *recognized);
     case ContainerFormat::Adts: return OpenAdtsReader(std::move(input));
-    case ContainerFormat::Mp4: return OpenMp4Reader(std::move(input));
+    case ContainerFormat::Mp4:
+    case ContainerFormat::Mov: return OpenMp4Reader(std::move(input), hint);
   }
   Fail(ContainerErrorCode::Unsupported, "Unsupported input container");
 }

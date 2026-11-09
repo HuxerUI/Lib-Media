@@ -3,6 +3,7 @@
 #include "codec/common.h"
 
 #include <array>
+#include <cmath>
 
 namespace huxerui::media::detail {
 namespace {
@@ -149,6 +150,102 @@ VideoRectangle Aperture(ByteView clap, std::uint32_t width, std::uint32_t height
   return {coordinate(width - crop_width, 16), coordinate(height - crop_height, 24), crop_width, crop_height};
 }
 
+VideoRotation Rotation(ByteView box, std::size_t matrix) {
+  constexpr std::int32_t unit = 0x10000;
+  const auto a = Number<std::int32_t>(box, matrix);
+  const auto b = Number<std::int32_t>(box, matrix + 4);
+  const auto c = Number<std::int32_t>(box, matrix + 12);
+  const auto d = Number<std::int32_t>(box, matrix + 16);
+  if (Number<std::uint32_t>(box, matrix + 8) || Number<std::uint32_t>(box, matrix + 20) ||
+      Number<std::uint32_t>(box, matrix + 32) != 0x40000000u)
+    Fail(Unsupported, "Perspective movie or track transform is unsupported");
+  // Placement translations do not change the orientation of the visible image.
+  if (a == unit && !b && !c && d == unit) return VideoRotation::None;
+  if (!a && b == unit && c == -unit && !d) return VideoRotation::Clockwise90;
+  if (a == -unit && !b && !c && d == -unit) return VideoRotation::Clockwise180;
+  if (!a && b == -unit && c == unit && !d) return VideoRotation::Clockwise270;
+  Fail(Unsupported, "Movie or track transform is not a right-angle rotation");
+}
+
+std::string EntryName(std::uint32_t tag) {
+  std::string name(4, ' ');
+  for (std::size_t i = 0; i < name.size(); ++i) name[i] = static_cast<char>((tag >> (24 - 8 * i)) & 255);
+  return name;
+}
+
+CodecId PcmType(unsigned bits, bool big, bool floating, bool signed_integer) {
+  if (floating && !signed_integer && bits == 32) return big ? CodecId::PcmF32Be : CodecId::PcmF32Le;
+  if (!floating) {
+    if (!signed_integer && bits == 8) return CodecId::PcmU8;
+    if (signed_integer) {
+      if (bits == 16) return big ? CodecId::PcmS16Be : CodecId::PcmS16Le;
+      if (bits == 24) return big ? CodecId::PcmS24Be : CodecId::PcmS24Le;
+      if (bits == 32) return big ? CodecId::PcmS32Be : CodecId::PcmS32Le;
+    }
+  }
+  Fail(Unsupported, "Unsupported QuickTime PCM sample type");
+}
+
+void ReadPcmDescription(const BoxView& entry, MediaTrack& track) {
+  const auto version = Number<std::uint16_t>(entry.bytes, 8);
+  std::uint32_t channels = 0, rate = 0, declared_frame_bytes = 0;
+  if (entry.tag == Tag("lpcm") && version == 2) {
+    const auto size = Number<std::uint32_t>(entry.bytes, 28);
+    const auto hz = std::bit_cast<double>(Number<std::uint64_t>(entry.bytes, 32));
+    if (size < 72 || size - 8 > entry.bytes.size() || !std::isfinite(hz) || hz < 1 ||
+        hz > std::numeric_limits<std::uint32_t>::max() || std::trunc(hz) != hz)
+      Fail(Unsupported, "Unsupported QuickTime LPCM sample description");
+    rate = static_cast<std::uint32_t>(hz);
+    channels = Number<std::uint32_t>(entry.bytes, 40);
+    const auto bits = Number<std::uint32_t>(entry.bytes, 48);
+    const auto flags = Number<std::uint32_t>(entry.bytes, 52);
+    declared_frame_bytes = Number<std::uint32_t>(entry.bytes, 56);
+    if ((flags & ~15u) || !(flags & 8) || Number<std::uint32_t>(entry.bytes, 60) != 1)
+      Fail(Unsupported, "QuickTime LPCM must be packed and interleaved with one frame per sample");
+    track.codec = PcmType(bits, flags & 2, flags & 1, flags & 4);
+  } else {
+    if (version > 1) Fail(Unsupported, "Unsupported QuickTime PCM sound description version");
+    const auto fixed_rate = Number<std::uint32_t>(entry.bytes, 24);
+    if (fixed_rate & 0xffff) Fail(Unsupported, "Fractional QuickTime PCM sample rate");
+    rate = fixed_rate >> 16;
+    channels = Number<std::uint16_t>(entry.bytes, 16);
+    if (version) {
+      if (Number<std::uint32_t>(entry.bytes, 28) != 1)
+        Fail(Unsupported, "QuickTime PCM must have one frame per sample");
+      declared_frame_bytes = Number<std::uint32_t>(entry.bytes, 36);
+    }
+    switch (entry.tag) {
+      case Tag("raw "): track.codec = CodecId::PcmU8; break;
+      case Tag("sowt"): track.codec = CodecId::PcmS16Le; break;
+      case Tag("twos"): track.codec = CodecId::PcmS16Be; break;
+      case Tag("in24"):
+      case Tag("in32"):
+      case Tag("fl32"): {
+        const auto offset = version ? 44u : 28u;
+        Slice(entry.bytes, 0, offset);
+        const auto extensions = entry.bytes.subspan(offset);
+        auto endian = Child(extensions, "enda", false);
+        if (endian.empty()) endian = Child(Child(extensions, "wave", false), "enda", false);
+        const auto little = endian.empty() ? 0 : Number<std::uint16_t>(endian);
+        if (little > 1) Fail(Invalid, "Invalid QuickTime PCM endianness");
+        const auto floating = entry.tag == Tag("fl32");
+        track.codec = PcmType(entry.tag == Tag("in24") ? 24 : 32, !little, floating, !floating);
+        break;
+      }
+      default: Fail(Unsupported, "Unsupported QuickTime audio sample entry");
+    }
+    if ((entry.tag == Tag("raw ") || entry.tag == Tag("sowt") || entry.tag == Tag("twos")) &&
+        Number<std::uint16_t>(entry.bytes, 18) != MovPcmBits(track.codec))
+      Fail(Unsupported, "QuickTime PCM sample width does not match its entry");
+  }
+  const auto frame_bytes = (MovPcmBits(track.codec) / 8) * channels;
+  if (!rate || !channels || channels > 64 || (version && frame_bytes != declared_frame_bytes))
+    Fail(Invalid, "Inconsistent QuickTime PCM channels, rate, or frame size");
+  track.kind = TrackKind::Audio;
+  track.sample_rate = rate;
+  track.channel_count = channels;
+}
+
 struct EditList {
   std::int64_t empty = 0;
   std::optional<std::int64_t> media_start;
@@ -206,6 +303,76 @@ struct TrackIndex {
   }
 };
 
+template<class Visit> void VisitChunks(ByteView stbl, std::uint32_t count, Visit visit) {
+  const auto offsets64 = Child(stbl, "co64", false);
+  const auto offsets = offsets64.empty() ? Child(stbl, "stco") : offsets64;
+  const auto stride = offsets64.empty() ? 4 : 8;
+  const auto chunk_count = Entries(offsets, stride);
+  const auto mapping = Child(stbl, "stsc");
+  const auto mappings = Entries(mapping, 12);
+  std::uint32_t index = 0;
+  std::size_t entry = 0;
+  std::uint32_t per_chunk = 0;
+  std::uint64_t previous_end = 0;
+  for (std::size_t chunk = 1; chunk <= chunk_count; ++chunk) {
+    const auto position = 8 + entry * 12;
+    if (entry < mappings && Number<std::uint32_t>(mapping, position) == chunk) {
+      per_chunk = Number<std::uint32_t>(mapping, position + 4);
+      if (Number<std::uint32_t>(mapping, position + 8) != 1)
+        Fail(Unsupported, "MP4 track uses more than one sample description");
+      ++entry;
+    }
+    if (!per_chunk || per_chunk > count - index) Fail(Invalid, "Invalid MP4 samples per chunk");
+    auto offset = stride == 4 ? Number<std::uint32_t>(offsets, 8 + (chunk - 1) * stride)
+                             : Number<std::uint64_t>(offsets, 8 + (chunk - 1) * stride);
+    if (offset < previous_end) Fail(Unsupported, "MP4 track chunks are not stored in decode order");
+    previous_end = visit(index, per_chunk, offset);
+    index += per_chunk;
+  }
+  if (entry != mappings || index != count) Fail(Invalid, "MP4 chunk table does not cover all samples");
+}
+
+void ParsePcmSamples(ByteView stbl, TrackIndex& index, const MediaTrack& track, std::size_t remaining) {
+  const auto frame_bytes = (MovPcmBits(track.codec) / 8) * *track.channel_count;
+  const auto rate = *track.sample_rate;
+  if (index.scale % rate) Fail(Unsupported, "QuickTime PCM track clock is not an integer multiple of its sample rate");
+  const auto ticks = index.scale / rate;
+  const auto sizes = Child(stbl, "stsz");
+  const auto size = Number<std::uint32_t>(sizes, 4);
+  const auto count = Number<std::uint32_t>(sizes, 8);
+  if (size != frame_bytes) Fail(Unsupported, "QuickTime PCM requires a constant size per sample frame");
+  if (!Child(stbl, "ctts", false).empty() || !Child(stbl, "stss", false).empty())
+    Fail(Unsupported, "QuickTime PCM composition and sync tables are unsupported");
+
+  const auto timing = Child(stbl, "stts");
+  std::uint32_t covered = 0;
+  for (std::size_t i = 0, entries = Entries(timing, 8); i < entries; ++i) {
+    const auto run = Number<std::uint32_t>(timing, 8 + i * 8);
+    if (!run || run > count - covered || Number<std::uint32_t>(timing, 12 + i * 8) != ticks)
+      Fail(Invalid, "Inconsistent QuickTime PCM sample timing");
+    covered += run;
+  }
+  if (covered != count) Fail(Invalid, "QuickTime PCM timing does not cover all frames");
+
+  const auto max_frames = std::min(16384u / frame_bytes, 0xffffffffu / ticks);
+  std::int64_t time = 0;
+  // A sample table can describe hours of one-frame samples. Index bounded blocks within each chunk instead.
+  VisitChunks(stbl, count, [&](std::uint32_t, std::uint32_t frames, std::uint64_t offset) {
+    while (frames) {
+      if (index.samples.size() == remaining) Fail(ContainerErrorCode::LimitExceeded, "QuickTime PCM index exceeds its limit");
+      const auto block = std::min(frames, max_frames);
+      const auto bytes = block * frame_bytes;
+      const auto duration = block * ticks;
+      index.sync.push_back(static_cast<std::uint32_t>(index.samples.size()));
+      index.samples.push_back({offset, bytes, time, time, duration, true});
+      time = AddTime(time, duration);
+      offset = AddOffset(offset, bytes);
+      frames -= block;
+    }
+    return offset;
+  });
+}
+
 void ParseSamples(ByteView stbl, TrackIndex& track, std::size_t remaining) {
   const auto sizes = Child(stbl, "stsz");
   const auto uniform = Number<std::uint32_t>(sizes, 4);
@@ -255,36 +422,14 @@ void ParseSamples(ByteView stbl, TrackIndex& track, std::size_t remaining) {
     if (index != count) Fail(Invalid, "MP4 composition time table does not cover all samples");
   }
 
-  const auto offsets64 = Child(stbl, "co64", false);
-  const auto offsets = offsets64.empty() ? Child(stbl, "stco") : offsets64;
-  const auto stride = offsets64.empty() ? 4 : 8;
-  const auto chunk_count = Entries(offsets, stride);
-  const auto mapping = Child(stbl, "stsc");
-  const auto mappings = Entries(mapping, 12);
-  index = 0;
-  std::size_t entry = 0;
-  std::uint32_t per_chunk = 0;
-  std::uint64_t previous_end = 0;
-  for (std::size_t chunk = 1; chunk <= chunk_count; ++chunk) {
-    const auto position = 8 + entry * 12;
-    if (entry < mappings && Number<std::uint32_t>(mapping, position) == chunk) {
-      per_chunk = Number<std::uint32_t>(mapping, position + 4);
-      if (Number<std::uint32_t>(mapping, position + 8) != 1)
-        Fail(Unsupported, "MP4 track uses more than one sample description");
-      ++entry;
-    }
-    if (!per_chunk || per_chunk > count - index) Fail(Invalid, "Invalid MP4 samples per chunk");
-    auto offset = stride == 4 ? Number<std::uint32_t>(offsets, 8 + (chunk - 1) * stride)
-                             : Number<std::uint64_t>(offsets, 8 + (chunk - 1) * stride);
-    if (offset < previous_end) Fail(Unsupported, "MP4 track chunks are not stored in decode order");
+  VisitChunks(stbl, count, [&](std::uint32_t first, std::uint32_t per_chunk, std::uint64_t offset) {
     for (std::uint32_t i = 0; i < per_chunk; ++i) {
-      auto& sample = track.samples[index++];
+      auto& sample = track.samples[first + i];
       sample.offset = offset;
       offset = AddOffset(offset, sample.size);
     }
-    previous_end = offset;
-  }
-  if (entry != mappings || index != count) Fail(Invalid, "MP4 chunk table does not cover all samples");
+    return offset;
+  });
 
   const auto sync = Child(stbl, "stss", false);
   if (sync.empty()) {
@@ -313,14 +458,24 @@ struct SampleRef {
 
 class Mp4Reader final : public ContainerReader {
 public:
-  explicit Mp4Reader(ContainerInput input) : ContainerReader(std::move(input), ContainerFormat::Mp4) {
-    bool movie = false;
+  Mp4Reader(ContainerInput input, std::optional<ContainerFormat> hint)
+      : ContainerReader(std::move(input), ContainerFormat::Mp4) {
+    bool movie = false, branded = false;
     std::size_t boxes = 0;
     while (const auto box = ReadBox(this->input)) {
       if (++boxes > 65536 || (!this->input.Random() && box->offset > MaxContainerMetadata))
         Fail(ContainerErrorCode::LimitExceeded, "MP4 movie discovery exceeds its budget");
-      if (box->tag == Tag("moov")) {
+      if (box->tag == Tag("ftyp")) {
+        if (branded || movie || box->size < 8) Fail(Invalid, "Invalid or misplaced file type box");
+        const auto major = Number<std::uint32_t>(this->input.ReadBytes(4));
+        if (major == Tag("qt  ")) format = ContainerFormat::Mov;
+        if ((!this->input.Random() || !this->input.Size()) && box->size > MaxContainerMetadata)
+          Fail(ContainerErrorCode::LimitExceeded, "File type box exceeds probe budget");
+        this->input.Skip(box->size - 4);
+        branded = true;
+      } else if (box->tag == Tag("moov")) {
         if (movie) Fail(Invalid, "Duplicate MP4 movie");
+        if (hint && *hint != format) Fail(ContainerErrorCode::UnrecognizedFormat, "Movie brand does not match the format hint");
         Movie(ReadMetadata(this->input, box->size));
         movie = true;
         if (!this->input.Random() || layout == ContainerLayout::Fragmented) break;
@@ -391,12 +546,18 @@ public:
     }
     const auto& sample = track.samples[*at];
     auto kind = track.nal_length ? SeekPoint::Kind::SyncMarked : SeekPoint::Kind::Independent;
-    if (track.nal_length && input.Random()) {
+    const auto& description = tracks[index];
+    const bool avc = description.codec == CodecId::H264;
+    const bool hvc1 = description.codec == CodecId::Hevc && description.sample_entry == "hvc1";
+    if ((avc || hvc1) && input.Random()) {
       // Inspect the sync sample without changing the session's observable read position.
       const auto previous = input.Position();
       input.Seek(sample.offset);
       try {
-        if (AvcIdr(input.ReadBytes(sample.size), track.nal_length, Invalid)) kind = SeekPoint::Kind::Independent;
+        const auto bytes = input.ReadBytes(sample.size);
+        const bool idr = avc ? AvcIdr(bytes, track.nal_length, Invalid)
+                             : HevcIdr(bytes, track.nal_length, true, Invalid);
+        if (idr) kind = SeekPoint::Kind::Independent;
       } catch (...) {
         input.Seek(previous);
         throw;
@@ -436,28 +597,34 @@ private:
     movie_scale_ = Number<std::uint32_t>(header, wide ? 20 : 12);
     const auto length = wide ? Number<std::uint64_t>(header, 24) : Number<std::uint32_t>(header, 16);
     if (!movie_scale_) Fail(Invalid, "Zero MP4 movie timescale");
+    movie_rotation_ = Rotation(header, wide ? 48 : 36);
     if (length && length <= std::numeric_limits<std::int64_t>::max() && (wide || length != 0xffffffffu))
       duration = MediaTimestamp{static_cast<std::int64_t>(length), movie_scale_};
     const auto extensions = Child(movie, "mvex", false);
-    if (!extensions.empty()) layout = ContainerLayout::Fragmented;
+    if (!extensions.empty()) {
+      if (format == ContainerFormat::Mov) Fail(Unsupported, "Fragmented QuickTime movies are unsupported");
+      layout = ContainerLayout::Fragmented;
+    }
     std::size_t count = 0;
     while (!movie.empty()) {
       const auto box = NextBox(movie);
-      if (box.tag == Tag("trak")) {
-        if (tracks.size() == MaxContainerTracks)
-          Fail(ContainerErrorCode::LimitExceeded, "Too many MP4 tracks");
-        ReadTrack(box.bytes, count);
-        count += indexes_.back().samples.size();
-      }
+      if (box.tag == Tag("trak")) ReadTrack(box.bytes, count);
     }
-    if (tracks.empty()) Fail(Invalid, "MP4 has no tracks");
+    if (tracks.empty()) Fail(Invalid, "Movie has no audio or video tracks");
     if (layout == ContainerLayout::Fragmented) {
       if (count) Fail(Unsupported, "MP4 hybrid sample tables and fragments are unsupported");
       ReadDefaults(extensions);
     }
   }
 
-  void ReadTrack(ByteView box, std::size_t count) {
+  void ReadTrack(ByteView box, std::size_t& count) {
+    const auto mdia = Child(box, "mdia");
+    const auto handler = Number<std::uint32_t>(Child(mdia, "hdlr"), 8);
+    // QuickTime files may have independent timecode or timed metadata tracks beside the editing media.
+    if (format == ContainerFormat::Mov &&
+        (handler == Tag("tmcd") || handler == Tag("meta") || handler == Tag("mdta"))) return;
+    if (tracks.size() == MaxContainerTracks)
+      Fail(ContainerErrorCode::LimitExceeded, "Too many movie tracks");
     MediaTrack track;
     TrackIndex index;
     const auto tkhd = Child(box, "tkhd");
@@ -465,20 +632,19 @@ private:
     track.id = Number<std::uint32_t>(tkhd, Version(tkhd) ? 20 : 12);
     if (!track.id || std::ranges::find(tracks, track.id, &MediaTrack::id) != tracks.end())
       Fail(Invalid, "MP4 track IDs must be nonzero and unique");
-    const auto mdia = Child(box, "mdia");
     const auto mdhd = Child(mdia, "mdhd");
     CheckVersion(mdhd, 1);
     index.clock = index.scale = Number<std::uint32_t>(mdhd, Version(mdhd) ? 20 : 12);
     if (!index.scale) Fail(Invalid, "Zero MP4 track timescale");
     track.timescale = index.scale;
-    const auto handler = Number<std::uint32_t>(Child(mdia, "hdlr"), 8);
     const auto minf = Child(mdia, "minf");
     const auto references = Child(Child(minf, "dinf"), "dref");
     if (Number<std::uint32_t>(references, 4) != 1)
       Fail(Unsupported, "MP4 external or multiple data references are unsupported");
     auto urls = references.subspan(8);
     const auto url = NextBox(urls);
-    if (url.tag != Tag("url ") || Number<std::uint32_t>(url.bytes) != 1 || !urls.empty())
+    if ((url.tag != Tag("url ") && !(format == ContainerFormat::Mov && url.tag == Tag("alis"))) ||
+        Number<std::uint32_t>(url.bytes) != 1 || !urls.empty())
       Fail(Unsupported, "MP4 external data reference");
     const auto stbl = Child(minf, "stbl");
     const auto description = Child(stbl, "stsd");
@@ -489,36 +655,68 @@ private:
     if (Number<std::uint16_t>(entry.bytes, 6) != 1 || !entries.empty())
       Fail(Unsupported, "Unsupported MP4 sample description reference");
     if (handler == Tag("soun") && entry.tag == Tag("mp4a")) {
-      if (Number<std::uint16_t>(entry.bytes, 8) != 0) Fail(Unsupported, "Unsupported MP4 audio sample entry version");
-      Slice(entry.bytes, 0, 28);
-      track.initialization_data = AacInitialization(Child(entry.bytes.subspan(28), "esds"));
+      const auto version = Number<std::uint16_t>(entry.bytes, 8);
+      if (version > 1 || (version && format != ContainerFormat::Mov))
+        Fail(Unsupported, "Unsupported AAC audio sample entry version");
+      const auto base = version ? 44u : 28u;
+      Slice(entry.bytes, 0, base);
+      const auto extensions = entry.bytes.subspan(base);
+      auto descriptor = Child(extensions, "esds", !version);
+      if (descriptor.empty()) descriptor = Child(Child(extensions, "wave"), "esds");
+      track.initialization_data = AacInitialization(descriptor);
       auto config = ParseAac(track.initialization_data);
       if (!config.Succeeded()) Fail(Unsupported, config.Error().message);
       track.kind = TrackKind::Audio;
       track.codec = CodecId::Aac;
       track.sample_rate = config.Value().sample_rate;
       track.channel_count = config.Value().channels;
-    } else if (handler == Tag("vide") && entry.tag == Tag("avc1")) {
+    } else if (handler == Tag("vide")) {
       track.kind = TrackKind::Video;
-      track.codec = CodecId::H264;
-      track.framing = PacketFraming::LengthPrefixedNals;
       const auto width = Number<std::uint16_t>(entry.bytes, 24), height = Number<std::uint16_t>(entry.bytes, 26);
       if (!width || !height) Fail(Invalid, "Invalid MP4 visual sample dimensions");
       track.coded_width = width;
       track.coded_height = height;
       Slice(entry.bytes, 0, 78);
-      const auto avcc = Child(entry.bytes.subspan(78), "avcC");
-      auto config = ParseAvc(avcc);
-      if (!config.Succeeded()) Fail(Unsupported, config.Error().message);
-      index.nal_length = config.Value().length_size;
-      track.initialization_data.assign(avcc.begin(), avcc.end());
-      const auto clap = Child(entry.bytes.subspan(78), "clap", false);
+      const auto extensions = entry.bytes.subspan(78);
+      ByteView config;
+      if (entry.tag == Tag("avc1")) {
+        track.codec = CodecId::H264;
+        config = Child(extensions, "avcC");
+        const auto avc = ParseAvc(config);
+        if (!avc.Succeeded()) Fail(Unsupported, avc.Error().message);
+        index.nal_length = avc.Value().length_size;
+      } else if (entry.tag == Tag("hvc1") || entry.tag == Tag("hev1")) {
+        track.codec = CodecId::Hevc;
+        track.sample_entry = EntryName(entry.tag);
+        config = Child(extensions, "hvcC");
+        index.nal_length = HevcNalLength(config, entry.tag == Tag("hvc1"), Invalid);
+      } else if (format == ContainerFormat::Mov && ProResEntry(entry.tag)) {
+        track.codec = CodecId::ProRes;
+        track.sample_entry = EntryName(entry.tag);
+      } else {
+        Fail(Unsupported, "Unsupported MP4 or QuickTime video sample entry");
+      }
+      if (index.nal_length) {
+        track.framing = PacketFraming::LengthPrefixedNals;
+        track.initialization_data.assign(config.begin(), config.end());
+      }
+      const auto rotation = Rotation(tkhd, Version(tkhd) ? 52 : 40);
+      track.rotation = static_cast<VideoRotation>(
+          (static_cast<unsigned>(movie_rotation_) + static_cast<unsigned>(rotation)) % 4);
+      const auto clap = Child(extensions, "clap", false);
       if (!clap.empty()) track.visible = Aperture(clap, width, height);
+    } else if (handler == Tag("soun") && format == ContainerFormat::Mov) {
+      ReadPcmDescription(entry, track);
     } else {
-      Fail(Unsupported, "MP4 track is not raw AAC-LC or length-prefixed AVC");
+      Fail(Unsupported, "Unsupported MP4 or QuickTime track");
     }
-    ParseSamples(stbl, index, MaxContainerSamples - count);
+    if (MovPcmBits(track.codec)) {
+      ParsePcmSamples(stbl, index, track, MaxContainerSamples - count);
+    } else {
+      ParseSamples(stbl, index, MaxContainerSamples - count);
+    }
     ApplyEdits(track, index, ParseEdits(Child(box, "edts", false)));
+    count += index.samples.size();
     tracks.push_back(std::move(track));
     indexes_.push_back(std::move(index));
   }
@@ -716,13 +914,14 @@ private:
   std::vector<SampleRef> order_;
   std::vector<std::pair<std::uint64_t, std::uint64_t>> media_;
   std::uint32_t movie_scale_ = 0;
+  VideoRotation movie_rotation_ = VideoRotation::None;
   std::size_t cursor_ = 0;
   std::uint64_t media_end_ = 0;
   bool media_to_eof_ = false;
 };
 } // namespace
 
-std::unique_ptr<ContainerReader> OpenMp4Reader(ContainerInput input) {
-  return std::make_unique<Mp4Reader>(std::move(input));
+std::unique_ptr<ContainerReader> OpenMp4Reader(ContainerInput input, std::optional<ContainerFormat> hint) {
+  return std::make_unique<Mp4Reader>(std::move(input), hint);
 }
 } // namespace huxerui::media::detail

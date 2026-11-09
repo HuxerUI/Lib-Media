@@ -35,7 +35,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; Apple encoder validation remains pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; Apple build/device validation remains pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | Codec capability discovery | Typed AAC-LC/H.264 snapshots for the current adapter; unreported platform facts remain unknown | `QueryCapabilities()` on the four codec classes in [`media_codec.h`](include/huxerui/media_codec.h) |
-| Container demuxing and muxing | AAC/AVC MP4 and fragmented MP4, PCM WAVE/RF64, and AAC ADTS | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
+| Container demuxing and muxing | MP4/fMP4 with AAC, AVC, or HEVC, QuickTime MOV including ProRes and PCM, PCM WAVE/RF64, and AAC ADTS | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
 
 Platform selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
 SDK `FileReference` values, which can be retained for reading, imported to local files, or passed to `MediaSource` for

@@ -32,5 +32,10 @@ template<class Body> void FullBox(Bytes& bytes, std::string_view tag, std::uint3
 
 std::uint32_t Mp4Scale(const MediaTrack& track);
 bool AvcIdr(ByteView bytes, unsigned length_size, ContainerErrorCode error);
+unsigned HevcNalLength(ByteView config, bool hvc1, ContainerErrorCode error);
+bool HevcIdr(ByteView bytes, unsigned length_size, bool hvc1, ContainerErrorCode error);
+bool ProResEntry(std::uint32_t tag);
+unsigned MovPcmBits(CodecId codec);
+bool MovPcmBigEndian(CodecId codec);
 
 } // namespace huxerui::media::detail

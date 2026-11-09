@@ -40,7 +40,7 @@ struct TrackFixture {
 };
 
 TrackFixture Fixture(bool audio, bool fragmented) {
-  const auto base = fs::path(MEDIA_CODEC_FIXTURES);
+  const auto base = fs::path(MEDIA_FIXTURES) / "codec";
   const std::string name = audio ? "aac" : "avc";
   TrackFixture fixture;
   auto& track = fixture.track;
@@ -249,12 +249,146 @@ void Adts(const fs::path& path) {
   for (const auto& packet : audio.packets) Compare(std::get<ContainerPacket>(*Take(demux.Read())), packet);
   Check(!Take(demux.Read()) && demux.Duration() == MediaTimestamp{next, 48000}, "Wrong ADTS end or duration");
 }
+
+void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in_band = false,
+         ContainerLayout layout = ContainerLayout::Default) {
+  const auto fixture = fs::path(MEDIA_FIXTURES) / "container" /
+      (hevc ? "hevc-aac-portrait.mov" : "prores-pcm.mov");
+  const auto file = Path(fixture);
+  auto wrong_hint = MediaDemuxer::Open(Take(file.OpenRandomAccess()), ContainerFormat::Mp4);
+  Check(!wrong_hint.Succeeded() && wrong_hint.Error().code == ContainerErrorCode::UnrecognizedFormat,
+        "A QuickTime brand matched an MP4 hint");
+  auto input = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess()), ContainerFormat::Mov));
+  Check(input.Format() == ContainerFormat::Mov && input.Tracks().size() == 2, "QuickTime brand or track count differs");
+
+  std::vector<MediaTrack> tracks(input.Tracks().begin(), input.Tracks().end());
+  Check(tracks[0].codec == (hevc ? CodecId::Hevc : CodecId::ProRes) &&
+        tracks[0].sample_entry == (hevc ? "hvc1" : "apcn") &&
+        tracks[0].rotation == (hevc ? VideoRotation::Clockwise90 : VideoRotation::None),
+        "QuickTime video description differs");
+  Check(tracks[1].codec == (hevc ? CodecId::Aac : CodecId::PcmS24Le), "QuickTime audio coding differs");
+  const auto seek = Take(input.FindSeekPoint(tracks[0].id, {0, 1}));
+  Check(seek && seek->kind == SeekPoint::Kind::Independent && seek->time == MediaTimestamp{0, 1},
+        "QuickTime video did not expose an independent first frame");
+  std::array<std::vector<ContainerPacket>, 2> packets;
+  std::size_t pcm_bytes = 0;
+  while (auto item = Take(input.Read())) {
+    auto packet = std::get<ContainerPacket>(std::move(*item));
+    const auto track = packet.track_id == tracks[0].id ? 0u : 1u;
+    if (!hevc && track == 1) {
+      const auto size = packet.data.AsBytes().size();
+      Check(size % 6 == 0 && size > 6 && size <= 16384, "QuickTime PCM did not group aligned frames");
+      pcm_bytes += size;
+    }
+    packets[track].push_back(std::move(packet));
+  }
+  Check(packets[0].size() == (hevc ? 6 : 4) && !packets[1].empty(), "Wrong QuickTime fixture packet count");
+  if (!hevc) Check(pcm_bytes == 4000 * 6, "QuickTime PCM lost sample frames");
+  Take(input.Close());
+
+  if (in_band) {
+    tracks[0].sample_entry = "hev1";
+    // Repeat the configuration's VPS/SPS/PPS in the first access unit as permitted by hev1.
+    const auto& config = tracks[0].initialization_data;
+    const auto read16 = [&](std::size_t offset) {
+      return (std::to_integer<unsigned>(config.at(offset)) << 8) | std::to_integer<unsigned>(config.at(offset + 1));
+    };
+    Check((std::to_integer<unsigned>(config.at(21)) & 3) == 3, "Expected four-byte HEVC NAL lengths");
+    Bytes bytes;
+    std::size_t offset = 23;
+    while (offset < config.size()) {
+      const auto type = std::to_integer<unsigned>(config.at(offset)) & 63;
+      const auto count = read16(offset + 1);
+      offset += 3;
+      for (unsigned i = 0; i < count; ++i) {
+        const auto length = read16(offset);
+        Check(length <= config.size() - offset - 2, "Invalid HEVC fixture NAL length");
+        if (type >= 32 && type <= 34) {
+          bytes.insert(bytes.end(), 2, std::byte{0});
+          bytes.insert(bytes.end(), config.begin() + offset, config.begin() + offset + 2 + length);
+        }
+        offset += 2 + length;
+      }
+    }
+    Check(!bytes.empty(), "No HEVC parameter sets in the fixture");
+    const auto original = packets[0].front().data.AsBytes();
+    bytes.insert(bytes.end(), original.begin(), original.end());
+    packets[0].front().data = BytesRef(std::move(bytes));
+  }
+
+  const bool fragmented = layout == ContainerLayout::Fragmented;
+  if (fragmented) {
+    for (auto& track : tracks) {
+      track.priming_samples.reset();
+      track.padding_samples.reset();
+    }
+    for (auto& group : packets) {
+      for (auto& packet : group) {
+        packet.pts->ticks += packet.pts->timescale;
+        packet.dts->ticks += packet.dts->timescale;
+      }
+    }
+  }
+  auto output = fragmented
+      ? Take(MediaMuxer::Open(Take(Path(destination).OpenWrite()), format, tracks, layout))
+      : Take(MediaMuxer::Open(Output(destination), format, tracks));
+  if (hevc && format == ContainerFormat::Mov) {
+    auto packet = packets[0].front();
+    const auto picture = packet.data.AsBytes();
+    Bytes combined(picture.begin(), picture.end());
+    combined.insert(combined.end(), picture.begin(), picture.end());
+    packet.data = BytesRef(std::move(combined));
+    const auto rejected = output.TryWrite(packet);
+    Check(!rejected.Succeeded() && rejected.Error().code == ContainerErrorCode::InvalidArgument,
+          "Mux accepted two HEVC pictures as one sample");
+  }
+  std::array<std::size_t, 2> cursor{};
+  std::size_t track = 0, attempts = 0;
+  while (cursor[0] < packets[0].size() || cursor[1] < packets[1].size()) {
+    Check(++attempts <= 2 * (packets[0].size() + packets[1].size()), "QuickTime remux did not make progress");
+    const auto need = Take(output.TryWrite(packets[track][cursor[track]]));
+    if (need) {
+      Check(*need == tracks[1 - track].id, "QuickTime remux requested the wrong track");
+      track = 1 - track;
+    } else if (++cursor[track] == packets[track].size()) {
+      Take(output.EndTrack(tracks[track].id));
+      track = 1 - track;
+    }
+  }
+  Take(output.Finish());
+
+  auto result = fragmented
+      ? Take(MediaDemuxer::Open(Take(Path(destination).OpenRead()), format))
+      : Take(MediaDemuxer::Open(Take(Path(destination).OpenRandomAccess()), format));
+  Check(result.Format() == format && result.Layout() == layout && result.Tracks().size() == tracks.size() &&
+        result.Tracks()[0].sample_entry == tracks[0].sample_entry &&
+        result.Tracks()[0].rotation == tracks[0].rotation &&
+        result.Tracks()[0].initialization_data == tracks[0].initialization_data &&
+        result.Tracks()[1].codec == tracks[1].codec && result.Tracks()[1].channel_count == tracks[1].channel_count,
+        "Remuxed video or audio description differs");
+  cursor = {};
+  while (auto item = Take(result.Read())) {
+    const auto& packet = std::get<ContainerPacket>(*item);
+    const auto index = packet.track_id == tracks[0].id ? 0u : 1u;
+    Check(cursor[index] < packets[index].size(), "Unexpected remuxed packet");
+    Compare(packet, packets[index][cursor[index]++]);
+  }
+  Check(cursor[0] == packets[0].size() && cursor[1] == packets[1].size(), "QuickTime remux lost packets");
+  if (fragmented) return;
+  const auto point = Take(result.Seek(tracks[0].id, {0, 1}));
+  Check(point && point->kind == (in_band ? SeekPoint::Kind::SyncMarked : SeekPoint::Kind::Independent),
+        "Remuxed video seek evidence differs");
+  Check(std::get<MediaTrack>(*Take(result.Read())).rotation == tracks[0].rotation,
+        "Seek did not deliver the remuxed rotation");
+  Compare(std::get<ContainerPacket>(*Take(result.Read())), packets[0].front());
+}
 } // namespace
 
 int main(int argc, char** argv) {
   const auto path = argc == 2 ? fs::path(argv[1]) : fs::temp_directory_path() /
       ("huxerui-container-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-  const std::array names{"regular.mp4", "fragmented.mp4", "audio.wav", "audio.rf64.wav", "audio.aac"};
+  const std::array names{"regular.mp4", "fragmented.mp4", "audio.wav", "audio.rf64.wav", "audio.aac",
+                         "hevc.mov", "hevc.mp4", "hev1.mp4", "prores-pcm.mov", "hevc-fragmented.mp4"};
   try {
     Check(fs::create_directory(path), "Could not create a fresh container test directory");
     Mp4(path / names[0], false);
@@ -262,6 +396,11 @@ int main(int argc, char** argv) {
     Wave(path / names[2], ContainerFormat::Wave);
     Wave(path / names[3], ContainerFormat::Rf64);
     Adts(path / names[4]);
+    Mov(path / names[5], true, ContainerFormat::Mov);
+    Mov(path / names[6], true, ContainerFormat::Mp4);
+    Mov(path / names[7], true, ContainerFormat::Mp4, true);
+    Mov(path / names[8], false, ContainerFormat::Mov);
+    Mov(path / names[9], true, ContainerFormat::Mp4, false, ContainerLayout::Fragmented);
     if (argc != 2) {
       for (auto name : names) fs::remove(path / name);
       fs::remove(path / "open-ended.mp4");

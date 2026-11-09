@@ -9,8 +9,9 @@ Serialize calls on each session.
 
 | Container | Packets | Input | Output |
 | --- | --- | --- | --- |
-| Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC and length-prefixed AVC | Random access, or sequential when movie metadata precedes samples | Random write |
-| Fragmented MP4 | Same AAC and AVC mappings | Sequential or random-access input, beginning with initialization | Sequential or random write |
+| Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC and length-prefixed AVC or HEVC | Random access, or sequential when movie metadata precedes samples | Random write |
+| Fragmented MP4 | Same AAC, AVC, and HEVC mappings | Sequential or random-access input, beginning with initialization | Sequential or random write |
+| QuickTime MOV | Same AAC, AVC, and HEVC mappings, ProRes, and packed interleaved PCM | Random access, or sequential when movie metadata precedes samples | Random write |
 | RIFF WAVE and RF64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
 | MPEG-4 ADTS | One raw mono/stereo AAC-LC access unit per frame | Sequential or random access | Sequential or random write |
 
@@ -21,13 +22,27 @@ so a shortened sample duration is already reflected in that timeline. The fragme
 fragments. It requires nonnegative DTS and rejects nonzero audio trim. Fragmented MP4 and ADTS
 currently report `IndexUnavailable` for time-based index queries.
 
+HEVC tracks retain `hvcC` and their `hvc1` or `hev1` sample entry. With `hvc1`, parameter sets are
+in the configuration and the writer rejects in-band parameter sets. `hev1` can carry parameter sets in
+samples, and its seek points report the container sync mark. With random input, a validated `hvc1`
+IDR can report `Independent`. Presentation rotation combines right-angle movie and track transforms
+and is emitted as a track matrix. Packet bytes and coded dimensions retain their original orientation.
+
+MOV uses the `qt  ` major brand and self-contained media. ProRes retains the Proxy, LT, 422, HQ,
+4444, or 4444 XQ sample entry. PCM supports U8, signed 16/24/32-bit, and 32-bit float, with little-
+and big-endian variants where applicable. The reader groups consecutive PCM frames in each chunk.
+The writer emits packed interleaved LPCM in a version-two sound description. MOV input can include
+auxiliary timecode and timed metadata tracks. The session reads and writes the supported audio and
+video tracks, and skips those auxiliary tracks.
+
 For WAVE, an extensible track carries the 22-byte format suffix in `initialization_data`. It preserves
 the subtype, valid bits, and speaker mask when passed to a WAVE or RF64 writer. WAVE packets are
 frame-aligned blocks. ADTS strips transport headers on read and supplies them on write. It provides a
 sample-count timeline starting at zero and emits an updated track description if the AAC configuration changes.
 
 The container API covers the track and packet fields declared in the header. Container-specific metadata
-such as tags, chapters, attachments, display transforms, and complex edit lists is outside these mappings.
+such as tags, chapters, attachments, color metadata, and complex edit lists is outside these mappings.
+Mirrored, scaled, or perspective movie and track matrices report `Unsupported`.
 A format or codec combination outside the table returns a format or support error.
 
 ## Read and seek
@@ -53,10 +68,11 @@ fresh `OutputStream` or an empty writable `RandomAccessStream`. `RandomWrite` re
 open and subsequent I/O can still report SDK errors, including permissions or insufficient space.
 
 Choose an exact output clock using the track's `timescale`. MP4 defaults to the audio sample rate or
-90 kHz for video. Supply PTS and duration, and explicit DTS for AVC. AAC decode time can use PTS and
-an omitted AAC duration is one 1024-sample access unit. Each track's decode times must follow a contiguous
-grid. Presentation times may move backwards across successive packets with B pictures. WAVE and ADTS
-can derive timing from sample counts and validate any supplied values against that grid.
+90 kHz for video. Supply PTS and duration, and explicit DTS for AVC and HEVC. AAC and ProRes decode
+time can use PTS. An omitted AAC duration is one 1024-sample access unit. Each track's decode times
+must follow a contiguous grid. Presentation times may move backwards across successive packets with
+B pictures. WAVE, ADTS, and MOV PCM can derive timing from sample counts and validate any supplied
+values against that grid.
 
 `TryWrite()` consumes the whole packet when it returns success with no ID. If it returns an ID, supply
 that track's next packet or call `EndTrack()` when the track is exhausted, then retry the unconsumed packet.
@@ -70,5 +86,6 @@ partial files. When a destination only exposes `AsyncOutputStream`, an applicati
 container in a writable temporary file and copy it through the SDK's asynchronous streams.
 
 The current bounds include eight tracks, 16 MiB per packet, 64 MiB per metadata box, and one million
-samples for a regular MP4 index or an individual fragment. See [the container contract test](../tests/container_contract.cpp)
-for packet round trips using the same AAC and AVC fixtures as the codecs.
+indexed packets for a regular movie or an individual fragment. A QuickTime PCM index entry can cover many
+sample frames. See [the container contract test](../tests/container_contract.cpp) for codec packet round trips and
+[the QuickTime fixtures](../tests/fixtures/container/README.md) for independent input samples.

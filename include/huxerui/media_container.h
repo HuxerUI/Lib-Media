@@ -29,6 +29,7 @@ enum class ContainerFormat {
   Wave,  ///< RIFF WAVE with 32-bit chunk sizes.
   Rf64,  ///< RF64 WAVE with a 64-bit size table.
   Adts,  ///< AAC with an ADTS header on each access unit.
+  Mov,   ///< Self-contained QuickTime movie with the `qt  ` major brand.
 };
 
 /// @brief File organization within a container format.
@@ -56,6 +57,12 @@ enum class CodecId {
   PcmS24Le, ///< Signed packed 24-bit little-endian PCM.
   PcmS32Le, ///< Signed 32-bit little-endian PCM.
   PcmF32Le, ///< IEEE float 32-bit little-endian PCM.
+  Hevc,     ///< High Efficiency Video Coding.
+  ProRes,   ///< Apple ProRes coded pictures. The sample entry identifies the profile.
+  PcmS16Be, ///< Signed 16-bit big-endian PCM.
+  PcmS24Be, ///< Signed packed 24-bit big-endian PCM.
+  PcmS32Be, ///< Signed 32-bit big-endian PCM.
+  PcmF32Be, ///< IEEE float 32-bit big-endian PCM.
 };
 
 /// @brief Byte representation of packets belonging to a track.
@@ -85,7 +92,7 @@ struct MediaTrack {
   CodecId codec = CodecId::Unknown;
   /// Representation of packet bytes.
   PacketFraming framing = PacketFraming::CodecPacket;
-  /// Codec configuration in the representation specified by the mapping.
+  /// Codec configuration in the representation specified by the mapping, such as the payload of an hvcC box.
   Bytes initialization_data;
   /// Known track clock or requested output tick rate.
   std::optional<std::uint32_t> timescale;
@@ -105,6 +112,12 @@ struct MediaTrack {
   std::optional<std::uint32_t> coded_height;
   /// Known visible area in coded luma pixels.
   std::optional<VideoRectangle> visible;
+  /// Clockwise presentation rotation of the visible image. Packet bytes keep their coded orientation.
+  VideoRotation rotation = VideoRotation::None;
+  /// Four-character ISO BMFF or QuickTime sample entry for mappings that distinguish variants.
+  /// HEVC retains hvc1 or hev1. ProRes retains its profile entry, such as apch.
+  /// Empty selects hvc1 for HEVC. ProRes output requires an explicit profile entry.
+  std::string sample_entry;
 };
 
 /// @brief A packet on a container session's common timeline.
