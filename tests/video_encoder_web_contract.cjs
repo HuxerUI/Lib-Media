@@ -17,7 +17,7 @@ function environment(extra = {}) {
     close() { this.state = 'closed'; ++this.closed; }
   }
   class Frame {
-    constructor(data, init) { this.data = data.slice(); this.init = init; this.closed = 0; frames.push(this); }
+    constructor(data, init) { this.data = ArrayBuffer.isView(data) ? data.slice() : data; this.init = init; this.closed = 0; frames.push(this); }
     close() { ++this.closed; }
   }
   const context = vm.createContext({VideoEncoder: Encoder, VideoFrame: Frame, Uint8Array, ArrayBuffer, ...extra});
@@ -50,6 +50,20 @@ async function run() {
     assert.equal(encoder.config.avc.format, 'avc');
     assert.equal(encoder.config.framerate, 30000 / 1001);
     assert.equal(encoder.config.codec.slice(5, 7), profile.toString(16));
+    env.api.close(id);
+  }
+  {
+    const env = environment(), id = await ready(env, {...options, layout: 'Opaque'});
+    const source = {timestamp: 123, copyTo() { throw new Error('Unexpected pixel readback'); }};
+    assert.equal(env.api.submit(id, source, 0, 33367), true);
+    const {frame} = env.encoders[0].last;
+    assert.equal(frame.data, source);
+    assert.equal(frame.init.timestamp, 0);
+    assert.equal(frame.init.duration, 33367);
+    assert.equal(frame.init.format, undefined);
+    assert.equal(frame.closed, 1);
+    assert.equal(source.timestamp, 123);
+    assert.equal(env.api.error(id), '');
     env.api.close(id);
   }
   {

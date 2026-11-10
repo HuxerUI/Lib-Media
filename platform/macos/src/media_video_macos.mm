@@ -175,6 +175,19 @@ CVPixelBufferRef PixelBuffer(const VideoFrame& frame) noexcept {
 
 } // namespace macos
 
+CodecResult<VideoFrame> detail::AcquirePlatformVideoFrame(const ExternalTexture& texture, VideoFormat format,
+    MediaTimestamp pts, std::optional<MediaTimestamp> duration) {
+  using R = CodecResult<VideoFrame>;
+  const auto* source = dynamic_cast<const huxerui::macos::PixelBufferTexture*>(&texture);
+  if (!source) return R::Failure(Error(CodecErrorCode::Unsupported, "Expected an SDK pixel buffer texture"));
+  const std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)>
+      image(source->AcquireFrame(), CVPixelBufferRelease);
+  if (!image) return R::Failure(Error(CodecErrorCode::InvalidState, "The texture has no published video frame"));
+  if (CVPixelBufferGetWidth(image.get()) != format.width || CVPixelBufferGetHeight(image.get()) != format.height)
+    return R::Failure(Error(CodecErrorCode::InvalidArgument, "Pixel buffer dimensions differ from the video format"));
+  return macos::RetainPixelBuffer(image.get(), format, pts, duration);
+}
+
 CodecResult<std::shared_ptr<ExternalTexture>> detail::MakePlatformVideoTexture(const VideoFrame& frame) {
   using R = CodecResult<std::shared_ptr<ExternalTexture>>;
   const auto image = macos::PixelBuffer(frame);

@@ -1,6 +1,10 @@
 #include "codec/encoder/backend.h"
+#include "format/platform_video_storage.h"
+#include "media_video_web.h"
 
+#include <emscripten/threading.h>
 #include <emscripten/val.h>
+#include <map>
 
 namespace huxerui::media::detail {
 namespace {
@@ -82,6 +86,9 @@ namespace {
 class WebVideoEncoder final : public VideoEncoderBackend {
 public:
   CodecResult<void> Open(const VideoEncoderConfig& config) override {
+    const bool platform = config.input_storage == VideoStorage::Platform;
+    if (platform && !emscripten_is_main_browser_thread())
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Web platform video requires the browser main thread"));
     config_ = config; config_.wakeup = {}; config_.cleanup_completed = {};
     auto options = val::object();
     options.set("width", config.input.width); options.set("height", config.input.height);
@@ -92,7 +99,7 @@ public:
     options.set("profile", config.profile == H264Profile::Baseline ? 66 : config.profile == H264Profile::Main ? 77 : 100);
     options.set("maxB", config.max_b_frames ? val(*config.max_b_frames) : val::null());
     options.set("hevc", config.codec == CodecId::Hevc);
-    options.set("layout", config.input.pixel_format == VideoPixelFormat::P010 ? "P010" :
+    options.set("layout", platform ? "Opaque" : config.input.pixel_format == VideoPixelFormat::P010 ? "P010" :
         config.input.pixel_format == VideoPixelFormat::NV12 ? "NV12" : "I420");
     auto color = val::object();
     if (config.input.primaries != ColorPrimaries::Unknown)
@@ -119,13 +126,28 @@ public:
     if (frame.pts.ticks > 9007199254740991LL ||
         (frame.duration && (!duration || duration->ticks > 9007199254740991LL)))
       return R::Failure(Error(CodecErrorCode::InvalidData, "Video timing exceeds the WebCodecs safe integer range"));
-    const auto sample = config_.input.pixel_format == VideoPixelFormat::P010 ? 2 : 1;
-    Bytes pixels(std::size_t(config_.input.width) * config_.input.height * sample * 3 / 2);
-    CopyVideoEncoderPixels(frame, config_.input.pixel_format, pixels);
-    const auto accepted = bridge_.call<bool>("submit", id_, Uint8(pixels), double(frame.pts.ticks),
+    auto input = val::undefined();
+    if (frame.Storage() == VideoStorage::Platform) {
+      const auto* source = BrowserFrame(frame);
+      if (!source) return R::Failure(Error(CodecErrorCode::Unsupported, "Expected a WebCodecs video frame"));
+      const auto valid = ValidateBrowserFrame(*source, config_.input);
+      if (!valid.Succeeded()) return R::Failure(valid.Error());
+      input = *source;
+      // The browser retains the image but cannot keep the C++ storage reservations alive.
+      pending_frames_.emplace(frame.pts.ticks, VideoFrameAccess::PlatformStorage(frame));
+    } else {
+      const auto sample = config_.input.pixel_format == VideoPixelFormat::P010 ? 2 : 1;
+      Bytes pixels(std::size_t(config_.input.width) * config_.input.height * sample * 3 / 2);
+      CopyVideoEncoderPixels(frame, config_.input.pixel_format, pixels);
+      input = Uint8(pixels);
+    }
+    const auto accepted = bridge_.call<bool>("submit", id_, input, double(frame.pts.ticks),
         duration ? val(double(duration->ticks)) : val::null());
     auto result = Check();
-    return result.Succeeded() ? R::Success(accepted ? SubmitStatus::Accepted : SubmitStatus::WouldBlock) : R::Failure(result.Error());
+    if (!result.Succeeded()) return R::Failure(result.Error());
+    if (accepted) return R::Success(SubmitStatus::Accepted);
+    pending_frames_.erase(frame.pts.ticks);
+    return R::Success(SubmitStatus::WouldBlock);
   }
   CodecResult<std::optional<VideoEncoderBackendOutput>> Poll() override {
     using R = CodecResult<std::optional<VideoEncoderBackendOutput>>;
@@ -153,8 +175,10 @@ public:
     auto bytes = Copy(value["data"]);
     auto normalized = NormalizeVideoEncoderPacket(bytes, length_size_, config_.max_packet_bytes, config_.codec);
     if (!normalized.Succeeded()) return R::Failure(normalized.Error());
+    const auto pts = static_cast<std::int64_t>(value["pts"].as<double>());
+    pending_frames_.erase(pts);
     return R::Success(EncodedPacket{Own(std::move(normalized).Value()),
-        {static_cast<std::int64_t>(value["pts"].as<double>()), 1000000}, std::nullopt, std::nullopt, false});
+        {pts, 1000000}, std::nullopt, std::nullopt, false});
   }
   CodecResult<void> RequestKeyFrame() override { bridge_.call<void>("requestKeyFrame", id_); return Check(); }
   CodecResult<void> FlushPending() override { bridge_.call<void>("progress", id_); return Check(); }
@@ -166,6 +190,7 @@ public:
   CodecResult<void> Close() override {
     if (!id_) return CodecResult<void>::Success();
     const auto error = bridge_.call<std::string>("close", id_); id_ = 0;
+    pending_frames_.clear();
     return error.empty() ? CodecResult<void>::Success() : CodecResult<void>::Failure(Error(CodecErrorCode::PlatformFailure, error, "WebCodecs.close"));
   }
 private:
@@ -176,6 +201,7 @@ private:
   }
   val bridge_ = val::global("HuxerMediaVideoEncoder");
   VideoEncoderConfig config_;
+  std::map<std::int64_t, std::shared_ptr<const PlatformVideoStorage>> pending_frames_;
   unsigned id_ = 0, length_size_ = 4;
   bool eos_ = false;
 };

@@ -293,7 +293,7 @@ VideoDecoderConfig VideoConfig(const MediaTrack& track, VideoStorage storage) {
     throw std::runtime_error("The preview supports coded dimensions up to 8192 pixels");
   const auto luma = std::size_t(video_config.width) * video_config.height;
   const auto chroma = std::size_t((video_config.width + 1) / 2) * ((video_config.height + 1) / 2);
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
   if (storage == VideoStorage::Platform && video_config.output != VideoPixelFormat::P010)
     video_config.output = VideoPixelFormat::Opaque;
 #endif
@@ -304,6 +304,12 @@ VideoDecoderConfig VideoConfig(const MediaTrack& track, VideoStorage storage) {
 }
 
 void ApplyVideoGeometry(VideoFrame& frame, const MediaTrack& track) {
+#ifdef __EMSCRIPTEN__
+  if (frame.Storage() == VideoStorage::Platform && (track.rotation != VideoRotation::None ||
+      (track.visible && *track.visible != frame.format.visible) ||
+      (track.pixel_aspect_ratio && track.pixel_aspect_ratio->width != track.pixel_aspect_ratio->height)))
+    throw std::runtime_error("Select CPU video to apply this movie's container crop, rotation, or pixel aspect ratio");
+#endif
   if (const auto& aspect = track.pixel_aspect_ratio) {
     frame.format.aspect_width = aspect->width;
     frame.format.aspect_height = aspect->height;
@@ -424,7 +430,7 @@ Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls
       size = frame_size;
       controls.reset_video(size, surface);
     }
-    if (frame.Storage() == VideoStorage::Platform && !surface) {
+    if (gpu_video_scaling_supported && frame.Storage() == VideoStorage::Platform && !surface) {
       const auto [width, height] = DisplayDimensions(format.visible, format.rotation);
       const auto scale = std::min(1.0, 640.0 / std::max(width, height));
       controls.publish(Require(transformer.Transform(frame, std::max(2u, unsigned(width * scale) & ~1u),
@@ -628,6 +634,10 @@ VideoFrame EncoderInput(VideoFrame frame) {
   const auto visible = frame.format.visible;
   if ((visible.x | visible.y | visible.width | visible.height) & 1u)
     throw std::runtime_error("Video encoding requires an even 4:2:0 crop");
+#ifdef __EMSCRIPTEN__
+  const auto texture = frame.Storage() == VideoStorage::Platform &&
+      visible != VideoRectangle{0, 0, frame.format.width, frame.format.height} ? Require(MakeExternalTexture(frame)) : nullptr;
+#endif
   for (std::size_t i = 0; i < frame.planes.size(); ++i) {
     auto& plane = frame.planes[i];
     const auto scale = i ? 2u : 1u;
@@ -639,6 +649,9 @@ VideoFrame EncoderInput(VideoFrame frame) {
   frame.format.visible = {0, 0, visible.width, visible.height};
   frame.format.aspect_width = frame.format.aspect_height = 1;
   frame.format.rotation = VideoRotation::None;
+#ifdef __EMSCRIPTEN__
+  if (texture) return Require(MakeVideoFrame(texture, frame.format, frame.pts, frame.duration));
+#endif
   return frame;
 }
 
@@ -697,7 +710,7 @@ struct ExportTrack {
       : source(std::move(source)), decoder(std::move(decoder)) {}
 
   VideoFrame PrepareVideo(VideoFrame frame) {
-    if (frame.Storage() == VideoStorage::Cpu) return EncoderInput(std::move(frame));
+    if (frame.Storage() == VideoStorage::Cpu || !gpu_video_scaling_supported) return EncoderInput(std::move(frame));
     const auto area = frame.format.visible;
     auto scaled = Require(transformer.Transform(frame, std::max(2u, (area.width / 2) & ~1u),
         std::max(2u, (area.height / 2) & ~1u)));

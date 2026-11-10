@@ -18,6 +18,8 @@ public:
 
 std::unique_ptr<VideoFrameTransformBackend> MakeVideoFrameTransformBackend();
 CodecResult<std::shared_ptr<ExternalTexture>> MakePlatformVideoTexture(const VideoFrame& frame);
+CodecResult<VideoFrame> AcquirePlatformVideoFrame(const ExternalTexture& texture, VideoFormat format,
+    MediaTimestamp pts, std::optional<MediaTimestamp> duration);
 
 // Reuses GPU resources across calls. Use and destroy the transformer on one thread.
 class VideoFrameTransformer final {

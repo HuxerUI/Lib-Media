@@ -394,7 +394,8 @@ struct VideoEncoderConfig {
   std::function<void(CodecResult<void>)> cleanup_completed;
   /// CodecId::H264 or CodecId::Hevc. Defaults to H.264.
   CodecId codec = CodecId::H264;
-  /// Selects submitted frame storage. Platform SDR input takes NV12 on macOS, iOS, and Windows, and Opaque on Android.
+  /// Selects submitted frame storage. Platform SDR input takes NV12 on macOS, iOS, and Windows, and Opaque on Android
+  /// and Web. Create, use, and release Web platform encoders and their input frames on the browser main thread.
   /// Check the complete configuration with Probe().
   VideoStorage input_storage = VideoStorage::Cpu;
 };
@@ -1007,5 +1008,28 @@ private:
 /// @return A texture with its frame published and further publication closed. InvalidArgument reports
 /// an invalid or CPU frame. Unsupported reports an unavailable backend or unsupported platform image.
 CodecResult<std::shared_ptr<ExternalTexture>> MakeExternalTexture(const VideoFrame& frame);
+
+/// @brief Retains one published SDK texture image as a platform VideoFrame.
+///
+/// Complete producer writes according to the SDK texture's publication contract. Serialize publication and acquisition
+/// to associate the intended image with its PTS. Later publications do not replace the returned frame. It retains the
+/// acquired image and texture ownership, including any attached decoder reservation. Keep the retained pixels immutable.
+/// Use the same frame for retries when VideoEncoder::TrySubmit() returns WouldBlock.
+///
+/// Supports SDR NV12 from macos::PixelBufferTexture, ios::PixelBufferTexture, and windows::D3D11Texture. Windows
+/// synchronously converts an opaque BGRA8 snapshot to NV12 on the encoder's graphics adapter and requires even
+/// dimensions. SDR Opaque is supported from android::GlTexture and web::VideoFrameTexture. On Web, acquire and
+/// release the frame on the browser main thread.
+/// @param texture Shared owner of an SDK texture with a completed publication.
+/// @param format Pixel geometry, layout, and color metadata for the image. Use physical pixels, independent of the
+/// texture's logical size. For Web, describe the visible image, excluding browser allocation padding.
+/// @param pts Presentation time on the media timeline, with a positive timescale.
+/// @param duration Optional positive presentation duration with a positive timescale.
+/// @return A retained frame with empty CPU planes. InvalidState indicates that the texture has not published a frame.
+/// InvalidArgument reports missing or inconsistent input. Unsupported reports an unavailable texture type or layout.
+/// ResourceExhausted reports allocation failure or a Windows snapshot that remained busy during acquisition.
+/// @see MakeExternalTexture(), VideoEncoder::TrySubmit(), VideoEncoderConfig::input_storage
+CodecResult<VideoFrame> MakeVideoFrame(std::shared_ptr<const ExternalTexture> texture, VideoFormat format,
+    MediaTimestamp pts, std::optional<MediaTimestamp> duration = std::nullopt);
 
 } // namespace huxerui::media

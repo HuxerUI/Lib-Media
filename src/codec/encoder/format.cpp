@@ -260,7 +260,7 @@ CodecResult<std::size_t> ValidateVideoEncoderConfig(const VideoEncoderConfig& co
   const bool platform_storage = config.input_storage == VideoStorage::Platform;
   if (config.input_storage != VideoStorage::Cpu && !platform_storage)
     return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid video encoder storage"));
-  if ((platform_storage && (!PlatformVideoEncodeSupported || input.pixel_format != PlatformVideoLayout)) ||
+  if ((platform_storage && (!PlatformVideoSupported || input.pixel_format != PlatformVideoLayout)) ||
       (!platform_storage && input.pixel_format == VideoPixelFormat::Opaque))
     return R::Failure(Error(CodecErrorCode::Unsupported, "Video encoder storage and pixel layout are incompatible"));
   if (!input.Validate() || input.width < 2 || input.height < 2 || input.width > 8192 || input.height > 8192 ||

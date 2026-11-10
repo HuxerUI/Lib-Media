@@ -32,7 +32,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
 | Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, and HEVC. See [decoder validation](#media-decoding). | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
 | HEVC encoding and decoding | Main and Main10 adapters for all six platforms. Device and runtime support varies. See the [HEVC matrix](docs/media-codec.md#hevc). | `CodecId::Hevc`, `VideoEncoder`, `VideoDecoder`, and `VideoPixelFormat::P010` |
-| GPU video | SDR H.264 and HEVC Main paths for macOS, Android, iOS, and Windows. Web publishes retained WebCodecs decode output as SDK textures. See [GPU video](docs/gpu-video.md) for device and validation status. | `VideoStorage::Platform`, `VideoFrame::Storage()`, and `MakeExternalTexture()` |
+| GPU video | SDR H.264 and HEVC Main platform frames and SDK texture input on macOS, Android, iOS, Windows, and supported Web browsers. See [GPU video](docs/gpu-video.md) for validation status. | `VideoStorage::Platform`, `MakeExternalTexture()`, and `MakeVideoFrame()` |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; macOS native tests passed; iOS validation pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; macOS native tests passed; iOS validation pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
@@ -449,9 +449,10 @@ can use a seek index to restart the decoders and replace the texture for each pl
 limit visible pictures and PCM to the intersection of sample coverage and edits. The bundled file has reordered H.264
 pictures, uneven frame intervals, and AAC priming. The Frames preview can also present rotated SDR HEVC when the selected decoder exposes CPU I420, NV12, or P010.
 
-On macOS, Android, iOS, and supported Windows setups, switch **CPU video** to **GPU video** to preview SDR frames on the GPU.
-Android can send the selected picture directly to `SurfaceStreamTexture`. **Encode half-size MP4** uses retained frames,
-GPU scaling, and platform encoder input, then reopens the result for the same Save Movie flow.
+Switch **CPU video** to **GPU video** to preview supported SDR platform frames. Android can send the selected picture
+directly to `SurfaceStreamTexture`. macOS, Android, iOS, and supported Windows setups can export a half-size MP4 with
+GPU scaling. On Web, GPU video publishes the browser frame and encodes at its visible size. Both paths reopen the MP4
+before enabling Save Movie.
 See the [frame storage contract and GPU performance comparison](docs/gpu-video.md).
 
 “Open audio” reuses the Frames controls for Ogg Opus, audio in WebM/MKA, native FLAC, MP3, and M4A. It plays decoded PCM

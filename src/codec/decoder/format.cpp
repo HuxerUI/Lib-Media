@@ -235,7 +235,7 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
     const bool platform_storage = video.output_storage == VideoStorage::Platform;
     if (video.output_storage != VideoStorage::Cpu && !platform_storage)
       return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid video decoder storage"));
-    if (platform_storage && (!PlatformVideoDecodeSupported || video.output != PlatformVideoLayout))
+    if (platform_storage && (!PlatformVideoSupported || video.output != PlatformVideoLayout))
       return R::Failure(Error(CodecErrorCode::Unsupported, "Platform video output layout is unavailable"));
     const bool eight_bit = platform_storage || video.output == VideoPixelFormat::NV12 || video.output == VideoPixelFormat::I420;
     if (video.codec == CodecId::H264) {

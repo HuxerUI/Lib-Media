@@ -341,10 +341,13 @@ void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File
   const auto& track = source.Tracks().front();
   VideoDecoderConfig decode{.initialization_data = track.initialization_data,
       .width = *track.coded_width, .height = *track.coded_height, .codec = CodecId::Hevc, .output_storage = storage};
-  const auto width = storage == VideoStorage::Platform ? (*track.coded_width / 2) & ~1u : *track.coded_width;
-  const auto height = storage == VideoStorage::Platform ? (*track.coded_height / 2) & ~1u : *track.coded_height;
+  const auto width = media_preview::gpu_video_scaling_supported ? (*track.coded_width / 2) & ~1u : *track.coded_width;
+  const auto height = media_preview::gpu_video_scaling_supported ? (*track.coded_height / 2) & ~1u : *track.coded_height;
+#ifdef __EMSCRIPTEN__
+  decode.output = VideoPixelFormat::Opaque;
+#endif
   VideoEncoderConfig encode;
-  encode.input = {width, height, {0, 0, width, height}};
+  encode.input = {width, height, {0, 0, width, height}, decode.output};
   encode.input_storage = storage;
   encode.max_b_frames = std::nullopt;
   encode.codec = CodecId::Hevc;

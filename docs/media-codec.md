@@ -364,10 +364,11 @@ when VideoToolbox rejects `MaxFrameDelayCount`. End of stream drains any remaini
 
 ### GPU video
 
-For SDR H.264 and HEVC Main on macOS, iOS, Android, and Windows, select `VideoStorage::Platform` in the decoder and
-encoder configurations and probe the chosen codec. Read the storage kind through `VideoFrame::Storage()`.
-On Web, request `VideoStorage::Platform` and `VideoPixelFormat::Opaque` for SDR decode output. `MakeExternalTexture()`
-publishes the browser frame without reading its pixels. Web encoding uses CPU input.
+For SDR H.264 and HEVC Main, select `VideoStorage::Platform` in the decoder and encoder configurations and probe the
+chosen codec. Read the storage kind through `VideoFrame::Storage()`. Web uses `VideoPixelFormat::Opaque` and retains
+the browser image through preview publication and encoding.
+Use `MakeVideoFrame()` to retain a published SDK texture image for `VideoEncoder::TrySubmit()`. The frame carries
+explicit PTS and remains fixed across newer publications and queue retries.
 See [GPU video](gpu-video.md) for single-frame SDK textures, preview publication, and the validation matrix.
 
 ### Bounded encoding pump

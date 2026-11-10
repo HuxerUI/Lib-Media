@@ -235,11 +235,16 @@
       try {
         if (!Number.isSafeInteger(pts) || (duration !== null && (!Number.isSafeInteger(duration) || duration <= 0)))
           throw new Error('Video timing exceeds the WebCodecs safe integer range');
-        const tenBit = options.layout === 'P010';
-        const init = {format: tenBit ? 'I420P10' : options.layout, codedWidth: options.width, codedHeight: options.height,
-          timestamp: pts, colorSpace: options.color};
+        const init = {timestamp: pts};
         if (duration !== null) init.duration = duration;
-        frame = new root.VideoFrame(tenBit ? planar10(data, options.width, options.height) : data, init);
+        if (options.layout === 'Opaque') {
+          frame = new root.VideoFrame(data, init);
+        } else {
+          const tenBit = options.layout === 'P010';
+          frame = new root.VideoFrame(tenBit ? planar10(data, options.width, options.height) : data, {...init,
+            format: tenBit ? 'I420P10' : options.layout, codedWidth: options.width, codedHeight: options.height,
+            colorSpace: options.color});
+        }
         const key = state.first || state.keyRequested || state.submitted % options.keyInterval === 0;
         ++state.pending; ++state.submitted;
         state.encoder.encode(frame, {keyFrame: key});

@@ -551,7 +551,8 @@ View FramesPage() {
           .With(Enabled{duration > 0 || (audio_mode && position > 0)}),
       Button(audio_mode ? "Copy Audio" : "Copy Movie").OnClick([prepare] { prepare(true); })
           .With(Enabled{can_prepare && (!audio_mode || audio_copy)}),
-      Button(audio_mode ? "Export WAV" : storage == VideoStorage::Platform ? "Encode half-size MP4" : "Encode MP4")
+      Button(audio_mode ? "Export WAV" : storage == VideoStorage::Platform && media_preview::gpu_video_scaling_supported ?
+          "Encode half-size MP4" : "Encode MP4")
           .OnClick([prepare] { prepare(false); }).With(Enabled{can_prepare}),
       Button(audio_mode ? "Save Audio" : "Save Movie").OnClick([=] {
         const std::shared_ptr<const File> output_file = output;

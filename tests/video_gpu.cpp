@@ -4,6 +4,7 @@
 #include "video_frame_transformer.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -15,16 +16,19 @@
 #include <thread>
 
 #ifdef _WIN32
+#include <d3d11.h>
 #include <future>
 #include <huxerui/windows/external_texture.h>
 #include <windows.h>
 #include <psapi.h>
+#include <wrl/client.h>
 #else
 #include <sys/resource.h>
 #endif
 
 #ifdef __APPLE__
-#include <CoreVideo/CVPixelBuffer.h>
+#import <CoreVideo/CoreVideo.h>
+#import <Metal/Metal.h>
 #include <TargetConditionals.h>
 #include <dlfcn.h>
 #if TARGET_OS_IOS
@@ -218,15 +222,19 @@ void SetDuration(VideoFrame& frame, const Clip& clip, std::size_t index) {
   frame.duration = MediaTimestamp{clip.times[index + 1].Rescale(clock)->ticks - frame.pts.Rescale(clock)->ticks, clock};
 }
 
-VideoFrame FirstPicture(VideoDecoder& decoder, const Clip& clip, std::size_t first = 0) {
-  DecoderFeed feed{.next = first};
+VideoFrame ReadPicture(VideoDecoder& decoder, const Clip& clip, DecoderFeed& feed) {
   const auto deadline = std::chrono::steady_clock::now() + 15s;
   while (std::chrono::steady_clock::now() < deadline) {
     if (auto output = Take(decoder.TryRead()))
       if (auto* frame = std::get_if<VideoFrame>(&*output)) return std::move(*frame);
     if (!feed.Pump(decoder, clip)) std::this_thread::sleep_for(1ms);
   }
-  throw std::runtime_error("Timed out waiting for the first picture");
+  throw std::runtime_error("Timed out waiting for a picture");
+}
+
+VideoFrame FirstPicture(VideoDecoder& decoder, const Clip& clip, std::size_t first = 0) {
+  DecoderFeed feed{.next = first};
+  return ReadPicture(decoder, clip, feed);
 }
 
 void CheckPixels(const Clip& source, const Clip& exported, unsigned width, unsigned height) {
@@ -279,9 +287,10 @@ double PeakMemoryMiB() {
 }
 
 #ifdef __ANDROID__
-void CheckGlImport(const android::GlFrame& frame) {
+template<class Work> void WithTestEgl(Work work) {
   const auto display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-  const EGLint config_attributes[]{EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE};
+  const EGLint config_attributes[]{EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+      EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_NONE};
   const EGLint context_attributes[]{EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
   const EGLint surface_attributes[]{EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
   EGLConfig config{};
@@ -303,9 +312,15 @@ void CheckGlImport(const android::GlFrame& frame) {
   Check(consumer.context != EGL_NO_CONTEXT && consumer.surface != EGL_NO_SURFACE &&
         eglMakeCurrent(display, consumer.surface, consumer.surface, consumer.context),
         "Cannot activate the Android texture consumer EGL context");
-  const auto name = frame.ImportCurrent();
-  Check(glIsTexture(name), "The SDK snapshot did not import as a GLES texture");
-  glDeleteTextures(1, &name);
+  work();
+}
+
+void CheckGlImport(const android::GlFrame& frame) {
+  WithTestEgl([&] {
+    const auto name = frame.ImportCurrent();
+    Check(glIsTexture(name), "The SDK snapshot did not import as a GLES texture");
+    glDeleteTextures(1, &name);
+  });
 }
 #endif
 
@@ -339,13 +354,197 @@ void CheckTexture(const ExternalTexture& texture, const VideoFormat& format) {
 #endif
 }
 
-void Transcode(const Clip& clip, const File& file, unsigned width, unsigned height, bool gpu, bool regression,
-    std::uint32_t bitrate) {
-  auto decoder_config = DecoderConfig(clip.track, gpu);
+std::array<VideoFrame, 2> WatermarkFrames(const VideoFormat& format) {
+#ifdef __APPLE__
+#if TARGET_OS_IOS
+  using Texture = huxerui::ios::PixelBufferTexture;
+#else
+  using Texture = huxerui::macos::PixelBufferTexture;
+#endif
+#elif defined(__ANDROID__)
+  using Texture = android::GlTexture;
+#else
+  using Texture = windows::D3D11Texture;
+#endif
+  const auto width = format.width, height = format.height;
+  auto texture = std::make_shared<Texture>(huxerui::Size{float(width) / 2, float(height) / 2});
+  const auto empty = MakeVideoFrame(texture, format, {0, 1});
+  Check(!empty.Succeeded() && empty.Error().code == CodecErrorCode::InvalidState, "An unpublished texture yielded a frame");
+  std::array<VideoFrame, 2> frames;
+  const auto acquire = [&](unsigned index) {
+    auto wrong_size = format;
+    wrong_size.width += 2;
+    const auto wrong = MakeVideoFrame(texture, wrong_size, {0, 1});
+    Check(!wrong.Succeeded() && wrong.Error().code == CodecErrorCode::InvalidArgument, "Texture pixel dimensions were not checked");
+    auto result = MakeVideoFrame(texture, format, {index, 1});
 #ifdef _WIN32
+    if (!result.Succeeded() && result.Error().code == CodecErrorCode::Unsupported &&
+        result.Error().platform_code == std::to_string(E_NOTIMPL)) {
+      std::cout << result.Error().message << '\n';
+      throw MissingHardware{};
+    }
+#endif
+    frames[index] = Take(std::move(result));
+    Check(frames[index].Validate() && frames[index].planes.empty(), "Texture input exposed invalid storage");
+  };
+#ifdef __APPLE__
+  @autoreleasepool {
+    const auto device = MTLCreateSystemDefaultDevice();
+    const auto queue = [device newCommandQueue];
+    NSString* source = @R"metal(
+      #include <metal_stdlib>
+      using namespace metal;
+      kernel void mark(texture2d<float, access::write> y [[texture(0)]],
+                       texture2d<float, access::write> uv [[texture(1)]],
+                       constant uint& index [[buffer(0)]], uint2 p [[thread_position_in_grid]]) {
+        const bool inside = p.x < y.get_width() / 2 && (p.y < y.get_height() / 2) == (index == 0);
+        y.write(float4(inside ? 0.85 : 0.2), p);
+        if (p.x < uv.get_width() && p.y < uv.get_height()) uv.write(float4(0.5), p);
+      }
+    )metal";
+    const auto library = [device newLibraryWithSource:source options:nil error:nil];
+    const auto function = [library newFunctionWithName:@"mark"];
+    const auto pipeline = function ? [device newComputePipelineStateWithFunction:function error:nil] : nil;
+    Check(queue && pipeline, "Cannot open the Metal watermark pipeline");
+    CVMetalTextureCacheRef cache = nullptr;
+    Check(CVMetalTextureCacheCreate(nullptr, nullptr, device, nullptr, &cache) == kCVReturnSuccess, "Cannot create the test Metal cache");
+    const std::unique_ptr<std::remove_pointer_t<CVMetalTextureCacheRef>, decltype(&CFRelease)> cache_owner(cache, CFRelease);
+    for (unsigned index = 0; index < frames.size(); ++index) {
+      CVPixelBufferRef buffer = nullptr;
+      NSDictionary* attributes = @{(__bridge NSString*)kCVPixelBufferIOSurfacePropertiesKey: @{},
+                                   (__bridge NSString*)kCVPixelBufferMetalCompatibilityKey: @YES};
+      Check(CVPixelBufferCreate(nullptr, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+          (__bridge CFDictionaryRef)attributes, &buffer) == kCVReturnSuccess, "Cannot allocate the NV12 watermark image");
+      const std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)> owner(buffer, CVPixelBufferRelease);
+      const auto command = [queue commandBuffer];
+      const auto compute = [command computeCommandEncoder];
+      [compute setComputePipelineState:pipeline];
+      using Plane = std::unique_ptr<std::remove_pointer_t<CVMetalTextureRef>, decltype(&CFRelease)>;
+      std::array planes{Plane(nullptr, CFRelease), Plane(nullptr, CFRelease)};
+      for (unsigned plane = 0; plane < planes.size(); ++plane) {
+        CVMetalTextureRef image = nullptr;
+        NSDictionary* options = @{(__bridge NSString*)kCVMetalTextureUsage: @(MTLTextureUsageShaderWrite)};
+        Check(CVMetalTextureCacheCreateTextureFromImage(nullptr, cache, buffer, (__bridge CFDictionaryRef)options,
+            plane ? MTLPixelFormatRG8Unorm : MTLPixelFormatR8Unorm, width >> plane, height >> plane, plane, &image) == kCVReturnSuccess,
+            "Cannot map the watermark plane to Metal");
+        planes[plane].reset(image);
+        [compute setTexture:CVMetalTextureGetTexture(image) atIndex:plane];
+      }
+      [compute setBytes:&index length:sizeof(index) atIndex:0];
+      [compute dispatchThreads:MTLSizeMake(width, height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+      [compute endEncoding];
+      [command commit];
+      [command waitUntilCompleted];
+      Check(command.status == MTLCommandBufferStatusCompleted, "Metal watermark did not complete");
+      texture->Publish(buffer);
+      acquire(index);
+    }
+  }
+#elif defined(_WIN32)
+  using Microsoft::WRL::ComPtr;
+  ComPtr<ID3D11Device> device;
+  ComPtr<ID3D11DeviceContext> context;
+  Check(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+      nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context)), "Cannot open the D3D11 watermark producer device");
+  struct Target {
+    ComPtr<ID3D11Texture2D> image;
+    ComPtr<ID3D11RenderTargetView> view;
+  };
+  const auto target = [&](UINT w, UINT h) {
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width = w;
+    description.Height = h;
+    description.MipLevels = description.ArraySize = description.SampleDesc.Count = 1;
+    description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    description.BindFlags = D3D11_BIND_RENDER_TARGET;
+    Target result;
+    Check(SUCCEEDED(device->CreateTexture2D(&description, nullptr, &result.image)) &&
+          SUCCEEDED(device->CreateRenderTargetView(result.image.Get(), nullptr, &result.view)),
+          "Cannot allocate the D3D11 watermark texture");
+    return result;
+  };
+  const auto image = target(width, height), marker = target(width / 2, height / 2);
+  const float green[]{0.2f, 0.9f, 0.25f, 1.0f}, gray[]{0.2f, 0.2f, 0.2f, 1.0f};
+  context->ClearRenderTargetView(marker.view.Get(), green);
+  for (unsigned index = 0; index < frames.size(); ++index) {
+    context->ClearRenderTargetView(image.view.Get(), gray);
+    context->CopySubresourceRegion(image.image.Get(), 0, 0, index * height / 2, 0, marker.image.Get(), 0, nullptr);
+    texture->Publish({image.image.Get(), Texture::Alpha::Opaque});
+    acquire(index);
+  }
+#else
+  WithTestEgl([&] {
+    struct Target {
+      GLuint image = 0, framebuffer = 0;
+      ~Target() { glDeleteFramebuffers(1, &framebuffer); glDeleteTextures(1, &image); }
+    };
+    for (unsigned index = 0; index < frames.size(); ++index) {
+      Target target;
+      glGenTextures(1, &target.image);
+      glBindTexture(GL_TEXTURE_2D, target.image);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+      glGenFramebuffers(1, &target.framebuffer);
+      glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target.image, 0);
+      Check(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE, "Cannot render the GLES watermark");
+      glClearColor(0.2f, 0.2f, 0.2f, 1);
+      glClear(GL_COLOR_BUFFER_BIT);
+      glEnable(GL_SCISSOR_TEST);
+      glScissor(0, index == 0 ? height / 2 : 0, width / 2, height / 2);
+      glClearColor(0.85f, 0.85f, 0.85f, 1);
+      glClear(GL_COLOR_BUFFER_BIT);
+      glDisable(GL_SCISSOR_TEST);
+      Check(glGetError() == GL_NO_ERROR, "Cannot paint the GLES watermark");
+      texture->PublishCurrent({target.image, int(width), int(height), -1, Texture::Origin::BottomLeft, Texture::Alpha::Opaque});
+      acquire(index);
+    }
+  });
+#endif
+  const std::weak_ptr<ExternalTexture> source = texture;
+  texture.reset();
+  Check(!source.expired(), "Acquired frames did not retain the texture owner");
+  return frames;
+}
+
+void CheckWatermark(const Clip& clip) {
+  TestSession<VideoDecoder> decoder(DecoderConfig(clip.track, false));
+  DecoderFeed feed;
+  for (const bool lower : {false, true}) {
+    const auto frame = ReadPicture(decoder.codec, clip, feed);
+    const auto area = frame.format.visible;
+    const auto& y = frame.planes.front();
+    const auto sample = [&](unsigned x, unsigned row) {
+      return std::to_integer<int>(y.data.AsBytes()[(area.y + row) * y.row_stride + (area.x + x) * y.pixel_stride]);
+    };
+    const auto mark_row = (lower ? 3u : 1u) * area.height / 4;
+    const auto opposite_row = (lower ? 1u : 3u) * area.height / 4;
+    const auto mark = sample(area.width / 4, mark_row);
+    Check(mark > sample(area.width * 3 / 4, mark_row) + 80 && mark > sample(area.width / 4, opposite_row) + 80,
+          "An encoded picture lost or flipped the captured texture watermark");
+#ifdef _WIN32
+    const auto& chroma = frame.planes[1];
+    const auto x = (area.x + area.width / 4) / 2, row = (area.y + mark_row) / 2;
+    const auto bytes = chroma.data.AsBytes().subspan(row * chroma.row_stride + x * chroma.pixel_stride);
+    Check(std::to_integer<int>(bytes[0]) < 112 && std::to_integer<int>(bytes[1]) < 112,
+          "D3D11 texture conversion changed the green watermark's chroma");
+#endif
+  }
+}
+
+void Transcode(const Clip& clip, const File& file, unsigned width, unsigned height, bool gpu, bool regression,
+    std::uint32_t bitrate, bool texture_input) {
+  auto decoder_config = DecoderConfig(clip.track, gpu);
+  VideoFormat watermark_format{width, height, {0, 0, width, height}, decoder_config.output};
+#ifdef _WIN32
+  if (texture_input) {
+    watermark_format.matrix = ColorMatrix::BT709;
+    watermark_format.range = ColorRange::Limited;
+  }
   if (gpu) {
     CheckHardware<VideoDecoder>(decoder_config);
-    VideoEncoderConfig config{.input = {width, height, {0, 0, width, height}}, .bitrate = bitrate,
+    VideoEncoderConfig config{.input = watermark_format, .bitrate = bitrate,
         .profile = H264Profile::Baseline, .codec = clip.track.codec, .input_storage = VideoStorage::Platform};
     CheckHardware<VideoEncoder>(config);
   }
@@ -371,6 +570,8 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
   std::optional<ContainerPacket> last_packet;
   std::int64_t first_dts = 0, total_duration = 0;
   std::optional<VideoFrame> pending, retained;
+  std::optional<std::array<VideoFrame, 2>> watermarks;
+  if (texture_input) watermarks = WatermarkFrames(watermark_format);
   std::shared_ptr<ExternalTexture> texture;
   DecoderFeed feed;
   std::size_t decoded = 0, encoded = 0;
@@ -427,7 +628,13 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
             retained = *frame;
             texture = Take(MakeExternalTexture(*frame));
           }
-          pending = gpu ? Take(transformer.Transform(*frame, width, height)) : ScaleCpu(*frame, width, height);
+          if (watermarks) {
+            pending = (*watermarks)[(decoded - 1) % watermarks->size()];
+            pending->pts = frame->pts;
+            pending->duration = frame->duration;
+          } else {
+            pending = gpu ? Take(transformer.Transform(*frame, width, height)) : ScaleCpu(*frame, width, height);
+          }
           Check(pending->Validate() && pending->Storage() == decoder_config.output_storage &&
                 (gpu ? pending->planes.empty() : !pending->planes.empty()), "Transform returned the wrong frame storage");
           if (!encoder) {
@@ -505,7 +712,12 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
         packet.duration && packet.duration->ticks > 0, "MP4 readback lost decode timing");
     previous_dts = packet.dts;
   }
-  if (regression) CheckPixels(clip, readback, width, height);
+  if (texture_input) {
+    CheckWatermark(readback);
+    std::cout << "SDK texture watermark and MP4 timing passed\n";
+  } else if (regression) {
+    CheckPixels(clip, readback, width, height);
+  }
 }
 
 } // namespace
@@ -540,13 +752,18 @@ extern "C" void __wrap_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei hei
 
 int main(int argc, char** argv) {
   if (argc != 4 && argc != 6 && argc != 7) {
-    std::cerr << "usage: media_video_gpu_tests INPUT OUTPUT|- gpu|cpu [WIDTH HEIGHT [BITRATE]]\n";
+    std::cerr << "usage: media_video_gpu_tests INPUT OUTPUT|- gpu|cpu|texture [WIDTH HEIGHT [BITRATE]]\n";
     return 2;
   }
   try {
     const auto clip = ReadClip(File(argv[1]));
-    const bool gpu = std::string_view(argv[3]) == "gpu";
-    Check(gpu || std::string_view(argv[3]) == "cpu", "Choose gpu or cpu");
+    const std::string_view mode(argv[3]);
+    const bool texture_input = mode == "texture";
+#if defined(_WIN32) && defined(HUXERUI_WINDOWS_7_COMPAT)
+    if (texture_input) throw MissingHardware{};
+#endif
+    const bool gpu = texture_input || mode == "gpu";
+    Check(gpu || mode == "cpu", "Unknown video test mode");
     const bool temporary = std::string_view(argv[2]) == "-";
     const auto path = temporary ? std::filesystem::temp_directory_path() /
         ("lib-media-gpu-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".mp4") :
@@ -559,7 +776,7 @@ int main(int argc, char** argv) {
     const auto width = argc >= 6 ? unsigned(std::stoul(argv[4])) : 112u;
     const auto height = argc >= 6 ? unsigned(std::stoul(argv[5])) : 144u;
     const auto bitrate = argc == 7 ? unsigned(std::stoul(argv[6])) : 4'000'000u;
-    Transcode(clip, File(path.u8string()), width, height, gpu, argc == 4, bitrate);
+    Transcode(clip, File(path.u8string()), width, height, gpu, argc == 4 && !texture_input, bitrate, texture_input);
     return 0;
 #ifdef _WIN32
   } catch (const MissingHardware&) {

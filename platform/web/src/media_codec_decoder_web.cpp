@@ -1,32 +1,14 @@
 #include "codec/decoder/backend.h"
 #include "codec/decoder/copy.h"
 #include "codec/hevc.h"
-#include "format/platform_video_storage.h"
-#include "format/video_frame_transformer.h"
-#include <huxerui/web/external_texture.h>
+#include "media_video_web.h"
 #include <algorithm>
 #include <emscripten/threading.h>
 #include <emscripten/val.h>
-#include <utility>
 
 namespace huxerui::media::detail {
 namespace {
 using emscripten::val;
-
-struct BrowserVideoFrame {
-  explicit BrowserVideoFrame(val value) : value(std::move(value)) {}
-  BrowserVideoFrame(BrowserVideoFrame&& other) : value(std::exchange(other.value, val::null())) {}
-  ~BrowserVideoFrame() {
-    if (!value.isNull() && !value.isUndefined()) value.call<void>("close");
-  }
-  val value;
-};
-
-struct WebVideoStorage final : PlatformVideoStorage {
-  WebVideoStorage(const VideoFormat& format, BrowserVideoFrame&& source)
-      : PlatformVideoStorage(format.width, format.height, format.pixel_format), frame(std::move(source)) {}
-  BrowserVideoFrame frame;
-};
 
 val Uint8(std::span<const std::byte> bytes) {
   return val(emscripten::typed_memory_view(bytes.size(), reinterpret_cast<const unsigned char*>(bytes.data()))).call<val>("slice");
@@ -157,11 +139,10 @@ public:
     if (!color["fullRange"].isNull() && !color["fullRange"].isUndefined()) format.range = color["fullRange"].as<bool>() ? ColorRange::Full : ColorRange::Limited;
     auto duration = value["duration"].isNull() ? std::nullopt : std::optional(MediaTimestamp{static_cast<std::int64_t>(value["duration"].as<double>()), 1000000});
     if (config.output_storage == VideoStorage::Platform) {
-      if (browser_frame.value.isNull() || browser_frame.value.isUndefined())
+      if (!browser_frame)
         return R::Failure(Error(CodecErrorCode::InvalidData, "WebCodecs did not return a platform frame"));
       format.pixel_format = VideoPixelFormat::Opaque;
-      auto storage = std::make_shared<WebVideoStorage>(format, std::move(browser_frame));
-      return R::Success(BackendOutput{DecodedFrame{VideoFrameAccess::FromPlatform(format, pts, duration, std::move(storage))}});
+      return R::Success(BackendOutput{DecodedFrame{RetainBrowserVideoFrame(std::move(browser_frame), format, pts, duration)}});
     }
     const auto layout = value["format"].as<std::string>();
     format.pixel_format = layout == "P010" ? VideoPixelFormat::P010 : layout == "I420" ? VideoPixelFormat::I420 : VideoPixelFormat::NV12;
@@ -201,26 +182,4 @@ private:
 };
 } // namespace
 std::unique_ptr<DecoderBackend> MakeDecoderBackend() { return std::make_unique<WebDecoder>(); }
-
-CodecResult<std::shared_ptr<ExternalTexture>> MakePlatformVideoTexture(const VideoFrame& frame) {
-  using R = CodecResult<std::shared_ptr<ExternalTexture>>;
-  if (!emscripten_is_main_browser_thread())
-    return R::Failure(Error(CodecErrorCode::Unsupported, "Web video textures require the browser main thread"));
-  const auto& storage = VideoFrameAccess::PlatformStorage(frame);
-  const auto* browser = dynamic_cast<const WebVideoStorage*>(storage.get());
-  if (!browser) return R::Failure(Error(CodecErrorCode::Unsupported, "Expected a WebCodecs video frame"));
-
-  struct TextureLease {
-    TextureLease(const std::shared_ptr<const PlatformVideoStorage>& source, Size size)
-        : source(source), texture(size) {}
-    std::shared_ptr<const PlatformVideoStorage> source;
-    web::VideoFrameTexture texture;
-  };
-  const auto& source = browser->frame.value;
-  auto lease = std::make_shared<TextureLease>(storage, Size{source["displayWidth"].as<float>(), source["displayHeight"].as<float>()});
-  lease->texture.Publish(source);
-  lease->texture.Finish();
-  auto* texture = &lease->texture;
-  return R::Success(std::shared_ptr<ExternalTexture>(std::move(lease), texture));
-}
 } // namespace huxerui::media::detail

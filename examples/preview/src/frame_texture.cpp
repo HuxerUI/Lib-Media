@@ -18,6 +18,7 @@
 #elif defined(__EMSCRIPTEN__)
 #include <emscripten.h>
 #include <huxerui/web/external_texture.h>
+#include "media_video_web.h"
 #elif defined(_WIN32)
 #include <huxerui/windows/external_texture.h>
 #include "media_video_windows.h"
@@ -278,6 +279,12 @@ std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size, VideoStora
 }
 
 void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
+  if (frame.Storage() == VideoStorage::Platform) {
+    const auto* image = huxerui::media::detail::BrowserFrame(frame);
+    if (!image) throw std::runtime_error("Expected a browser video frame");
+    static_cast<web::VideoFrameTexture&>(texture).Publish(*image);
+    return;
+  }
   const auto pixels = ConvertFramePixels(frame);
   const auto timestamp = frame.pts.Rescale(1'000'000);
   constexpr std::int64_t max_safe_integer = 9'007'199'254'740'991;

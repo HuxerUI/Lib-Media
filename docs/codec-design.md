@@ -123,6 +123,9 @@ CPU output is library-owned. Platform SDR output retains an IOSurface-backed NV1
 a hardware buffer lease on Android, a DXGI sample on Windows, or a WebCodecs frame on Web. Both storage modes
 use the same format and timing events. Android direct preview releases selected MediaCodec pictures into an SDK
 SurfaceStreamTexture.
+`MakeVideoFrame()` acquires one published SDK image and retains its texture owner with the frame. Encoders keep
+the image through platform use. This preserves a decoder reservation attached to a texture and lets callers retry
+the same frame under backpressure even when the texture receives another publication.
 See [GPU video](gpu-video.md) for synchronization and retirement.
 
 ### Encoded packets and configuration

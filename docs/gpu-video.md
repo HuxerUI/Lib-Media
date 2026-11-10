@@ -1,8 +1,8 @@
 # GPU video
 
-macOS, Android, iOS, and Windows can decode and encode SDR H.264 and HEVC Main using platform images. Select `VideoStorage::Platform`
-in `VideoDecoderConfig::output_storage` and `VideoEncoderConfig::input_storage`. Use Opaque on Android
-and NV12 on macOS, iOS, and Windows. `Probe()` checks codec
+macOS, Android, iOS, Windows, and supported Web browsers can decode and encode SDR H.264 and HEVC Main using
+platform images. Select `VideoStorage::Platform` in `VideoDecoderConfig::output_storage` and
+`VideoEncoderConfig::input_storage`. Use Opaque on Android and Web and NV12 on macOS, iOS, and Windows. `Probe()` checks codec
 initialization for the supplied configuration. Verify the actual output with representative packets and frames.
 
 | Platform | Decode and process | Encode and present |
@@ -10,8 +10,8 @@ initialization for the supplied configuration. Verify the actual output with rep
 | macOS | VideoToolbox returns retained IOSurface-backed `CVPixelBuffer` images. Metal samples the two NV12 planes and writes into a pixel buffer pool. | VideoToolbox takes the scaled pixel buffer directly. The preview retains it through `PixelBufferTexture`. |
 | Android | MediaCodec renders into a private `AImageReader` surface for per-frame processing. Each acquired image leases its GPU-sampleable `AHardwareBuffer`. GLES samples it through EGLImage and renders the scaled image into another hardware buffer. | GLES draws to the MediaCodec input Surface and submits each frame's presentation time. The Frames preview can render selected codec output directly into the SDK's `SurfaceStreamTexture`. |
 | iOS | The iOS VideoToolbox adapter retains IOSurface-backed NV12 images. Its own Metal scaler writes into a pixel buffer pool. | VideoToolbox takes the resulting NV12 buffer. `PixelBufferTexture` retains it for display. |
-| Windows | A D3D11-aware Media Foundation decoder returns DXGI samples. The D3D11 video processor crops and scales NV12 textures. | A hardware MFT accepts a DXGI buffer on the same device. Preview converts to BGRA on the GPU and publishes through `D3D11Texture` on the same adapter. |
-| Web | WebCodecs returns browser `VideoFrame` objects. Select `VideoStorage::Platform` and `VideoPixelFormat::Opaque` for decoder output. | `MakeExternalTexture()` publishes the frame through `VideoFrameTexture`. Encoding and the Frames example use CPU input on Web. |
+| Windows | A D3D11-aware Media Foundation decoder returns DXGI samples. The D3D11 video processor crops and scales NV12 textures and converts SDK BGRA8 snapshots to NV12. | A hardware MFT accepts a DXGI buffer on the same device. Preview converts to BGRA on the GPU and publishes through `D3D11Texture` on the same adapter. |
+| Web | WebCodecs returns retained browser `VideoFrame` objects. | The SDK `VideoFrameTexture` publishes the browser frame. WebCodecs encodes a reference to its image with the submitted presentation timing. |
 
 The Android decoder image reader requires API 26. The existing encoder negotiation requires API 28, with the
 requested B-picture controls and EGL extensions subject to the installed driver and MediaCodec component.
@@ -68,12 +68,35 @@ Pass the texture to HuxerUI `Image` or include the SDK platform texture header a
 Keep the returned texture alive through GPU use. On macOS, iOS, and Web it holds the input image and its decoder
 output credit, so bound how many textures you retain. Android and Windows convert and snapshot on the GPU only
 when this function is called. The preview continues to reuse a live SDK texture. Decode-to-encode workflows can
-pass platform frames directly to the encoder on macOS, iOS, Android, and Windows.
+submit compatible platform frames directly to the encoder.
 
-On Web, create, use, and release platform decoders, frames, and textures on the browser main thread. The SDK
+On Web, create, use, and release platform codecs, frames, and textures on the browser main thread. The SDK
 publishes a clone of the original browser frame without calling `VideoFrame.copyTo()` in Lib-Media. The browser
 selects the decoder implementation. Probe the codec configuration and release frames promptly so the browser can
 reuse its decoder surfaces. [WebCodecs decoder output](https://www.w3.org/TR/webcodecs/#dom-videodecoder-decode)
+
+## Encoding a published SDK frame
+
+Render an opaque SDR image at the encoder's input size and complete producer writes according to the SDK texture's
+publication contract. Publish it, then call `MakeVideoFrame(texture, encoder_config.input, pts, duration)` before
+publishing again on the same texture. The format describes physical pixels and color, independently of the texture's
+logical size. On Web, use the browser frame's visible dimensions and apply orientation before publication.
+
+| Platform | Input texture | Image used by the encoder |
+| --- | --- | --- |
+| macOS and iOS | `PixelBufferTexture` | The retained IOSurface-backed NV12 buffer goes to VideoToolbox. |
+| Android | `GlTexture` | The SDK retains its completed RGBA snapshot. The encoder imports it on the same EGL display and draws it to the MediaCodec input Surface. |
+| Windows 10 or later | `D3D11Texture` | `MakeVideoFrame()` copies the opaque BGRA8 snapshot on the encoder's adapter and waits for its GPU conversion to NV12. Supply even pixel dimensions and NV12 output color metadata. |
+| Web | `VideoFrameTexture` | The encoder shares the browser frame's media resource and applies the submitted timeline on the browser main thread. |
+
+On the tested Huawei Android 12 device, publishing the same GLES render target a second time returned `EGL_BAD_ACCESS`
+from the SDK. Alternating GLES render targets in the same SDK `GlTexture` passed the texture input tests.
+
+Submit the resulting `VideoFrame` to `VideoEncoder::TrySubmit()`. On `WouldBlock`, keep it and retry it when capacity
+returns. Later texture publications leave the captured frame intact. On `Accepted`, the encoder retains the image
+through platform use. On Web, the input reservation stays charged until WebCodecs returns the corresponding packet
+or the encoder closes the browser session. The frame's shared texture owner also retains any decoder reservation
+attached by `MakeExternalTexture()`. Treat captured pixels as immutable and release each frame when it is no longer needed.
 
 ## Preview and verification
 
@@ -83,9 +106,11 @@ as the MediaCodec output. The scheduler releases only the selected picture to th
 codec buffers without rendering. The last visible image remains during seek until the new epoch presents its
 first picture. Rotated or cropped movies use the GPU transform to apply the container geometry.
 **Encode half-size MP4** applies the visible crop and encodes at half the visible width and height, rounded to
-even dimensions. It reads platform images independently of the preview output. The action reopens
-the MP4 before enabling Save Movie. The macOS test publishes into the
-SDK's PixelBufferTexture; the AppKit renderer's own conversion is outside the application pixel audit.
+even dimensions on macOS, Android, iOS, and supported Windows setups. Web **GPU video** previews and exports
+compatible SDR browser frames at their visible size. Use **CPU video** to apply additional container geometry on Web.
+Export reads platform images independently of the preview output and reopens the MP4 before enabling Save Movie.
+The macOS test publishes into the SDK's PixelBufferTexture. The AppKit renderer's own conversion is outside the
+application pixel audit.
 
 `media_video_gpu_tests` runs both codecs headlessly. It checks output storage, all picture times,
 MP4 decode timing, visible dimensions, crop and rotation pixels, reset at keyframes, and a retained image
@@ -97,20 +122,27 @@ test verifies DXGI-backed storage and D3D11 texture publication.
 The test uses CPU decoding separately to inspect the finished MP4 pixels. Application-side measurements
 exclude private copies and memory accounting inside platform codecs, GPU drivers, and the UI renderer.
 
+The `texture` test mode renders two different watermarks and captures both from the same SDK texture before encoding.
+MP4 readback checks both watermarks, dimensions, and picture timing. On Web, build `media_video_encoder_web_native`
+and open `tests/video_encoder_wasm.html?storage=platform`. It disables `VideoFrame.copyTo()` during encoding and checks
+watermarks and timing after retrying a blocked submission and reopening the MP4. It also checks that delayed output
+holds the input reservation and that reset and close release in-flight textures.
+
 ```sh
 cmake -S . -B build/gpu -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DHUXERUI_MEDIA_BUILD_TESTS=ON -DHUXERUI_HOME=/path/to/sdk
 cmake --build build/gpu --target media_video_gpu_tests
-ctest --test-dir build/gpu -R media_video_gpu --output-on-failure
+ctest --test-dir build/gpu -R 'media_video_(gpu|texture)' --output-on-failure
 ```
 
 Use the same CTest selection on Windows with the installed Windows SDK and a hardware graphics adapter.
-An unsupported codec configuration reported during the probe skips that fixture. A failure during the
-round trip remains a test failure. Windows x64 source and test cross-compilation has passed. Windows hardware
-validation and performance measurements are pending.
+The texture cases publish colored BGRA8 watermarks from a separate D3D11 device on the same adapter. MP4
+readback checks the acquired frame's position, chroma, and timing. An unsupported codec or video processor
+skips the corresponding fixture. The Windows video backend and texture test sources cross-compile for x64 and
+ARM64. Hardware validation and performance measurements are pending.
 
 For the iOS Simulator, build the target using the iOS CMake configuration and run the executable with
-`xcrun simctl spawn booted`. Supply an absolute fixture path, `-` for temporary output, and `gpu`.
+`xcrun simctl spawn booted`. Supply an absolute fixture path, `-` for temporary output, and `gpu` or `texture`.
 The simulator passed both H.264 (87 pictures) and HEVC Main (20 pictures) with zero audited pixel accesses.
 HEVC also passed the Frames preview and reordered export checks. Use a physical iPhone to validate
 camera-original MOV files and to measure device performance.
@@ -122,6 +154,8 @@ Run from that directory with TMPDIR set there. Use a fresh output path or `-` fo
 ```sh
 ./media_video_gpu_tests preview-avc-aac.mp4 - gpu
 ./media_video_gpu_tests preview-hevc-main.mp4 - gpu
+./media_video_gpu_tests preview-avc-aac.mp4 - texture
+./media_video_gpu_tests preview-hevc-main.mp4 - texture
 ```
 
 ## CPU and GPU comparison

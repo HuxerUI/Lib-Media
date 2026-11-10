@@ -27,18 +27,43 @@ CodecResult<std::shared_ptr<ExternalTexture>> MakePlatformVideoTexture(const Vid
 #endif
 #endif
 
+#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__) && !defined(_WIN32) && !(defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS))
+CodecResult<VideoFrame> AcquirePlatformVideoFrame(const ExternalTexture&, VideoFormat,
+    MediaTimestamp, std::optional<MediaTimestamp>) {
+  return CodecResult<VideoFrame>::Failure(Error(CodecErrorCode::Unsupported, "SDK texture input is unavailable"));
+}
+#endif
+
 } // namespace huxerui::media::detail
 
 namespace huxerui::media {
 namespace {
 
 bool SupportsPlatformSdr(const VideoFormat& format) {
-  return detail::PlatformVideoDecodeSupported && format.pixel_format == detail::PlatformVideoLayout &&
+  return detail::PlatformVideoSupported && format.pixel_format == detail::PlatformVideoLayout &&
       format.primaries != ColorPrimaries::BT2020 && format.matrix != ColorMatrix::BT2020 &&
       format.transfer != ColorTransfer::PQ && format.transfer != ColorTransfer::HLG;
 }
 
 } // namespace
+
+CodecResult<VideoFrame> MakeVideoFrame(std::shared_ptr<const ExternalTexture> texture, VideoFormat format,
+    MediaTimestamp pts, std::optional<MediaTimestamp> duration) {
+  using R = CodecResult<VideoFrame>;
+  if (!texture || !format.Validate() || !pts.timescale || (duration && (!duration->timescale || duration->ticks <= 0)))
+    return R::Failure(detail::Error(CodecErrorCode::InvalidArgument, "Invalid video texture, format, or timing"));
+  if (!SupportsPlatformSdr(format))
+    return R::Failure(detail::Error(CodecErrorCode::Unsupported, "Video texture input requires a supported SDR layout"));
+  try {
+    auto frame = detail::AcquirePlatformVideoFrame(*texture, format, pts, duration);
+    if (frame.Succeeded()) detail::VideoFrameAccess::RetainPlatformStorage(frame.Value(), texture);
+    return frame;
+  } catch (const std::bad_alloc&) {
+    return R::Failure(detail::Error(CodecErrorCode::ResourceExhausted, "Cannot retain the texture's video frame"));
+  } catch (const std::exception& error) {
+    return R::Failure(detail::Error(CodecErrorCode::PlatformFailure, error.what()));
+  }
+}
 
 CodecResult<std::shared_ptr<ExternalTexture>> MakeExternalTexture(const VideoFrame& frame) {
   using R = CodecResult<std::shared_ptr<ExternalTexture>>;

@@ -62,14 +62,14 @@ private:
   std::shared_ptr<const PlatformVideoStorage> image_;
 };
 
-HRESULT WaitForVideo(ID3D11DeviceContext& context, ID3D11Query& query) {
+HRESULT WaitForVideo(ID3D11DeviceContext& context, ID3D11Query& query, bool wait_for_copy) {
   context.End(&query);
   context.Flush();
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   for (;;) {
     const auto status = context.GetData(&query, nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
     if (status != S_FALSE) return status;
-    if (std::chrono::steady_clock::now() >= deadline) return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+    if (!wait_for_copy && std::chrono::steady_clock::now() >= deadline) return HRESULT_FROM_WIN32(WAIT_TIMEOUT);
     std::this_thread::yield();
   }
 }
@@ -77,16 +77,17 @@ HRESULT WaitForVideo(ID3D11DeviceContext& context, ID3D11Query& query) {
 class VideoProcessor {
 public:
   HRESULT Run(const TextureStorage& source, const VideoFormat& format, UINT width, UINT height,
-      DXGI_FORMAT layout, ComPtr<ID3D11Texture2D>& output) {
+      DXGI_FORMAT layout, ComPtr<ID3D11Texture2D>& output, const windows::D3D11Frame* snapshot = nullptr) {
     auto& device = *source.device;
-    std::lock_guard lock(device.commands);
+    std::unique_lock lock(device.commands);
     D3D11_TEXTURE2D_DESC source_desc{};
     source.image->GetDesc(&source_desc);
     if (device_.Get() != device.device.Get() || input_width_ != source_desc.Width || input_height_ != source_desc.Height ||
-        width_ != width || height_ != height || layout_ != layout) {
-      const auto status = Open(device, source_desc.Width, source_desc.Height, width, height, layout);
+        input_layout_ != source_desc.Format || width_ != width || height_ != height || layout_ != layout) {
+      const auto status = Open(device, source_desc, width, height, layout);
       if (FAILED(status)) return status;
     }
+    if (snapshot && format.range == ColorRange::Full && !nominal_range_) return E_NOTIMPL;
 
     D3D11_TEXTURE2D_DESC output_desc{};
     output_desc.Width = width;
@@ -122,10 +123,12 @@ public:
 
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE color{};
     color.YCbCr_Matrix = format.matrix == ColorMatrix::BT709;
-    color.Nominal_Range = format.range == ColorRange::Full ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255 :
+    const auto video_range = format.range == ColorRange::Full ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255 :
         D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235;
+    color.Nominal_Range = source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ?
+        D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255 : video_range;
     context.VideoProcessorSetStreamColorSpace(processor, 0, &color);
-    if (layout == DXGI_FORMAT_B8G8R8A8_UNORM) color.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255;
+    color.Nominal_Range = layout == DXGI_FORMAT_B8G8R8A8_UNORM ? D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255 : video_range;
     context.VideoProcessorSetOutputColorSpace(processor, &color);
 
     const bool rotated = format.rotation != VideoRotation::None;
@@ -144,19 +147,37 @@ public:
     D3D11_VIDEO_PROCESSOR_STREAM stream{};
     stream.Enable = TRUE;
     stream.pInputSurface = input_view.Get();
+    if (snapshot) {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      for (;;) {
+        try {
+          if (snapshot->TryCopyTo(*device.context.Get(), *source.image.Get())) break;
+        } catch (...) {
+          // The SDK can report a synchronization error after submitting the copy.
+          WaitForVideo(*device.context.Get(), *completed_.Get(), true);
+          throw;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        lock.lock();
+      }
+    }
     status = context.VideoProcessorBlt(processor, output_view.Get(), 0, 1, &stream);
-    if (FAILED(status)) return status;
-    return WaitForVideo(*device.context.Get(), *completed_.Get());
+    if (FAILED(status) && !snapshot) return status;
+    // A submitted copy must complete before the caller releases the SDK frame.
+    const auto completed = WaitForVideo(*device.context.Get(), *completed_.Get(), snapshot != nullptr);
+    return FAILED(status) ? status : completed;
   }
 
 private:
-  HRESULT Open(const WindowsVideoDevice& device, UINT input_width, UINT input_height,
+  HRESULT Open(const WindowsVideoDevice& device, const D3D11_TEXTURE2D_DESC& source,
       UINT width, UINT height, DXGI_FORMAT layout) {
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC content{};
     content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
     content.InputFrameRate = content.OutputFrameRate = {30, 1};
-    content.InputWidth = input_width;
-    content.InputHeight = input_height;
+    content.InputWidth = source.Width;
+    content.InputHeight = source.Height;
     content.OutputWidth = width;
     content.OutputHeight = height;
     content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
@@ -164,7 +185,7 @@ private:
     auto status = device.video->CreateVideoProcessorEnumerator(&content, &enumerator);
     if (FAILED(status)) return status;
     UINT input = 0, output = 0;
-    if (FAILED(enumerator->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &input)) ||
+    if (FAILED(enumerator->CheckVideoProcessorFormat(source.Format, &input)) ||
         FAILED(enumerator->CheckVideoProcessorFormat(layout, &output)) ||
         !(input & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) || !(output & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT))
       return E_NOTIMPL;
@@ -176,15 +197,18 @@ private:
     status = device.device->CreateQuery(&query, &completed);
     if (FAILED(status)) return status;
     D3D11_VIDEO_PROCESSOR_CAPS caps{};
-    rotation_ = SUCCEEDED(enumerator->GetVideoProcessorCaps(&caps)) && (caps.FeatureCaps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION);
+    const bool has_caps = SUCCEEDED(enumerator->GetVideoProcessorCaps(&caps));
+    rotation_ = has_caps && (caps.FeatureCaps & D3D11_VIDEO_PROCESSOR_FEATURE_CAPS_ROTATION);
+    nominal_range_ = has_caps && (caps.DeviceCaps & D3D11_VIDEO_PROCESSOR_DEVICE_CAPS_NOMINAL_RANGE);
     context1_.Reset();
     device.processor.As(&context1_);
     enumerator_ = std::move(enumerator);
     processor_ = std::move(processor);
     completed_ = std::move(completed);
     device_ = device.device;
-    input_width_ = input_width;
-    input_height_ = input_height;
+    input_width_ = source.Width;
+    input_height_ = source.Height;
+    input_layout_ = source.Format;
     width_ = width;
     height_ = height;
     layout_ = layout;
@@ -197,8 +221,8 @@ private:
   ComPtr<ID3D11VideoContext1> context1_;
   ComPtr<ID3D11Query> completed_;
   UINT input_width_ = 0, input_height_ = 0, width_ = 0, height_ = 0;
-  DXGI_FORMAT layout_ = DXGI_FORMAT_UNKNOWN;
-  bool rotation_ = false;
+  DXGI_FORMAT input_layout_ = DXGI_FORMAT_UNKNOWN, layout_ = DXGI_FORMAT_UNKNOWN;
+  bool rotation_ = false, nominal_range_ = false;
 };
 
 class D3D11VideoFrameTransformer final : public VideoFrameTransformBackend {
@@ -299,6 +323,45 @@ HRESULT MakeVideoInputBuffer(const VideoFrame& frame, const WindowsVideoDevice& 
   DWORD length = 0;
   status = buffer->GetMaxLength(&length);
   return FAILED(status) ? status : buffer->SetCurrentLength(length);
+}
+
+CodecResult<VideoFrame> AcquirePlatformVideoFrame(const ExternalTexture& texture, VideoFormat format,
+    MediaTimestamp pts, std::optional<MediaTimestamp> duration) {
+  using R = CodecResult<VideoFrame>;
+  const auto* source = dynamic_cast<const windows::D3D11Texture*>(&texture);
+  if (!source) return R::Failure(Error(CodecErrorCode::Unsupported, "Expected an SDK D3D11 texture"));
+  const auto snapshot = source->AcquireFrame();
+  if (!snapshot) return R::Failure(Error(CodecErrorCode::InvalidState, "The texture has no published video frame"));
+  if (std::uint32_t(snapshot->PixelWidth()) != format.width || std::uint32_t(snapshot->PixelHeight()) != format.height ||
+      ((format.width | format.height) & 1u))
+    return R::Failure(Error(CodecErrorCode::InvalidArgument, "D3D11 video input requires matching even pixel dimensions"));
+  if (snapshot->Alpha() != windows::D3D11Texture::Alpha::Opaque)
+    return R::Failure(Error(CodecErrorCode::Unsupported, "D3D11 video input requires an opaque SDK texture"));
+
+  std::shared_ptr<WindowsVideoDevice> device;
+  auto status = OpenVideoDevice(device);
+  if (FAILED(status)) return R::Failure(Error(CodecErrorCode::Unsupported, "No compatible D3D11 video device", std::to_string(status)));
+  D3D11_TEXTURE2D_DESC description{};
+  description.Width = format.width;
+  description.Height = format.height;
+  description.MipLevels = description.ArraySize = description.SampleDesc.Count = 1;
+  description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  ComPtr<ID3D11Texture2D> bgra;
+  status = device->device->CreateTexture2D(&description, nullptr, &bgra);
+  if (FAILED(status)) return R::Failure(VideoError(status, "Cannot allocate D3D11 texture input"));
+
+  auto coded = format;
+  coded.visible = {0, 0, format.width, format.height};
+  coded.rotation = VideoRotation::None;
+  TextureStorage input(format, device, std::move(bgra), 0);
+  VideoProcessor processor;
+  ComPtr<ID3D11Texture2D> output;
+  status = processor.Run(input, coded, format.width, format.height, DXGI_FORMAT_NV12, output, snapshot.get());
+  if (status == HRESULT_FROM_WIN32(ERROR_BUSY))
+    return R::Failure(Error(CodecErrorCode::ResourceExhausted, "The SDK D3D11 frame is busy"));
+  if (FAILED(status)) return R::Failure(VideoError(status, "Cannot convert the SDK D3D11 frame to NV12"));
+  return R::Success(VideoFrameAccess::FromPlatform(format, pts, duration,
+      std::make_shared<TextureStorage>(format, std::move(device), std::move(output), 0)));
 }
 
 CodecResult<void> PublishWindowsVideo(ExternalTexture& texture, const VideoFrame& frame) {

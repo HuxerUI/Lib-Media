@@ -31,13 +31,13 @@ struct VideoFrameAccess {
     return frame.platform_storage_;
   }
 
-  // Keep the queue reservation with the image until its last owner releases it.
-  static void RetainPlatformStorage(VideoFrame& frame, const std::shared_ptr<const void>& credit) {
+  // Keep the reservation or source texture with the image through its last use.
+  static void RetainPlatformStorage(VideoFrame& frame, const std::shared_ptr<const void>& dependency) {
     struct Owner {
-      std::shared_ptr<const void> credit;
+      std::shared_ptr<const void> dependency;
       std::shared_ptr<const PlatformVideoStorage> image;
     };
-    auto owner = std::make_shared<Owner>(Owner{credit, frame.platform_storage_});
+    auto owner = std::make_shared<Owner>(Owner{dependency, frame.platform_storage_});
     frame.platform_storage_ = std::shared_ptr<const PlatformVideoStorage>(std::move(owner), frame.platform_storage_.get());
   }
 };
@@ -48,16 +48,10 @@ inline constexpr auto PlatformVideoLayout = VideoPixelFormat::Opaque;
 inline constexpr auto PlatformVideoLayout = VideoPixelFormat::NV12;
 #endif
 
-#if defined(__ANDROID__) || defined(_WIN32) || (defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS))
-inline constexpr bool PlatformVideoEncodeSupported = true;
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__) || defined(_WIN32) || (defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS))
+inline constexpr bool PlatformVideoSupported = true;
 #else
-inline constexpr bool PlatformVideoEncodeSupported = false;
-#endif
-
-#if defined(__EMSCRIPTEN__)
-inline constexpr bool PlatformVideoDecodeSupported = true;
-#else
-inline constexpr bool PlatformVideoDecodeSupported = PlatformVideoEncodeSupported;
+inline constexpr bool PlatformVideoSupported = false;
 #endif
 
 // Call with coded dimensions already bounded by the codec configuration.

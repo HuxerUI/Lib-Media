@@ -29,9 +29,15 @@ inline constexpr bool frame_texture_supported = false;
 #endif
 
 #if defined(__ANDROID__) || (defined(_WIN32) && !defined(HUXERUI_WINDOWS_7_COMPAT)) || (defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS))
+inline constexpr bool gpu_video_scaling_supported = true;
+#else
+inline constexpr bool gpu_video_scaling_supported = false;
+#endif
+
+#ifdef __EMSCRIPTEN__
 inline constexpr bool gpu_video_supported = true;
 #else
-inline constexpr bool gpu_video_supported = false;
+inline constexpr bool gpu_video_supported = gpu_video_scaling_supported;
 #endif
 
 // Creates a texture for one preview run; publication copies or retains pixels through the public SDK.
