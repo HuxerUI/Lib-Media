@@ -4,24 +4,34 @@ else ()
     set(MEDIA_TEST_FRAMEWORK HuxerUI::huxerui_static)
 endif ()
 
-if (APPLE AND NOT IOS AND HuxerUI_DIR AND NOT TARGET HuxerUI::testing)
+if (((APPLE AND NOT IOS) OR EMSCRIPTEN) AND HuxerUI_DIR AND NOT TARGET HuxerUI::testing)
     find_package(HuxerUI CONFIG QUIET COMPONENTS static testing)
 endif ()
 
-if (APPLE AND NOT IOS AND TARGET HuxerUI::testing)
+if (((APPLE AND NOT IOS) OR EMSCRIPTEN) AND TARGET HuxerUI::testing)
     set(MEDIA_PREVIEW_SOURCE_DIR "${PROJECT_SOURCE_DIR}/examples/preview/src")
     set(MEDIA_PREVIEW_FIXTURES "${CMAKE_CURRENT_BINARY_DIR}/preview-fixtures")
     configure_file(fixtures/container/preview-avc-aac.mp4
             "${MEDIA_PREVIEW_FIXTURES}/raw/preview-avc-aac.mp4" COPYONLY)
     add_executable(media_container_preview_tests container_preview.cpp
-            "${MEDIA_PREVIEW_SOURCE_DIR}/decoded_clip.cpp" "${MEDIA_PREVIEW_SOURCE_DIR}/frame_texture.cpp")
+            "${MEDIA_PREVIEW_SOURCE_DIR}/decoded_clip.cpp" "${MEDIA_PREVIEW_SOURCE_DIR}/decoded_audio.cpp"
+            "${MEDIA_PREVIEW_SOURCE_DIR}/frame_texture.cpp")
     target_link_libraries(media_container_preview_tests PRIVATE huxerui_media ${MEDIA_TEST_FRAMEWORK} HuxerUI::testing)
     target_compile_features(media_container_preview_tests PRIVATE cxx_std_20)
     target_include_directories(media_container_preview_tests PRIVATE "${MEDIA_PREVIEW_SOURCE_DIR}")
-    target_compile_definitions(media_container_preview_tests PRIVATE MEDIA_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container")
     huxerui_add_resources(media_container_preview_tests ROOT "${MEDIA_PREVIEW_FIXTURES}" NAMESPACE fixture)
-    add_test(NAME media_container_preview COMMAND media_container_preview_tests)
-    set_tests_properties(media_container_preview PROPERTIES TIMEOUT 60)
+    if (EMSCRIPTEN)
+        target_compile_definitions(media_container_preview_tests PRIVATE MEDIA_FIXTURES="/fixtures/container")
+        target_link_options(media_container_preview_tests PRIVATE
+                "SHELL:--preload-file \"${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container/tagged-mp3.mp3@/fixtures/container/tagged-mp3.mp3\""
+                "-sASYNCIFY=1" "-sALLOW_MEMORY_GROWTH=1" "-sEXPORTED_FUNCTIONS=['_main']")
+        set_target_properties(media_container_preview_tests PROPERTIES SUFFIX ".js")
+        configure_file(container_preview_wasm.html "${CMAKE_CURRENT_BINARY_DIR}/container_preview_wasm.html" COPYONLY)
+    else ()
+        target_compile_definitions(media_container_preview_tests PRIVATE MEDIA_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container")
+        add_test(NAME media_container_preview COMMAND media_container_preview_tests)
+        set_tests_properties(media_container_preview PROPERTIES TIMEOUT 60)
+    endif ()
 endif ()
 
 if (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR (APPLE AND NOT IOS))

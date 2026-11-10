@@ -127,6 +127,21 @@ struct OpusHead {
 OpusHead ParseOpus(ByteView bytes, ContainerErrorCode error);
 
 unsigned OpusPacketSamples(ByteView packet, ContainerErrorCode error);
+
+struct FlacStreamInfo {
+  unsigned min_block, max_block, max_frame, rate, channels, bits;
+  std::uint64_t total;
+};
+
+FlacStreamInfo ParseFlacStreamInfo(ByteView bytes, ContainerErrorCode error);
+unsigned FlacPacketSamples(ByteView bytes, const FlacStreamInfo& info);
+
+struct Mp3FrameHeader {
+  unsigned version, rate, channels, samples, length, side_offset, side_size;
+};
+
+std::optional<Mp3FrameHeader> ParseMp3FrameHeader(ByteView bytes);
+
 ByteView AacLcInitialization(ByteView config);
 std::uint64_t AddOffset(std::uint64_t offset, std::uint64_t size);
 std::int64_t AddTime(std::int64_t time, std::int64_t delta);
@@ -172,6 +187,10 @@ public:
 };
 
 std::unique_ptr<ContainerReader> OpenWaveReader(ContainerInput input, ContainerFormat format);
+void ValidateFlac(std::span<const MediaTrack> tracks);
+void ValidateMp3(std::span<const MediaTrack> tracks);
+std::unique_ptr<ContainerWriter> OpenFlacWriter(ContainerOutput output, std::span<const MediaTrack> tracks);
+std::unique_ptr<ContainerWriter> OpenMp3Writer(ContainerOutput output, std::span<const MediaTrack> tracks);
 std::unique_ptr<ContainerWriter> OpenWaveWriter(ContainerOutput output, ContainerFormat format,
                                                 std::span<const MediaTrack> tracks);
 void ValidateWave(std::span<const MediaTrack> tracks);

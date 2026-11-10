@@ -109,10 +109,26 @@ void UnknownBounds() {
       unavailable.profiles[1].bounded_b_frames == CodecSupport::Unsupported && unavailable.profiles[1].maximum_b_frames == 0,
       "Unavailable and unknown discovery were conflated");
 }
+void AudioReferenceEvidence() {
+  auto snapshot = std::get<AudioDecoderCapabilities>(DefaultCapabilities(CapabilityKind::AudioDecoder));
+  snapshot.sample_rates = {{48000}, {44100}};
+  const auto rejected = ApplyAudioDecoderProbe(snapshot, 48000,
+      CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Rejected stereo reference")));
+  Check(rejected.Succeeded() && rejected.Value().availability == CodecSupport::Unknown &&
+        rejected.Value().sample_rates.front().support == CodecSupport::Unknown &&
+        rejected.Value().sample_rates.back().support == CodecSupport::Unknown &&
+        rejected.Value().channel_layouts.front().support == CodecSupport::Unknown &&
+        !rejected.Value().diagnostic.empty(), "One rejected configuration marked the codec unavailable");
+  const auto accepted = ApplyAudioDecoderProbe(std::move(snapshot), 44100, CodecResult<void>::Success());
+  Check(accepted.Succeeded() && accepted.Value().availability == CodecSupport::Supported &&
+        accepted.Value().sample_rates.front().support == CodecSupport::Unknown &&
+        accepted.Value().sample_rates.back().support == CodecSupport::Supported,
+        "A successful probe widened evidence to an untested rate");
+}
 }
 int main() {
   try {
-    UnknownBounds(); WorkerLifetime(); Failures();
+    UnknownBounds(); AudioReferenceEvidence(); WorkerLifetime(); Failures();
     std::cout << "Codec capability worker and evidence contracts passed\n";
     return 0;
   } catch (const std::exception& error) {

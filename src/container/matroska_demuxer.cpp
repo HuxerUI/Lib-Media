@@ -294,6 +294,7 @@ public:
       seek_offset_ = result->second.block;
       pending_.reset();
       in_cluster_ = false;
+      cluster_end_.reset();
       lace_.clear();
       lace_cursor_ = 0;
     }

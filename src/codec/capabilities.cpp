@@ -127,6 +127,21 @@ void SetUnavailable(CapabilitySnapshot& snapshot, std::string diagnostic) {
     }
   }, snapshot);
 }
+CodecResult<AudioDecoderCapabilities> ApplyAudioDecoderProbe(
+    AudioDecoderCapabilities snapshot, std::uint32_t sample_rate, CodecResult<void> result) {
+  using R = CodecResult<AudioDecoderCapabilities>;
+  if (result.Succeeded()) {
+    snapshot.availability = CodecSupport::Supported;
+    const auto rate = std::ranges::find(snapshot.sample_rates, sample_rate, &CodecCapability<std::uint32_t>::value);
+    if (rate != snapshot.sample_rates.end()) rate->support = CodecSupport::Supported;
+  } else {
+    auto error = std::move(result).Error();
+    if (error.code == CodecErrorCode::InvalidArgument) return R::Failure(std::move(error));
+    // A rejected configuration says nothing about other rates, layouts, or bitstreams.
+    snapshot.diagnostic = std::move(error.message);
+  }
+  return R::Success(std::move(snapshot));
+}
 #ifdef __EMSCRIPTEN__
 void RunCapabilitiesQuery(CapabilityKind kind, CapabilityCompletion completion) {
 #else

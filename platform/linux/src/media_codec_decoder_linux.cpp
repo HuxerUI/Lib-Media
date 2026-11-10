@@ -2,6 +2,7 @@
 #include "codec/decoder/copy.h"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 
 #include <gst/app/gstappsrc.h>
@@ -22,6 +23,33 @@ struct VideoMapping {
   bool mapped = false;
   ~VideoMapping() { if (mapped) gst_video_frame_unmap(&frame); }
 };
+bool SetDescription(GstCaps* caps, std::span<const std::byte> bytes, bool stream_header,
+                    std::span<const std::byte> comments = {}) {
+  GValue headers = G_VALUE_INIT;
+  if (stream_header) g_value_init(&headers, GST_TYPE_ARRAY);
+  const auto add = [&](std::span<const std::byte> data) {
+    auto* buffer = gst_buffer_new_allocate(nullptr, data.size(), nullptr);
+    if (!buffer) return false;
+    const auto copied = gst_buffer_fill(buffer, 0, data.data(), data.size());
+    if (copied == data.size()) {
+      if (stream_header) {
+        GValue value = G_VALUE_INIT;
+        g_value_init(&value, GST_TYPE_BUFFER);
+        gst_value_set_buffer(&value, buffer);
+        gst_value_array_append_value(&headers, &value);
+        g_value_unset(&value);
+      } else gst_caps_set_simple(caps, "codec_data", GST_TYPE_BUFFER, buffer, nullptr);
+    }
+    gst_buffer_unref(buffer);
+    return copied == data.size();
+  };
+  const auto success = add(bytes) && (comments.empty() || add(comments));
+  if (stream_header) {
+    if (success) gst_structure_set_value(gst_caps_get_structure(caps, 0), "streamheader", &headers);
+    g_value_unset(&headers);
+  }
+  return success;
+}
 class GstreamerDecoder final : public DecoderBackend {
 public:
   CodecResult<void> Open(const DecoderConfig& config) override {
@@ -33,15 +61,49 @@ public:
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, message, "GStreamer"));
     }
     const auto* audio = std::get_if<AudioDecoderConfig>(&config_);
-    auto* input = audio ? gst_caps_new_simple("audio/mpeg", "mpegversion", G_TYPE_INT, 4, "stream-format", G_TYPE_STRING, "raw",
-        "rate", G_TYPE_INT, int(audio->output.sample_rate), "channels", G_TYPE_INT, int(audio->output.ChannelCount()), nullptr)
-        : gst_caps_new_simple("video/x-h264", "stream-format", G_TYPE_STRING, "avc", "alignment", G_TYPE_STRING, "au", nullptr);
-    const auto init = std::visit([](const auto& c) { return c.initialization_data; }, config_);
-    auto* description = gst_buffer_new_allocate(nullptr, init.size(), nullptr);
-    const auto copied = gst_buffer_fill(description, 0, init.data(), init.size());
-    if (copied != init.size()) { gst_buffer_unref(description); gst_caps_unref(input); return CodecResult<void>::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot copy GStreamer configuration")); }
-    gst_caps_set_simple(input, "codec_data", GST_TYPE_BUFFER, description, nullptr);
-    gst_buffer_unref(description);
+    GstCaps* input;
+    const char* parser_name = "h264parse";
+    bool headers_ok;
+    if (audio) {
+      audio_sample_limit_ = AudioSampleLimit(*audio).Value();
+      const auto rate = int(audio->output.sample_rate), channels = int(audio->output.ChannelCount());
+      const auto header = AudioDecoderHeader(*audio);
+      parser_name = nullptr;
+      switch (audio->codec) {
+        case CodecId::Aac:
+          parser_name = "aacparse";
+          input = gst_caps_new_simple("audio/mpeg", "mpegversion", G_TYPE_INT, 4, "stream-format", G_TYPE_STRING, "raw",
+              "rate", G_TYPE_INT, rate, "channels", G_TYPE_INT, channels, nullptr);
+          headers_ok = SetDescription(input, header, false);
+          break;
+        case CodecId::Opus: {
+          input = gst_caps_new_simple("audio/x-opus", "channel-mapping-family", G_TYPE_INT, 0,
+              "rate", G_TYPE_INT, rate, "channels", G_TYPE_INT, channels, nullptr);
+          const std::array<std::uint8_t, 16> tags{'O', 'p', 'u', 's', 'T', 'a', 'g', 's'};
+          headers_ok = SetDescription(input, header, true, std::as_bytes(std::span(tags)));
+          break;
+        }
+        case CodecId::Flac:
+          input = gst_caps_new_simple("audio/x-flac", "framed", G_TYPE_BOOLEAN, TRUE,
+              "rate", G_TYPE_INT, rate, "channels", G_TYPE_INT, channels, nullptr);
+          headers_ok = SetDescription(input, header, true);
+          break;
+        case CodecId::Mp3:
+          input = gst_caps_new_simple("audio/mpeg", "mpegversion", G_TYPE_INT, 1, "layer", G_TYPE_INT, 3,
+              "parsed", G_TYPE_BOOLEAN, TRUE, "rate", G_TYPE_INT, rate, "channels", G_TYPE_INT, channels, nullptr);
+          headers_ok = true;
+          break;
+        default:
+          return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Unsupported GStreamer audio codec"));
+      }
+    } else {
+      input = gst_caps_new_simple("video/x-h264", "stream-format", G_TYPE_STRING, "avc", "alignment", G_TYPE_STRING, "au", nullptr);
+      headers_ok = SetDescription(input, std::get<VideoDecoderConfig>(config_).initialization_data, false);
+    }
+    if (!headers_ok) {
+      gst_caps_unref(input);
+      return CodecResult<void>::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot copy GStreamer configuration"));
+    }
     auto* factories = gst_element_factory_list_get_elements(GST_ELEMENT_FACTORY_TYPE_DECODER
         | (audio ? GST_ELEMENT_FACTORY_TYPE_MEDIA_AUDIO : GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO), GST_RANK_MARGINAL);
     auto* compatible = gst_element_factory_list_filter(factories, input, GST_PAD_SINK, FALSE);
@@ -54,9 +116,9 @@ public:
     pipeline_ = gst_pipeline_new(nullptr);
     source_ = gst_element_factory_make("appsrc", nullptr);
     sink_ = gst_element_factory_make("appsink", nullptr);
-    auto* parser = gst_element_factory_make(audio ? "aacparse" : "h264parse", nullptr);
+    auto* parser = parser_name ? gst_element_factory_make(parser_name, nullptr) : nullptr;
     auto* convert = gst_element_factory_make(audio ? "audioconvert" : "videoconvert", nullptr);
-    if (!pipeline_ || !source_ || !sink_ || !parser || !convert) {
+    if (!pipeline_ || !source_ || !sink_ || (parser_name && !parser) || !convert) {
       for (auto* element : {source_, sink_, parser, convert, decoder}) if (element) gst_object_unref(element);
       source_ = sink_ = nullptr;
       gst_caps_unref(input);
@@ -79,8 +141,11 @@ public:
         std::get<VideoDecoderConfig>(config_).output == VideoPixelFormat::NV12 ? "NV12" : "I420", nullptr);
     gst_app_sink_set_caps(GST_APP_SINK(sink_), output);
     gst_caps_unref(output);
-    gst_bin_add_many(GST_BIN(pipeline_), source_, parser, decoder, convert, sink_, nullptr);
-    if (!gst_element_link_many(source_, parser, decoder, convert, sink_, nullptr))
+    gst_bin_add_many(GST_BIN(pipeline_), source_, decoder, convert, sink_, nullptr);
+    if (parser) gst_bin_add(GST_BIN(pipeline_), parser);
+    const auto linked = parser ? gst_element_link_many(source_, parser, decoder, convert, sink_, nullptr)
+                               : gst_element_link_many(source_, decoder, convert, sink_, nullptr);
+    if (!linked)
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Cannot link the configured GStreamer decoder"));
     bus_ = gst_element_get_bus(pipeline_);
     if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
@@ -198,8 +263,8 @@ private:
       auto bytes = Own(Bytes(reinterpret_cast<std::byte*>(map.info.data), reinterpret_cast<std::byte*>(map.info.data + map.info.size)));
       auto format = audio->output; format.packing = AudioPacking::Interleaved;
       const auto stride = format.BytesPerSample() * format.ChannelCount();
-      if (bytes.AsBytes().size() % stride || bytes.AsBytes().size() / stride > 1024)
-        return R::Failure(Error(CodecErrorCode::InvalidData, "Unexpected GStreamer AAC sample count"));
+      if (bytes.AsBytes().size() % stride || bytes.AsBytes().size() / stride > audio_sample_limit_)
+        return R::Failure(Error(CodecErrorCode::InvalidData, "Unexpected GStreamer PCM sample count"));
       auto copied = CopyAudio({format, pts, std::uint32_t(bytes.AsBytes().size() / stride), {bytes}}, audio->output);
       if (!copied.Succeeded()) return R::Failure(copied.Error());
       return R::Success(DecodedFrame{std::move(copied).Value()});
@@ -242,6 +307,7 @@ private:
     return R::Success(DecodedFrame{std::move(copied).Value()});
   }
   DecoderConfig config_;
+  unsigned audio_sample_limit_ = 0;
   GstElement* pipeline_ = nullptr;
   GstElement* source_ = nullptr;
   GstElement* sink_ = nullptr;

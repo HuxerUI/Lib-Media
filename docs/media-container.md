@@ -5,8 +5,8 @@ with the SDK's synchronous streams and can run on a caller-owned worker without 
 Use an SDK build that provides `RandomAccessStream` and `File::OpenRandomAccess()`.
 Serialize calls on each session.
 
-`MediaTrack::codec` uses `CodecId` from `<huxerui/media_format.h>`. For H.264 or HEVC tracks, pass
-that identifier directly to `VideoDecoderConfig::codec` along with the track's initialization data.
+`MediaTrack::codec` uses `CodecId` from `<huxerui/media_format.h>`. Pass that identifier and the
+track's initialization data to the corresponding decoder configuration for a supported mapping.
 
 ## Supported combinations
 
@@ -19,9 +19,9 @@ that identifier directly to `VideoDecoderConfig::codec` along with the track's i
 | WebM | VP8, VP9, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
 | RIFF WAVE and RF64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
 | MPEG-4 ADTS | One raw mono/stereo AAC-LC access unit per frame | Sequential or random access | Sequential or random write |
-| Ogg | One logical Opus stream, mapping family zero | Sequential or random access | Sequential or random write |
-| Native FLAC | Complete FLAC frames with STREAMINFO | Sequential or random access | |
-| MP3 | MPEG Layer III frames, including variable bitrate | Sequential or random access | |
+| Ogg | Mapping-family-zero Opus, including chained logical streams on input | Sequential or random access | Sequential or random write for one logical stream |
+| Native FLAC | Complete FLAC frames with STREAMINFO | Sequential or random access, with native seek table support | Random write for whole-frame packet copy |
+| MP3 | MPEG Layer III frames, including variable bitrate | Sequential or random access | Random write for whole-track packet copy |
 
 MP4 supports one description per track and self-contained samples in decode order within each track.
 Regular MP4 accepts one rate-one edit and an optional leading empty edit. Its writer uses those edits to
@@ -37,6 +37,7 @@ timeline. For MP4 and MOV it intersects sample coverage with the supported edit,
 sample even if the edit extends farther. Equal endpoints describe an empty interval. An absent result means coverage
 is unavailable or the track ID is unknown. The query does not move the cursor or build an index. `Read()` continues
 to return coded preroll and tail packets. Apply the range to decoded pictures and PCM for presentation.
+Native FLAC and MP3 provide a range once their total sample count is known, with any recognized gapless trim applied.
 
 `MediaTrack::presentation_edit` carries a finite authored edit. Pass the track and original packet PTS, DTS, and
 duration to regular MP4 or MOV output to retain the edit. Any supplied audio priming or padding must agree with it.
@@ -69,24 +70,38 @@ the subtype, valid bits, and speaker mask when passed to a WAVE or RF64 writer. 
 frame-aligned blocks. ADTS strips transport headers on read and supplies them on write. It provides a
 sample-count timeline starting at zero and emits an updated track description if the AAC configuration changes.
 
-The container API covers the track and packet fields declared in the header. Tags, chapters, attachments,
-unmapped color metadata, and complex edit lists are outside these mappings.
+The container API covers the track and packet fields declared in the header. Tag and cover support is limited
+to the native FLAC and MP3 mappings below. Chapters, attachments, unmapped color metadata, and complex edit lists
+remain outside these mappings.
 Mirrored, scaled, or perspective movie and track matrices report `Unsupported`.
 A format or codec combination outside the table returns a format or support error.
 
 Ogg Opus preserves OpusHead, pre-skip, and final-packet trim. The reader validates page CRCs and
-assembles continued packets. Random input builds a bounded page index on the first seek query and
-returns an earlier decode start for the 80 ms Opus preroll. The writer emits one packet per page and
-accepts up to 1 ms of timestamp rounding for WebM interoperability. Chained Ogg reports `Unsupported`
-when reading past the first logical stream or building the seek index. Multiplexed Ogg and nonzero Opus
-mapping families are also outside this mapping.
+assembles continued packets. At a chain boundary it emits an updated `MediaTrack` before the new link's
+packets. Each link begins at the previous link's audible end. Its leading packets can precede that point
+on the coded timeline. Random input builds a bounded link and page index on the first seek query. The
+80 ms Opus preroll stays within the selected link. After `Seek()`, use the replayed description to open or
+reset the decoder for that link. The writer emits one packet per page for a single logical stream and
+accepts up to 1 ms of timestamp rounding for WebM interoperability. Supported streams use mapping family zero.
+[Ogg Opus mapping and seeking](https://www.rfc-editor.org/rfc/rfc7845.html#section-4.6)
 
-Native FLAC validates frame structure and checksums. MP3 handles MPEG-1, MPEG-2 and MPEG-2.5
-Layer III with fixed sample rate and channel count, optional ID3, and Xing/Info frame counts and
-recognized LAME gapless metadata. The reported trim is the encoder delay and padding from the
-header. A consumer's MPEG audio decoder can have additional synthesis delay. For these formats the
-first random seek query builds a bounded frame index. MP3 selects a reservoir restart point and
-reports preroll. FLAC metadata other than STREAMINFO and MP3 tags are skipped.
+Native FLAC validates frame geometry, position, and checksums. Random input uses checked `SEEKTABLE`
+entries when present, with a bounded frame index as a fallback. The writer retains the compressed frames,
+updates STREAMINFO sample and frame-size statistics, and writes a bounded seek table. Frame numbering and
+timing must begin at the stream origin. The STREAMINFO PCM checksum belongs to the supplied complete stream.
+[FLAC metadata and frame format](https://www.rfc-editor.org/rfc/rfc9639.html#section-8)
+
+MP3 handles MPEG-1, MPEG-2 and MPEG-2.5 Layer III with a fixed sample rate and layout. The reader understands
+Xing/Info and VBRI frame counts and recognized LAME delay and padding. It builds a bounded frame index and
+returns an earlier reservoir restart point as `decode_start`. The writer requires a restartable first frame,
+copies the original audio bytes, and rebuilds Xing/Info frame and byte counts, its seek table, and supplied
+gapless information. The demuxer's audio window describes the encoder trim on the coded timeline.
+
+Native FLAC and MP3 expose common text and retained JPEG or PNG front-cover bytes through
+`MediaTrack::audio_metadata`. Supported text fields are title, artist, album, track number, genre, and date.
+FLAC uses Vorbis comments and PICTURE. MP3 reads ID3v2.3 and v2.4 and writes ID3v2.4. Copying a track to its
+native format rewrites these fields without modifying the compressed audio. The output mapping supports one
+track and requires a seekable destination for final metadata. [ID3 frame definitions](https://id3.org/id3v2.4.0-frames)
 
 ## Read and seek
 
@@ -125,7 +140,7 @@ the track preroll and signed per-packet trim.
 Random input uses Cues from SeekHead or finds existing tail Cues by following EBML element boundaries.
 Each returned anchor is matched to a Block on its reference track. An Opus seek can start before the
 anchor at the returned `decode_start`. A file with no usable Cues for that track reports
-`IndexUnavailable`; normal packet reads remain available.
+`IndexUnavailable` for seek. Sequential preview and WAV export can continue using the packet timestamps and trim.
 
 ## Write and finish
 

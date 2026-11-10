@@ -30,6 +30,8 @@ public:
   std::uint32_t PresentationTimescale() const noexcept override { return 10000000; }
 
   CodecResult<void> Open(const DecoderConfig& config) override {
+    if (const auto* audio = std::get_if<AudioDecoderConfig>(&config); audio && audio->codec != CodecId::Aac)
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "The Media Foundation adapter currently requires AAC-LC"));
     return Guard<void>([&] {
       config_ = config;
       Require(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "COM initialization failed"); com_ = true;

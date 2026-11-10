@@ -1,7 +1,9 @@
 #include "codec/decoder/backend.h"
 #include "codec/decoder/copy.h"
 #include "codec/hevc.h"
+#include "container/container_io.h"
 
+#include <cmath>
 #include <deque>
 #include <mutex>
 
@@ -40,10 +42,48 @@ public:
       const auto channels = audio->output.ChannelCount();
       AudioStreamBasicDescription input{};
       input.mSampleRate = audio->output.sample_rate;
-      input.mFormatID = kAudioFormatMPEG4AAC;
-      input.mFormatFlags = kMPEG4Object_AAC_LC;
       input.mChannelsPerFrame = channels;
-      input.mFramesPerPacket = 1024;
+      audio_sample_limit_ = AudioSampleLimit(*audio).Value();
+      Bytes cookie;
+      switch (audio->codec) {
+        case CodecId::Aac: {
+          input.mFormatID = kAudioFormatMPEG4AAC;
+          input.mFormatFlags = kMPEG4Object_AAC_LC;
+          input.mFramesPerPacket = 1024;
+          const auto& asc = audio->initialization_data;
+          const std::uint8_t esds[]{3, 25, 0, 0, 0, 4, 17, 0x40, 0x15, 0, 0, 0,
+              0, 0, 0, 0, 0, 0, 0, 0, 5, 2, std::to_integer<std::uint8_t>(asc[0]),
+              std::to_integer<std::uint8_t>(asc[1]), 6, 1, 2};
+          const auto bytes = std::as_bytes(std::span(esds));
+          cookie.assign(bytes.begin(), bytes.end());
+          break;
+        }
+        case CodecId::Opus:
+          input.mFormatID = kAudioFormatOpus;
+          audio_gain_ = std::pow(10.0f, Number<std::int16_t>(audio->initialization_data, 16, true) / 5120.0f);
+          break;
+        case CodecId::Flac: {
+          input.mFormatID = kAudioFormatFLAC;
+          const auto info = ParseFlacStreamInfo(audio->initialization_data, ContainerErrorCode::InvalidArgument);
+          input.mFormatFlags = info.bits <= 16 ? kAppleLosslessFormatFlag_16BitSourceData :
+              info.bits <= 20 ? kAppleLosslessFormatFlag_20BitSourceData :
+              info.bits <= 24 ? kAppleLosslessFormatFlag_24BitSourceData : kAppleLosslessFormatFlag_32BitSourceData;
+          input.mFramesPerPacket = info.min_block == info.max_block ? info.max_block : 0;
+          Put(cookie, 50u);
+          Put(cookie, Tag("dfLa"));
+          Put(cookie, 0u);
+          Put(cookie, 0x80000022u);
+          Append(cookie, audio->initialization_data);
+          break;
+        }
+        case CodecId::Mp3:
+          input.mFormatID = kAudioFormatMPEGLayer3;
+          input.mFramesPerPacket = audio_sample_limit_;
+          mp3_.emplace(audio->output, audio_sample_limit_);
+          break;
+        default:
+          return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Unsupported AudioConverter codec"));
+      }
       AudioStreamBasicDescription output{};
       output.mSampleRate = input.mSampleRate;
       output.mFormatID = kAudioFormatLinearPCM;
@@ -57,12 +97,17 @@ public:
       output.mBytesPerPacket = output.mBytesPerFrame;
       auto status = AudioConverterNew(&input, &output, &audio_);
       if (status) return CodecResult<void>::Failure(AppleError(status, "AudioConverterNew failed"));
-      const auto asc = audio->initialization_data;
-      const std::uint8_t cookie[]{3, 25, 0, 0, 0, 4, 17, 0x40, 0x15, 0, 0, 0,
-          0, 0, 0, 0, 0, 0, 0, 0, 5, 2, std::to_integer<std::uint8_t>(asc[0]),
-          std::to_integer<std::uint8_t>(asc[1]), 6, 1, 2};
-      status = AudioConverterSetProperty(audio_, kAudioConverterDecompressionMagicCookie, sizeof(cookie), cookie);
-      if (status) return CodecResult<void>::Failure(AppleError(status, "AAC magic cookie was rejected"));
+      if (!cookie.empty()) {
+        status = AudioConverterSetProperty(audio_, kAudioConverterDecompressionMagicCookie,
+                                           static_cast<UInt32>(cookie.size()), cookie.data());
+        if (status) return CodecResult<void>::Failure(AppleError(status, "Audio decoder cookie was rejected"));
+      }
+      if (audio->codec == CodecId::Opus) {
+        // OpusHead trim belongs to the container timeline. Decode the complete packet here.
+        const AudioConverterPrimeInfo prime{};
+        status = AudioConverterSetProperty(audio_, kAudioConverterPrimeInfo, sizeof(prime), &prime);
+        if (status) return CodecResult<void>::Failure(AppleError(status, "Cannot disable Opus decoder trim"));
+      }
       return CodecResult<void>::Success();
     }
     const auto& video = std::get<VideoDecoderConfig>(config_);
@@ -101,8 +146,11 @@ public:
   CodecResult<SubmitStatus> Submit(const EncodedPacket& packet) override {
     if (audio_) {
       if (!audio_packets_.empty()) return CodecResult<SubmitStatus>::Success(SubmitStatus::WouldBlock);
-      audio_packets_.push_back(packet);
-      audio_times_.push_back(packet.pts);
+      const auto samples = AudioPacketSamples(std::get<AudioDecoderConfig>(config_), packet.data.AsBytes());
+      if (!samples.Succeeded()) return CodecResult<SubmitStatus>::Failure(samples.Error());
+      audio_packets_.push_back({packet, samples.Value()});
+      if (mp3_) mp3_->Expect(packet.pts);
+      else audio_times_.emplace_back(packet.pts, samples.Value());
       return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
     }
     CMBlockBufferRef block = nullptr;
@@ -186,38 +234,59 @@ private:
     }
     self.active_packet_ = std::move(self.audio_packets_.front());
     self.audio_packets_.pop_front();
-    const auto bytes = self.active_packet_->data.AsBytes();
+    const auto bytes = self.active_packet_->packet.data.AsBytes();
     *count = 1;
     data->mNumberBuffers = 1;
     data->mBuffers[0] = {std::get<AudioDecoderConfig>(self.config_).output.ChannelCount(),
         static_cast<UInt32>(bytes.size()), const_cast<std::byte*>(bytes.data())};
-    self.packet_description_ = {0, 1024, static_cast<UInt32>(bytes.size())};
+    self.packet_description_ = {0, self.active_packet_->samples, static_cast<UInt32>(bytes.size())};
     if (descriptions) *descriptions = &self.packet_description_;
     return noErr;
   }
   CodecResult<std::optional<BackendOutput>> ReadAudio() {
     using R = CodecResult<std::optional<BackendOutput>>;
     if (eos_) return R::Success(std::nullopt);
-    const auto format = std::get<AudioDecoderConfig>(config_).output;
+    const auto& config = std::get<AudioDecoderConfig>(config_);
+    const auto format = config.output;
     const auto count = format.packing == AudioPacking::Planar ? format.ChannelCount() : 1;
     const auto stride = format.BytesPerSample() * format.ChannelCount() / count;
     struct Buffers { UInt32 count; AudioBuffer planes[2]; } buffers{};
     buffers.count = count;
-    std::vector<Bytes> storage(count, Bytes(1024 * stride));
+    const auto expected = audio_times_.empty() ? audio_sample_limit_ : audio_times_.front().second;
+    UInt32 samples = expected;
+    std::vector<Bytes> storage(count, Bytes(samples * stride));
     for (unsigned i = 0; i < count; ++i) buffers.planes[i] = {format.ChannelCount() / count,
         static_cast<UInt32>(storage[i].size()), storage[i].data()};
-    UInt32 samples = 1024;
     const auto status = AudioConverterFillComplexBuffer(audio_, Input, this, &samples,
         reinterpret_cast<AudioBufferList*>(&buffers), nullptr);
-    if (status && status != NeedInput) return R::Failure(AppleError(status, "AAC conversion failed"));
+    if (status && status != NeedInput) return R::Failure(AppleError(status, "AudioConverter decoding failed"));
+    if (config.codec == CodecId::Opus && !audio_times_.empty() && samples != expected)
+      return R::Failure(Error(CodecErrorCode::InvalidData, "AudioConverter changed the Opus packet sample count"));
     if (samples) {
-      if (audio_times_.empty()) return R::Failure(Error(CodecErrorCode::InvalidData, "AAC output has no input timing"));
-      AudioFrame frame{format, audio_times_.front(), samples, {}};
-      audio_times_.pop_front();
+      if (!mp3_ && audio_times_.empty())
+        return R::Failure(Error(CodecErrorCode::InvalidData, "PCM output has no input timing"));
+      AudioFrame frame{format, mp3_ ? MediaTimestamp{0, format.sample_rate} : audio_times_.front().first, samples, {}};
       for (auto& bytes : storage) { bytes.resize(samples * stride); frame.planes.push_back(Own(std::move(bytes))); }
+      if (mp3_) {
+        const auto buffered = mp3_->Append(frame);
+        if (!buffered.Succeeded()) return R::Failure(buffered.Error());
+        if (auto packet = mp3_->Read()) return R::Success(BackendOutput{DecodedFrame{std::move(*packet)}});
+        return R::Success(std::nullopt);
+      }
+      if (audio_gain_ != 1.0f) {
+        auto adjusted = CopyAudio(frame, format, audio_gain_);
+        if (!adjusted.Succeeded()) return R::Failure(adjusted.Error());
+        frame = std::move(adjusted).Value();
+      }
+      audio_times_.pop_front();
       return R::Success(BackendOutput{DecodedFrame{std::move(frame)}});
     }
-    if (finished_ && status == noErr) { eos_ = true; return R::Success(BackendOutput{EndOfStream{}}); }
+    if (finished_ && status == noErr) {
+      if (mp3_ && !mp3_->Drained())
+        return R::Failure(Error(CodecErrorCode::InvalidData, "AudioConverter MP3 drain has missing PCM samples"));
+      eos_ = true;
+      return R::Success(BackendOutput{EndOfStream{}});
+    }
     return R::Success(std::nullopt);
   }
   static void Output(void* context, void*, OSStatus status, VTDecodeInfoFlags flags, CVImageBufferRef image,
@@ -303,9 +372,16 @@ private:
   AudioConverterRef audio_ = nullptr;
   VTDecompressionSessionRef video_ = nullptr;
   CMVideoFormatDescriptionRef description_ = nullptr;
-  std::deque<EncodedPacket> audio_packets_;
-  std::optional<EncodedPacket> active_packet_;
-  std::deque<MediaTimestamp> audio_times_;
+  struct AudioInput {
+    EncodedPacket packet;
+    unsigned samples;
+  };
+  std::deque<AudioInput> audio_packets_;
+  std::optional<AudioInput> active_packet_;
+  std::deque<std::pair<MediaTimestamp, unsigned>> audio_times_;
+  unsigned audio_sample_limit_ = 0;
+  std::optional<PcmPackets> mp3_;
+  float audio_gain_ = 1.0f;
   AudioStreamPacketDescription packet_description_{};
   std::mutex output_mutex_;
   std::deque<DecodedFrame> output_;

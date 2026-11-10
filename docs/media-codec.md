@@ -4,7 +4,7 @@
 [codec issue #20](https://github.com/HuxerUI/HuxerUI/issues/20). Link `HuxerUI::Media` with the installed public SDK.
 No `Install()`, View, Runtime, window, or application Task is needed. Existing MediaPlayer and photo-library APIs are unchanged.
 
-This guide covers raw AAC-LC access units decoded to CPU PCM and length-prefixed AVC access units decoded to CPU YUV.
+This guide covers AAC-LC, Opus, FLAC, and MP3 decoded to CPU PCM, and length-prefixed AVC and HEVC decoded to CPU YUV.
 The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264. Codec sessions do not
 demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
@@ -12,6 +12,9 @@ demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns
 `VideoDecoderConfig::codec` uses `CodecId` from `<huxerui/media_format.h>` and defaults to `CodecId::H264`.
 Use `CodecId::H264` or `CodecId::Hevc`. Other identifiers return `InvalidArgument`. When decoding a
 supported demuxed track, assign `MediaTrack::codec` directly to the decoder configuration.
+
+`AudioDecoderConfig::codec` uses the same `CodecId` and defaults to `CodecId::Aac`. Use the audio track's
+codec, `initialization_data`, sample rate, and channel layout to configure a demuxed stream.
 
 Apple VideoToolbox also decodes single-layer HEVC with complete out-of-band VPS, SPS and PPS. Set
 `VideoDecoderConfig::codec` to `CodecId::Hevc` and supply an hvcC record. Use NV12 or I420 for
@@ -44,8 +47,10 @@ than decoder internals. iOS and macOS keep independent platform implementations.
 ## Capability queries
 
 `AudioDecoder`, `VideoDecoder`, `AudioEncoder`, and `VideoEncoder` each provide a static asynchronous
-`QueryCapabilities(completion)` and a corresponding typed snapshot. Discovery covers the current AAC-LC/H.264
-adapter, without an application-wide codec registry, backend-selection policy, or active session.
+`QueryCapabilities(completion)` and a corresponding typed snapshot. The audio decoder also accepts
+`QueryCapabilities(codec, completion)`. AAC uses its existing discovery path. Opus, FLAC, and MP3 use one
+48 kHz stereo reference configuration to establish positive evidence. A rejected reference leaves codec availability
+and untested choices unknown. Use `Probe()` to check the actual configuration.
 
 ```cpp
 VideoEncoder::QueryCapabilities([](CodecResult<VideoEncoderCapabilities> result) {
@@ -96,7 +101,7 @@ existing adapter restrictions. Platform compilation and runtime validation are r
 
 ## Decoder platform status
 
-| Platform | Adapter | Validation in this change |
+| Platform | AAC/H.264 adapters | AAC/H.264 validation |
 | --- | --- | --- |
 | Android API 23+ | NDK MediaCodec, no Activity/JNI requirement; standard CPU I420/NV12 buffers | AAC/AVC fixtures ran on a Huawei Android 12 device; full preview builds for arm64/x86_64 |
 | macOS | AudioConverter for AAC and VideoToolbox with CoreMedia for H.264 | Headless AAC/AVC fixture tests on Apple Silicon and a full preview build |
@@ -104,6 +109,20 @@ existing adapter restrictions. Platform compilation and runtime validation are r
 | Windows | System synchronous Media Foundation AAC/H.264 transforms, COM/MF owned on the codec worker | Windows 11 installed-SDK builds and platform AAC/AVC fixtures, including the longer synchronization fixtures with tight output pools |
 | Linux | GStreamer appsrc/parser/installed decoder/converter/appsink pipeline | Headless installed-SDK tests on Ubuntu 24.04 under WSL with GStreamer 1.24.2, including the longer AAC/AVC synchronization fixtures and appsrc backpressure |
 | Web | WebCodecs on the owning JS event loop | Full WASM build and real Chrome C++ decoder/bridge fixture tests; simulated late probe/copy/flush retirement tests |
+
+### Opus, FLAC, and MP3
+
+| Platform | Opus | FLAC | MP3 | Validation for this batch |
+| --- | --- | --- | --- | --- |
+| macOS | AudioConverter | AudioConverter | AudioConverter | Native decode, PCM preview, repeated seeks, and WAV readback on Apple Silicon |
+| Android API 23+ | NDK MediaCodec | NDK MediaCodec | NDK MediaCodec | Huawei Android 12 device passed file selection, PCM preview, repeated seeks, and WAV readback. PCM preview uses AAudio on API 26+. |
+| iOS 15+ | AudioConverter | AudioConverter | AudioConverter | Native packet decode on iOS Simulator. Physical device playback remains pending. |
+| Windows | Unsupported by the current adapter | Unsupported by the current adapter | Unsupported by the current adapter | The existing synchronous Media Foundation adapter continues to decode AAC. |
+| Linux | GStreamer `audio/x-opus` | GStreamer `audio/x-flac` | GStreamer `audio/mpeg` Layer III | Requires an installed decoder accepting the packet caps. Runtime acceptance for these mappings is pending. |
+| Web | WebCodecs `opus` | WebCodecs `flac` | WebCodecs `mp3` | Chrome ran the WASM preview, repeated seeks, and WAV export and save. Runtime support depends on the browser. |
+
+The container mappings, metadata, and packet-copy paths are independent of the platform decoder. Use
+`Probe(config, completion)` to check the selected stream configuration on the running platform.
 
 Availability depends on the requested configuration and installed platform media components. `Probe(config, completion)`
 initializes, negotiates, and releases a decoder asynchronously. Probe success is neither a resource reservation nor a
@@ -137,6 +156,13 @@ cleanup and final callback dispatch. There is no blocking proxy to another event
   explicit SBR extensions, resampling, and channel mixing are unsupported. Choose S16/F32 and packed/planar PCM;
   sample rate and channel layout must match initialization data. Decoder output includes untrimmed priming/padding;
   the source/container layer owns any trim metadata.
+- Opus uses mapping family zero, a complete packet and OpusHead, and mono/stereo output at 48 kHz. The container
+  supplies pre-skip and end trim for the consumer to apply. Apple configures AudioConverter to return the complete
+  packet, including a 2.5 ms first packet when pre-skip is zero. Reopen or reset when seeking into another Ogg link.
+  [AudioConverter priming information](https://developer.apple.com/documentation/audiotoolbox/audioconverterprimeinfo)
+- FLAC takes complete native frames and the 34-byte STREAMINFO payload. Sample rate and mono/stereo layout must
+  match STREAMINFO. MP3 takes complete MPEG Layer III frames with empty initialization data. After a seek, start at
+  the demuxer's `decode_start` to rebuild the MP3 bit reservoir. Apply the track's presentation interval to decoded PCM.
 - AVC uses avcC and its 1-, 2-, or 4-byte NAL lengths. The initial subset is progressive 8-bit 4:2:0 Baseline/Main/High,
   continuous complete input, at most 16 reference pictures. An SPS may declare frame-number gaps allowed; that flag
   alone does not imply missing pictures or make incomplete input supported. SPS dimensions and in-band SPS updates are validated against
@@ -174,7 +200,9 @@ Oversized packets and impossible configurations fail rather than blocking
 forever. Calls copy bounded data and take short locks; they are not hard-real-time audio callbacks.
 
 Both decoders require at least two copied-input slots. Audio requires at least four output slots and enough output bytes
-for four 1024-sample frames: Android MediaCodec decoding can require more than two units before returning its first PCM frame.
+for four maximum-size decoded packets. The sample bound is 1024 for AAC, 5760 for Opus, the STREAMINFO maximum block
+size for FLAC, and 1152 for MP3 at MPEG-1 rates or 576 at lower rates. Android MediaCodec can buffer several packets
+before returning its first PCM frame.
 Video conservatively requires 34 output slots and maximum-frame byte reservations: up to 16 platform delayed frames, 16 presentation-order
 slots, and progress headroom. The initial implementation retains a 16-frame presentation window until Finish, even for
 low-delay streams. This is a deliberate conservative bound for the decoding milestone, not a low-latency playback claim.
@@ -389,6 +417,11 @@ The separate Node test injects late support, flush, and copy completions after r
 still needs dedicated validation. Physical iOS devices, Linux hardware/plugin diversity, stress/RSS, and release-failure injection
 in platform APIs remain validation work; shared fake-backend failure tests do not replace those checks.
 
+On macOS, `media_container_preview` verifies PCM across a zero-pre-skip Ogg link and WAV export from WebM without
+Cues. For Web, build `media_container_preview_tests` and serve the generated `tests/container_preview_wasm.html`
+with its JS/WASM/data files. The test checks that an application callback runs during packet copy and that the copied
+MP3 reopens with the same duration, packet count, and cover metadata.
+
 A local Apple Silicon Release archive comparison against the pre-codec commit grew from approximately 0.54 MiB to
 1.04 MiB (about 0.50 MiB). These figures exclude system frameworks and vary by toolchain. The existing macOS preview,
 which does not call a codec API, contains no decoder/session/platform codec entry-point symbols. Web includes the small
@@ -414,7 +447,8 @@ output. Android compilation and static Apple review do not replace device runs; 
 Capability discovery adds `media_codec_capabilities`, `media_codec_capabilities_contract` on native targets, and
 `media_codec_capabilities_web_contract` when Node is available. The public API test queries all four codecs without
 Runtime or Install. Shared tests cover unknown versus unavailable evidence, independent workers, capture cleanup,
-post-TLS completion, and discovery failures. Node checks bounded reference queries, unchanged configuration evidence,
+post-TLS completion, discovery failures, and a rejected audio reference followed by support at another rate.
+Node checks bounded reference queries, unchanged configuration evidence,
 and promise retirement. Run the subset with `ctest --test-dir <build> -R media_codec_capabilities --output-on-failure`.
 For a browser, build `media_codec_capabilities_tests` and serve the generated `tests/codec_capabilities_wasm.html`.
 Windows/Linux and macOS native queries and Android/Web compilation are validated. iOS device

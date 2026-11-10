@@ -1,5 +1,6 @@
 #include "codec/decoder/backend.h"
 #include "codec/decoder/copy.h"
+#include <algorithm>
 #include <emscripten/val.h>
 
 namespace huxerui::media::detail {
@@ -25,11 +26,23 @@ public:
     config_ = config;
     auto options = val::object();
     if (const auto* audio = std::get_if<AudioDecoderConfig>(&config)) {
+      switch (audio->codec) {
+        case CodecId::Aac: options.set("codec", std::string("mp4a.40.2")); break;
+        case CodecId::Opus: options.set("codec", std::string("opus")); break;
+        case CodecId::Flac: options.set("codec", std::string("flac")); break;
+        case CodecId::Mp3:
+          options.set("codec", std::string("mp3"));
+          // Raw MP3 WebCodecs chunks carry the synthesis delay, which the file trim does not include.
+          mp3_.emplace(audio->output, AudioSampleLimit(*audio).Value(), 529);
+          break;
+        default: return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Unsupported WebCodecs audio codec"));
+      }
       options.set("audio", true); options.set("rate", audio->output.sample_rate); options.set("channels", audio->output.ChannelCount());
+      options.set("maxSamples", AudioSampleLimit(*audio).Value());
       options.set("planar", audio->output.packing == AudioPacking::Planar);
       std::string sample = audio->output.sample_format == AudioSampleFormat::F32 ? "f32" : "s16";
       if (audio->output.packing == AudioPacking::Planar) sample += "-planar";
-      options.set("sampleFormat", sample); options.set("description", Uint8(audio->initialization_data));
+      options.set("sampleFormat", sample); options.set("description", Uint8(AudioDecoderHeader(*audio)));
     } else {
       const auto& video = std::get<VideoDecoderConfig>(config);
       options.set("audio", false); options.set("width", video.width); options.set("height", video.height);
@@ -46,18 +59,35 @@ public:
   CodecResult<SubmitStatus> Submit(const EncodedPacket& packet) override {
     const auto pts = packet.pts.Rescale(1000000).value().ticks;
     const auto duration = packet.duration ? val(double(packet.duration->Rescale(1000000).value().ticks)) : val::null();
-    bridge_.call<void>("submit", id_, Uint8(packet.data.AsBytes()), double(pts), duration, packet.key_frame);
+    const auto bytes = packet.data.AsBytes();
+    bridge_.call<void>("submit", id_, Uint8(bytes), double(pts), duration, packet.key_frame);
     const auto error = ErrorText();
     if (!error.empty()) return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::InvalidData, error, "WebCodecs"));
+    if (mp3_) {
+      if (mp3_drain_frame_.empty()) {
+        // An empty, reservoir-free frame releases the decoder's final synthesis samples.
+        mp3_drain_frame_.resize(bytes.size());
+        std::ranges::copy(bytes.first(4), mp3_drain_frame_.begin());
+        mp3_drain_frame_[1] |= std::byte{1};
+      }
+      mp3_->Expect(packet.pts);
+    }
     return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
   }
   CodecResult<std::optional<BackendOutput>> Poll() override {
     using R = CodecResult<std::optional<BackendOutput>>;
     const auto error = ErrorText();
     if (!error.empty()) return R::Failure(Error(CodecErrorCode::PlatformFailure, error, "WebCodecs"));
+    if (mp3_) {
+      if (auto frame = mp3_->Read()) return R::Success(BackendOutput{DecodedFrame{std::move(*frame)}});
+    }
     auto value = bridge_.call<val>("poll", id_);
     if (value.isNull()) {
-      if (!eos_ && bridge_.call<bool>("ended", id_)) { eos_ = true; return R::Success(BackendOutput{EndOfStream{}}); }
+      if (!eos_ && bridge_.call<bool>("ended", id_)) {
+        if (mp3_ && !mp3_->Drained()) return R::Failure(Error(CodecErrorCode::InvalidData, "MP3 drain has missing samples"));
+        eos_ = true;
+        return R::Success(BackendOutput{EndOfStream{}});
+      }
       return R::Success(std::nullopt);
     }
     MediaTimestamp pts{static_cast<std::int64_t>(value["pts"].as<double>()), 1000000};
@@ -65,6 +95,12 @@ public:
     if (const auto* audio = std::get_if<AudioDecoderConfig>(&config_)) {
       AudioFrame frame{audio->output, pts, value["samples"].as<std::uint32_t>(), {}};
       for (unsigned i = 0; i < planes["length"].as<unsigned>(); ++i) frame.planes.push_back(Buffer(planes[i]));
+      if (mp3_) {
+        const auto appended = mp3_->Append(frame, draining_);
+        if (!appended.Succeeded()) return R::Failure(appended.Error());
+        if (auto packet = mp3_->Read()) return R::Success(BackendOutput{DecodedFrame{std::move(*packet)}});
+        return R::Success(std::nullopt);
+      }
       return R::Success(BackendOutput{DecodedFrame{std::move(frame)}});
     }
     const auto& config = std::get<VideoDecoderConfig>(config_);
@@ -91,6 +127,12 @@ public:
     return R::Success(BackendOutput{DecodedFrame{std::move(copied).Value()}});
   }
   CodecResult<SubmitStatus> Finish() override {
+    if (!mp3_drain_frame_.empty()) {
+      bridge_.call<void>("submit", id_, Uint8(mp3_drain_frame_), 0.0, val::null(), true);
+      const auto error = ErrorText();
+      if (!error.empty()) return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::InvalidData, error, "WebCodecs"));
+    }
+    draining_ = true;
     bridge_.call<void>("finish", id_);
     return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
   }
@@ -104,8 +146,11 @@ private:
   std::string ErrorText() { return bridge_.call<std::string>("error", id_); }
   val bridge_ = val::global("HuxerMediaCodec");
   DecoderConfig config_;
+  std::optional<PcmPackets> mp3_;
+  Bytes mp3_drain_frame_;
   unsigned id_ = 0;
   bool eos_ = false;
+  bool draining_ = false;
 };
 } // namespace
 std::unique_ptr<DecoderBackend> MakeDecoderBackend() { return std::make_unique<WebDecoder>(); }

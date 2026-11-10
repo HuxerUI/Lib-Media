@@ -35,7 +35,7 @@ enum class ContainerFormat {
   Rf64,     ///< RF64 WAVE with a 64-bit size table.
 
   Adts,     ///< AAC with an ADTS header on each access unit.
-  Ogg,      ///< A single Ogg logical stream with mapping-family-zero Opus.
+  Ogg,      ///< Mapping-family-zero Opus, with chained logical streams supported on input.
   Flac,     ///< Native FLAC frames following a STREAMINFO metadata block.
   Mp3,      ///< MPEG Layer III audio frames with optional ID3 and Xing information.
 };
@@ -81,6 +81,35 @@ struct MediaPresentationRange {
 
   /// Compares both endpoints as exact rational times.
   bool operator==(const MediaPresentationRange&) const = default;
+};
+
+/// @brief Common text tags and front-cover artwork in a native FLAC or MP3 file.
+///
+/// Text is UTF-8. Empty strings represent absent tags. When copying a track to the same container format,
+/// its writer emits the supported fields using that format's native metadata blocks.
+struct MediaAudioMetadata {
+  /// @brief Retained, encoded front-cover image.
+  struct Cover {
+    /// Image MIME type, for example image/jpeg or image/png.
+    std::string mime_type;
+    /// Image bytes. Holding this reference keeps the bytes alive after the reader closes.
+    BufferReference data;
+  };
+
+  /// Track title.
+  std::string title;
+  /// Performing artist.
+  std::string artist;
+  /// Album or collection title.
+  std::string album;
+  /// Track number as written, which may include the total, such as 2/12.
+  std::string track_number;
+  /// Genre text.
+  std::string genre;
+  /// Release or recording date as written.
+  std::string date;
+  /// First supported front cover, if present.
+  std::optional<Cover> cover;
 };
 
 /// @brief Track description shared by the demuxer and muxer.
@@ -157,6 +186,8 @@ struct MediaTrack {
   /// Supported color and HDR extension payloads from MP4 or MOV. Preserve them when copying compatible
   /// compressed samples. Supply metadata for the new bitstream when encoding different pictures.
   std::vector<VideoExtension> video_extensions = {};
+  /// Supported file tags for the single audio track of native FLAC or MP3. Retained when copying to the same mapping.
+  std::optional<MediaAudioMetadata> audio_metadata = {};
 };
 
 /// @brief A packet on a container session's common timeline.
@@ -273,6 +304,7 @@ public:
   /// @return A half-open interval, or std::nullopt for an unknown track or unavailable sample timing.
   /// Equal endpoints mean no samples intersect the edit. Requires a live session and does not move the read
   /// position or build an index. MP4 and MOV supply these bounds from sample tables or a built fragment index.
+  /// Native FLAC and MP3 supply them when the total sample count and any available gapless trim are known.
   std::optional<MediaPresentationRange> PresentationRange(std::uint32_t track_id) const;
 
   /// @brief Selects tracks for subsequent reads at the current position.

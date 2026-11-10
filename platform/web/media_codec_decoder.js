@@ -13,7 +13,8 @@
     try {
       const record = {pts: frame.timestamp, duration: frame.duration ?? null, planes: []};
       if (state.audio) {
-        if (frame.sampleRate !== state.rate || frame.numberOfChannels !== state.channels || frame.numberOfFrames > 1024)
+        if (frame.sampleRate !== state.rate || frame.numberOfChannels !== state.channels ||
+            frame.numberOfFrames > (state.maxSamples || 1024))
           throw new Error('WebCodecs changed the configured PCM rate/layout or frame bound');
         record.samples = frame.numberOfFrames;
         for (let i = 0; i < (state.planar ? state.channels : 1); ++i) {
@@ -61,7 +62,8 @@
       if (!Type) { failure(state, 'WebCodecs decoder is unavailable'); return id; }
       const description = config.description;
       const codecConfig = config.audio
-        ? {codec: 'mp4a.40.2', sampleRate: config.rate, numberOfChannels: config.channels, description}
+        ? {codec: config.codec || 'mp4a.40.2', sampleRate: config.rate, numberOfChannels: config.channels,
+           ...(description.length ? {description} : {})}
         : {codec: 'avc1.' + Array.from(description.slice(1, 4), x => x.toString(16).padStart(2, '0')).join(''),
            codedWidth: config.width, codedHeight: config.height, description};
       Type.isConfigSupported(codecConfig).then(support => {

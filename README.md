@@ -30,13 +30,13 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`media_player.h`](include/huxerui/media_player.h) |
 | Platform image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
-| AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
+| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, and Apple HEVC. See [decoder validation](#media-decoding). | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
 | HEVC decoding | Apple VideoToolbox with 8-bit or 10-bit 4:2:0 output for single-layer `hvc1` | `CodecId::Hevc`, `VideoPixelFormat::P010` |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; macOS native tests passed; iOS validation pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; macOS native tests passed; iOS validation pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | Codec capability discovery | Typed AAC-LC/H.264 snapshots for the current adapter; unreported platform facts remain unknown | `QueryCapabilities()` on the four codec classes in [`media_codec.h`](include/huxerui/media_codec.h) |
-| Container demuxing and muxing | MP4/fMP4, QuickTime MOV, Matroska, WebM, WAVE/RF64, ADTS, and Ogg Opus; native FLAC and MP3 input | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
+| Container demuxing and muxing | MP4/fMP4, QuickTime MOV, Matroska, WebM, WAVE/RF64, ADTS, Ogg Opus with chained input, and native FLAC/MP3 with tag and cover copy | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
 
 Platform selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
 SDK `FileReference` values, which can be retained for reading, imported to local files, or passed to `MediaSource` for
@@ -297,10 +297,12 @@ See the [media library guide](docs/media-library.md) and [`media_library.h`](inc
 ## Media decoding
 
 `AudioDecoder` and `VideoDecoder` are move-only sessions with bounded queues. Supply complete access units from a source
-or demuxer: raw AAC-LC with AudioSpecificConfig produces mono/stereo S16 or F32 PCM, and length-prefixed H.264 with
-`avcC` produces I420 or NV12 video. Returned frames own immutable CPU storage and remain readable after reset and close.
+or demuxer. The audio decoder produces mono/stereo S16 or F32 PCM from AAC-LC, Opus, FLAC, or MP3. The video decoder
+produces CPU YUV from length-prefixed H.264 or HEVC. Returned frames own immutable CPU storage and remain readable after
+reset and close.
 
 - `QueryCapabilities(completion)` discovers candidates and known limits; see [capability queries](docs/media-codec.md#capability-queries).
+  The audio decoder also accepts `QueryCapabilities(codec, completion)`.
   `Probe(config, completion)` checks a complete configuration by opening and releasing a temporary decoder.
   `Create()` starts a session asynchronously.
 - `TrySubmit()` copies an accepted packet. On `WouldBlock`, keep the packet and retry when the session can accept input.
@@ -316,6 +318,8 @@ AAC/H.264 fixture decoding passed on an Android 12 device, an iOS simulator, App
 Ubuntu 24.04 under WSL, and Chrome through the C++/WASM API. Windows and Linux also check the longer synchronization
 fixtures with tight output pools. Physical iOS decoding remains unvalidated. See the [decoding guide](docs/media-codec.md) for examples, queue limits,
 platform requirements, and validation instructions.
+
+See the [six-platform Opus, FLAC, and MP3 matrix](docs/media-codec.md#opus-flac-and-mp3) for adapters and validation results.
 
 ## Media encoding
 
@@ -430,7 +434,7 @@ The [preview](examples/preview) exercises the library through four tabs.
 | Video | Local/reference/URL sources, playback controls, progress, seeking, volume, looping, and video fitting |
 | Music | Audio playback using the same player API without a video surface |
 | Library | Platform image/video/mixed selection, capability-aware multi-select, retained references, and publication |
-| Frames | Seek local MP4/MOV or the bundled sample, copy compatible packets or encode H.264, and save the prepared movie |
+| Frames | Seek decoded video or audio, copy compatible packets, encode H.264, export PCM to WAV, and save the prepared file |
 
 The Library tab disables multi-select when the maximum is below two; otherwise it requests up to three items within
 the platform limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
@@ -440,6 +444,12 @@ The Frames tab decodes files through `MediaDemuxer` and `DecodedPlayback`. Local
 can use a seek index to restart the decoders and replace the texture for each playback epoch. Effective track ranges
 limit visible pictures and PCM to the intersection of sample coverage and edits. The bundled file has reordered H.264
 pictures, uneven frame intervals, and AAC priming. Apple platforms also preview rotated SDR HEVC in 8-bit or P010.
+
+“Open audio” reuses the Frames controls for Ogg Opus, audio in WebM/MKA, native FLAC, and MP3. It plays decoded PCM
+and supports repeated seeks, including across chained Ogg links. Sequential preview and WAV export also work with
+WebM audio that has no seek index. “Export WAV” writes and reopens S16 PCM at the source rate and layout. “Copy Audio”
+keeps native FLAC or MP3 compressed frames, supported tags, and cover art. The copy and readback yield between packet
+batches on Web. Use “Save Audio” to save the prepared file.
 
 “Copy Movie” rewrites up to two compatible tracks into MP4 or MOV with the original access units, timing,
 authored edits, and supported visual metadata. This includes HLG and Dolby Vision configuration on the

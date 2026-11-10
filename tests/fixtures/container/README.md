@@ -11,7 +11,8 @@ FFmpeg is a fixture-generation and interoperability tool for these tests.
 - `mkv-avc-aac.mkv` carries H.264 Main with reordered video, mono AAC-LC, and Cues.
 - `webm-vp8-opus.webm` carries VP8 and Opus with Cues and final discard padding.
 - `webm-vp9-opus.webm` carries VP9 and Opus with pre-skip, seek preroll, and final discard padding.
-- `webm-opus.webm` carries audio-only Opus with frequent Cues for testing preroll across Cluster boundaries.
+- `webm-opus.webm` carries 247200 audible mono samples at 48 kHz with frequent Cues for testing preroll across
+  Cluster boundaries. Its 258 coded packets each represent 960 samples, with 312 initial and 168 trailing samples trimmed.
 
 ```sh
 ffmpeg -f lavfi -i testsrc2=size=64x48:rate=12:duration=0.5 \
@@ -51,12 +52,37 @@ ffmpeg -f lavfi -i sine=sample_rate=48000:duration=5.15 \
 - `preview-opus.ogg`, `preview-flac.flac`, and `preview-mp3.mp3` use generated sine waves.
   The Ogg end granule is 107496 at 48 kHz with a pre-skip of 120 samples. FLAC and MP3 both represent
   50142 audible samples at 44.1 kHz. The MP3 uses the LAME VBR header.
+- `opus-link.ogg` is a second 48 kHz stereo link with 2.5 ms packets, a 120-sample pre-skip, and 34224
+  audible samples. The preview test remuxes it with zero pre-skip, appends it to `preview-opus.ogg`, and verifies
+  playback across the link boundary, repeated seeks, and the signal in the first packet of the second link.
+- `streaming-opus.webm` has no duration or Cues. It carries 38 960-sample stereo packets at 48 kHz, with
+  120 samples of pre-skip and 480 of end trim. The preview test checks sequential playback and 35880 WAV samples.
+- `tagged-flac.flac` and `tagged-mp3.mp3` carry the same audio as the untagged samples and contain UTF-8 or
+  UTF-16 text and a front cover. FLAC includes a native seek point. The tests compare every compressed frame
+  before and after copying and verify that WAV readback contains exactly 50142 samples.
 
 ```sh
 ffmpeg -f lavfi -i sine=sample_rate=48000:duration=2.237 -c:a opus -strict experimental -ac 2 -b:a 48k preview-opus.ogg
 ffmpeg -f lavfi -i sine=sample_rate=44100:duration=1.137 -c:a flac -ac 2 preview-flac.flac
 ffmpeg -f lavfi -i sine=sample_rate=44100:duration=1.137 -c:a pcm_s16le -ac 2 audio.wav
 lame -V 4 audio.wav preview-mp3.mp3
+ffmpeg -f lavfi -i 'sine=frequency=700:sample_rate=48000:duration=0.713' \
+  -ac 2 -c:a opus -strict experimental -opus_delay 2.5 -b:a 48k opus-link.ogg
+ffmpeg -f lavfi -i 'sine=frequency=500:sample_rate=48000:duration=0.75' \
+  -ac 2 -c:a opus -strict experimental -b:a 48k -live 1 -f webm streaming-opus.webm
+```
+
+To recreate the tagged files, use a small PNG as `audio-cover.png`.
+
+```sh
+cp preview-flac.flac tagged-flac.flac
+metaflac --set-tag='TITLE=试听 Café' --set-tag='ARTIST=Lib-Media' --set-tag='ALBUM=Audio Fixtures' \
+  --set-tag='TRACKNUMBER=2/12' --set-tag='GENRE=Test' --set-tag='DATE=2026' --add-seekpoint=23040 \
+  --import-picture-from='3|image/png|||audio-cover.png' tagged-flac.flac
+ffmpeg -i preview-mp3.mp3 -i audio-cover.png -map 0:a -map 1:v -c copy -id3v2_version 3 \
+  -metadata 'title=试听 Café' -metadata 'artist=Lib-Media' -metadata 'album=Audio Fixtures' \
+  -metadata 'track=2/12' -metadata 'genre=Test' -metadata 'date=2026' \
+  -metadata:s:v 'comment=Cover (front)' -disposition:v attached_pic tagged-mp3.mp3
 ```
 
 ```sh

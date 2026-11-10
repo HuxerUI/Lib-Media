@@ -68,7 +68,7 @@ template<class T> using CodecResult = Result<T, CodecError>;
 /// retained output to let pending input advance when the output pool is full.
 ///
 /// Decoders require at least two input slots and a positive input byte limit. Audio decoding requires four output
-/// slots sized for 1024 samples per channel. Video requires 34 output slots sized for the coded bounds and 4:2:0 planes.
+/// slots sized for the largest access unit of the configured codec. Video requires 34 output slots sized for the coded bounds and 4:2:0 planes.
 /// Count one byte per coded luma sample and two bytes per subsampled chroma position for each video slot.
 /// Both output limits must accommodate the required slots. Platform codec and adapter scratch allocations are separate.
 /// AudioEncoderConfig and VideoEncoderConfig specify their respective input and compressed output minimums.
@@ -87,15 +87,17 @@ struct QueueLimits {
   std::size_t output_bytes = 192 * 1024 * 1024;
 };
 
-/// @brief Configuration for decoding raw AAC-LC access units to CPU PCM.
+/// @brief Configuration for decoding complete compressed audio access units to CPU PCM.
 ///
-/// Supply AAC-LC with 1024 samples per channel per access unit and a mono or stereo layout. The decoder uses
-/// the stream's sample rate and channel layout. Choose PCM packing and sample representation in output.
+/// The decoder preserves the stream's mono or stereo layout and sample rate. Opus uses a 48 kHz output clock.
+/// Choose PCM packing and sample representation in output. Apply container trim and seek preroll to the
+/// decoded timeline. Use Probe() to check the selected codec and stream configuration on the current platform.
 /// @see AudioDecoder::Create(), AudioDecoder::Probe()
 struct AudioDecoderConfig {
-  /// Two-byte MPEG-4 AudioSpecificConfig for the raw AAC-LC access units supplied to TrySubmit().
+  /// Two-byte AudioSpecificConfig for AAC-LC, OpusHead for Opus, or the 34-byte STREAMINFO payload for FLAC.
+  /// Leave empty for MPEG Layer III, whose complete frames carry their own configuration.
   Bytes initialization_data;
-  /// Requested PCM format. Set the sample rate and channel layout to match initialization_data.
+  /// Requested PCM format. Set the sample rate and channel layout to match the compressed stream.
   /// S16 and F32 are available with either interleaved or planar packing, subject to backend support.
   AudioFormat output;
   /// Retained input and output bounds. See QueueLimits for the audio minimum and byte accounting.
@@ -112,6 +114,8 @@ struct AudioDecoderConfig {
   /// any decoding error. Platform work that cannot safely be retired leaves it pending.
   /// Retained CPU frames remain readable and do not delay completion. The callback must return promptly and not throw.
   std::function<void(CodecResult<void>)> cleanup_completed;
+  /// Coding of the configuration and access units. Use Aac, Opus, Flac, or Mp3.
+  CodecId codec = CodecId::Aac;
 };
 
 /// @brief Configuration for decoding length-prefixed video access units to CPU YUV.
@@ -221,7 +225,7 @@ struct CodecVideoLimits {
   std::optional<CodecUIntRange> bitrate;
 };
 
-/// @brief Discovery snapshot for the current AAC-LC decoder adapter.
+/// @brief Discovery snapshot for an audio codec on the current adapter.
 ///
 /// Availability describes discovery of a suitable component, not successful decoding or a resource reservation.
 /// Library limits and platform limits are separate: an absent platform bound must not be replaced by a library
@@ -241,7 +245,7 @@ struct AudioDecoderCapabilities {
   std::vector<CodecCapability<AudioPacking>> packings;
   /// Candidate channel layouts; decoding preserves the stream's channel layout.
   std::vector<CodecCapability<AudioChannelLayout>> channel_layouts;
-  /// Candidate AAC sample rates; decoding preserves the stream's rate.
+  /// Candidate PCM sample rates; Opus uses 48 kHz.
   std::vector<CodecCapability<std::uint32_t>> sample_rates;
   /// Fixed bounds imposed by this library.
   CodecAudioLimits library_limits;
@@ -508,7 +512,7 @@ using AudioEncodeOutput = std::variant<AudioEncodeFormat, EncodedPacket, AudioEn
 /// @see VideoEncoder::TryRead(), VideoEncodeFormat
 using VideoEncodeOutput = std::variant<VideoEncodeFormat, EncodedPacket, EndOfStream>;
 
-/// @brief Move-only AAC-LC decoder with bounded queues and independently retained CPU output.
+/// @brief Move-only AAC-LC, Opus, FLAC, or MP3 decoder with bounded queues and independently retained PCM output.
 ///
 /// The returned handle owns the session. On desktop and mobile platforms, queue and control calls may run concurrently on a live
 /// handle. On Web, use the JavaScript event loop that created the session. Move or destroy a handle only after its
@@ -551,6 +555,12 @@ public:
   /// @see AudioDecoderCapabilities, Probe(), CodecSupport
   static void QueryCapabilities(std::function<void(CodecResult<AudioDecoderCapabilities>)> completion);
 
+  /// @brief Checks for a decoder using a representative configuration of the requested audio codec.
+  /// @param codec Aac, Opus, Flac, or Mp3. Aac uses the platform discovery query above.
+  /// @param completion Optional callback with the delivery and lifetime contract of the AAC query above.
+  /// A rejected reference configuration leaves availability unknown. Use Probe() for the actual stream and PCM format.
+  static void QueryCapabilities(CodecId codec, std::function<void(CodecResult<AudioDecoderCapabilities>)> completion);
+
   /// @brief Transfers ownership of the session and its callbacks. The source handle then behaves as closed.
   AudioDecoder(AudioDecoder&&) noexcept;
   /// @brief Retires the destination's previous session and takes ownership of the source session.
@@ -562,7 +572,7 @@ public:
   /// @brief Retires the session as in Close(). Internal state remains alive through asynchronous teardown.
   ~AudioDecoder();
 
-  /// @brief Queues one raw AAC access unit without waiting for platform decoding.
+  /// @brief Queues one complete audio access unit without waiting for platform decoding.
   /// @param packet Complete access unit with a nonempty payload and valid timing. Submit packets in decode order
   /// with nondecreasing PTS and keep the bytes unchanged until the call returns.
   /// @return Accepted after copying the packet. WouldBlock leaves it unconsumed while startup or reset is pending

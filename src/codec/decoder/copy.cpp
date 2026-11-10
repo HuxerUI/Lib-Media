@@ -8,7 +8,45 @@
 #include <type_traits>
 
 namespace huxerui::media::detail {
-CodecResult<AudioFrame> CopyAudio(const AudioFrame& source, AudioFormat requested) {
+
+PcmPackets::PcmPackets(AudioFormat format, unsigned packet_samples, unsigned decoder_delay)
+    : format_(format), packet_samples_(packet_samples),
+      stride_(format.BytesPerSample() * (format.packing == AudioPacking::Planar ? 1 : format.ChannelCount())),
+      leading_(decoder_delay),
+      planes_(format.packing == AudioPacking::Planar ? format.ChannelCount() : 1) {}
+
+CodecResult<void> PcmPackets::Append(const AudioFrame& frame, bool trim_drain_padding) {
+  const auto skip = std::min(leading_, frame.sample_count);
+  const auto available = pending_.size() * packet_samples_ - samples_;
+  auto count = frame.sample_count - skip;
+  if (trim_drain_padding && count > available) count = static_cast<unsigned>(available);
+  if (frame.format != format_ || !frame.Validate() ||
+      count > 3 * packet_samples_ - samples_ || count > available)
+    return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidData, "Unexpected PCM outside accepted packet boundaries"));
+  for (std::size_t i = 0; i < planes_.size(); ++i) {
+    const auto bytes = frame.planes[i].AsBytes().subspan(std::size_t(skip) * stride_, std::size_t(count) * stride_);
+    planes_[i].insert(planes_[i].end(), bytes.begin(), bytes.end());
+  }
+  leading_ -= skip;
+  samples_ += count;
+  return CodecResult<void>::Success();
+}
+
+std::optional<AudioFrame> PcmPackets::Read() {
+  if (pending_.empty() || samples_ < packet_samples_) return {};
+  AudioFrame frame{format_, pending_.front(), packet_samples_, {}};
+  const auto bytes = std::size_t(packet_samples_) * stride_;
+  for (auto& plane : planes_) {
+    const auto end = plane.begin() + bytes;
+    frame.planes.push_back(Own(Bytes(plane.begin(), end)));
+    plane.erase(plane.begin(), end);
+  }
+  pending_.pop_front();
+  samples_ -= packet_samples_;
+  return frame;
+}
+
+CodecResult<AudioFrame> CopyAudio(const AudioFrame& source, AudioFormat requested, float gain) {
   if (!source.Validate() || source.format.sample_rate != requested.sample_rate
       || source.format.channel_layout != requested.channel_layout)
     return CodecResult<AudioFrame>::Failure(Error(CodecErrorCode::InvalidData, "Invalid platform PCM format"));
@@ -23,6 +61,7 @@ CodecResult<AudioFrame> CopyAudio(const AudioFrame& source, AudioFormat requeste
       float value;
       if (source.format.sample_format == AudioSampleFormat::F32) std::memcpy(&value, input, sizeof(value));
       else { std::int16_t integer; std::memcpy(&integer, input, sizeof(integer)); value = integer / 32768.0f; }
+      value *= gain;
       auto* output = storage[count == 1 ? 0 : channel].data() + (count == 1 ? sample * channels + channel : sample) * bytes;
       if (requested.sample_format == AudioSampleFormat::F32) std::memcpy(output, &value, sizeof(value));
       else {

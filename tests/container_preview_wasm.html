@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lib-Media Web audio packet copy test</title>
+<pre id="out">Running audio packet copy…</pre>
+<script type="module">
+import create from './media_container_preview_tests.js';
+const output = document.querySelector('pre');
+const log = line => { output.textContent += '\n' + line; };
+try {
+  await create({print: log, printErr: log});
+} catch (error) { log('FAIL: ' + error.message); }
+</script>

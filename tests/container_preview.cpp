@@ -7,10 +7,15 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 using namespace huxerui;
 using namespace huxerui::media;
@@ -148,7 +153,11 @@ void Until(testing::UiTest& ui, const std::exception_ptr& failure, Condition con
   while (!condition() && std::chrono::steady_clock::now() < deadline) {
     if (failure) std::rethrow_exception(failure);
     ui.Pump(4ms);
+#ifdef __EMSCRIPTEN__
+    emscripten_sleep(1);
+#else
     std::this_thread::sleep_for(2ms);
+#endif
   }
   if (failure) std::rethrow_exception(failure);
   Check(condition(), error);
@@ -239,15 +248,140 @@ void CheckCopy(const File& source, const File& output, ContainerFormat format) {
   }
 }
 
+void CheckAudioCopy(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+  struct CopyResult {
+    std::shared_ptr<const File> file;
+    bool dispatched_during_copy = false;
+  };
+  const auto result = std::make_shared<CopyResult>();
+  std::exception_ptr failure;
+  const auto copying = tasks.Launch([&]() -> Task<void> {
+    try {
+      tasks.Post([result] { result->dispatched_during_copy = !result->file; });
+      result->file = co_await media_preview::CopyAudioClip(Fixture("tagged-mp3.mp3"), temporary);
+    } catch (...) { failure = std::current_exception(); }
+  });
+  Until(ui, failure, [&] { return bool(result->file); }, "Audio packet copy did not complete");
+#ifdef __EMSCRIPTEN__
+  Check(result->dispatched_during_copy, "Audio packet copy occupied the Web event loop until completion");
+#endif
+  auto copy = media_preview::Open(*result->file);
+  const auto tracks = copy.Tracks();
+  const auto& tags = tracks.front().audio_metadata;
+  Check(copy.Format() == ContainerFormat::Mp3 && copy.Duration() == MediaTimestamp{50142, 44100} &&
+        tags && tags->cover, "Audio packet copy lost timing or cover metadata");
+  std::size_t packets = 0;
+  while (Require(copy.Read())) ++packets;
+  Check(packets == 45, "Audio packet copy changed the number of frames");
+}
+
+void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+  const auto link = media_preview::TemporaryFile(temporary, ".ogg");
+  auto source = media_preview::Open(*Fixture("opus-link.ogg"));
+  auto track = source.Tracks().front();
+  const auto pre_skip = track.priming_samples.value();
+  track.priming_samples = 0;
+  track.initialization_data[10] = track.initialization_data[11] = std::byte{};
+  auto mux = Require(MediaMuxer::Open(Require(link->OpenWrite()), ContainerFormat::Ogg, std::span(&track, 1)));
+  while (auto item = Require(source.Read())) {
+    auto packet = std::get<ContainerPacket>(std::move(*item));
+    packet.pts->ticks += static_cast<std::int64_t>(pre_skip);
+    Check(!Require(mux.TryWrite(packet)), "Zero-pre-skip link requested another track");
+  }
+  Require(mux.Finish());
+  const auto chain = media_preview::TemporaryFile(temporary, ".ogg");
+  auto links = Require(Fixture("preview-opus.ogg")->ReadBytes());
+  const auto next = Require(link->ReadBytes());
+  links.insert(links.end(), next.begin(), next.end());
+  Check(chain->WriteBytes(links), "Could not stage the chained audio fixture");
+  const auto streaming = Fixture("streaming-opus.webm");
+  auto no_index = media_preview::Open(*streaming);
+  const auto unavailable = no_index.FindSeekPoint(1, {0, 1});
+  Check(!no_index.Duration() && !unavailable.Succeeded() && unavailable.Error().code == ContainerErrorCode::IndexUnavailable,
+        "Streaming WebM unexpectedly has a duration or seek index");
+  struct Sample {
+    std::shared_ptr<const File> file;
+    MediaTimestamp duration;
+  };
+  const std::array samples{
+      Sample{chain, {107376 + 34344, 48000}},
+      Sample{Fixture("webm-opus.webm"), {247200, 48000}},
+      Sample{streaming, {35880, 48000}},
+      Sample{Fixture("tagged-flac.flac"), {50142, 44100}},
+      Sample{Fixture("tagged-mp3.mp3"), {50142, 44100}}};
+  for (const auto& sample : samples) {
+    float position = 0;
+    float duration = 0;
+    std::optional<float> seek;
+    std::exception_ptr failure;
+    const auto playing = tasks.Launch([&]() -> Task<void> {
+      try {
+        co_await media_preview::PlayAudio(sample.file, {
+            .paused = [] { return false; }, .take_seek = [&] { return std::exchange(seek, std::nullopt); },
+            .position = [&](float at, float end) { position = at; duration = end; },
+        });
+      } catch (...) { failure = std::current_exception(); }
+    });
+    Until(ui, failure, [&] { return position > 0.03F; }, "Audio preview did not advance its PCM clock");
+    if (sample.file == streaming) {
+      Check(duration == 0, "Streaming WebM reported a known duration");
+    } else {
+      Check(std::abs(duration - media_preview::Seconds(sample.duration)) < 0.01F, "Wrong audio preview duration");
+      if (sample.file == chain)
+        Until(ui, failure, [&] { return position > 2.28F; }, "PCM playback stopped at the zero-pre-skip link");
+      for (float target : {duration * 0.85F, 0.15F, duration * 0.6F}) {
+        seek = target;
+        Until(ui, failure, [&] { return !seek && position > target + 0.015F && position < target + 0.2F; },
+              "Audio preview did not resume from the requested seek position");
+      }
+    }
+    playing.Cancel();
+    ui.Pump();
+    std::shared_ptr<const File> wave;
+    const auto exporting = tasks.Launch([&]() -> Task<void> {
+      try { wave = co_await media_preview::ExportWave(sample.file, temporary); }
+      catch (...) { failure = std::current_exception(); }
+    });
+    Until(ui, failure, [&] { return bool(wave); }, "Audio preview could not export a WAV");
+    auto output = media_preview::Open(*wave);
+    Check(output.Format() == ContainerFormat::Wave && output.Duration() == sample.duration &&
+          output.Tracks().front().codec == CodecId::PcmS16Le,
+          "Audio WAV readback lost PCM samples or trim");
+    if (sample.file == chain) {
+      Check(Require(output.Seek(1, {107376, 48000})).has_value(), "Could not read the second link's first samples");
+      Check(std::holds_alternative<MediaTrack>(Require(output.Read()).value()), "WAV seek lost its description");
+      const auto packet = std::get<ContainerPacket>(Require(output.Read()).value());
+      const auto pcm = packet.data.AsBytes().first(120 * 2 * sizeof(std::int16_t));
+      int peak = 0;
+      for (std::size_t i = 0; i < pcm.size(); i += sizeof(std::int16_t)) {
+        std::int16_t value;
+        std::memcpy(&value, pcm.data() + i, sizeof(value));
+        peak = std::max(peak, std::abs(int(value)));
+      }
+      Check(peak > 500, "The first packet of the zero-pre-skip link lost its decoded signal");
+    }
+    exporting.Cancel();
+  }
+}
+
 } // namespace
 
+#ifdef __EMSCRIPTEN__
+int main() {
+#else
 int main(int argc, char** argv) {
+#endif
   try {
     TaskScope tasks;
     const Application app([] { return View{}; }, {
         .application_hooks = {[&](ApplicationContext&) { tasks = UseApplicationTaskScope(); }},
     });
     testing::UiTest ui(app);
+    const File temporary(std::filesystem::temp_directory_path().u8string());
+    CheckAudioCopy(tasks, ui, temporary);
+#ifdef __EMSCRIPTEN__
+    std::cout << "Web audio packet copy yielded and preserved its output\n";
+#else
     const auto mp4 = Fixture("preview-avc-aac.mp4");
     std::exception_ptr failure;
     Observations seen;
@@ -282,7 +416,6 @@ int main(int argc, char** argv) {
     preview.Cancel();
     ui.Pump();
 
-    const File temporary(std::filesystem::temp_directory_path().u8string());
     const auto edited = EditedClip(*mp4, temporary);
     seen = {};
     preview = Play(tasks, edited, seen, failure);
@@ -353,10 +486,12 @@ int main(int argc, char** argv) {
     }
     const auto hdr_copy = run_export(hlg, ContainerFormat::Mp4);
     CheckCopy(*hlg, *hdr_copy, ContainerFormat::Mp4);
+    CheckAudioPreview(tasks, ui, temporary);
     if (argc >= 2) Check(output->CopyTo(File(argv[1]), true), "Cannot retain export for independent validation");
     if (argc >= 3) Check(reordered->CopyTo(File(argv[2]), true), "Cannot retain reordered export");
     if (argc >= 4) Check(hdr_copy->CopyTo(File(argv[3]), true), "Cannot retain HDR packet copy");
     std::cout << "MP4 seek, presentation edits, B-picture export, and MOV metadata copy passed\n";
+#endif
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

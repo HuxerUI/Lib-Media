@@ -13,6 +13,8 @@ using CapabilityCompletion = std::function<void(CapabilityResult)>;
 // Candidates and library bounds come from the existing codec contracts; platform evidence starts unknown.
 CapabilitySnapshot DefaultCapabilities(CapabilityKind kind);
 void SetUnavailable(CapabilitySnapshot& snapshot, std::string diagnostic);
+CodecResult<AudioDecoderCapabilities> ApplyAudioDecoderProbe(
+    AudioDecoderCapabilities snapshot, std::uint32_t sample_rate, CodecResult<void> result);
 
 template<class T> void SetSupport(std::vector<CodecCapability<T>>& values, CodecSupport support) {
   for (auto& value : values) value.support = support;

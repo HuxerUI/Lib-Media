@@ -16,15 +16,33 @@ public:
   CodecResult<void> Open(const DecoderConfig& config) override {
     config_ = config;
     const auto* audio = std::get_if<AudioDecoderConfig>(&config_);
-    codec_ = AMediaCodec_createDecoderByType(audio ? "audio/mp4a-latm" : "video/avc");
+    const char* mime = "video/avc";
+    if (audio) {
+      switch (audio->codec) {
+        case CodecId::Aac: mime = "audio/mp4a-latm"; break;
+        case CodecId::Opus: mime = "audio/opus"; break;
+        case CodecId::Flac: mime = "audio/flac"; break;
+        case CodecId::Mp3: mime = "audio/mpeg"; break;
+        default: return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Unsupported Android audio codec"));
+      }
+    }
+    codec_ = AMediaCodec_createDecoderByType(mime);
     if (!codec_) return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "No Android decoder for this MIME type"));
     auto* format = AMediaFormat_new();
-    AMediaFormat_setString(format, "mime", audio ? "audio/mp4a-latm" : "video/avc");
+    AMediaFormat_setString(format, "mime", mime);
     if (audio) {
+      audio_sample_limit_ = AudioSampleLimit(*audio).Value();
+      if (audio->codec == CodecId::Mp3) mp3_.emplace(audio->output, audio_sample_limit_);
       AMediaFormat_setInt32(format, "sample-rate", audio->output.sample_rate);
       AMediaFormat_setInt32(format, "channel-count", audio->output.ChannelCount());
-      AMediaFormat_setInt32(format, "pcm-encoding", 2);
-      AMediaFormat_setBuffer(format, "csd-0", audio->initialization_data.data(), audio->initialization_data.size());
+      AMediaFormat_setInt32(format, "pcm-encoding", audio->output.sample_format == AudioSampleFormat::F32 ? 4 : 2);
+      const auto header = AudioDecoderHeader(*audio);
+      if (!header.empty()) AMediaFormat_setBuffer(format, "csd-0", header.data(), header.size());
+      if (audio->codec == CodecId::Opus) {
+        const std::uint64_t delay = 0;
+        AMediaFormat_setBuffer(format, "csd-1", &delay, sizeof(delay));
+        AMediaFormat_setBuffer(format, "csd-2", &delay, sizeof(delay));
+      }
     } else {
       const auto& video = std::get<VideoDecoderConfig>(config_);
       AMediaFormat_setInt32(format, "width", video.width);
@@ -58,12 +76,17 @@ public:
       if (!result.Succeeded()) return CodecResult<SubmitStatus>::Failure(result.Error());
       converted = std::move(result).Value(); bytes = converted;
     }
-    return Queue(bytes, packet.pts.Rescale(1000000)->ticks, packet.key_frame ? AMEDIACODEC_BUFFER_FLAG_KEY_FRAME : 0);
+    auto queued = Queue(bytes, packet.pts.Rescale(1000000)->ticks, packet.key_frame ? AMEDIACODEC_BUFFER_FLAG_KEY_FRAME : 0);
+    if (mp3_ && queued.Succeeded() && queued.Value() == SubmitStatus::Accepted) mp3_->Expect(packet.pts);
+    return queued;
   }
   CodecResult<std::optional<BackendOutput>> Poll() override {
     using R = CodecResult<std::optional<BackendOutput>>;
     if (eos_) return R::Success(std::nullopt);
-    if (pending_eos_) { eos_ = true; return R::Success(BackendOutput{EndOfStream{}}); }
+    if (mp3_) {
+      if (auto frame = mp3_->Read()) return R::Success(BackendOutput{DecodedFrame{std::move(*frame)}});
+    }
+    if (pending_eos_) return EndOutput();
     AMediaCodecBufferInfo info{};
     const auto index = AMediaCodec_dequeueOutputBuffer(codec_, &info, 0);
     if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER || index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) return R::Success(std::nullopt);
@@ -90,8 +113,8 @@ public:
     if (status != AMEDIA_OK) return R::Failure(AndroidError(status, "MediaCodec output release failed"));
     if (!result.Succeeded()) return result;
     if (info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
-      if (result.Value()) pending_eos_ = true;
-      else { eos_ = true; return R::Success(BackendOutput{EndOfStream{}}); }
+      pending_eos_ = true;
+      if (!result.Value()) return EndOutput();
     }
     return result;
   }
@@ -113,6 +136,14 @@ public:
     return error ? CodecResult<void>::Failure(*error) : CodecResult<void>::Success();
   }
 private:
+  CodecResult<std::optional<BackendOutput>> EndOutput() {
+    using R = CodecResult<std::optional<BackendOutput>>;
+    if (mp3_ && !mp3_->Drained())
+      return R::Failure(Error(CodecErrorCode::InvalidData, "MediaCodec MP3 drain has missing PCM samples"));
+    eos_ = true;
+    return R::Success(BackendOutput{EndOfStream{}});
+  }
+
   int Get(const char* key, int fallback) const {
     std::int32_t value;
     return format_ && AMediaFormat_getInt32(format_, key, &value) ? value : fallback;
@@ -145,9 +176,16 @@ private:
       if (encoding != 2 && encoding != 4) return R::Failure(Error(CodecErrorCode::Unsupported, "Unsupported MediaCodec PCM sample format"));
       format.sample_format = encoding == 4 ? AudioSampleFormat::F32 : AudioSampleFormat::S16;
       const auto stride = format.BytesPerSample() * format.ChannelCount();
-      if (bytes.size() % stride || bytes.size() / stride > 1024) return R::Failure(Error(CodecErrorCode::InvalidData, "Unexpected AAC output sample count"));
+      if (bytes.size() % stride || bytes.size() / stride > audio_sample_limit_ * (mp3_ ? 2 : 1))
+        return R::Failure(Error(CodecErrorCode::InvalidData, "Unexpected MediaCodec PCM sample count"));
       auto copied = CopyAudio({format, pts, static_cast<std::uint32_t>(bytes.size() / stride), {data}}, audio->output);
       if (!copied.Succeeded()) return R::Failure(copied.Error());
+      if (mp3_) {
+        const auto buffered = mp3_->Append(copied.Value());
+        if (!buffered.Succeeded()) return R::Failure(buffered.Error());
+        if (auto frame = mp3_->Read()) return R::Success(BackendOutput{DecodedFrame{std::move(*frame)}});
+        return R::Success(std::nullopt);
+      }
       return R::Success(BackendOutput{DecodedFrame{std::move(copied).Value()}});
     }
     const auto& config = std::get<VideoDecoderConfig>(config_);
@@ -185,6 +223,8 @@ private:
   DecoderConfig config_;
   AMediaCodec* codec_ = nullptr;
   AMediaFormat* format_ = nullptr;
+  unsigned audio_sample_limit_ = 0;
+  std::optional<PcmPackets> mp3_;
   unsigned length_size_ = 4;
   bool started_ = false, eos_ = false, pending_eos_ = false;
 };

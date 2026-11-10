@@ -2,6 +2,8 @@
 
 #include "container_io.h"
 
+#include <array>
+
 namespace huxerui::media::detail {
 
 struct AudioPacket {
@@ -10,6 +12,25 @@ struct AudioPacket {
   bool restartable = true;
 };
 
+struct AudioTag {
+  std::string_view flac, id3;
+  std::string MediaAudioMetadata::*field;
+};
+
+inline constexpr std::array AudioTags{
+    AudioTag{"TITLE", "TIT2", &MediaAudioMetadata::title},
+    AudioTag{"ARTIST", "TPE1", &MediaAudioMetadata::artist},
+    AudioTag{"ALBUM", "TALB", &MediaAudioMetadata::album},
+    AudioTag{"TRACKNUMBER", "TRCK", &MediaAudioMetadata::track_number},
+    AudioTag{"GENRE", "TCON", &MediaAudioMetadata::genre},
+    AudioTag{"DATE", "TDRC", &MediaAudioMetadata::date}};
+inline constexpr std::size_t MaxAudioText = 64 * 1024;
+
+bool HasAudioMetadata(const MediaAudioMetadata& metadata);
+bool IsCoverMime(std::string_view mime);
+void ValidateAudioMetadata(const MediaAudioMetadata& metadata);
+void ValidateAudioPacketTime(const ContainerPacket& packet, std::int64_t start, unsigned samples, unsigned rate);
+
 // FLAC and MPEG audio frames carry their sample count and are stored in timeline order.
 class FramedAudioReader : public ContainerReader {
 public:
@@ -17,10 +38,13 @@ public:
 
   std::optional<DemuxItem> Read() override;
   std::optional<SeekPoint> Find(std::uint32_t, MediaTimestamp target, SeekDirection direction, bool seek) override;
+  std::optional<MediaPresentationRange> PresentationRange(std::size_t) const override;
 
 protected:
   virtual std::optional<AudioPacket> ReadFrame(std::int64_t position) = 0;
   void Begin(MediaTrack track, std::optional<std::uint64_t> coded_samples = {});
+  std::uint64_t FirstFrameOffset() const { return first_; }
+  void SeekFrame(std::uint64_t offset, std::int64_t samples);
 
 private:
   struct Entry {

@@ -8,9 +8,10 @@ record current support. Each planned capability has its own format, direction, p
 
 | Order | Work | Acceptance |
 | --- | --- | --- |
-| Current | Track presentation intervals, local fMP4 seek, MP4/MOV packet copy and reordered export | macOS passes fixture integration and independent B-picture readback. Android 12 hardware and iOS Simulator pass headless FFmpeg-generated fMP4 seek and HLG HEVC MOV-to-MP4 copy with identical access units and supported metadata. iOS Simulator decodes SDR Main10 MOV to P010. |
+| Current | Chained Ogg, Opus/FLAC/MP3 decoding, native audio packet copy, and WAV export | macOS and Android 12 hardware pass preview, repeated seek, packet copy, and WAV readback. Independent checks verify compressed frames, tag and cover retention, and sample counts. See the [six-platform audio matrix](media-codec.md#opus-flac-and-mp3). |
+| Delivered | Track presentation intervals, local fMP4 seek, MP4/MOV packet copy and reordered export | macOS passes fixture integration and independent B-picture readback. Android 12 hardware and iOS Simulator pass headless FFmpeg-generated fMP4 seek and HLG HEVC MOV-to-MP4 copy with identical access units and supported metadata. iOS Simulator decodes SDR Main10 MOV to P010. |
 | Remaining acceptance | iPhone camera originals and additional desktop and browser runs | On an iPhone, import a camera-original MOV, verify SDR preview and repeated seeks, then save a packet copy and check its display transform, timing and color metadata independently. Validate HDR presentation separately from metadata retention. Expand Windows, Linux and browser checks. |
-| Next audio batch | Extend the audio mappings | Ogg/Opus and native FLAC/MP3 input cover basic timing and random seek. Add chained Ogg, Opus decode and PCM playback, then extend FLAC and MPEG audio metadata, seeking and output with independent samples. |
+| Remaining audio acceptance | Expand native audio backend coverage | Check physical iOS, Linux plugins, and additional browsers. Add Windows decoder mappings when the selected transforms meet the packet and PCM timing contract. |
 
 ## File and URL playback
 
@@ -45,8 +46,8 @@ See the [decoded playback design](codec-design.md#decoded-playback-boundary) and
 - Exercise H.264 profile and B-picture controls, keyframe requests, variable frame intervals, and codec configuration
   changes. Preserve PTS, DTS, duration, and the evidence for independently decodable output. Android and Web H.264
   encoding currently omit DTS. Windows may omit DTS when variable timing makes its codec clock unsuitable.
-- Extend Apple HEVC decoding and 10-bit frame output to additional platforms, then cover HEVC encoding and Opus. Evaluate ProRes, AV1,
-  VP8/VP9, FLAC, MP3, and Vorbis by platform and direction. Add capability and configuration coverage with each codec.
+- Extend Apple HEVC decoding and 10-bit frame output to additional platforms, then cover HEVC encoding. Evaluate ProRes,
+  AV1, VP8/VP9, and Vorbis by platform and direction. Add capability and configuration coverage with each codec.
 - Extend the frame contract as needed for higher bit depths, visible region, and color and HDR information.
   Evaluate platform-frame import and zero-copy paths against measured workloads, with explicit synchronization,
   ownership, and release requirements.
@@ -76,9 +77,9 @@ capabilities before opening.
 
 | Format | Planned coverage |
 | --- | --- |
-| Ogg extensions | Vorbis, FLAC, Theora, and chained logical streams. |
-| Native FLAC extensions | Writing, metadata and cover art, and using native seek tables. |
-| MPEG audio extensions | MP3 writing and VBRI, ID3 metadata, and MP2 frame mapping. |
+| Ogg extensions | Vorbis, FLAC, Theora, and chained output. |
+| Native FLAC extensions | Multichannel decode and additional native metadata blocks. |
+| MPEG audio extensions | MP2 frame mapping and additional ID3 frames. |
 | Wave64, AIFF, AIFC, CAF | PCM and floating-point descriptions, byte order, channel layout, and file lengths. |
 | 3GP | ISO BMFF brands and supported track and codec mappings. |
 | MPEG-TS, M2TS, MTS | Programs and tracks, PES assembly, clock wrap and discontinuities, sequential I/O, and seek. |

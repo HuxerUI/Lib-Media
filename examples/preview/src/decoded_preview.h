@@ -1,6 +1,8 @@
 #pragma once
 
 #include <functional>
+#include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include <huxerui/external_texture.h>
@@ -53,13 +55,41 @@ struct ClipControls {
   std::function<bool()> paused;
   std::function<std::optional<float>()> take_seek;
   std::function<void(float position, float duration)> position;
+  std::function<void(bool can_copy, const std::optional<huxerui::media::MediaAudioMetadata>&)> audio_info;
 };
+
+template<class T, class E> T Require(huxerui::Result<T, E> result) {
+  if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
+  if constexpr (!std::is_void_v<T>) return std::move(result).Value();
+}
+
+template<class Operation> huxerui::Task<std::invoke_result_t<Operation>> OnFileThread(Operation operation) {
+#ifdef __EMSCRIPTEN__
+  co_return operation();
+#else
+  co_return co_await huxerui::RunWorker(std::move(operation));
+#endif
+}
+
+huxerui::media::MediaDemuxer Open(const huxerui::File& file);
+std::int64_t Ticks(huxerui::media::MediaTimestamp time, std::uint32_t scale);
+std::int64_t CeilTicks(huxerui::media::MediaTimestamp time, std::uint32_t scale);
+float Seconds(huxerui::media::MediaTimestamp time);
+huxerui::media::MediaTimestamp TimeAt(float seconds);
+bool TrimAudio(huxerui::media::AudioFrame& frame, huxerui::media::MediaTimestamp target,
+               std::optional<huxerui::media::MediaTimestamp> end);
+std::shared_ptr<const huxerui::File> TemporaryFile(const huxerui::File& directory, std::string_view suffix);
 
 // Staged inputs and completed exports are removed when their last owner releases them.
 huxerui::Task<std::shared_ptr<const huxerui::File>> StageClip(
     huxerui::File temporary, std::optional<huxerui::FileReference> selected,
     std::shared_ptr<huxerui::Resources> resources);
 huxerui::Task<void> PlayContainer(std::shared_ptr<const huxerui::File> file, ClipControls controls);
+huxerui::Task<void> PlayAudio(std::shared_ptr<const huxerui::File> file, ClipControls controls);
+huxerui::Task<std::shared_ptr<const huxerui::File>> CopyAudioClip(
+    std::shared_ptr<const huxerui::File> file, huxerui::File temporary);
+huxerui::Task<std::shared_ptr<const huxerui::File>> ExportWave(
+    std::shared_ptr<const huxerui::File> file, huxerui::File temporary);
 huxerui::Task<std::shared_ptr<const huxerui::File>> CopyClip(
     std::shared_ptr<const huxerui::File> file, huxerui::File temporary,
     std::optional<huxerui::media::ContainerFormat> format = {});

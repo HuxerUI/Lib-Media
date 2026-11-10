@@ -26,6 +26,8 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied presentation metadata");
     if (it->kind != TrackKind::Video && (it->pixel_aspect_ratio || !it->video_extensions.empty()))
       Fail(ContainerErrorCode::InvalidArgument, "Visual metadata requires a video track");
+    if (it->audio_metadata && format != ContainerFormat::Flac && format != ContainerFormat::Mp3)
+      Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied audio tags");
   }
   if (layout != ContainerLayout::Default && (format != ContainerFormat::Mp4 ||
       (layout != ContainerLayout::Fragmented && layout != ContainerLayout::FastStart)))
@@ -51,7 +53,11 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
       ValidateMatroska(format, tracks);
       return Requirement::SequentialWrite;
     case ContainerFormat::Flac:
-    case ContainerFormat::Mp3: break;
+      ValidateFlac(tracks);
+      return Requirement::RandomWrite;
+    case ContainerFormat::Mp3:
+      ValidateMp3(tracks);
+      return Requirement::RandomWrite;
   }
   Fail(ContainerErrorCode::Unsupported, "Unsupported output container");
 }
@@ -71,8 +77,8 @@ std::unique_ptr<ContainerWriter> OpenWriter(ContainerOutput output, ContainerFor
     case ContainerFormat::Mov: return OpenMp4Writer(std::move(output), format, tracks, layout);
     case ContainerFormat::Matroska:
     case ContainerFormat::WebM: return OpenMatroskaWriter(std::move(output), format, tracks);
-    case ContainerFormat::Flac:
-    case ContainerFormat::Mp3: break;
+    case ContainerFormat::Flac: return OpenFlacWriter(std::move(output), tracks);
+    case ContainerFormat::Mp3: return OpenMp3Writer(std::move(output), tracks);
   }
   Fail(ContainerErrorCode::Unsupported, "Unsupported output container");
 }

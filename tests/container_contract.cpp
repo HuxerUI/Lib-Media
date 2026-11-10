@@ -423,18 +423,78 @@ void AudioFormats(const fs::path& directory) {
   links.insert(links.end(), next_link.begin(), next_link.end());
   const auto chained = Path(directory / "chained.ogg");
   Check(chained.WriteBytes(links), "Could not write chained Ogg input");
+  const auto boundary = MediaTimestamp{107376, 48000};
+  const auto second_duration = reopened.Duration()->Rescale(48000)->ticks;
   for (const bool random : {false, true}) {
     auto reader = random ? Take(MediaDemuxer::Open(Take(chained.OpenRandomAccess())))
                          : Take(MediaDemuxer::Open(Take(chained.OpenRead())));
-    auto item = reader.Read();
-    while (item.Succeeded() && item.Value()) item = reader.Read();
-    Check(!item.Succeeded() && item.Error().code == ContainerErrorCode::Unsupported,
-          "Chained Ogg input was treated as clean EOF");
+    unsigned descriptions = 0;
+    std::optional<MediaTimestamp> next_start;
+    while (auto item = Take(reader.Read())) {
+      if (const auto* track = std::get_if<MediaTrack>(&*item)) {
+        ++descriptions;
+        next_start = {boundary.ticks - static_cast<std::int64_t>(*track->priming_samples), 48000};
+      } else if (next_start) {
+        Check(std::get<ContainerPacket>(*item).pts == next_start, "Second Ogg link lost its leading trim or offset");
+        next_start.reset();
+      }
+    }
+    Check(descriptions == 1 && reader.Duration() == MediaTimestamp{boundary.ticks + second_duration, 48000},
+          "Chained Ogg did not expose both links on one presentation timeline");
   }
   auto indexed = Take(MediaDemuxer::Open(Take(chained.OpenRandomAccess())));
-  const auto point = indexed.FindSeekPoint(1, {1, 1});
-  Check(!point.Succeeded() && point.Error().code == ContainerErrorCode::Unsupported,
-        "Chained Ogg input produced an index for only the first stream");
+  const auto first_config = indexed.Tracks().front().initialization_data;
+  const auto second_config = reopened.Tracks().front().initialization_data;
+  const auto next = Take(indexed.FindSeekPoint(1, boundary));
+  Check(next && next->byte_offset >= links.size() - next_link.size() && indexed.Tracks().front().initialization_data == first_config,
+        "Ogg link index query changed the active description");
+  Check(std::holds_alternative<ContainerPacket>(*Take(indexed.Read())), "Ogg index query moved the read cursor");
+  for (auto target : {boundary, MediaTimestamp{1, 1}, MediaTimestamp{3, 1}, boundary}) {
+    const auto point = Take(indexed.Seek(1, target));
+    const bool second = target.Compare(boundary) >= 0;
+    Check(point && point->decode_start && (second == (*point->byte_offset >= links.size() - next_link.size())),
+          "Ogg seek landed in the wrong link");
+    const auto track = std::get<MediaTrack>(*Take(indexed.Read()));
+    const auto packet = std::get<ContainerPacket>(*Take(indexed.Read()));
+    Check(track.initialization_data == (second ? second_config : first_config) && packet.pts == point->decode_start,
+          "Ogg seek replayed the wrong link or preroll");
+  }
+
+  for (const auto format : {ContainerFormat::Flac, ContainerFormat::Mp3}) {
+    const bool flac = format == ContainerFormat::Flac;
+    const auto input = Path(fixtures / (flac ? "tagged-flac.flac" : "tagged-mp3.mp3"));
+    const auto copy = Path(directory / (flac ? "copy.flac" : "copy.mp3"));
+    auto audio = Take(MediaDemuxer::Open(Take(input.OpenRandomAccess())));
+    const auto track = audio.Tracks().front();
+    const auto& tags = track.audio_metadata;
+    Check(tags && tags->title == "试听 Café" && tags->artist == "Lib-Media" && tags->album == "Audio Fixtures" &&
+          tags->track_number == "2/12" && tags->cover && tags->cover->mime_type == "image/png",
+          "Audio tags or front cover were not exposed");
+    Check(Take(MediaMuxer::ValidateOutput(format, audio.Tracks())) == MediaMuxer::OutputRequirement::RandomWrite,
+          "Native audio copy must request random writes");
+    auto mux = Take(MediaMuxer::Open(Output(directory / (flac ? "copy.flac" : "copy.mp3")), format, audio.Tracks()));
+    std::vector<ContainerPacket> packets;
+    while (auto item = Take(audio.Read())) {
+      packets.push_back(std::get<ContainerPacket>(std::move(*item)));
+      Check(!Take(mux.TryWrite(packets.back())), "Single-track audio output requested another packet");
+    }
+    Take(mux.Finish());
+    auto readback = Take(MediaDemuxer::Open(Take(copy.OpenRandomAccess())));
+    const auto descriptions = readback.Tracks();
+    const auto& metadata = descriptions.front().audio_metadata;
+    Check(readback.Duration() == audio.Duration() && metadata && metadata->title == tags->title &&
+          metadata->artist == tags->artist && metadata->album == tags->album && metadata->cover &&
+          std::ranges::equal(metadata->cover->data.AsBytes(), tags->cover->data.AsBytes()), "Audio copy lost metadata or trim");
+    for (const auto& packet : packets) Compare(std::get<ContainerPacket>(*Take(readback.Read())), packet);
+    Check(!Take(readback.Read()), "Audio copy added an access unit");
+    for (const auto target : {MediaTimestamp{1, 1}, MediaTimestamp{1, 5}, MediaTimestamp{4, 5}}) {
+      const auto point = Take(readback.Seek(1, target));
+      Check(point && point->time.Compare(target) <= 0 && std::holds_alternative<MediaTrack>(*Take(readback.Read())),
+            "Audio copy could not seek to a covered packet");
+      Check(std::get<ContainerPacket>(*Take(readback.Read())).pts == point->decode_start.value_or(point->time),
+            "Audio copy seek landed at the wrong packet");
+    }
+  }
 }
 
 void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in_band = false,
@@ -627,6 +687,15 @@ void EbmlRoundTrip(const fs::path& destination, std::string_view fixture, Contai
     Check(std::adjacent_find(video.begin(), video.end(), [](const auto& a, const auto& b) {
       return a.pts->Compare(*b.pts) > 0;
     }) != video.end(), "Matroska fixture did not preserve decode order with B pictures");
+  }
+  if (audio_only) {
+    for (const auto milliseconds : {500, 4500, 180, 3200}) {
+      const auto point = Take(input.Seek(tracks.front().id, {milliseconds, 1000}));
+      Check(point && point->decode_start, "Repeated WebM seek lost its preroll anchor");
+      Check(std::holds_alternative<MediaTrack>(*Take(input.Read())), "WebM seek lost its description");
+      Check(std::get<ContainerPacket>(*Take(input.Read())).pts == point->decode_start,
+            "Repeated WebM seek started in the wrong Cluster");
+    }
   }
   Take(input.Close());
 
@@ -823,6 +892,8 @@ int main(int argc, char** argv) {
       fs::remove(path / "remux.ogg");
       fs::remove(path / "remux.webm");
       fs::remove(path / "chained.ogg");
+      fs::remove(path / "copy.flac");
+      fs::remove(path / "copy.mp3");
       fs::remove(path / "truncated-audio");
       fs::remove(path);
     }

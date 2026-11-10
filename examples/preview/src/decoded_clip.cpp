@@ -20,55 +20,14 @@ using namespace huxerui::media;
 using namespace std::chrono_literals;
 
 namespace media_preview {
-namespace {
-
-template<class T, class E> T Require(Result<T, E> result) {
-  if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
-  if constexpr (!std::is_void_v<T>) return std::move(result).Value();
-}
-
-template<class Operation> Task<std::invoke_result_t<Operation>> OnFileThread(Operation operation) {
-#ifdef __EMSCRIPTEN__
-  co_return operation();
-#else
-  co_return co_await RunWorker(std::move(operation));
-#endif
-}
-
 MediaDemuxer Open(const File& file) {
   return Require(MediaDemuxer::Open(Require(file.OpenRandomAccess())));
-}
-
-MediaDemuxer OpenIndexed(const File& file) {
-  auto source = Open(file);
-  if (source.Layout() == ContainerLayout::Fragmented)
-    Require(source.FindSeekPoint(source.Tracks().front().id, {0, 1}));
-  return source;
-}
-
-std::optional<MediaTrack> Track(const MediaDemuxer& source, TrackKind kind) {
-  const auto tracks = source.Tracks();
-  const auto found = std::ranges::find(tracks, kind, &MediaTrack::kind);
-  if (found == tracks.end()) return {};
-  return *found;
 }
 
 std::int64_t Ticks(MediaTimestamp time, std::uint32_t scale) {
   const auto value = time.Rescale(scale);
   if (!value) throw std::runtime_error("Preview timestamp is outside its time grid");
   return value->ticks;
-}
-
-std::uint32_t CommonClock(std::uint32_t first, std::uint32_t second) {
-  const auto scale = std::lcm(std::uint64_t(first), std::uint64_t(second));
-  if (!scale || scale > UINT32_MAX) throw std::runtime_error("Preview clocks have no exact common scale");
-  return static_cast<std::uint32_t>(scale);
-}
-
-std::int64_t PositiveDistance(std::int64_t end, std::int64_t start) {
-  if (end <= start || (start < 0 && end > INT64_MAX + start))
-    throw std::runtime_error("Invalid preview interval");
-  return end - start;
 }
 
 std::int64_t CeilTicks(MediaTimestamp time, std::uint32_t scale) {
@@ -86,6 +45,71 @@ float Seconds(MediaTimestamp time) {
 
 MediaTimestamp TimeAt(float seconds) {
   return {std::llround(double(seconds) * 1000000), 1000000};
+}
+
+bool TrimAudio(AudioFrame& frame, MediaTimestamp target, std::optional<MediaTimestamp> end) {
+  const auto scale = frame.format.sample_rate;
+  const auto pts = Ticks(frame.pts, scale);
+  const auto first = CeilTicks(target, scale);
+  const auto count = std::int64_t(frame.sample_count);
+  if (pts > INT64_MAX - count) throw std::runtime_error("Invalid audio frame duration");
+  if (pts + count <= first) return false;
+  const auto skip = first > pts ? first - pts : 0;
+  auto keep = count - skip;
+  if (end) {
+    const auto cutoff = CeilTicks(*end, scale);
+    const auto position = pts + skip;
+    if (cutoff <= position) return false;
+    if (cutoff < pts + count) keep = cutoff - position;
+  }
+  const auto stride = std::size_t(frame.format.ChannelCount()) * frame.format.BytesPerSample();
+  frame.pts = {pts + skip, scale};
+  frame.sample_count = static_cast<std::uint32_t>(keep);
+  frame.planes.front() = frame.planes.front().Slice(std::size_t(skip) * stride, std::size_t(keep) * stride);
+  return true;
+}
+
+std::shared_ptr<const File> TemporaryFile(const File& directory, std::string_view suffix) {
+  static std::atomic_uint64_t serial = 0;
+  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto file = directory.Child("media-preview-" + std::to_string(now) + "-" +
+                                    std::to_string(++serial) + std::string(suffix));
+  auto stream = Require(file.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew));
+  Require(stream.Close());
+  return std::shared_ptr<const File>(new File(file), [](const File* file) {
+    try {
+      [[maybe_unused]] const bool removed = file->Delete();
+    } catch (...) {}
+    delete file;
+  });
+}
+
+namespace {
+
+MediaDemuxer OpenIndexed(const File& file) {
+  auto source = Open(file);
+  if (source.Layout() == ContainerLayout::Fragmented)
+    Require(source.FindSeekPoint(source.Tracks().front().id, {0, 1}));
+  return source;
+}
+
+std::optional<MediaTrack> Track(const MediaDemuxer& source, TrackKind kind) {
+  const auto tracks = source.Tracks();
+  const auto found = std::ranges::find(tracks, kind, &MediaTrack::kind);
+  if (found == tracks.end()) return {};
+  return *found;
+}
+
+std::uint32_t CommonClock(std::uint32_t first, std::uint32_t second) {
+  const auto scale = std::lcm(std::uint64_t(first), std::uint64_t(second));
+  if (!scale || scale > UINT32_MAX) throw std::runtime_error("Preview clocks have no exact common scale");
+  return static_cast<std::uint32_t>(scale);
+}
+
+std::int64_t PositiveDistance(std::int64_t end, std::int64_t start) {
+  if (end <= start || (start < 0 && end > INT64_MAX + start))
+    throw std::runtime_error("Invalid preview interval");
+  return end - start;
 }
 
 bool HasHdrMetadata(const MediaTrack& track) {
@@ -308,42 +332,6 @@ bool LimitPicture(VideoFrame& frame, const std::optional<MediaPresentationRange>
   return true;
 }
 
-bool TrimAudio(AudioFrame& frame, MediaTimestamp target, std::optional<MediaTimestamp> end) {
-  const auto scale = frame.format.sample_rate;
-  const auto pts = Ticks(frame.pts, scale);
-  const auto first = CeilTicks(target, scale);
-  const auto count = std::int64_t(frame.sample_count);
-  if (pts > INT64_MAX - count) throw std::runtime_error("Invalid audio frame duration");
-  if (pts + count <= first) return false;
-  const auto skip = first > pts ? first - pts : 0;
-  auto keep = count - skip;
-  if (end) {
-    const auto cutoff = CeilTicks(*end, scale);
-    const auto position = pts + skip;
-    if (cutoff <= position) return false;
-    if (cutoff < pts + count) keep = cutoff - position;
-  }
-  const auto stride = std::size_t(frame.format.ChannelCount()) * 2;
-  frame.pts = {pts + skip, scale};
-  frame.sample_count = static_cast<std::uint32_t>(keep);
-  frame.planes.front() = frame.planes.front().Slice(std::size_t(skip) * stride, std::size_t(keep) * stride);
-  return true;
-}
-
-std::shared_ptr<const File> TemporaryFile(const File& directory, std::string_view suffix) {
-  static std::atomic_uint64_t serial = 0;
-  const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-  const auto file = directory.Child("media-preview-" + std::to_string(now) + "-" +
-                                    std::to_string(++serial) + std::string(suffix));
-  auto stream = Require(file.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew));
-  Require(stream.Close());
-  return std::shared_ptr<const File>(new File(file), [](const File* file) {
-    try {
-      [[maybe_unused]] const bool removed = file->Delete();
-    } catch (...) {}
-    delete file;
-  });
-}
 
 } // namespace
 

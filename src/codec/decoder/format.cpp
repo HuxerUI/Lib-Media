@@ -1,5 +1,8 @@
 #include "format.h"
 #include "../hevc.h"
+#include "container/container_io.h"
+
+#include <array>
 
 namespace huxerui::media::detail {
 namespace {
@@ -83,6 +86,79 @@ CodecResult<void> ValidateSps(const AvcConfig& avc, std::uint32_t maximum_width,
   return CodecResult<void>::Success();
 }
 } // namespace
+
+CodecResult<unsigned> AudioSampleLimit(const AudioDecoderConfig& config) {
+  using R = CodecResult<unsigned>;
+  const auto& output = config.output;
+  if (!output.sample_rate || !output.ChannelCount() || !output.BytesPerSample() ||
+      (output.packing != AudioPacking::Planar && output.packing != AudioPacking::Interleaved))
+    return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid PCM output format"));
+  const auto matches = [&](unsigned rate, unsigned channels, unsigned samples) {
+    if (rate == output.sample_rate && channels == output.ChannelCount()) return R::Success(samples);
+    return R::Failure(Error(CodecErrorCode::Unsupported, "PCM rate and layout must match the coded stream"));
+  };
+  try {
+    switch (config.codec) {
+      case CodecId::Aac: {
+        const auto info = ParseAac(config.initialization_data);
+        if (!info.Succeeded()) return R::Failure(info.Error());
+        return matches(info.Value().sample_rate, info.Value().channels, 1024);
+      }
+      case CodecId::Opus: {
+        const auto info = ParseOpus(config.initialization_data, ContainerErrorCode::Unsupported);
+        return matches(48000, info.channels, 5760);
+      }
+      case CodecId::Flac: {
+        const auto info = ParseFlacStreamInfo(config.initialization_data, ContainerErrorCode::InvalidArgument);
+        return matches(info.rate, info.channels, info.max_block);
+      }
+      case CodecId::Mp3: {
+        constexpr std::array rates{8000u, 11025u, 12000u, 16000u, 22050u, 24000u, 32000u, 44100u, 48000u};
+        if (!config.initialization_data.empty() || std::ranges::find(rates, output.sample_rate) == rates.end())
+          return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid MPEG Layer III configuration"));
+        return R::Success(output.sample_rate >= 32000 ? 1152u : 576u);
+      }
+      default: return R::Failure(Error(CodecErrorCode::InvalidArgument, "Unsupported audio codec identifier"));
+    }
+  } catch (const ContainerError& error) {
+    return R::Failure(Error(error.code == ContainerErrorCode::Unsupported ? CodecErrorCode::Unsupported :
+                            CodecErrorCode::InvalidArgument, error.message));
+  }
+}
+
+CodecResult<unsigned> AudioPacketSamples(const AudioDecoderConfig& config, std::span<const std::byte> bytes) {
+  using R = CodecResult<unsigned>;
+  try {
+    switch (config.codec) {
+      case CodecId::Aac: return R::Success(1024);
+      case CodecId::Opus: return R::Success(OpusPacketSamples(bytes, ContainerErrorCode::InvalidData));
+      case CodecId::Flac:
+        return R::Success(FlacPacketSamples(bytes, ParseFlacStreamInfo(config.initialization_data, ContainerErrorCode::InvalidData)));
+      case CodecId::Mp3: {
+        const auto info = ParseMp3FrameHeader(bytes);
+        if (info && info->length == bytes.size() && info->rate == config.output.sample_rate &&
+            info->channels == config.output.ChannelCount()) return R::Success(info->samples);
+        return R::Failure(Error(CodecErrorCode::InvalidData, "Invalid MPEG Layer III frame or configuration change"));
+      }
+      default: return R::Failure(Error(CodecErrorCode::InvalidArgument, "Unsupported audio codec identifier"));
+    }
+  } catch (const ContainerError& error) {
+    return R::Failure(Error(CodecErrorCode::InvalidData, error.message));
+  }
+}
+
+Bytes AudioDecoderHeader(const AudioDecoderConfig& config) {
+  if (config.codec == CodecId::Flac) {
+    Bytes header{std::byte{'f'}, std::byte{'L'}, std::byte{'a'}, std::byte{'C'},
+                 std::byte{0x80}, std::byte{0}, std::byte{0}, std::byte{34}};
+    Append(header, config.initialization_data);
+    return header;
+  }
+  auto header = config.initialization_data;
+  if (config.codec == CodecId::Opus) header[10] = header[11] = std::byte{};
+  return header;
+}
+
 CodecResult<Bytes> AnnexB(const EncodedPacket& packet, unsigned length_size) {
   const auto data = packet.data.AsBytes();
   Bytes result;
@@ -103,6 +179,10 @@ CodecResult<void> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
       || (packet.dts && !packet.dts->Rescale(1000000))
       || (packet.duration && (!packet.duration->Rescale(1000000) || packet.duration->ticks < 0)))
     return invalid("Empty packet or invalid/unrepresentable timing");
+  if (const auto* audio = std::get_if<AudioDecoderConfig>(&config); audio && audio->codec != CodecId::Aac) {
+    const auto samples = AudioPacketSamples(*audio, packet.data.AsBytes());
+    if (!samples.Succeeded()) return CodecResult<void>::Failure(samples.Error());
+  }
   if (const auto* video = std::get_if<VideoDecoderConfig>(&config)) {
     if (video->codec == CodecId::Hevc) {
       const auto length = (std::to_integer<unsigned>(video->initialization_data[21]) & 3u) + 1;
@@ -144,13 +224,9 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
   using R = CodecResult<std::size_t>;
   std::size_t frame_bytes = 0, minimum = 4;
   if (const auto* audio = std::get_if<AudioDecoderConfig>(&config)) {
-    const auto parsed = ParseAac(audio->initialization_data);
-    if (!parsed.Succeeded()) return R::Failure(parsed.Error());
-    if (parsed.Value().sample_rate != audio->output.sample_rate || parsed.Value().channels != audio->output.ChannelCount())
-      return R::Failure(Error(CodecErrorCode::Unsupported, "PCM rate/layout must match AAC initialization data"));
-    if (!audio->output.BytesPerSample() || (audio->output.packing != AudioPacking::Planar && audio->output.packing != AudioPacking::Interleaved))
-      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid PCM representation"));
-    frame_bytes = 1024 * audio->output.BytesPerSample() * audio->output.ChannelCount();
+    const auto samples = AudioSampleLimit(*audio);
+    if (!samples.Succeeded()) return R::Failure(samples.Error());
+    frame_bytes = std::size_t(samples.Value()) * audio->output.BytesPerSample() * audio->output.ChannelCount();
   } else {
     const auto& video = std::get<VideoDecoderConfig>(config);
     if (!video.width || !video.height || video.width > 8192 || video.height > 8192)

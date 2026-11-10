@@ -1,5 +1,7 @@
 #include <huxerui/media_codec.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -60,12 +62,19 @@ int main() {
     Reply<VideoDecoderCapabilities> video_decoder;
     Reply<AudioEncoderCapabilities> audio_encoder;
     Reply<VideoEncoderCapabilities> video_encoder;
+    constexpr std::array audio_codecs{CodecId::Opus, CodecId::Flac, CodecId::Mp3};
+    std::array<Reply<AudioDecoderCapabilities>, audio_codecs.size()> audio_queries;
     AudioDecoder::QueryCapabilities([&](auto result) { audio_decoder.Receive(std::move(result)); });
     VideoDecoder::QueryCapabilities([&](auto result) { video_decoder.Receive(std::move(result)); });
     AudioEncoder::QueryCapabilities([&](auto result) { audio_encoder.Receive(std::move(result)); });
     VideoEncoder::QueryCapabilities([&](auto result) { video_encoder.Receive(std::move(result)); });
+    for (std::size_t i = 0; i < audio_codecs.size(); ++i) {
+      AudioDecoder::QueryCapabilities(audio_codecs[i],
+          [&, i](auto result) { audio_queries[i].Receive(std::move(result)); });
+    }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(25);
-    while (!audio_decoder.Ready() || !video_decoder.Ready() || !audio_encoder.Ready() || !video_encoder.Ready()) {
+    while (!audio_decoder.Ready() || !video_decoder.Ready() || !audio_encoder.Ready() || !video_encoder.Ready() ||
+        !std::ranges::all_of(audio_queries, &Reply<AudioDecoderCapabilities>::Ready)) {
       Check(std::chrono::steady_clock::now() < deadline, "Capability query timed out without a UI runtime");
 #ifdef __EMSCRIPTEN__
       emscripten_sleep(1);
@@ -76,6 +85,7 @@ int main() {
     auto ad = audio_decoder.Take(); const auto ae = audio_encoder.Take();
     const auto vd = video_decoder.Take(); const auto ve = video_encoder.Take();
     Audio(ad); Audio(ae);
+    for (auto& query : audio_queries) Audio(query.Take());
     Limits(vd.library_limits); Limits(vd.platform_limits);
     Limits(ve.library_limits); Limits(ve.platform_limits);
     Candidates(vd.pixel_formats, vd.availability); Candidates(vd.profiles, vd.availability);

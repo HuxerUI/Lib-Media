@@ -2,6 +2,32 @@
 
 namespace huxerui::media::detail {
 
+bool HasAudioMetadata(const MediaAudioMetadata& metadata) {
+  return metadata.cover || std::ranges::any_of(AudioTags, [&](const auto& tag) { return !(metadata.*tag.field).empty(); });
+}
+
+bool IsCoverMime(std::string_view mime) {
+  return mime == "image/jpeg" || mime == "image/png";
+}
+
+void ValidateAudioMetadata(const MediaAudioMetadata& metadata) {
+  for (const auto& tag : AudioTags) {
+    const auto& value = metadata.*tag.field;
+    if (value.size() > MaxAudioText || value.find('\0') != std::string::npos)
+      Fail(ContainerErrorCode::InvalidArgument, "Invalid audio text tag size or content");
+  }
+  if (metadata.cover && (!IsCoverMime(metadata.cover->mime_type) || metadata.cover->data.AsBytes().empty() ||
+                         metadata.cover->data.AsBytes().size() > MaxContainerPacket - 64))
+    Fail(ContainerErrorCode::InvalidArgument, "Invalid or oversized audio cover image");
+}
+
+void ValidateAudioPacketTime(const ContainerPacket& packet, std::int64_t start, unsigned samples, unsigned rate) {
+  if ((packet.pts && *packet.pts != MediaTimestamp{start, rate}) ||
+      (packet.dts && *packet.dts != MediaTimestamp{start, rate}) ||
+      (packet.duration && *packet.duration != MediaTimestamp{samples, rate}))
+    Fail(ContainerErrorCode::InvalidArgument, "Audio packet timing differs from its encoded sample count");
+}
+
 void FramedAudioReader::Begin(MediaTrack track, std::optional<std::uint64_t> coded_samples) {
   first_ = input.Position();
   priming_ = static_cast<std::int64_t>(track.priming_samples.value_or(0));
@@ -20,6 +46,16 @@ void FramedAudioReader::CheckEnd(std::int64_t samples) {
   if ((coded_samples_ && *coded_samples_ != std::uint64_t(samples)) || samples < priming_ + padding_)
     Fail(ContainerErrorCode::InvalidData, "Audio frame counts differ from the stream header");
   duration = At(samples - padding_);
+}
+
+std::optional<MediaPresentationRange> FramedAudioReader::PresentationRange(std::size_t) const {
+  if (!duration) return {};
+  return MediaPresentationRange{*start, *duration};
+}
+
+void FramedAudioReader::SeekFrame(std::uint64_t offset, std::int64_t samples) {
+  input.Seek(offset);
+  position_ = samples;
 }
 
 std::optional<DemuxItem> FramedAudioReader::Read() {
@@ -80,10 +116,7 @@ std::optional<SeekPoint> FramedAudioReader::Find(std::uint32_t id, MediaTimestam
     while (decode != index_.begin() && !decode->restartable) --decode;
     if (!decode->restartable) Fail(ContainerErrorCode::IndexUnavailable, "No MPEG audio reservoir restart point");
   }
-  if (seek) {
-    input.Seek(decode->offset);
-    position_ = decode->samples;
-  }
+  if (seek) SeekFrame(decode->offset, decode->samples);
   const auto kind = format == ContainerFormat::Mp3 ? SeekPoint::Kind::NeedsPreroll : SeekPoint::Kind::Independent;
   return SeekPoint{id, At(point->samples), kind, point->offset,
                    kind == SeekPoint::Kind::NeedsPreroll ? std::optional{At(decode->samples)} : std::nullopt};
