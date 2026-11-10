@@ -7,6 +7,9 @@
 #include <cstring>
 #include <iostream>
 #include <thread>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
@@ -273,6 +276,13 @@ int main() {
       Check(encoded.bframes && encoded.reordered, "Requested B-picture test did not exercise real reordering");
 #endif
     }
+#if defined(__APPLE__) && TARGET_OS_OSX
+    // Submitting more frames than the queues can hold requires output before Finish().
+    auto tight = Config(H264Profile::High, std::nullopt);
+    tight.limits.output_items = 2;
+    tight.limits.output_bytes = tight.limits.output_items * tight.max_packet_bytes;
+    Decode(Encode(tight, 40, true, true), tight);
+#endif
     auto config = Config(H264Profile::High, std::nullopt, VideoPixelFormat::I420, 242);
     auto encoded = Encode(config, 17); Decode(encoded, config);
     auto variable = Encode(config, 17, true, true); Decode(variable, config);

@@ -170,9 +170,16 @@ public:
       const bool reorder = config.profile != H264Profile::Baseline && !config.max_b_frames;
       Property(kVTCompressionPropertyKey_AllowFrameReordering, reorder ? kCFBooleanTrue : kCFBooleanFalse);
       Property(kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
-      Integer(kVTCompressionPropertyKey_AverageBitRate, config.bitrate);
-      Integer(kVTCompressionPropertyKey_MaxKeyFrameInterval, config.key_frame_interval);
-      Integer(kVTCompressionPropertyKey_MaxFrameDelayCount, static_cast<std::int32_t>(VideoEncoderWindow(config) - 1));
+      VideoStatus(SetInteger(kVTCompressionPropertyKey_AverageBitRate, config.bitrate),
+                  "VideoToolbox rejected AverageBitRate", CodecErrorCode::Unsupported);
+      VideoStatus(SetInteger(kVTCompressionPropertyKey_MaxKeyFrameInterval, config.key_frame_interval),
+                  "VideoToolbox rejected MaxKeyFrameInterval", CodecErrorCode::Unsupported);
+      const auto delay_status = SetInteger(kVTCompressionPropertyKey_MaxFrameDelayCount,
+                                          static_cast<std::int32_t>(VideoEncoderWindow(config) - 1));
+      needs_progress_flush_ = delay_status == kVTPropertyNotSupportedErr;
+      if (!needs_progress_flush_) {
+        VideoStatus(delay_status, "VideoToolbox rejected MaxFrameDelayCount", CodecErrorCode::Unsupported);
+      }
       const double rate = double(config.frame_rate_numerator) / config.frame_rate_denominator;
       auto number = CFNumberCreate(kCFAllocatorDefault, kCFNumberDoubleType, &rate);
       if (!number) throw std::bad_alloc();
@@ -273,6 +280,18 @@ public:
     return R::Success(std::nullopt);
   }
   CodecResult<void> RequestKeyFrame() override { key_requested_ = true; return CodecResult<void>::Success(); }
+  CodecResult<void> FlushPending() override {
+    return VideoGuard<void>([&] {
+      if (!needs_progress_flush_) return;
+      {
+        std::lock_guard lock(output_mutex_);
+        if (!pending_frames_) return;
+      }
+      // VideoToolbox can invoke the output callback while completing pending frames.
+      VideoStatus(VTCompressionSessionCompleteFrames(session_, kCMTimeInvalid),
+                  "Cannot make progress on pending H.264 frames");
+    });
+  }
   CodecResult<SubmitStatus> Finish() override {
     const auto status = VTCompressionSessionCompleteFrames(session_, kCMTimeInvalid);
     if (status) return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot drain H.264 compression", std::to_string(status)));
@@ -299,11 +318,12 @@ private:
   void Property(CFStringRef key, CFTypeRef value) {
     VideoStatus(VTSessionSetProperty(session_, key, value), "VideoToolbox rejected a requested H.264 control", CodecErrorCode::Unsupported);
   }
-  void Integer(CFStringRef key, std::int32_t value) {
+  OSStatus SetInteger(CFStringRef key, std::int32_t value) {
     auto number = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &value);
     if (!number) throw std::bad_alloc();
-    const auto status = VTSessionSetProperty(session_, key, number); CFRelease(number);
-    VideoStatus(status, "VideoToolbox rejected a numeric H.264 control", CodecErrorCode::Unsupported);
+    const auto status = VTSessionSetProperty(session_, key, number);
+    CFRelease(number);
+    return status;
   }
   static CFStringRef Primaries(ColorPrimaries value) {
     return value == ColorPrimaries::BT709 ? kCVImageBufferColorPrimaries_ITU_R_709_2 :
@@ -375,6 +395,7 @@ private:
   std::optional<CodecError> failure_;
   Bytes scratch_;
   std::size_t pending_frames_ = 0;
+  bool needs_progress_flush_ = false;
   bool key_requested_ = false, finished_ = false, eos_ = false, closing_ = false;
 };
 }
