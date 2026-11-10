@@ -529,6 +529,9 @@ private state, validation, and backend contracts. Shared worker execution lives 
 
 ## Roadmap
 
+The [Lib-Media roadmap](docs/media_roadmap.md) tracks remaining work across playback, codecs, containers, and the
+system media library, with the next integration milestones and acceptance checks.
+
 The [codec and decoded-playback design](docs/codec-design.md) records the shared formats, ownership rules, six-platform
 lifecycle contract, and delivery order. The AAC/AVC decoding milestone is now implemented, with remaining platform
 validation called out in the [decoding guide](docs/mediacodec.md).
