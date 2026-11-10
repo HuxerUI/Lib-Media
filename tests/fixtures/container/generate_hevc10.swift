@@ -5,9 +5,10 @@ import Foundation
 import VideoToolbox
 
 let file = URL(fileURLWithPath: CommandLine.arguments[1])
+let hlg = CommandLine.arguments.dropFirst(2).first == "hlg"
 let writer = try AVAssetWriter(outputURL: file, fileType: .mov)
 let width = 128, height = 96
-let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+var settings: [String: Any] = [
     AVVideoCodecKey: AVVideoCodecType.hevc,
     AVVideoWidthKey: width, AVVideoHeightKey: height,
     AVVideoCompressionPropertiesKey: [
@@ -16,11 +17,18 @@ let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
         AVVideoAllowFrameReorderingKey: false,
     ],
     AVVideoColorPropertiesKey: [
-        AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-        AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-        AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+        AVVideoColorPrimariesKey: hlg ? AVVideoColorPrimaries_ITU_R_2020 : AVVideoColorPrimaries_ITU_R_709_2,
+        AVVideoTransferFunctionKey: hlg ? AVVideoTransferFunction_ITU_R_2100_HLG : AVVideoTransferFunction_ITU_R_709_2,
+        AVVideoYCbCrMatrixKey: hlg ? AVVideoYCbCrMatrix_ITU_R_2020 : AVVideoYCbCrMatrix_ITU_R_709_2,
     ],
-])
+]
+if hlg {
+    settings[AVVideoPixelAspectRatioKey] = [
+        AVVideoPixelAspectRatioHorizontalSpacingKey: 4,
+        AVVideoPixelAspectRatioVerticalSpacingKey: 3,
+    ]
+}
+let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
 input.transform = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: CGFloat(height), ty: 0)
 let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
     kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,

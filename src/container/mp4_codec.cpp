@@ -2,6 +2,34 @@
 #include "../codec/hevc.h"
 
 namespace huxerui::media::detail {
+bool Mp4VideoExtensionTag(std::uint32_t tag) {
+  switch (tag) {
+    case Tag("colr"):
+    case Tag("mdcv"):
+    case Tag("clli"):
+    case Tag("amve"):
+    case Tag("dvcC"):
+    case Tag("dvvC"): return true;
+    default: return false;
+  }
+}
+
+void ValidateMp4VideoExtension(std::uint32_t tag, ByteView payload, CodecId codec, ContainerErrorCode error) {
+  if (tag == Tag("colr") && payload.size() >= 4 && payload.size() <= 65536) {
+    const auto type = Number<std::uint32_t>(payload);
+    if ((type == Tag("nclc") && payload.size() == 10) ||
+        (type == Tag("nclx") && payload.size() == 11) ||
+        ((type == Tag("prof") || type == Tag("rICC")) && payload.size() > 4)) return;
+  } else if ((tag == Tag("mdcv") && payload.size() == 24) ||
+             (tag == Tag("clli") && payload.size() == 4) ||
+             (tag == Tag("amve") && payload.size() == 8) ||
+             ((tag == Tag("dvcC") || tag == Tag("dvvC")) && codec == CodecId::Hevc &&
+              payload.size() >= 4 && payload.size() <= 256)) {
+    return;
+  }
+  Fail(error, "Unsupported or malformed MP4 visual extension");
+}
+
 unsigned HevcNalLength(ByteView config, bool hvc1, ContainerErrorCode error) {
   try {
     return ParseHevcConfiguration(config, hvc1, false).length;

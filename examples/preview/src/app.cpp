@@ -417,8 +417,7 @@ View FramesPage() {
   auto output = UseState(std::shared_ptr<const File>{});
   auto texture = UseState(std::shared_ptr<ExternalTexture>{});
   auto notice = UseState(std::string("Open a file or play the bundled MP4."));
-  auto loading = UseState(false);
-  auto exporting = UseState(false);
+  auto busy = UseState(false);
   auto paused = UseState(false);
   auto position = UseState(0.0F);
   auto duration = UseState(0.0F);
@@ -428,6 +427,8 @@ View FramesPage() {
   auto play = [=](std::shared_ptr<const File> staged) {
     current->Cancel();
     source = staged;
+    output = std::shared_ptr<const File>{};
+    texture = std::shared_ptr<ExternalTexture>{};
     paused = false;
     position = 0.0F;
     duration = 0.0F;
@@ -458,7 +459,8 @@ View FramesPage() {
   };
 
   auto open = [=](bool sample) {
-    loading = true;
+    if (busy) return;
+    busy = true;
     tasks.Launch([=]() -> Task<void> {
       try {
         std::optional<FileReference> chosen;
@@ -474,13 +476,32 @@ View FramesPage() {
       } catch (const std::exception& error) {
         notice = error.what();
       }
-      loading = false;
+      busy = false;
     });
   };
 
   const std::shared_ptr<ExternalTexture> image = texture;
-  const std::shared_ptr<const File> input_file = source;
-  const std::shared_ptr<const File> output_file = output;
+  const auto prepare = [=](bool copy) {
+    const std::shared_ptr<const File> input_file = source;
+    if (busy || !input_file) return;
+    output = std::shared_ptr<const File>{};
+    busy = true;
+    tasks.Launch([=]() -> Task<void> {
+      try {
+        if (copy) {
+          output = co_await media_preview::CopyClip(input_file, temporary);
+        } else {
+          output = co_await media_preview::ExportClip(input_file, temporary, media_preview::preview_reordered_export);
+        }
+        notice = copy ? "Movie copied and reopened successfully." : "MP4 encoded and reopened successfully.";
+      } catch (const std::exception& error) {
+        notice = error.what();
+      }
+      busy = false;
+    });
+  };
+  const bool can_prepare = !busy && bool(source.Get());
+  const bool can_save = !busy && bool(output.Get()) && picker->CanSaveFiles();
   return Column {
     Text("File preview", TextRole::Title),
     (image ? Image(image).Fit(ImageFit::Contain).With(Frame{.width = 300.0F, .height = 180.0F}) : View{}),
@@ -494,30 +515,29 @@ View FramesPage() {
         .With(Enabled{duration > 0}, Semantics{.label = "Preview position"}),
     Flow {
       Button("Open movie").OnClick([open] { open(false); })
-          .With(Enabled{media_preview::frame_texture_supported && picker->CanOpenFiles() && !loading}),
+          .With(Enabled{media_preview::frame_texture_supported && picker->CanOpenFiles() && !busy}),
       Button("Play sample").OnClick([open] { open(true); })
-          .With(Enabled{media_preview::frame_texture_supported && !loading}),
+          .With(Enabled{media_preview::frame_texture_supported && !busy}),
       Button(paused ? "Resume" : "Pause").OnClick([paused] { paused = !paused; }).With(Enabled{duration > 0}),
-      Button("Prepare MP4").OnClick([=] {
-        exporting = true;
+      Button("Copy Movie").OnClick([prepare] { prepare(true); }).With(Enabled{can_prepare}),
+      Button("Encode MP4").OnClick([prepare] { prepare(false); }).With(Enabled{can_prepare}),
+      Button("Save Movie").OnClick([=] {
+        const std::shared_ptr<const File> output_file = output;
+        if (busy || !output_file) return;
+        busy = true;
         tasks.Launch([=]() -> Task<void> {
           try {
-            output = co_await media_preview::ExportClip(input_file, temporary);
-            notice = "MP4 prepared and reopened successfully.";
+            const auto mov = output_file->Name().ends_with(".mov");
+            const auto saved = co_await picker->SaveFileAsync(*output_file, {
+                .suggested_name = mov ? "preview-copy.mov" : "preview-export.mp4",
+                .filter = {.name = "Movie", .extensions = {mov ? "mov" : "mp4"}, .content_types = {"video/*"}}});
+            notice = saved ? "Movie saved." : "Movie was not saved.";
           } catch (const std::exception& error) {
             notice = error.what();
           }
-          exporting = false;
+          busy = false;
         });
-      }).With(Enabled{bool(input_file) && !exporting}),
-      Button("Save MP4").OnClick([=] {
-        tasks.Launch([=]() -> Task<void> {
-          const auto saved = co_await picker->SaveFileAsync(*output_file, {
-              .suggested_name = "preview-export.mp4",
-              .filter = {.name = "MP4", .extensions = {"mp4"}, .content_types = {"video/mp4"}}});
-          notice = saved ? "MP4 saved." : "MP4 was not saved.";
-        });
-      }).With(Enabled{bool(output_file) && picker->CanSaveFiles()}),
+      }).With(Enabled{can_save}),
     }.With(Spacing(10.0F)),
     Text(notice),
   }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));

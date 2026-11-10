@@ -31,6 +31,8 @@ template<class Body> void FullBox(Bytes& bytes, std::string_view tag, std::uint3
 }
 
 std::uint32_t Mp4Scale(const MediaTrack& track);
+bool Mp4VideoExtensionTag(std::uint32_t tag);
+void ValidateMp4VideoExtension(std::uint32_t tag, ByteView payload, CodecId codec, ContainerErrorCode error);
 bool AvcIdr(ByteView bytes, unsigned length_size, ContainerErrorCode error);
 unsigned HevcNalLength(ByteView config, bool hvc1, ContainerErrorCode error);
 bool HevcIdr(ByteView bytes, unsigned length_size, bool hvc1, ContainerErrorCode error);

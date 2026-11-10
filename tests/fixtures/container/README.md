@@ -43,6 +43,11 @@ ffmpeg -f lavfi -i sine=sample_rate=48000:duration=5.15 \
 - `preview-hevc10.mov` is an AVAssetWriter-generated Main10 `hvc1` movie with an SDR BT.709 ramp and
   a clockwise 90-degree transform. Generate it on macOS with
   `xcrun swift generate_hevc10.swift preview-hevc10.mov` in this directory.
+- `preview-hevc-hlg.mov` uses the same generated ramp and transform with BT.2020 HLG, 4:3 pixel aspect,
+  and the `dvvC` payload emitted by AVAssetWriter. It exercises metadata and exact access-unit retention on
+  the packet-copy path. Generate it with `xcrun swift generate_hevc10.swift preview-hevc-hlg.mov hlg`.
+- An independent fragmented MP4 for device checks can be generated from the bundled AVC/AAC fixture with
+  `ffmpeg -i preview-avc-aac.mp4 -c copy -movflags +empty_moov+frag_keyframe+default_base_moof fragmented.mp4`.
 - `preview-opus.ogg`, `preview-flac.flac`, and `preview-mp3.mp3` use generated sine waves.
   The Ogg end granule is 107496 at 48 kHz with a pre-skip of 120 samples. FLAC and MP3 both represent
   50142 audible samples at 44.1 kHz. The MP3 uses the LAME VBR header.

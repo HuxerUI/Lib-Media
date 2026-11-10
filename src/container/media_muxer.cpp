@@ -19,6 +19,13 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain track seek preroll");
     if (it->initialization_data.size() > 65536)
       Fail(ContainerErrorCode::LimitExceeded, "Output track configuration exceeds 64 KiB");
+    if (it->presentation_edit && it->presentation_edit->start.Compare(it->presentation_edit->end) != -1)
+      Fail(ContainerErrorCode::InvalidArgument, "Invalid track presentation edit");
+    if ((it->presentation_edit || it->pixel_aspect_ratio || !it->video_extensions.empty()) &&
+        format != ContainerFormat::Mp4 && format != ContainerFormat::Mov)
+      Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied presentation metadata");
+    if (it->kind != TrackKind::Video && (it->pixel_aspect_ratio || !it->video_extensions.empty()))
+      Fail(ContainerErrorCode::InvalidArgument, "Visual metadata requires a video track");
   }
   if (layout != ContainerLayout::Default && (format != ContainerFormat::Mp4 ||
       (layout != ContainerLayout::Fragmented && layout != ContainerLayout::FastStart)))

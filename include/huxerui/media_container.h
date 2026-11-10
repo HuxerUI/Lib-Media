@@ -70,11 +70,46 @@ enum class SeekDirection {
   AtOrAfter,  ///< Prefer the earliest covered point at or after the request.
 };
 
+/// @brief Half-open interval of a track on the exact session presentation timeline.
+///
+/// Packets outside this interval can still be required for decoding. The interval does not change packet PTS or DTS.
+struct MediaPresentationRange {
+  /// Inclusive presentation start.
+  MediaTimestamp start;
+  /// Exclusive presentation end, expressed as a position rather than a duration.
+  MediaTimestamp end;
+
+  /// Compares both endpoints as exact rational times.
+  bool operator==(const MediaPresentationRange&) const = default;
+};
+
 /// @brief Track description shared by the demuxer and muxer.
 ///
 /// A track ID is nonzero and unique in its session. Callers may reuse an input track ID in an output session.
 /// A description returned by Read() applies to subsequent packets with the same ID until replaced.
 struct MediaTrack {
+  /// @brief Width-to-height ratio of one coded pixel, before presentation rotation.
+  struct PixelAspectRatio {
+    /// Positive horizontal spacing in the same units as height.
+    std::uint32_t width = 1;
+    /// Positive vertical spacing in the same units as width.
+    std::uint32_t height = 1;
+
+    /// Compares both stored spacings.
+    bool operator==(const PixelAspectRatio&) const = default;
+  };
+
+  /// @brief A supported MP4 or MOV visual sample-entry extension retained for packet-copy output.
+  struct VideoExtension {
+    /// Four-character box type, such as colr, mdcv, or dvcC.
+    std::string type;
+    /// Exact box payload after its size and type. Codec initialization, crop, and aspect use separate fields.
+    Bytes payload;
+
+    /// Compares the box type and payload bytes.
+    bool operator==(const VideoExtension&) const = default;
+  };
+
   /// Session-local track identity.
   std::uint32_t id = 0;
   /// Media kind.
@@ -112,6 +147,16 @@ struct MediaTrack {
   /// Known nonnegative duration of data to decode before using the output after seeking.
   /// Absence leaves the preroll unspecified. Matroska and WebM can retain this value in the track header.
   std::optional<MediaTimestamp> seek_preroll = {};
+  /// Finite, authored presentation window from a supported MP4 or MOV edit list.
+  /// Pass it with the original packet timing to retain the edit in regular MP4 or MOV output. The start must
+  /// precede the end. Any supplied audio trim must agree with the edit on the packet timeline.
+  /// Use MediaDemuxer::PresentationRange() for the effective window covered by media samples.
+  std::optional<MediaPresentationRange> presentation_edit = {};
+  /// Explicit pixel spacing from a video sample entry. Absence leaves the source's aspect unspecified.
+  std::optional<PixelAspectRatio> pixel_aspect_ratio = {};
+  /// Supported color and HDR extension payloads from MP4 or MOV. Preserve them when copying compatible
+  /// compressed samples. Supply metadata for the new bitstream when encoding different pictures.
+  std::vector<VideoExtension> video_extensions = {};
 };
 
 /// @brief A packet on a container session's common timeline.
@@ -223,6 +268,13 @@ public:
   /// @return Known presentation duration. Requires a live session.
   [[nodiscard]] std::optional<MediaTimestamp> Duration() const;
 
+  /// @brief Returns the sample coverage of a track intersected with its supported presentation edit.
+  /// @param track_id Track identity in this session.
+  /// @return A half-open interval, or std::nullopt for an unknown track or unavailable sample timing.
+  /// Equal endpoints mean no samples intersect the edit. Requires a live session and does not move the read
+  /// position or build an index. MP4 and MOV supply these bounds from sample tables or a built fragment index.
+  std::optional<MediaPresentationRange> PresentationRange(std::uint32_t track_id) const;
+
   /// @brief Selects tracks for subsequent reads at the current position.
   /// @param tracks Known track IDs. An empty span restores selection of all tracks.
   /// @return Success or an error. Selection is preserved across seeks.
@@ -234,6 +286,7 @@ public:
   ContainerResult<std::optional<DemuxItem>> Read();
 
   /// @brief Queries a covered point while preserving the read position.
+  /// A random-access fragmented MP4 can build its bounded sample index and establish track presentation ranges and audio trim.
   /// @param track_id Reference track.
   /// @param time Target presentation time.
   /// @param direction Inclusive search direction.

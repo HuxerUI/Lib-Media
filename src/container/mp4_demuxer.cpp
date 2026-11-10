@@ -289,6 +289,8 @@ struct TrackIndex {
   std::uint32_t clock = 0;
   std::int64_t shift = 0;
   unsigned nal_length = 0;
+  EditList edit;
+  std::optional<MediaPresentationRange> presentation_range;
   std::vector<Mp4Sample> samples;
   std::vector<std::uint32_t> sync;
   std::uint32_t default_duration = 0;
@@ -301,6 +303,15 @@ struct TrackIndex {
     return {AddTime(ExactTicks({ticks, scale}, clock), shift), clock};
   }
 };
+
+void IndexSyncSamples(TrackIndex& track) {
+  for (std::uint32_t i = 0; i < track.samples.size(); ++i) {
+    if (track.samples[i].sync) track.sync.push_back(i);
+  }
+  std::stable_sort(track.sync.begin(), track.sync.end(), [&](auto first, auto second) {
+    return track.samples[first].pts < track.samples[second].pts;
+  });
+}
 
 template<class Visit> void VisitChunks(ByteView stbl, std::uint32_t count, Visit visit) {
   const auto offsets64 = Child(stbl, "co64", false);
@@ -442,12 +453,7 @@ void ParseSamples(ByteView stbl, TrackIndex& track, std::size_t remaining) {
       previous = number;
     }
   }
-  for (std::uint32_t i = 0; i < count; ++i) {
-    if (track.samples[i].sync) track.sync.push_back(i);
-  }
-  std::stable_sort(track.sync.begin(), track.sync.end(), [&](auto first, auto second) {
-    return track.samples[first].pts < track.samples[second].pts;
-  });
+  IndexSyncSamples(track);
 }
 
 struct SampleRef {
@@ -477,6 +483,7 @@ public:
         if (hint && *hint != format) Fail(ContainerErrorCode::UnrecognizedFormat, "Movie brand does not match the format hint");
         Movie(ReadMetadata(this->input, box->size));
         movie = true;
+        fragment_start_ = this->input.Position();
         if (!this->input.Random() || layout == ContainerLayout::Fragmented) break;
       } else if (box->tag == Tag("mdat")) {
         if (!this->input.Random()) Fail(ContainerErrorCode::NeedRandomAccess, "MP4 media data precedes movie metadata");
@@ -491,32 +498,24 @@ public:
     }
     if (!movie) Fail(Invalid, "Missing MP4 movie metadata");
     if (layout == ContainerLayout::Default) {
-      OrderSamples();
-      if (this->input.Random()) {
-        std::size_t range = 0;
-        for (auto ref : order_) {
-          const auto& sample = Sample(ref);
-          while (range < media_.size() && sample.offset >= media_[range].second) ++range;
-          if (range == media_.size() || sample.offset < media_[range].first ||
-              AddOffset(sample.offset, sample.size) > media_[range].second)
-            Fail(Invalid, "MP4 sample lies outside media data");
-        }
-      }
+      order_ = OrderSamples(indexes_);
+      if (this->input.Random()) ValidateMedia(indexes_, order_, media_);
     }
   }
 
   std::optional<DemuxItem> Read() override {
-    if (input.Random() && layout == ContainerLayout::Default && !selected.empty()) {
+    const bool indexed = layout == ContainerLayout::Default || fragment_indexed_;
+    if (input.Random() && indexed && !selected.empty()) {
       while (cursor_ < order_.size() &&
              std::ranges::find(selected, tracks[order_[cursor_].track].id) == selected.end())
         ++cursor_;
     }
     if (cursor_ == order_.size()) {
-      if (layout == ContainerLayout::Default || !NextFragment()) return {};
+      if (indexed || !NextFragment()) return {};
     }
     const auto ref = order_[cursor_++];
-    const auto& sample = Sample(ref);
-    if (input.Random() && layout == ContainerLayout::Default) {
+    const auto& sample = Sample(indexes_, ref);
+    if (input.Random() && indexed) {
       input.Seek(sample.offset);
     } else {
       PositionSample(sample);
@@ -528,10 +527,13 @@ public:
                            MediaTimestamp{sample.duration, track.scale}, sample.sync};
   }
 
+  std::optional<MediaPresentationRange> PresentationRange(std::size_t track) const override {
+    return indexes_[track].presentation_range;
+  }
+
   std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp time, SeekDirection direction, bool seek) override {
     if (seek && !input.Random()) Fail(ContainerErrorCode::NeedRandomAccess, "MP4 input cannot seek");
-    if (layout == ContainerLayout::Fragmented)
-      Fail(ContainerErrorCode::IndexUnavailable, "Fragmented MP4 has no covered seek index");
+    if (layout == ContainerLayout::Fragmented && !fragment_indexed_) BuildFragmentIndex();
     const auto index = PacketTrack(tracks, id);
     const auto& track = indexes_[index];
     const auto& points = track.sync;
@@ -570,27 +572,43 @@ public:
     }
     if (seek) {
       const auto entry = std::lower_bound(order_.begin(), order_.end(), sample.offset,
-                                          [&](SampleRef ref, std::uint64_t offset) { return Sample(ref).offset < offset; });
+          [&](SampleRef ref, std::uint64_t offset) { return Sample(indexes_, ref).offset < offset; });
       cursor_ = static_cast<std::size_t>(entry - order_.begin());
     }
     return SeekPoint{id, track.Time(sample.pts), kind, sample.offset, {}};
   }
 
 private:
-  const Mp4Sample& Sample(SampleRef ref) const { return indexes_[ref.track].samples[ref.index]; }
+  static const Mp4Sample& Sample(const std::vector<TrackIndex>& indexes, SampleRef ref) {
+    return indexes[ref.track].samples[ref.index];
+  }
 
-  void OrderSamples() {
-    order_.clear();
-    cursor_ = 0;
-    for (std::uint32_t i = 0; i < indexes_.size(); ++i) {
-      for (std::uint32_t j = 0; j < indexes_[i].samples.size(); ++j) order_.push_back({i, j});
+  static std::vector<SampleRef> OrderSamples(const std::vector<TrackIndex>& indexes) {
+    std::vector<SampleRef> order;
+    for (std::uint32_t i = 0; i < indexes.size(); ++i) {
+      for (std::uint32_t j = 0; j < indexes[i].samples.size(); ++j) order.push_back({i, j});
     }
-    std::ranges::sort(order_, {}, [&](SampleRef ref) { return Sample(ref).offset; });
+    std::ranges::sort(order, {}, [&](SampleRef ref) { return Sample(indexes, ref).offset; });
     std::uint64_t end = 0;
-    for (const auto ref : order_) {
-      const auto& sample = Sample(ref);
+    for (const auto ref : order) {
+      const auto& sample = Sample(indexes, ref);
       if (sample.offset < end) Fail(Invalid, "MP4 sample byte ranges overlap");
       end = AddOffset(sample.offset, sample.size);
+    }
+    return order;
+  }
+
+  using MediaRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+  static void ValidateMedia(const std::vector<TrackIndex>& indexes, std::span<const SampleRef> order,
+                            const MediaRanges& media) {
+    std::size_t range = 0;
+    for (auto ref : order) {
+      const auto& sample = Sample(indexes, ref);
+      while (range < media.size() && sample.offset >= media[range].second) ++range;
+      if (range == media.size() || sample.offset < media[range].first ||
+          AddOffset(sample.offset, sample.size) > media[range].second)
+        Fail(Invalid, "MP4 sample lies outside media data");
     }
   }
 
@@ -708,8 +726,7 @@ private:
       const auto rotation = Rotation(tkhd, Version(tkhd) ? 52 : 40);
       track.rotation = static_cast<VideoRotation>(
           (static_cast<unsigned>(movie_rotation_) + static_cast<unsigned>(rotation)) % 4);
-      const auto clap = Child(extensions, "clap", false, mov_visual);
-      if (!clap.empty()) track.visible = Aperture(clap, width, height);
+      ReadVisualMetadata(extensions, track, mov_visual);
     } else if (handler == Tag("soun") && format == ContainerFormat::Mov) {
       ReadPcmDescription(entry, track);
     } else {
@@ -720,25 +737,65 @@ private:
     } else {
       ParseSamples(stbl, index, MaxContainerSamples - count);
     }
-    ApplyEdits(track, index, ParseEdits(Child(box, "edts", false)));
+    index.edit = ParseEdits(Child(box, "edts", false));
+    ApplyEdits(track, index);
+    SetPresentation(track, index);
+    const auto& window = track.presentation_edit ? track.presentation_edit : index.presentation_range;
+    if (window && (!start || window->start.Compare(*start) < 0)) start = window->start;
     count += index.samples.size();
     tracks.push_back(std::move(track));
     indexes_.push_back(std::move(index));
   }
 
-  void ApplyEdits(MediaTrack& track, TrackIndex& index, const EditList& edit) {
-    if (edit.media_start) {
-      // Only introduce a common scale if the movie edit cannot be represented on the track clock.
-      const MediaTimestamp leading{edit.empty, movie_scale_};
-      const auto track_ticks = leading.Rescale(index.scale);
-      if (!track_ticks || *track_ticks != leading) index.clock = CommonScale(movie_scale_, index.scale);
-      index.shift = SubTime(ExactTicks(leading, index.clock), ExactTicks({*edit.media_start, index.scale}, index.clock));
-      track.timescale = index.clock;
+  static void ReadVisualMetadata(ByteView extensions, MediaTrack& track, bool mov_visual) {
+    while (!extensions.empty()) {
+      if (mov_visual && extensions.size() == 4 && Number<std::uint32_t>(extensions) == 0) break;
+      const auto box = NextBox(extensions);
+      if (box.tag == Tag("clap")) {
+        if (track.visible) Fail(Invalid, "Duplicate MP4 clean aperture");
+        track.visible = Aperture(box.bytes, *track.coded_width, *track.coded_height);
+      } else if (box.tag == Tag("pasp")) {
+        if (track.pixel_aspect_ratio || box.bytes.size() != 8)
+          Fail(Invalid, "Duplicate or malformed MP4 pixel aspect ratio");
+        const auto width = Number<std::uint32_t>(box.bytes), height = Number<std::uint32_t>(box.bytes, 4);
+        if (!width || !height) Fail(Invalid, "Zero MP4 pixel aspect spacing");
+        track.pixel_aspect_ratio = MediaTrack::PixelAspectRatio{width, height};
+      } else if (Mp4VideoExtensionTag(box.tag)) {
+        auto type = EntryName(box.tag);
+        if (std::ranges::find(track.video_extensions, type, &MediaTrack::VideoExtension::type) != track.video_extensions.end())
+          Fail(Invalid, "Duplicate MP4 visual extension");
+        ValidateMp4VideoExtension(box.tag, box.bytes, track.codec, Invalid);
+        track.video_extensions.push_back({std::move(type), Bytes(box.bytes.begin(), box.bytes.end())});
+      }
     }
+  }
+
+  void ApplyEdits(MediaTrack& track, TrackIndex& index) {
+    const auto& edit = index.edit;
+    if (!edit.media_start) return;
+    const MediaTimestamp leading{edit.empty, movie_scale_};
+    if (edit.duration)
+      track.presentation_edit = MediaPresentationRange{leading, {AddTime(edit.empty, edit.duration), movie_scale_}};
+    // Only introduce a common scale if the movie edit cannot be represented on the track clock.
+    const auto track_ticks = leading.Rescale(index.scale);
+    if (!track_ticks || *track_ticks != leading) index.clock = CommonScale(movie_scale_, index.scale);
+    index.shift = SubTime(ExactTicks(leading, index.clock), ExactTicks({*edit.media_start, index.scale}, index.clock));
+    track.timescale = index.clock;
+  }
+
+  void SetPresentation(MediaTrack& track, TrackIndex& index) const {
     if (index.samples.empty()) return;
-    const auto first = std::ranges::min_element(index.samples, {}, &Mp4Sample::pts)->pts;
-    const auto visible = edit.media_start ? MediaTimestamp{edit.empty, movie_scale_} : index.Time(first);
-    if (!start || visible.Compare(*start) < 0) start = visible;
+    auto first = index.samples.front().pts, last = first;
+    for (const auto& sample : index.samples) {
+      first = std::min(first, sample.pts);
+      last = std::max(last, AddTime(sample.pts, sample.duration));
+    }
+    const auto earlier = [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; };
+    const auto& edit = index.edit;
+    auto begin = index.Time(first), end = index.Time(last);
+    if (edit.media_start) begin = std::max(begin, MediaTimestamp{edit.empty, movie_scale_}, earlier);
+    if (track.presentation_edit) end = std::min(end, track.presentation_edit->end, earlier);
+    index.presentation_range = MediaPresentationRange{begin, std::max(begin, end, earlier)};
     if (!track.sample_rate || !edit.media_start) return;
     const auto rate = *track.sample_rate;
     auto trim = [&](MediaTimestamp time) -> std::optional<std::uint64_t> {
@@ -748,8 +805,6 @@ private:
     };
     track.priming_samples = trim({SubTime(*edit.media_start, first), index.scale});
     if (edit.duration) {
-      std::int64_t last = first;
-      for (auto& sample : index.samples) last = std::max(last, AddTime(sample.pts, sample.duration));
       auto scale = CommonScale(movie_scale_, index.scale);
       auto tail = SubTime(ExactTicks({SubTime(last, *edit.media_start), index.scale}, scale),
                           ExactTicks({edit.duration, movie_scale_}, scale));
@@ -781,6 +836,64 @@ private:
     return static_cast<std::size_t>(track - tracks.begin());
   }
 
+  void BuildFragmentIndex() {
+    if (!input.Random() || !input.Size())
+      Fail(ContainerErrorCode::IndexUnavailable, "Fragmented MP4 indexing requires a bounded random-access input");
+    const auto previous = input.Position();
+    const auto next = cursor_ < order_.size() ? Sample(indexes_, order_[cursor_]).offset : previous;
+    std::vector<TrackIndex> indexes;
+    indexes.reserve(indexes_.size());
+    for (const auto& track : indexes_) {
+      indexes.push_back({.scale = track.scale, .clock = track.clock, .shift = track.shift,
+          .nal_length = track.nal_length, .edit = track.edit, .default_duration = track.default_duration,
+          .default_size = track.default_size, .default_flags = track.default_flags, .defaults = track.defaults});
+    }
+    MediaRanges media;
+    std::size_t boxes = 0, samples = 0;
+    try {
+      input.Seek(fragment_start_);
+      while (const auto box = ReadBox(input)) {
+        if (++boxes > 3 * MaxContainerSamples)
+          Fail(ContainerErrorCode::LimitExceeded, "MP4 fragment index exceeds its box limit");
+        const auto end = AddOffset(input.Position(), box->size);
+        if (box->tag == Tag("moof")) Fragment(ReadMetadata(input, box->size), box->offset, indexes, samples);
+        if (box->tag == Tag("mdat")) {
+          if (media.size() == MaxContainerSamples)
+            Fail(ContainerErrorCode::LimitExceeded, "MP4 fragment index exceeds its media box limit");
+          media.emplace_back(input.Position(), end);
+        }
+        input.Seek(end);
+      }
+    } catch (...) {
+      input.Seek(previous);
+      throw;
+    }
+    input.Seek(previous);
+    auto order = OrderSamples(indexes);
+    ValidateMedia(indexes, order, media);
+    auto descriptions = tracks;
+    auto first = start;
+    std::optional<MediaTimestamp> end;
+    for (std::size_t i = 0; i < indexes.size(); ++i) {
+      IndexSyncSamples(indexes[i]);
+      SetPresentation(descriptions[i], indexes[i]);
+      const auto& window = descriptions[i].presentation_edit ? descriptions[i].presentation_edit : indexes[i].presentation_range;
+      if (window) {
+        if (!first || window->start.Compare(*first) < 0) first = window->start;
+        if (!end || window->end.Compare(*end) > 0) end = window->end;
+      }
+    }
+    const auto entry = std::lower_bound(order.begin(), order.end(), next,
+        [&](SampleRef ref, std::uint64_t offset) { return Sample(indexes, ref).offset < offset; });
+    cursor_ = static_cast<std::size_t>(entry - order.begin());
+    indexes_ = std::move(indexes);
+    order_ = std::move(order);
+    tracks = std::move(descriptions);
+    start = first;
+    if (!duration && end && end->ticks > 0) duration = end;
+    fragment_indexed_ = true;
+  }
+
   bool NextFragment() {
     // A size-zero mdat consumes the rest of the input. After its declared samples there is no next box.
     if (media_to_eof_) return false;
@@ -791,8 +904,10 @@ private:
       if (++boxes > 4096) Fail(ContainerErrorCode::LimitExceeded, "Too many boxes between MP4 fragments");
       if (box->tag == Tag("moof")) {
         for (auto& index : indexes_) index.samples.clear();
-        Fragment(ReadMetadata(input, box->size), box->offset);
-        OrderSamples();
+        std::size_t samples = 0;
+        Fragment(ReadMetadata(input, box->size), box->offset, indexes_, samples);
+        order_ = OrderSamples(indexes_);
+        cursor_ = 0;
         if (!order_.empty()) return true;
       } else {
         if (box->to_eof) return false;
@@ -804,8 +919,7 @@ private:
     return false;
   }
 
-  void Fragment(ByteView moof, std::uint64_t offset) {
-    std::size_t count = 0;
+  void Fragment(ByteView moof, std::uint64_t offset, std::vector<TrackIndex>& indexes, std::size_t& count) {
     auto previous_end = offset;
     while (!moof.empty()) {
       const auto box = NextBox(moof);
@@ -814,7 +928,7 @@ private:
       CheckVersion(tfhd, 0);
       const auto flags = Number<std::uint32_t>(tfhd);
       if (flags & ~0x03003bu) Fail(Unsupported, "Unsupported MP4 track fragment flags");
-      auto& track = indexes_[FragmentTrack(Number<std::uint32_t>(tfhd, 4))];
+      auto& track = indexes[FragmentTrack(Number<std::uint32_t>(tfhd, 4))];
       std::size_t pos = 8;
       auto base = flags & 0x20000 ? offset : previous_end;
       if (flags & 1) {
@@ -917,12 +1031,14 @@ private:
 
   std::vector<TrackIndex> indexes_;
   std::vector<SampleRef> order_;
-  std::vector<std::pair<std::uint64_t, std::uint64_t>> media_;
+  MediaRanges media_;
   std::uint32_t movie_scale_ = 0;
   VideoRotation movie_rotation_ = VideoRotation::None;
   std::size_t cursor_ = 0;
+  std::uint64_t fragment_start_ = 0;
   std::uint64_t media_end_ = 0;
   bool media_to_eof_ = false;
+  bool fragment_indexed_ = false;
 };
 } // namespace
 

@@ -141,6 +141,7 @@ public:
   virtual ~ContainerReader() = default;
   virtual std::optional<DemuxItem> Read() = 0;
   virtual std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp time, SeekDirection direction, bool seek);
+  virtual std::optional<MediaPresentationRange> PresentationRange(std::size_t) const { return {}; }
 
   ContainerInput input;
   ContainerFormat format;

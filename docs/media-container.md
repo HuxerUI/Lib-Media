@@ -13,7 +13,7 @@ that identifier directly to `VideoDecoderConfig::codec` along with the track's i
 | Container | Packets | Input | Output |
 | --- | --- | --- | --- |
 | Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC and length-prefixed AVC or HEVC | Random access, or sequential when movie metadata precedes samples | Random write; fast-start requires random read/write |
-| Fragmented MP4 | Same AAC, AVC, and HEVC mappings | Sequential or random-access input, beginning with initialization | Sequential or random write |
+| Fragmented MP4 | Same AAC, AVC, and HEVC mappings | Sequential or random access from initialization. Finite random-access files support seek. | Sequential or random write |
 | QuickTime MOV | Same AAC, AVC, and HEVC mappings, ProRes, and packed interleaved PCM | Random access, or sequential when movie metadata precedes samples | Random write |
 | Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, raw AAC-LC, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
 | WebM | VP8, VP9, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
@@ -27,14 +27,35 @@ MP4 supports one description per track and self-contained samples in decode orde
 Regular MP4 accepts one rate-one edit and an optional leading empty edit. Its writer uses those edits to
 preserve track offsets and audio trim. Trim is measured relative to packet timing from the sample tables,
 so a shortened sample duration is already reflected in that timeline. The fragmented writer emits an initialization movie and bounded
-fragments. It requires nonnegative DTS and rejects nonzero audio trim. Fragmented MP4 and ADTS
-currently report `IndexUnavailable` for time-based index queries.
+fragments. It requires nonnegative DTS and rejects explicit presentation edits and nonzero audio trim. ADTS and
+sequential fragmented MP4 report `IndexUnavailable` for time-based index queries.
+
+### Track presentation intervals
+
+`MediaDemuxer::PresentationRange(track_id)` returns the effective half-open interval on the common presentation
+timeline. For MP4 and MOV it intersects sample coverage with the supported edit, so the end stays within the last
+sample even if the edit extends farther. Equal endpoints describe an empty interval. An absent result means coverage
+is unavailable or the track ID is unknown. The query does not move the cursor or build an index. `Read()` continues
+to return coded preroll and tail packets. Apply the range to decoded pictures and PCM for presentation.
+
+`MediaTrack::presentation_edit` carries a finite authored edit. Pass the track and original packet PTS, DTS, and
+duration to regular MP4 or MOV output to retain the edit. Any supplied audio priming or padding must agree with it.
+Callers that intentionally drop an edit can clear `presentation_edit` and supply the desired trim policy.
+`ValidateOutput()` rejects an authored edit if the target cannot retain it. Learning the sample coverage of an
+unedited track leaves its output compatibility unchanged.
 
 HEVC tracks retain `hvcC` and their `hvc1` or `hev1` sample entry. With `hvc1`, parameter sets are
 in the configuration and the writer rejects in-band parameter sets. `hev1` can carry parameter sets in
 samples, and its seek points report the container sync mark. With random input, a validated `hvc1`
 IDR can report `Independent`. Presentation rotation combines right-angle movie and track transforms
 and is emitted as a track matrix. Packet bytes and coded dimensions retain their original orientation.
+
+Video descriptions also retain `pasp` as `pixel_aspect_ratio` and `colr`, `mdcv`, `clli`, `amve`, `dvcC`, and `dvvC`
+as bounded `video_extensions` payloads. The writer retains supported payloads byte for byte on compatible MP4 or MOV
+tracks. `colr` accepts `nclc`, `nclx`, and bounded ICC profiles. Dolby Vision configuration is supported on compatible
+HEVC sample entries. The example uses aspect ratio for display and keeps HDR files on the packet-copy path.
+[QuickTime pixel aspect](https://developer.apple.com/documentation/quicktime-file-format/pixel_aspect_ratio) ·
+[QuickTime color parameters](https://developer.apple.com/documentation/quicktime-file-format/color_parameter_atom)
 
 MOV uses the `qt  ` major brand and self-contained media. ProRes retains the Proxy, LT, 422, HQ,
 4444, or 4444 XQ sample entry. PCM supports U8, signed 16/24/32-bit, and 32-bit float, with little-
@@ -48,8 +69,8 @@ the subtype, valid bits, and speaker mask when passed to a WAVE or RF64 writer. 
 frame-aligned blocks. ADTS strips transport headers on read and supplies them on write. It provides a
 sample-count timeline starting at zero and emits an updated track description if the AAC configuration changes.
 
-The container API covers the track and packet fields declared in the header. Container-specific metadata
-such as tags, chapters, attachments, color metadata, and complex edit lists is outside these mappings.
+The container API covers the track and packet fields declared in the header. Tags, chapters, attachments,
+unmapped color metadata, and complex edit lists are outside these mappings.
 Mirrored, scaled, or perspective movie and track matrices report `Unsupported`.
 A format or codec combination outside the table returns a format or support error.
 
@@ -78,10 +99,16 @@ Use the most recent description for that track before interpreting its packet. A
 EOF. Truncated packets and malformed sample tables are errors. A returned `BufferReference` keeps its bytes alive
 across reads, seeks, and session closure.
 
-`FindSeekPoint()` preserves the read position. `Seek()` uses indexed anchors in regular MP4, MOV, Matroska,
-and WebM, sample frames in WAVE and RF64, or packet anchors in Ogg, native FLAC, and MP3. Check the returned point and its evidence before starting a decoder. A
-reference-track anchor can also affect the starting positions of other selected tracks. The first packet read
-from each track after a seek is preceded by its description.
+`FindSeekPoint()` preserves the read position. `Seek()` uses indexed anchors in MP4, MOV, Matroska, and WebM,
+sample frames in WAVE and RF64, or packet anchors in Ogg, native FLAC, and MP3. Check the returned point and its
+evidence before starting a decoder. A reference-track anchor can also affect the starting positions of other
+selected tracks. The first packet read from each track after a seek is preceded by its description.
+
+The first index query on a finite random-access fMP4 scans fragment headers and validates sample offsets against
+media data boxes. The index retains at most one million samples and uses the same anchor rules as regular MP4.
+Subsequent seeks reuse the index. Indexing can establish `PresentationRange()` and `Duration()` and refine audio
+trim in `Tracks()`. Sequential reading still processes one fragment at a time. A malformed or oversized index
+reports an error and leaves the current read position available.
 
 Matroska and WebM share the EBML reader. The document type selects the mapping. The reader accepts
 known- and unknown-sized Segments and Clusters, `SimpleBlock`, `BlockGroup`, and Xiph, fixed, and EBML

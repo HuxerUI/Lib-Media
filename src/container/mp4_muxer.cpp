@@ -3,6 +3,7 @@
 #include "codec/common.h"
 
 #include <array>
+#include <numeric>
 
 namespace huxerui::media::detail {
 namespace {
@@ -14,8 +15,8 @@ void Zero(Bytes& bytes, std::size_t size) { bytes.resize(bytes.size() + size); }
 void Matrix(Bytes& bytes, VideoRotation rotation = VideoRotation::None,
             std::uint32_t width = 0, std::uint32_t height = 0) {
   constexpr std::int32_t unit = 0x10000;
-  const auto x = static_cast<std::int32_t>(width << 16);
-  const auto y = static_cast<std::int32_t>(height << 16);
+  const auto x = static_cast<std::int32_t>(width);
+  const auto y = static_cast<std::int32_t>(height);
   std::array<std::int32_t, 9> matrix{unit, 0, 0, 0, unit, 0, 0, 0, 0x40000000};
   // QuickTime stores a row-vector transform. Translate the rotated rectangle back to a zero origin.
   switch (rotation) {
@@ -29,8 +30,25 @@ void Matrix(Bytes& bytes, VideoRotation rotation = VideoRotation::None,
 
 std::uint32_t MovieScale(std::span<const MediaTrack> tracks) {
   std::uint32_t scale = 1;
-  for (auto& track : tracks) scale = CommonScale(scale, Mp4Scale(track));
+  for (const auto& track : tracks) {
+    scale = CommonScale(scale, Mp4Scale(track));
+    if (const auto& range = track.presentation_edit) {
+      for (const auto time : {range->start, range->end}) {
+        const auto divisor = std::gcd(std::uint64_t(time.ticks), std::uint64_t(time.timescale));
+        scale = CommonScale(scale, static_cast<std::uint32_t>(time.timescale / divisor));
+      }
+    }
+  }
   return scale;
+}
+
+std::uint32_t DisplayWidth(const MediaTrack& track, std::uint32_t width) {
+  auto fixed = std::uint64_t(width) << 16;
+  if (const auto& aspect = track.pixel_aspect_ratio)
+    fixed = (fixed * aspect->width + aspect->height / 2) / aspect->height;
+  if (!fixed || fixed > std::numeric_limits<std::uint32_t>::max())
+    Fail(WriteError, "MP4 display width exceeds the track header grid");
+  return static_cast<std::uint32_t>(fixed);
 }
 
 Bytes Descriptor(std::uint8_t type, ByteView data) {
@@ -159,6 +177,11 @@ void SampleDescription(Bytes& bytes, const MediaTrack& track, bool mov) {
             Put(bytes, 2u);
           });
         }
+        if (const auto& aspect = track.pixel_aspect_ratio) {
+          Box(bytes, "pasp", [&] { Put(bytes, aspect->width); Put(bytes, aspect->height); });
+        }
+        for (const auto& extension : track.video_extensions)
+          Box(bytes, extension.type, [&] { Append(bytes, extension.payload); });
       });
     }
   });
@@ -248,7 +271,10 @@ struct TrackEdit {
 };
 
 TrackEdit Edit(const MediaTrack& track, std::span<const Mp4Sample> samples, std::uint32_t movie_scale) {
-  if (samples.empty()) return {};
+  if (samples.empty()) {
+    if (track.presentation_edit) Fail(WriteError, "A presentation edit requires media samples");
+    return {};
+  }
   const auto scale = Mp4Scale(track);
   const auto first = std::ranges::min_element(samples, {}, &Mp4Sample::pts)->pts;
   auto end = first;
@@ -259,13 +285,22 @@ TrackEdit Edit(const MediaTrack& track, std::span<const Mp4Sample> samples, std:
       Fail(WriteError, "Invalid MP4 audio trim");
     return ExactTicks({static_cast<std::int64_t>(value), *track.sample_rate}, scale);
   };
-  const auto start = std::max<std::int64_t>(0, AddTime(first, trim(track.priming_samples.value_or(0))));
+  auto start = std::max<std::int64_t>(0, AddTime(first, trim(track.priming_samples.value_or(0))));
   end = SubTime(end, trim(track.padding_samples.value_or(0)));
+  auto movie_end = ExactTicks({end, scale}, movie_scale);
+  if (const auto& range = track.presentation_edit) {
+    const auto explicit_start = ExactTicks(range->start, scale);
+    if ((track.priming_samples && explicit_start != start) ||
+        (track.padding_samples && range->end != MediaTimestamp{end, scale}))
+      Fail(WriteError, "MP4 audio trim conflicts with its presentation interval");
+    start = explicit_start;
+    movie_end = ExactTicks(range->end, movie_scale);
+  }
+  const auto movie_start = ExactTicks({start, scale}, movie_scale);
   const auto media_start = SubTime(start, samples.front().dts);
-  if (end <= start || media_start < 0)
+  if (movie_end <= movie_start || media_start < 0)
     Fail(ContainerErrorCode::Unsupported, "MP4 edit cannot represent the requested presentation interval");
-  return {ExactTicks({start, scale}, movie_scale),
-          ExactTicks({SubTime(end, start), scale}, movie_scale), media_start,
+  return {movie_start, SubTime(movie_end, movie_start), media_start,
           SubTime(AddTime(samples.back().dts, samples.back().duration), samples.front().dts)};
 }
 
@@ -280,11 +315,11 @@ void TrackBox(Bytes& bytes, const MediaTrack& track, std::span<const Mp4Sample> 
       Zero(bytes, 12);
       Put<std::uint16_t>(bytes, video ? 0 : 0x100);
       Put<std::uint16_t>(bytes, 0);
-      const auto width = track.visible ? track.visible->width : track.coded_width.value_or(0);
-      const auto height = track.visible ? track.visible->height : track.coded_height.value_or(0);
+      const auto width = video ? DisplayWidth(track, track.visible ? track.visible->width : *track.coded_width) : 0;
+      const auto height = (track.visible ? track.visible->height : track.coded_height.value_or(0)) << 16;
       Matrix(bytes, track.rotation, width, height);
-      Put(bytes, width << 16);
-      Put(bytes, height << 16);
+      Put(bytes, width);
+      Put(bytes, height);
     });
     if (!samples.empty()) {
       // An optional empty edit preserves the track's offset on the common presentation timeline.
@@ -598,9 +633,14 @@ bool AvcIdr(ByteView bytes, unsigned length_size, ContainerErrorCode error) {
 }
 
 void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout) {
-  MovieScale(tracks);
   for (const auto& track : tracks) {
     if (track.id == 0xffffffffu) Fail(WriteError, "MP4 track ID leaves no next track ID");
+    if (const auto& range = track.presentation_edit) {
+      if (layout == ContainerLayout::Fragmented)
+        Fail(ContainerErrorCode::Unsupported, "Fragmented MP4 output cannot retain an explicit presentation interval");
+      if (range->start.ticks < 0) Fail(WriteError, "MP4 presentation starts before the movie origin");
+      ExactTicks(range->start, Mp4Scale(track));
+    }
     if (track.kind == TrackKind::Audio && track.codec == CodecId::Aac && track.framing == PacketFraming::CodecPacket) {
       const auto config = ParseAac(track.initialization_data);
       if (!config.Succeeded()) Fail(ContainerErrorCode::Unsupported, config.Error().message);
@@ -635,17 +675,28 @@ void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, Con
           track.visible->y >= height || track.visible->width > width - track.visible->x ||
           track.visible->height > height - track.visible->y))
         Fail(WriteError, "Visible rectangle exceeds coded bounds");
+      if (const auto& aspect = track.pixel_aspect_ratio; aspect && (!aspect->width || !aspect->height))
+        Fail(WriteError, "MP4 pixel aspect terms must be positive");
+      const auto display_width = DisplayWidth(track, track.visible ? track.visible->width : width);
       if (track.rotation < VideoRotation::None || track.rotation > VideoRotation::Clockwise270 ||
           (track.rotation != VideoRotation::None &&
-           ((track.visible ? track.visible->width : width) > 32767 ||
+           (display_width > std::numeric_limits<std::int32_t>::max() ||
             (track.visible ? track.visible->height : height) > 32767)))
         Fail(WriteError, "Video rotation cannot be represented by the track matrix");
+      for (auto extension = track.video_extensions.begin(); extension != track.video_extensions.end(); ++extension) {
+        if (extension->type.size() != 4 ||
+            std::ranges::find(track.video_extensions.begin(), extension, extension->type,
+                              &MediaTrack::VideoExtension::type) != extension)
+          Fail(WriteError, "Invalid or duplicate MP4 visual extension type");
+        ValidateMp4VideoExtension(Tag(extension->type), extension->payload, track.codec, WriteError);
+      }
     } else {
       Fail(ContainerErrorCode::Unsupported, "Unsupported MP4 or QuickTime audio sample entry");
     }
     if (track.kind != TrackKind::Video && track.rotation != VideoRotation::None)
       Fail(WriteError, "Presentation rotation requires a video track");
   }
+  MovieScale(tracks);
 }
 
 std::unique_ptr<ContainerWriter> OpenMp4Writer(ContainerOutput output, ContainerFormat format,

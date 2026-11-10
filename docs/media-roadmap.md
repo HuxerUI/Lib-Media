@@ -8,9 +8,9 @@ record current support. Each planned capability has its own format, direction, p
 
 | Order | Work | Acceptance |
 | --- | --- | --- |
-| Next | Expand real-file MP4 preview and export acceptance | Extend macOS, Android 12 and Chrome coverage to iOS, Windows, Linux, other devices and browsers. Verify frame order, duration, audio trim, and A/V alignment with independent readers and device playback. |
-| Then | Expand phone MOV/HEVC acceptance and export timing | Check real phone footage on devices, HDR presentation, and hardware combinations. Validate explicit DTS paths for reordered encoding in addition to the preview's no-reorder path. |
-| In parallel | Extend the audio mappings | Ogg/Opus and native FLAC/MP3 input cover basic timing and random seek. Expand Ogg chaining and mappings, FLAC metadata and writing, and MP3 writing and tag variants with independent samples. |
+| Current | Track presentation intervals, local fMP4 seek, MP4/MOV packet copy and reordered export | macOS passes fixture integration and independent B-picture readback. Android 12 hardware and iOS Simulator pass headless FFmpeg-generated fMP4 seek and HLG HEVC MOV-to-MP4 copy with identical access units and supported metadata. iOS Simulator decodes SDR Main10 MOV to P010. |
+| Remaining acceptance | iPhone camera originals and additional desktop and browser runs | On an iPhone, import a camera-original MOV, verify SDR preview and repeated seeks, then save a packet copy and check its display transform, timing and color metadata independently. Validate HDR presentation separately from metadata retention. Expand Windows, Linux and browser checks. |
+| Next audio batch | Extend the audio mappings | Ogg/Opus and native FLAC/MP3 input cover basic timing and random seek. Add chained Ogg, Opus decode and PCM playback, then extend FLAC and MPEG audio metadata, seeking and output with independent samples. |
 
 ## File and URL playback
 
@@ -59,7 +59,7 @@ See the [codec guide](media-codec.md), [codec validation](media-codec.md#validat
 
 | Container | Remaining work |
 | --- | --- |
-| MP4, M4A, MOV, fMP4 | Fragment boundaries and seek indexes, multiple sample descriptions and configuration changes, additional edit lists and fragmented audio trim, AV1 and other needed mappings, and MOV timecode, timed metadata, and display transforms. |
+| MP4, M4A, MOV, fMP4 | Incremental or embedded fragment indexes for larger and growing inputs, multiple sample descriptions and configuration changes, additional edit lists and fragmented audio trim, AV1 and other needed mappings, and MOV timecode, timed metadata, and additional display transforms. |
 | Matroska, MKA, WebM | Additional mappings such as VP8, VP9, AV1, FLAC, and Vorbis for Matroska, and AV1 and Vorbis for WebM. Extend Opus beyond mapping family zero. Cover files without Cues, timestamp precision beyond the current 1 ms output grid, and subtitle, chapter, attachment, and tag preservation. |
 | WAVE and RF64 | RF64 additional-size entries, large-file interoperation, and further PCM or channel layouts where needed. |
 | ADTS | Additional AAC configurations and transport variants driven by input samples. |

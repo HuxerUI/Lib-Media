@@ -74,6 +74,17 @@ TrackFixture Fixture(bool audio, bool fragmented) {
   }
   Check(!fixture.packets.empty(), "Missing codec fixtures");
   if (audio && !fragmented) fixture.packets.back().duration = MediaTimestamp{1024, 48000};
+  if (fragmented && !audio) {
+    const auto count = fixture.packets.size();
+    const auto span = fixture.packets.back().dts->ticks + fixture.packets.back().duration->ticks -
+                      fixture.packets.front().dts->ticks;
+    for (std::size_t i = 0; i < count; ++i) {
+      auto packet = fixture.packets[i];
+      packet.pts->ticks += span;
+      packet.dts->ticks += span;
+      fixture.packets.push_back(std::move(packet));
+    }
+  }
   return fixture;
 }
 
@@ -152,6 +163,12 @@ void Mp4(const fs::path& path, ContainerLayout layout) {
   if (!fragmented) {
     Check(demux.Tracks()[1].priming_samples == 1024 && demux.Tracks()[1].padding_samples == 288,
           "MP4 AAC edit list did not retain trim");
+    const auto& first = audio.packets.front();
+    const auto& last = audio.packets.back();
+    const MediaPresentationRange expected{{first.pts->ticks + 1024, 48000},
+        {last.pts->ticks + last.duration->ticks - 288, 48000}};
+    Check(demux.Tracks()[1].presentation_edit == expected && demux.PresentationRange(audio.track.id) == expected,
+          "MP4 AAC presentation range includes trimmed packets");
   }
   cursor = {};
   std::optional<ContainerPacket> retained;
@@ -185,6 +202,38 @@ void Mp4(const fs::path& path, ContainerLayout layout) {
   Compare(*retained, video.packets[0]);
 
   if (fragmented) {
+    auto indexed = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+    Check(!indexed.PresentationRange(video.track.id), "Unindexed fragments reported sample coverage");
+    const auto requirement = Take(MediaMuxer::ValidateOutput(ContainerFormat::Mp4, indexed.Tracks(), layout));
+    const std::array selected{video.track.id};
+    Take(indexed.SelectTracks(selected));
+    Compare(std::get<ContainerPacket>(*Take(indexed.Read())), video.packets[0]);
+    const auto& second_idr = video.packets[video.packets.size() / 2];
+    const auto future = Take(indexed.FindSeekPoint(video.track.id, *video.packets[1].pts, SeekDirection::AtOrAfter));
+    Check(future && future->time == *second_idr.pts && future->kind == SeekPoint::Kind::Independent,
+          "Fragment index did not find the next independent sample");
+    Compare(std::get<ContainerPacket>(*Take(indexed.Read())), video.packets[1]);
+    const auto video_range = indexed.PresentationRange(video.track.id);
+    Check(indexed.Duration() && video_range && indexed.PresentationRange(audio.track.id) &&
+          !indexed.PresentationRange(0),
+          "Fragment index did not establish presentation coverage");
+    Check(!indexed.Tracks()[0].presentation_edit && !indexed.Tracks()[1].presentation_edit &&
+          Take(MediaMuxer::ValidateOutput(ContainerFormat::Mp4, indexed.Tracks(), layout)) == requirement,
+          "Building an index made unedited tracks incompatible with fragmented output");
+    auto edited = indexed.Tracks()[0];
+    edited.presentation_edit = video_range;
+    const auto unsupported = MediaMuxer::ValidateOutput(ContainerFormat::Mp4, std::span(&edited, 1), layout);
+    Check(!unsupported.Succeeded() && unsupported.Error().code == ContainerErrorCode::Unsupported,
+          "Fragmented output accepted an authored edit");
+    for (const auto* expected : {&second_idr, &video.packets[0], &second_idr}) {
+      const auto point = Take(indexed.Seek(video.track.id, *expected->pts));
+      Check(point && point->time == *expected->pts && point->kind == SeekPoint::Kind::Independent,
+            "Fragment seek changed its anchor");
+      Check(std::get<MediaTrack>(*Take(indexed.Read())).id == video.track.id &&
+            indexed.PresentationRange(video.track.id) == video_range, "Fragment seek changed the track or its coverage");
+      Compare(std::get<ContainerPacket>(*Take(indexed.Read())), *expected);
+    }
+
     auto bytes = Take(file.ReadBytes());
     Check(bytes.size() >= last_packet_size + 8, "Missing final fragment data box");
     auto header = std::span(bytes).subspan(bytes.size() - last_packet_size - 8, 8);
@@ -209,6 +258,12 @@ void Mp4(const fs::path& path, ContainerLayout layout) {
     while (result.Succeeded() && result.Value()) result = truncated.Read();
     Check(!result.Succeeded() && result.Error().code == ContainerErrorCode::InvalidData,
           "Truncated fragment was treated as EOF");
+    auto damaged_index = Take(MediaDemuxer::Open(Take(Path(shortened).OpenRandomAccess())));
+    const auto failed = damaged_index.FindSeekPoint(video.track.id, {1, 1});
+    Check(!failed.Succeeded() && failed.Error().code == ContainerErrorCode::InvalidData,
+          "Truncated fragments produced a seek index");
+    Take(damaged_index.SelectTracks(selected));
+    Compare(std::get<ContainerPacket>(*Take(damaged_index.Read())), video.packets.front());
   }
 }
 
@@ -416,6 +471,7 @@ void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in
   }
   Check(packets[0].size() == (hevc ? 6 : 4) && !packets[1].empty(), "Wrong QuickTime fixture packet count");
   if (!hevc) Check(pcm_bytes == 4000 * 6, "QuickTime PCM lost sample frames");
+  const std::array source_ranges{input.PresentationRange(tracks[0].id), input.PresentationRange(tracks[1].id)};
   Take(input.Close());
 
   if (in_band) {
@@ -453,6 +509,7 @@ void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in
     for (auto& track : tracks) {
       track.priming_samples.reset();
       track.padding_samples.reset();
+      track.presentation_edit.reset();
     }
     for (auto& group : packets) {
       for (auto& packet : group) {
@@ -495,9 +552,18 @@ void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in
   Check(result.Format() == format && result.Layout() == layout && result.Tracks().size() == tracks.size() &&
         result.Tracks()[0].sample_entry == tracks[0].sample_entry &&
         result.Tracks()[0].rotation == tracks[0].rotation &&
+        result.Tracks()[0].pixel_aspect_ratio == tracks[0].pixel_aspect_ratio &&
+        result.Tracks()[0].video_extensions == tracks[0].video_extensions &&
         result.Tracks()[0].initialization_data == tracks[0].initialization_data &&
         result.Tracks()[1].codec == tracks[1].codec && result.Tracks()[1].channel_count == tracks[1].channel_count,
         "Remuxed video or audio description differs");
+  if (!fragmented) {
+    for (std::size_t i = 0; i < tracks.size(); ++i) {
+      Check(result.Tracks()[i].presentation_edit == tracks[i].presentation_edit &&
+            result.PresentationRange(tracks[i].id) == source_ranges[i],
+            "QuickTime remux changed the track edit or effective presentation range");
+    }
+  }
   cursor = {};
   while (auto item = Take(result.Read())) {
     const auto& packet = std::get<ContainerPacket>(*item);

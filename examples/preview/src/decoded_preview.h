@@ -5,7 +5,7 @@
 
 #include <huxerui/external_texture.h>
 #include <huxerui/file.h>
-#include <huxerui/media_format.h>
+#include <huxerui/media_container.h>
 #include <huxerui/resource.h>
 #include <huxerui/task.h>
 
@@ -14,6 +14,12 @@
 #endif
 
 namespace media_preview {
+#if defined(__APPLE__) && TARGET_OS_OSX
+inline constexpr bool preview_reordered_export = true;
+#else
+inline constexpr bool preview_reordered_export = false;
+#endif
+
 #if defined(__ANDROID__) || defined(__APPLE__) || defined(__EMSCRIPTEN__) || defined(_WIN32) || defined(__linux__)
 inline constexpr bool frame_texture_supported = true;
 #else
@@ -54,6 +60,9 @@ huxerui::Task<std::shared_ptr<const huxerui::File>> StageClip(
     huxerui::File temporary, std::optional<huxerui::FileReference> selected,
     std::shared_ptr<huxerui::Resources> resources);
 huxerui::Task<void> PlayContainer(std::shared_ptr<const huxerui::File> file, ClipControls controls);
+huxerui::Task<std::shared_ptr<const huxerui::File>> CopyClip(
+    std::shared_ptr<const huxerui::File> file, huxerui::File temporary,
+    std::optional<huxerui::media::ContainerFormat> format = {});
 huxerui::Task<std::shared_ptr<const huxerui::File>> ExportClip(
-    std::shared_ptr<const huxerui::File> file, huxerui::File temporary);
+    std::shared_ptr<const huxerui::File> file, huxerui::File temporary, bool reorder = false);
 }

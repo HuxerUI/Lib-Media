@@ -81,6 +81,13 @@ std::span<const MediaTrack> MediaDemuxer::Tracks() const { return Require().trac
 std::optional<MediaTimestamp> MediaDemuxer::StartTime() const { return Require().start; }
 std::optional<MediaTimestamp> MediaDemuxer::Duration() const { return Require().duration; }
 
+std::optional<MediaPresentationRange> MediaDemuxer::PresentationRange(std::uint32_t track_id) const {
+  const auto& reader = Require();
+  const auto track = std::ranges::find(reader.tracks, track_id, &MediaTrack::id);
+  if (track == reader.tracks.end()) return {};
+  return reader.PresentationRange(static_cast<std::size_t>(track - reader.tracks.begin()));
+}
+
 ContainerResult<void> MediaDemuxer::SelectTracks(std::span<const std::uint32_t> tracks) {
   return ContainerCall<void>([&] {
     auto& reader = Require();

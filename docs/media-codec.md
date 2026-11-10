@@ -277,6 +277,11 @@ reliable platform timing. Android/Web leave it absent. Windows uses a bounded fi
 pictures and omits DTS once variable input timing makes that clock unsuitable for the input timeline. Do not derive
 DTS from PTS or assume absent DTS means presentation order. A muxer must handle that limitation explicitly.
 
+The macOS preview enables High profile with automatic B pictures. It submits a bounded group of decoded pictures
+and retains one encoded packet until the next DTS establishes its decode duration. It keeps the source PTS and
+presentation window on an exact common clock. Export reports a timing error if the adapter does not provide the
+DTS required for that mode. The Baseline path explicitly disables reordering.
+
 The default video limits are four copied inputs/64 MiB and eight compressed outputs/32 MiB, with 4 MiB maximum per
 packet. Input must fit one packed picture. Output must fit at least two full maximum-packet reservations, or
 `max_b_frames + 2` for a positive bound. Adapter controls use a progress window of at most 32 pictures and may require
@@ -356,8 +361,8 @@ Initialize `next = 0` and `finishing = false`. Call from scheduled work after re
 do not busy-wait on the UI/event-loop thread. `true` means EOS was consumed and the pump should stop. `Finish()` seals
 input; keep draining until EOS. `Reset()` can discard a running/draining stream immediately, and `Close()` starts
 asynchronous cleanup. Use owned/weak callback captures and observe `cleanup_completed` when resource release matters.
-The Frames preview's [streaming round trip](../examples/preview/src/decoded_clip.cpp) retains at most one pending
-source frame, packet, and decoded picture rather than collecting a whole clip.
+The Frames preview's [streaming round trip](../examples/preview/src/decoded_clip.cpp) uses bounded queues. It
+submits individual pictures in the Baseline path and groups up to four in the reordered path.
 
 ## Validation
 

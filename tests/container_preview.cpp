@@ -19,6 +19,7 @@ using namespace std::chrono_literals;
 namespace {
 
 constexpr VideoRectangle EditedAperture{2, 2, 316, 236};
+constexpr MediaTrack::PixelAspectRatio EditedAspect{4, 3};
 constexpr std::int64_t OriginalSamples = 192000;
 constexpr std::int64_t EditedSamples = 24000;
 
@@ -35,7 +36,8 @@ std::shared_ptr<const File> Fixture(const char* name) {
   return std::make_shared<const File>(File(MEDIA_FIXTURES).Child(name));
 }
 
-std::shared_ptr<const File> EditedClip(const File& source, const File& directory) {
+std::shared_ptr<const File> EditedClip(const File& source, const File& directory,
+    MediaPresentationRange video_edit = {{1, 4}, {7, 2}}, std::optional<std::int64_t> audio_packet_end = {}) {
   auto input = Require(MediaDemuxer::Open(Require(source.OpenRandomAccess())));
   Check(input.Tracks().size() == 2, "The edited preview fixture requires two tracks");
   std::array tracks{input.Tracks()[0], input.Tracks()[1]};
@@ -49,9 +51,23 @@ std::shared_ptr<const File> EditedClip(const File& source, const File& directory
   }
   for (std::size_t i = 0; i < tracks.size(); ++i) {
     auto& track = tracks[i];
-    if (track.kind == TrackKind::Video) track.visible = EditedAperture;
+    if (track.kind == TrackKind::Video) {
+      track.visible = EditedAperture;
+      track.pixel_aspect_ratio = EditedAspect;
+      track.presentation_edit = video_edit;
+    }
     if (track.kind == TrackKind::Audio) {
-      track.padding_samples = track.padding_samples.value_or(0) + OriginalSamples - EditedSamples;
+      if (audio_packet_end) {
+        auto& last = packets[i].back();
+        const auto duration = *audio_packet_end - last.pts->Rescale(48000)->ticks;
+        Check(duration > 0 && MediaTimestamp{duration, 48000}.Compare(*last.duration) < 0,
+              "The tail fixture must shorten the final AAC packet");
+        last.duration = MediaTimestamp{duration, 48000};
+        track.padding_samples.reset();
+      } else {
+        track.padding_samples = track.padding_samples.value_or(0) + OriginalSamples - EditedSamples;
+        track.presentation_edit->end = {EditedSamples, 48000};
+      }
       packets[i].front().sync_sample = false;
       packets[i].back().sync_sample = false;
     }
@@ -87,6 +103,7 @@ std::shared_ptr<const File> EditedClip(const File& source, const File& directory
 struct Observations {
   std::optional<float> seek;
   std::optional<MediaTimestamp> first_frame;
+  std::optional<MediaTimestamp> first_duration;
   std::optional<VideoFormat> format;
   Size size;
   float position = 0;
@@ -110,6 +127,7 @@ TaskHandle Play(const TaskScope& tasks, std::shared_ptr<const File> file, Observ
               const auto pixels = media_preview::ConvertFramePixels(frame);
               Check(!pixels.empty(), "Preview could not convert the decoded picture");
               seen.first_frame = frame.pts;
+              seen.first_duration = frame.duration;
               seen.format = frame.format;
             }
           },
@@ -136,7 +154,7 @@ void Until(testing::UiTest& ui, const std::exception_ptr& failure, Condition con
   Check(condition(), error);
 }
 
-void CheckExport(const File& source, const File& output, std::int64_t audio_samples) {
+void CheckExport(const File& source, const File& output, std::int64_t audio_samples, bool reorder = false) {
   auto input = Require(MediaDemuxer::Open(Require(source.OpenRandomAccess())));
   auto exported = Require(MediaDemuxer::Open(Require(output.OpenRead())));
   Check(exported.Format() == ContainerFormat::Mp4 && exported.Tracks().size() == 2,
@@ -152,25 +170,73 @@ void CheckExport(const File& source, const File& output, std::int64_t audio_samp
       VideoRectangle{0, 0, *source_video->coded_width, *source_video->coded_height});
   const auto actual = video->visible.value_or(VideoRectangle{0, 0, *video->coded_width, *video->coded_height});
   Check(actual == VideoRectangle{0, 0, expected.width, expected.height}, "Export lost the source's visible area");
+  Check(video->pixel_aspect_ratio == source_video->pixel_aspect_ratio, "Export changed the display aspect ratio");
+  Check(video->presentation_edit == input.PresentationRange(source_video->id) &&
+        exported.PresentationRange(video->id) == input.PresentationRange(source_video->id),
+        "Export changed the effective video presentation range");
   std::vector<MediaTimestamp> input_pictures, exported_pictures;
   while (auto item = Require(input.Read())) {
     const auto& packet = std::get<ContainerPacket>(*item);
     if (packet.track_id == video->id && packet.pts && packet.pts->ticks >= 0) input_pictures.push_back(*packet.pts);
   }
   std::int64_t coded_audio = 0;
+  std::optional<MediaTimestamp> last_dts;
+  bool reordered = false;
   while (auto item = Require(exported.Read())) {
     const auto& packet = std::get<ContainerPacket>(*item);
     if (packet.track_id == video->id) {
-      Check(packet.pts && packet.pts == packet.dts, "Export reorders its Baseline video");
+      Check(packet.pts && packet.dts && packet.duration, "Export lost video timing");
+      if (last_dts) Check(packet.dts->Compare(*last_dts) > 0, "Export DTS moved backwards");
+      if (!reorder) Check(packet.pts == packet.dts, "Export reorders its Baseline video");
+      if (!exported_pictures.empty()) reordered |= packet.pts->Compare(exported_pictures.back()) < 0;
+      last_dts = packet.dts;
       exported_pictures.push_back(*packet.pts);
     } else {
       coded_audio += packet.duration->Rescale(48000)->ticks;
     }
   }
-  std::ranges::sort(input_pictures, [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; });
+  const auto earlier = [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; };
+  std::ranges::sort(input_pictures, earlier);
+  std::ranges::sort(exported_pictures, earlier);
   Check(!input_pictures.empty() && input_pictures == exported_pictures, "Export changed picture presentation times");
   Check(coded_audio - std::int64_t(*audio->priming_samples + *audio->padding_samples) == audio_samples,
         "Export changed the trimmed audio length");
+  if (reorder) std::cout << "VideoToolbox reordered output: " << reordered << '\n';
+}
+
+std::optional<ContainerPacket> ReadPacket(MediaDemuxer& demux) {
+  while (auto item = Require(demux.Read())) {
+    if (auto* packet = std::get_if<ContainerPacket>(&*item)) return std::move(*packet);
+  }
+  return {};
+}
+
+void CheckCopy(const File& source, const File& output, ContainerFormat format) {
+  auto open = [](const File& file) { return Require(MediaDemuxer::Open(Require(file.OpenRandomAccess()))); };
+  const auto original = open(source);
+  const auto copy = open(output);
+  Check(copy.Format() == format && copy.Tracks().size() == original.Tracks().size(), "Packet copy changed the track set");
+  for (const auto& track : original.Tracks()) {
+    const auto found = std::ranges::find(copy.Tracks(), track.id, &MediaTrack::id);
+    Check(found != copy.Tracks().end() && found->codec == track.codec && found->sample_entry == track.sample_entry &&
+          found->initialization_data == track.initialization_data && found->visible == track.visible &&
+          found->rotation == track.rotation && found->pixel_aspect_ratio == track.pixel_aspect_ratio &&
+          found->video_extensions == track.video_extensions && found->presentation_edit == track.presentation_edit &&
+          copy.PresentationRange(track.id) == original.PresentationRange(track.id) &&
+          found->priming_samples == track.priming_samples && found->padding_samples == track.padding_samples,
+          "Packet copy changed the track description or presentation metadata");
+    auto before = open(source), after = open(output);
+    Require(before.SelectTracks(std::span(&track.id, 1)));
+    Require(after.SelectTracks(std::span(&track.id, 1)));
+    while (const auto expected = ReadPacket(before)) {
+      const auto actual = ReadPacket(after);
+      Check(actual && actual->track_id == expected->track_id && actual->pts == expected->pts &&
+            actual->dts == expected->dts && actual->duration == expected->duration &&
+            actual->sync_sample == expected->sync_sample &&
+            std::ranges::equal(actual->data.AsBytes(), expected->data.AsBytes()), "Packet copy changed access units or timing");
+    }
+    Check(!ReadPacket(after), "Packet copy added access units");
+  }
 }
 
 } // namespace
@@ -221,20 +287,44 @@ int main(int argc, char** argv) {
     seen = {};
     preview = Play(tasks, edited, seen, failure);
     Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.15F; }, "The edited MP4 did not start playing");
-    Check(seen.format->visible == EditedAperture && seen.size == Size{316.0F, 236.0F},
-          "MP4 preview lost the container's clean aperture");
+    Check(seen.format->visible == EditedAperture && seen.size == Size{316.0F * 4 / 3, 236.0F} &&
+          seen.first_frame->Compare({1, 4}) >= 0, "MP4 preview lost its clean aperture or showed a preroll frame");
     const auto edited_epoch = seen.epoch;
     seen.seek = 2.1F;
     Until(ui, failure, [&] { return seen.epoch > edited_epoch && seen.first_frame && seen.position > 2.12F; },
           "Video did not continue past the trimmed audio after a seek");
+    const auto tail_epoch = seen.epoch;
+    seen.paused = true;
+    seen.seek = 3.95F;
+    Until(ui, failure, [&] { return seen.epoch > tail_epoch && seen.first_frame; },
+          "Seek beyond the video edit did not retain its last presented picture");
+    Check(seen.first_frame->Compare({7, 2}) < 0, "Seek displayed a picture past the video edit");
     preview.Cancel();
     ui.Pump();
 
-    const auto export_clip = [&](std::shared_ptr<const File> input) {
+    constexpr MediaPresentationRange first_picture_edit{{1, 100}, {3, 100}};
+    constexpr auto shortened_samples = OriginalSamples - 22;
+    const auto first_picture = EditedClip(*mp4, temporary, first_picture_edit, shortened_samples);
+    auto short_input = Require(MediaDemuxer::Open(Require(first_picture->OpenRandomAccess())));
+    const auto short_audio = std::ranges::find(short_input.Tracks(), TrackKind::Audio, &MediaTrack::kind);
+    Check(short_audio != short_input.Tracks().end() && short_audio->presentation_edit &&
+          short_audio->presentation_edit->end == MediaTimestamp{OriginalSamples, 48000} &&
+          short_input.PresentationRange(short_audio->id) == MediaPresentationRange{{0, 1}, {shortened_samples, 48000}},
+          "AAC presentation range extended past the shortened final packet");
+    seen = {};
+    preview = Play(tasks, first_picture, seen, failure);
+    Until(ui, failure, [&] { return seen.first_frame.has_value(); }, "The edit inside the first picture displayed nothing");
+    Check(seen.first_frame == first_picture_edit.start && seen.first_duration == MediaTimestamp{1, 50},
+          "The first picture was not clipped to the intersection with the edit");
+    preview.Cancel();
+    ui.Pump();
+
+    const auto run_export = [&](std::shared_ptr<const File> input, std::optional<ContainerFormat> copy, bool reorder = false) {
       std::shared_ptr<const File> output;
-      const auto exporting = tasks.Launch([&, input = std::move(input)]() -> Task<void> {
+      const auto exporting = tasks.Launch([&, input = std::move(input), copy, reorder]() -> Task<void> {
         try {
-          output = co_await media_preview::ExportClip(input, temporary);
+          if (copy) output = co_await media_preview::CopyClip(input, temporary, copy);
+          else output = co_await media_preview::ExportClip(input, temporary, reorder);
         } catch (...) { failure = std::current_exception(); }
       });
       try {
@@ -245,11 +335,28 @@ int main(int argc, char** argv) {
       }
       return output;
     };
-    const auto output = export_clip(mp4);
+    const auto output = run_export(mp4, {});
     CheckExport(*mp4, *output, OriginalSamples);
-    CheckExport(*edited, *export_clip(edited), EditedSamples);
-    if (argc == 2) Check(output->CopyTo(File(argv[1]), true), "Cannot retain export for independent validation");
-    std::cout << "MP4 seek, clean aperture, AAC trim, Main10 MOV, and export readback passed\n";
+    CheckExport(*edited, *run_export(edited, {}), EditedSamples);
+    CheckExport(*first_picture, *run_export(first_picture, {}), shortened_samples);
+    const auto reordered = run_export(mp4, {}, true);
+    CheckExport(*mp4, *reordered, OriginalSamples, true);
+    CheckCopy(*edited, *run_export(edited, ContainerFormat::Mov), ContainerFormat::Mov);
+    CheckCopy(*first_picture, *run_export(first_picture, ContainerFormat::Mp4), ContainerFormat::Mp4);
+    const auto hlg = Fixture("preview-hevc-hlg.mov");
+    const auto hdr = Require(MediaDemuxer::Open(Require(hlg->OpenRandomAccess())));
+    const auto& hdr_track = hdr.Tracks().front();
+    Check(hdr_track.pixel_aspect_ratio == MediaTrack::PixelAspectRatio{4, 3}, "HLG fixture lost its pixel aspect");
+    for (const auto box : {"colr", "dvvC"}) {
+      Check(std::ranges::find(hdr_track.video_extensions, box, &MediaTrack::VideoExtension::type) !=
+            hdr_track.video_extensions.end(), "HLG fixture lost a color or Dolby Vision extension");
+    }
+    const auto hdr_copy = run_export(hlg, ContainerFormat::Mp4);
+    CheckCopy(*hlg, *hdr_copy, ContainerFormat::Mp4);
+    if (argc >= 2) Check(output->CopyTo(File(argv[1]), true), "Cannot retain export for independent validation");
+    if (argc >= 3) Check(reordered->CopyTo(File(argv[2]), true), "Cannot retain reordered export");
+    if (argc >= 4) Check(hdr_copy->CopyTo(File(argv[3]), true), "Cannot retain HDR packet copy");
+    std::cout << "MP4 seek, presentation edits, B-picture export, and MOV metadata copy passed\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

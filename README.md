@@ -430,27 +430,33 @@ The [preview](examples/preview) exercises the library through four tabs.
 | Video | Local/reference/URL sources, playback controls, progress, seeking, volume, looping, and video fitting |
 | Music | Audio playback using the same player API without a video surface |
 | Library | Platform image/video/mixed selection, capability-aware multi-select, retained references, and publication |
-| Frames | Open a local MP4/MOV or the bundled H.264/AAC sample, seek through decoded playback, and prepare and save a fast-start MP4 |
+| Frames | Seek local MP4/MOV or the bundled sample, copy compatible packets or encode H.264, and save the prepared movie |
 
 The Library tab disables multi-select when the maximum is below two; otherwise it requests up to three items within
 the platform limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
 FilePicker explicitly to obtain a source. Switching tabs unmounts the previous session and cancels its pending work.
 
-The Frames tab decodes files through `MediaDemuxer` and `DecodedPlayback`. Seeking uses the container index,
-restarts the decoders, and replaces the texture for the new playback epoch. The bundled file has reordered
-H.264 pictures, uneven frame intervals, and AAC priming. On Apple, the tab can also open SDR HEVC MOV
-files and display rotated 8-bit or 10-bit frames.
+The Frames tab decodes files through `MediaDemuxer` and `DecodedPlayback`. Local MP4, MOV, and fragmented MP4
+can use a seek index to restart the decoders and replace the texture for each playback epoch. Effective track ranges
+limit visible pictures and PCM to the intersection of sample coverage and edits. The bundled file has reordered H.264
+pictures, uneven frame intervals, and AAC priming. Apple platforms also preview rotated SDR HEVC in 8-bit or P010.
 
-“Prepare MP4” encodes eight-bit H.264 input as Baseline without B pictures. Android, Windows, and Web copy the
-original AAC packets to preserve their trim. On the other platforms, the example encodes the audio and requires
-a known AAC trim summary. It preserves presentation times and the source's visible area, then reopens the
-finished fast-start file before enabling “Save MP4”. Preparing and saving are separate actions so the browser picker can
-start from a fresh click. Browser input is staged in memory and limited to 128 MiB.
+“Copy Movie” rewrites up to two compatible tracks into MP4 or MOV with the original access units, timing,
+authored edits, and supported visual metadata. This includes HLG and Dolby Vision configuration on the
+HEVC packet-copy path. “Encode MP4” encodes eight-bit H.264 to fast-start MP4. macOS allows B pictures and uses
+explicit encoder DTS. Other platforms use Baseline without reordering. The output container preserves the display
+pixel aspect ratio. Android, Windows, and Web pass AAC packets through. The other platforms encode PCM and require
+a known AAC trim summary.
 
-The [macOS integration test](tests/container_preview.cpp) runs the same preview and export code with the
-bundled MP4 and a rotated Main10 MOV. The [texture contract test](tests/frame_texture_contract.cpp) checks
-cropped, padded CPU frames and successive publications.
-The bundled MP4 also ran through preview, seek and export readback on a Huawei Android 12 device and in Chrome.
+Both actions reopen the finished file before “Save Movie” can publish it. Changing the source or preparing another
+result clears the previous export. The separate save action lets the browser picker start from a fresh click.
+Browser input is staged in memory and limited to 128 MiB.
+
+The [macOS integration test](tests/container_preview.cpp) checks seeks, presentation edits, DTS export, and packet
+copy with the bundled MP4 and rotated Main10 MOV fixtures. The [texture contract test](tests/frame_texture_contract.cpp)
+checks cropped, padded CPU frames and successive publications. Android 12 and iOS Simulator passed headless
+cross-fragment seek and HLG MOV packet-copy checks. iOS Simulator also decoded the SDR Main10 fixture to P010.
+The [roadmap](docs/media-roadmap.md#delivery-order) tracks iPhone camera-original and HDR display acceptance.
 
 ### Build and run
 
