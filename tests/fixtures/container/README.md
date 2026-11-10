@@ -8,6 +8,8 @@ FFmpeg is a fixture-generation and interoperability tool for these tests.
 - `prores-pcm.mov` carries four ProRes 422 frames, 4000 stereo S24LE PCM sample frames, and an
   auxiliary timecode track. The audio uses QuickTime's version-one `in24` sample description.
 - `mkv-hevc-aac.mkv` remuxes the HEVC and AAC fixture with reordered video and Cues.
+- `mkv-avc-aac.mkv` carries H.264 Main with reordered video, mono AAC-LC, and Cues.
+- `webm-vp8-opus.webm` carries VP8 and Opus with Cues and final discard padding.
 - `webm-vp9-opus.webm` carries VP9 and Opus with pre-skip, seek preroll, and final discard padding.
 - `webm-opus.webm` carries audio-only Opus with frequent Cues for testing preroll across Cluster boundaries.
 
@@ -21,6 +23,12 @@ ffmpeg -f lavfi -i testsrc2=size=64x48:rate=8:duration=0.5 \
   -f lavfi -i sine=sample_rate=8000:duration=0.5 -c:v prores_ks -profile:v 2 \
   -pix_fmt yuv422p10le -c:a pcm_s24le -ac 2 -timecode 01:00:00:00 prores-pcm.mov
 ffmpeg -i hevc-aac-portrait.mov -map 0:v:0 -map 0:a:0 -c copy -map_metadata -1 mkv-hevc-aac.mkv
+ffmpeg -f lavfi -i testsrc2=size=64x48:rate=12:duration=0.75 \
+  -f lavfi -i sine=sample_rate=48000:duration=0.75 -c:v libx264 -profile:v main \
+  -pix_fmt yuv420p -bf 2 -g 6 -c:a aac -b:a 32k mkv-avc-aac.mkv
+ffmpeg -f lavfi -i testsrc2=size=64x48:rate=12:duration=1.25 \
+  -f lavfi -i sine=sample_rate=48000:duration=1.25 -c:v libvpx -b:v 40k \
+  -g 6 -lag-in-frames 0 -c:a libopus -b:a 32k webm-vp8-opus.webm
 ffmpeg -f lavfi -i testsrc2=size=64x48:rate=12:duration=1.25 \
   -f lavfi -i sine=sample_rate=48000:duration=1.25 -c:v libvpx-vp9 -b:v 0 -crf 36 \
   -g 6 -lag-in-frames 0 -c:a libopus -b:a 32k webm-vp9-opus.webm

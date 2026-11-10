@@ -426,6 +426,16 @@ private:
         HevcNalLength(track.initialization_data, false, BadData);
         track.codec = CodecId::Hevc;
         track.framing = PacketFraming::LengthPrefixedNals;
+      } else if (codec == "V_MPEG4/ISO/AVC" && format == ContainerFormat::Matroska) {
+        const auto config = ParseAvc(track.initialization_data);
+        if (!config.Succeeded()) {
+          if (config.Error().code == CodecErrorCode::Unsupported) return;
+          Fail(BadData, config.Error().message);
+        }
+        track.codec = CodecId::H264;
+        track.framing = PacketFraming::LengthPrefixedNals;
+      } else if (codec == "V_VP8" && format == ContainerFormat::WebM && track.initialization_data.empty()) {
+        track.codec = CodecId::Vp8;
       } else if (codec == "V_VP9" && format == ContainerFormat::WebM) {
         track.codec = CodecId::Vp9;
       }

@@ -14,7 +14,9 @@ constexpr std::size_t ClusterTarget = 4 * 1024 * 1024;
 
 std::string_view CodecName(ContainerFormat format, const MediaTrack& track) {
   if (track.kind == TrackKind::Video) {
+    if (format == ContainerFormat::Matroska && track.codec == CodecId::H264) return "V_MPEG4/ISO/AVC";
     if (format == ContainerFormat::Matroska && track.codec == CodecId::Hevc) return "V_MPEGH/ISO/HEVC";
+    if (format == ContainerFormat::WebM && track.codec == CodecId::Vp8) return "V_VP8";
     if (format == ContainerFormat::WebM && track.codec == CodecId::Vp9) return "V_VP9";
   }
   if (track.kind == TrackKind::Audio) {
@@ -109,6 +111,8 @@ public:
       states_[i].delay = Delay(tracks[i]);
       if (tracks[i].codec == CodecId::Hevc)
         states_[i].nal_length = HevcNalLength(tracks[i].initialization_data, false, BadArgument);
+      if (tracks[i].codec == CodecId::H264)
+        states_[i].nal_length = ParseAvc(tracks[i].initialization_data).Value().length_size;
       has_video_ |= tracks[i].kind == TrackKind::Video;
     }
     Bytes header;
@@ -180,8 +184,10 @@ public:
       }
       duration = static_cast<std::uint64_t>(ticks);
     }
-    const bool independent = track.codec == CodecId::Hevc
-        ? HevcIdr(data, state.nal_length, false, BadArgument) : track.kind == TrackKind::Audio;
+    bool independent = track.kind == TrackKind::Audio;
+    // AVC and HEVC can derive a sync flag from an IDR. VPx uses the caller's container sync flag.
+    if (track.codec == CodecId::H264) independent = AvcIdr(data, state.nal_length, BadArgument);
+    if (track.codec == CodecId::Hevc) independent = HevcIdr(data, state.nal_length, false, BadArgument);
     state.pending = PendingBlock{Bytes(data.begin(), data.end()), time,
                                  webm_ ? time : (packet.dts ? ToNs(*packet.dts) : stored),
                                  duration, discard, packet.sync_sample.value_or(independent)};
@@ -340,12 +346,19 @@ void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks
           track.visible->y >= height || track.visible->width > width - track.visible->x ||
           track.visible->height > height - track.visible->y))
         Fail(BadArgument, "Matroska visible rectangle exceeds coded bounds");
-      if (track.codec == CodecId::Hevc) {
+      if (track.codec == CodecId::H264 || track.codec == CodecId::Hevc) {
         if (track.framing != PacketFraming::LengthPrefixedNals)
-          Fail(Unsupported, "Matroska HEVC requires length-prefixed access units");
-        HevcNalLength(track.initialization_data, false, BadArgument);
+          Fail(Unsupported, "Matroska AVC and HEVC require length-prefixed access units");
+        if (track.codec == CodecId::H264) {
+          const auto config = ParseAvc(track.initialization_data);
+          if (!config.Succeeded()) Fail(Unsupported, config.Error().message);
+        } else {
+          HevcNalLength(track.initialization_data, false, BadArgument);
+        }
       } else if (track.framing != PacketFraming::CodecPacket) {
-        Fail(Unsupported, "WebM VP9 requires complete codec packets");
+        Fail(Unsupported, "WebM VP8 and VP9 require complete codec packets");
+      } else if (track.codec == CodecId::Vp8 && !track.initialization_data.empty()) {
+        Fail(BadArgument, "WebM VP8 has no codec private data");
       }
     } else {
       if (track.framing != PacketFraming::CodecPacket)

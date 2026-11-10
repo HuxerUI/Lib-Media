@@ -67,6 +67,7 @@ enum class CodecId {
   PcmF32Be, ///< IEEE float 32-bit big-endian PCM.
   Vp9,      ///< VP9 coded pictures.
   Opus,     ///< Opus coded audio. Trim uses the 48 kHz decoded sample grid.
+  Vp8,      ///< VP8 coded pictures.
 };
 
 /// @brief Byte representation of packets belonging to a track.

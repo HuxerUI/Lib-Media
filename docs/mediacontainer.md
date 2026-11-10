@@ -12,8 +12,8 @@ Serialize calls on each session.
 | Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC and length-prefixed AVC or HEVC | Random access, or sequential when movie metadata precedes samples | Random write |
 | Fragmented MP4 | Same AAC, AVC, and HEVC mappings | Sequential or random-access input, beginning with initialization | Sequential or random write |
 | QuickTime MOV | Same AAC, AVC, and HEVC mappings, ProRes, and packed interleaved PCM | Random access, or sequential when movie metadata precedes samples | Random write |
-| Matroska, including audio-only MKA | Length-prefixed HEVC, raw AAC-LC, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
-| WebM | VP9 and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
+| Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, raw AAC-LC, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
+| WebM | VP8, VP9, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
 | RIFF WAVE and RF64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
 | MPEG-4 ADTS | One raw mono/stereo AAC-LC access unit per frame | Sequential or random access | Sequential or random write |
 
@@ -67,6 +67,8 @@ Matroska and WebM share the EBML reader. The document type selects the mapping. 
 known- and unknown-sized Segments and Clusters, `SimpleBlock`, `BlockGroup`, and Xiph, fixed, and EBML
 lacing. Laced frames are delivered separately in their stored order. Select mapped tracks before reading
 when `Tracks()` contains an unknown codec. A sequential input requires Info and Tracks before media.
+AVC carries the AVCDecoderConfigurationRecord in CodecPrivate. VP8 uses complete codec packets
+without CodecPrivate. Use container sync marks when submitting VP8 or VP9 for indexed output.
 
 Matroska Block time is a presentation clock adjusted by the track's CodecDelay. The reader leaves DTS absent.
 BlockDuration, DefaultDuration, and known codec frame durations supply timing where available. Opus preserves

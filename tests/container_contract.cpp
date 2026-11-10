@@ -386,16 +386,25 @@ void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in
   Compare(std::get<ContainerPacket>(*Take(result.Read())), packets[0].front());
 }
 
-void EbmlRoundTrip(const fs::path& destination, std::string_view fixture, ContainerFormat format) {
+void EbmlRoundTrip(const fs::path& destination, std::string_view fixture, ContainerFormat format,
+                   CodecId video_codec = CodecId::Unknown) {
   namespace ebml = huxerui::media::detail::ebml;
   const auto source = Path(fs::path(MEDIA_FIXTURES) / "container" / fixture);
   auto input = Take(MediaDemuxer::Open(Take(source.OpenRandomAccess()), format));
   std::vector<MediaTrack> tracks(input.Tracks().begin(), input.Tracks().end());
-  const bool audio_only = tracks.size() == 1;
+  const bool audio_only = video_codec == CodecId::Unknown;
   const bool webm = format == ContainerFormat::WebM;
-  Check(input.Format() == format && (audio_only || tracks.size() == 2), "Wrong Matroska or WebM track count");
-  Check(tracks.front().codec == (audio_only ? CodecId::Opus : (webm ? CodecId::Vp9 : CodecId::Hevc)) &&
+  Check(input.Format() == format && tracks.size() == (audio_only ? 1u : 2u), "Wrong Matroska or WebM track count");
+  Check(tracks.front().codec == (audio_only ? CodecId::Opus : video_codec) &&
         tracks.back().codec == (webm ? CodecId::Opus : CodecId::Aac), "Wrong Matroska or WebM codec mapping");
+  if (video_codec == CodecId::Vp8) {
+    Check(tracks.front().initialization_data.empty(), "WebM VP8 unexpectedly reported codec private data");
+    auto invalid = tracks;
+    invalid.front().initialization_data.push_back(std::byte{0});
+    const auto result = MediaMuxer::ValidateOutput(format, invalid);
+    Check(!result.Succeeded() && result.Error().code == ContainerErrorCode::InvalidArgument,
+          "WebM VP8 accepted codec private data");
+  }
   if (webm) {
     Check(tracks.back().seek_preroll == MediaTimestamp{80, 1000} &&
           tracks.back().priming_samples == 312, "Opus seek preroll or pre-skip differs");
@@ -422,7 +431,7 @@ void EbmlRoundTrip(const fs::path& destination, std::string_view fixture, Contai
     const auto& video = packets.front();
     Check(std::adjacent_find(video.begin(), video.end(), [](const auto& a, const auto& b) {
       return a.pts->Compare(*b.pts) > 0;
-    }) != video.end(), "HEVC fixture did not preserve decode order with B pictures");
+    }) != video.end(), "Matroska fixture did not preserve decode order with B pictures");
   }
   Take(input.Close());
 
@@ -461,7 +470,10 @@ void EbmlRoundTrip(const fs::path& destination, std::string_view fixture, Contai
   Take(output.Finish());
 
   auto readback = Take(MediaDemuxer::Open(Take(Path(destination).OpenRead()), format));
-  Check(readback.Tracks().size() == tracks.size(), "Matroska or WebM output lost tracks");
+  Check(readback.Tracks().size() == tracks.size() &&
+        readback.Tracks().front().codec == tracks.front().codec &&
+        readback.Tracks().front().initialization_data == tracks.front().initialization_data,
+        "Matroska or WebM output lost a track or changed its codec mapping");
   std::fill(cursor.begin(), cursor.end(), 0);
   while (auto item = Take(readback.Read())) {
     const auto& packet = std::get<ContainerPacket>(*item);
@@ -586,7 +598,8 @@ int main(int argc, char** argv) {
       ("huxerui-container-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   const std::array names{"regular.mp4", "fragmented.mp4", "audio.wav", "audio.rf64.wav", "audio.aac",
                          "hevc.mov", "hevc.mp4", "hev1.mp4", "prores-pcm.mov", "hevc-fragmented.mp4",
-                         "hevc-aac.mkv", "vp9-opus.webm", "opus.webm", "lace.mka", "lace-invalid.mka"};
+                         "hevc-aac.mkv", "vp9-opus.webm", "opus.webm", "lace.mka", "lace-invalid.mka",
+                         "avc-aac.mkv", "vp8-opus.webm"};
   try {
     Check(fs::create_directory(path), "Could not create a fresh container test directory");
     Mp4(path / names[0], false);
@@ -599,11 +612,13 @@ int main(int argc, char** argv) {
     Mov(path / names[7], true, ContainerFormat::Mp4, true);
     Mov(path / names[8], false, ContainerFormat::Mov);
     Mov(path / names[9], true, ContainerFormat::Mp4, false, ContainerLayout::Fragmented);
-    EbmlRoundTrip(path / names[10], "mkv-hevc-aac.mkv", ContainerFormat::Matroska);
-    EbmlRoundTrip(path / names[11], "webm-vp9-opus.webm", ContainerFormat::WebM);
+    EbmlRoundTrip(path / names[10], "mkv-hevc-aac.mkv", ContainerFormat::Matroska, CodecId::Hevc);
+    EbmlRoundTrip(path / names[11], "webm-vp9-opus.webm", ContainerFormat::WebM, CodecId::Vp9);
     EbmlRoundTrip(path / names[12], "webm-opus.webm", ContainerFormat::WebM);
     MatroskaLacing(path / names[13], false);
     MatroskaLacing(path / names[14], true);
+    EbmlRoundTrip(path / names[15], "mkv-avc-aac.mkv", ContainerFormat::Matroska, CodecId::H264);
+    EbmlRoundTrip(path / names[16], "webm-vp8-opus.webm", ContainerFormat::WebM, CodecId::Vp8);
     if (argc != 2) {
       for (auto name : names) fs::remove(path / name);
       fs::remove(path / "open-ended.mp4");
