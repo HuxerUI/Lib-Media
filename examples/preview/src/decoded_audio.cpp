@@ -271,6 +271,10 @@ DecodedPlayback AudioPlayback(const AudioFormat& format) {
 
 } // namespace
 
+#if defined(_MSC_VER) && !defined(__clang__)
+// MSVC cannot generate the required coroutine tail transfer for this optimized playback loop.
+#pragma optimize("", off)
+#endif
 Task<void> PlayAudio(std::shared_ptr<const File> file, ClipControls controls) {
   auto input = co_await OnFileThread([file] {
     auto audio = std::make_shared<AudioInput>(file);
@@ -336,6 +340,9 @@ Task<void> PlayAudio(std::shared_ptr<const File> file, ClipControls controls) {
     if (!advanced) co_await Delay(8ms);
   }
 }
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma optimize("", on)
+#endif
 
 Task<std::shared_ptr<const File>> CopyAudioClip(std::shared_ptr<const File> file, File temporary) {
   auto copy = co_await OnFileThread([file, temporary] { return std::make_shared<AudioCopy>(file, temporary); });

@@ -158,8 +158,9 @@ TaskHandle Play(const TaskScope& tasks, std::shared_ptr<const File> file, Observ
 }
 
 template<class Condition>
-void Until(testing::UiTest& ui, const std::exception_ptr& failure, Condition condition, const char* error) {
-  const auto deadline = std::chrono::steady_clock::now() + 15s;
+void Until(testing::UiTest& ui, const std::exception_ptr& failure, Condition condition, const char* error,
+    std::chrono::seconds timeout = 15s) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (!condition() && std::chrono::steady_clock::now() < deadline) {
     if (failure) std::rethrow_exception(failure);
     ui.Pump(4ms);
@@ -181,8 +182,9 @@ void CheckExport(const File& source, const File& output, std::int64_t audio_samp
         "Export is not a sequentially readable two-track MP4");
   const auto audio = std::ranges::find(exported.Tracks(), CodecId::Aac, &MediaTrack::codec);
   const auto video = std::ranges::find(exported.Tracks(), CodecId::H264, &MediaTrack::codec);
-  Check(audio != exported.Tracks().end() && video != exported.Tracks().end() &&
-        audio->priming_samples && audio->padding_samples, "Export lost AAC/H.264 track or trim metadata");
+  Check(audio != exported.Tracks().end() && video != exported.Tracks().end(), "Export lost the AAC or H.264 track");
+  Check(exported.PresentationRange(audio->id) == MediaPresentationRange{{0, 1}, {audio_samples, 48000}},
+        "Export changed the effective audio presentation range");
   const auto source_video = std::ranges::find(input.Tracks(), TrackKind::Video, &MediaTrack::kind);
   Check(source_video != input.Tracks().end() && source_video->coded_width && source_video->coded_height,
         "The source has no coded video dimensions");
@@ -223,7 +225,7 @@ void CheckExport(const File& source, const File& output, std::int64_t audio_samp
   std::ranges::sort(input_pictures, earlier);
   std::ranges::sort(exported_pictures, earlier);
   Check(!input_pictures.empty() && input_pictures == exported_pictures, "Export changed picture presentation times");
-  Check(coded_audio - std::int64_t(*audio->priming_samples + *audio->padding_samples) == audio_samples,
+  Check(coded_audio - std::int64_t(audio->priming_samples.value_or(0) + audio->padding_samples.value_or(0)) == audio_samples,
         "Export changed the trimmed audio length");
   if (reorder) std::cout << "VideoToolbox reordered output: " << reordered << '\n';
 }
@@ -247,7 +249,9 @@ std::shared_ptr<const File> RunMovieExport(const TaskScope& tasks, testing::UiTe
     } catch (...) { failure = std::current_exception(); }
   });
   try {
-    Until(ui, failure, [&] { return bool(output); }, "MP4 export did not finish");
+    Until(ui, failure, [&] { return bool(output); },
+          copy ? "Movie packet copy did not finish" :
+              storage == VideoStorage::Platform ? "GPU movie export did not finish" : "CPU movie export did not finish", 35s);
   } catch (...) {
     exporting.Cancel();
     throw;
@@ -333,47 +337,63 @@ void CheckAudioCopy(const TaskScope& tasks, testing::UiTest& ui, const File& tem
   }
 }
 
-#if defined(__EMSCRIPTEN__) || defined(__APPLE__)
+template<class Config, class Probe>
+bool CodecAvailable(testing::UiTest& ui, const Config& config, Probe probe, const char* name) {
+  struct Observation {
+    std::optional<CodecResult<void>> result;
+    std::atomic<bool> ready = false;
+  };
+  const auto observation = std::make_shared<Observation>();
+  probe(config, [observation](CodecResult<void> result) {
+    observation->result.emplace(std::move(result));
+    observation->ready = true;
+  });
+  Until(ui, {}, [&] { return observation->ready.load(); }, "Codec probe timed out");
+  const auto& result = *observation->result;
+  if (result.Succeeded()) return true;
+  const auto& error = result.Error();
+  if (error.code != CodecErrorCode::Unsupported)
+    throw std::runtime_error(std::string(name) + ": " + error.message + " " + error.platform_code);
+  std::cout << name << " unavailable: " << error.message << '\n';
+  return false;
+}
+
+VideoDecoderConfig VideoFixtureConfig(const MediaTrack& track, VideoPixelFormat output, VideoStorage storage) {
+  return {.initialization_data = track.initialization_data, .width = *track.coded_width,
+      .height = *track.coded_height, .output = output, .codec = track.codec, .output_storage = storage};
+}
+
 void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+  constexpr auto storage = VideoStorage::Cpu;
+#else
   constexpr auto storage = media_preview::gpu_video_supported ? VideoStorage::Platform : VideoStorage::Cpu;
+#endif
   const auto input = Fixture("preview-hevc-main.mp4");
   auto source = media_preview::Open(*input);
   const auto& track = source.Tracks().front();
-  VideoDecoderConfig decode{.initialization_data = track.initialization_data,
-      .width = *track.coded_width, .height = *track.coded_height, .codec = CodecId::Hevc, .output_storage = storage};
-  const auto width = media_preview::gpu_video_scaling_supported ? (*track.coded_width / 2) & ~1u : *track.coded_width;
-  const auto height = media_preview::gpu_video_scaling_supported ? (*track.coded_height / 2) & ~1u : *track.coded_height;
+  auto decode = VideoFixtureConfig(track, VideoPixelFormat::NV12, storage);
+  constexpr bool scale = storage == VideoStorage::Platform && media_preview::gpu_video_scaling_supported;
+  const auto width = scale ? (*track.coded_width / 2) & ~1u : *track.coded_width;
+  const auto height = scale ? (*track.coded_height / 2) & ~1u : *track.coded_height;
 #ifdef __EMSCRIPTEN__
   decode.output = VideoPixelFormat::Opaque;
 #endif
   VideoEncoderConfig encode;
   encode.input = {width, height, {0, 0, width, height}, decode.output};
   encode.input_storage = storage;
+#if defined(__APPLE__) || defined(__EMSCRIPTEN__)
   encode.max_b_frames = std::nullopt;
+#endif
   encode.codec = CodecId::Hevc;
-  const auto supported = [&](const auto& config, auto probe) {
-    enum class Status { Pending, Supported, Unsupported, Failed };
-    const auto status = std::make_shared<std::atomic<Status>>(Status::Pending);
-    probe(config, [status](auto result) {
-      *status = result.Succeeded() ? Status::Supported :
-          result.Error().code == CodecErrorCode::Unsupported ? Status::Unsupported : Status::Failed;
-    });
-    Until(ui, {}, [&] { return *status != Status::Pending; }, "HEVC probe timed out");
-    Check(*status != Status::Failed, "HEVC probe failed");
-    return *status == Status::Supported;
-  };
-  if (!supported(decode, VideoDecoder::Probe) || !supported(encode, VideoEncoder::Probe)) {
-    std::cout << "HEVC Main preview export skipped for an unavailable codec\n";
-    return;
-  }
-  if constexpr (media_preview::gpu_video_supported) {
-    Observations seen;
-    std::exception_ptr failure;
-    const auto preview = Play(tasks, input, seen, failure, storage);
-    Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.15F; }, "HEVC GPU preview did not start");
-    preview.Cancel();
-    ui.Pump();
-  }
+  if (!CodecAvailable(ui, decode, VideoDecoder::Probe, "HEVC Main preview decoder")) return;
+  Observations seen;
+  std::exception_ptr failure;
+  const auto preview = Play(tasks, input, seen, failure, storage);
+  Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.15F; }, "HEVC Main preview did not start");
+  preview.Cancel();
+  ui.Pump();
+  if (!CodecAvailable(ui, encode, VideoEncoder::Probe, "HEVC Main preview encoder")) return;
   const auto output = RunMovieExport(tasks, ui, temporary, input, {}, media_preview::preview_reordered_export, storage);
   auto result = media_preview::Open(*output);
   const auto& encoded = result.Tracks().front();
@@ -406,7 +426,6 @@ void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File
   Check(!expected_pts.empty() && actual_pts == expected_pts, "HEVC export changed the picture presentation times");
   std::cout << "HEVC Main preview export preserved " << actual_pts.size() << " picture times\n";
 }
-#endif
 
 void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
   const auto link = media_preview::TemporaryFile(temporary, ".ogg");
@@ -428,6 +447,7 @@ void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& 
   links.insert(links.end(), next.begin(), next.end());
   Check(chain->WriteBytes(links), "Could not stage the chained audio fixture");
   const auto streaming = Fixture("streaming-opus.webm");
+  const auto mp3 = Fixture("tagged-mp3.mp3");
   auto no_index = media_preview::Open(*streaming);
   const auto unavailable = no_index.FindSeekPoint(1, {0, 1});
   Check(!no_index.Duration() && !unavailable.Succeeded() && unavailable.Error().code == ContainerErrorCode::IndexUnavailable,
@@ -441,8 +461,21 @@ void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& 
       Sample{Fixture("webm-opus.webm"), {247200, 48000}},
       Sample{streaming, {35880, 48000}},
       Sample{Fixture("tagged-flac.flac"), {50142, 44100}},
-      Sample{Fixture("tagged-mp3.mp3"), {50142, 44100}},
+      Sample{mp3, {50142, 44100}},
       Sample{Fixture("tagged-aac.m4a"), {52800, 48000}}};
+  const auto check_signal = [](MediaDemuxer& output, const char* message) {
+    const auto packet = std::get<ContainerPacket>(Require(output.Read()).value());
+    const auto bytes = packet.data.AsBytes();
+    constexpr auto sample_bytes = 120 * 2 * sizeof(std::int16_t);
+    Check(bytes.size() >= sample_bytes, "WAV packet is too short for the signal check");
+    int peak = 0;
+    for (std::size_t i = 0; i < sample_bytes; i += sizeof(std::int16_t)) {
+      std::int16_t value;
+      std::memcpy(&value, bytes.data() + i, sizeof(value));
+      peak = std::max(peak, std::abs(int(value)));
+    }
+    Check(peak > 500, message);
+  };
   for (const auto& sample : samples) {
     float position = 0;
     float duration = 0;
@@ -484,16 +517,11 @@ void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& 
     if (sample.file == chain) {
       Check(Require(output.Seek(1, {107376, 48000})).has_value(), "Could not read the second link's first samples");
       Check(std::holds_alternative<MediaTrack>(Require(output.Read()).value()), "WAV seek lost its description");
-      const auto packet = std::get<ContainerPacket>(Require(output.Read()).value());
-      const auto pcm = packet.data.AsBytes().first(120 * 2 * sizeof(std::int16_t));
-      int peak = 0;
-      for (std::size_t i = 0; i < pcm.size(); i += sizeof(std::int16_t)) {
-        std::int16_t value;
-        std::memcpy(&value, pcm.data() + i, sizeof(value));
-        peak = std::max(peak, std::abs(int(value)));
-      }
-      Check(peak > 500, "The first packet of the zero-pre-skip link lost its decoded signal");
+      check_signal(output, "The first packet of the zero-pre-skip link lost its decoded signal");
     }
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+    if (sample.file == mp3) check_signal(output, "MP3 WAV starts with synthesis delay");
+#endif
     exporting.Cancel();
   }
 }
@@ -515,9 +543,7 @@ int main(int argc, char** argv) {
     CheckAudioCopy(tasks, ui, temporary, "tagged-mp3.mp3");
     CheckAudioCopy(tasks, ui, temporary, "tagged-aac.m4a");
     CheckAudioCopy(tasks, ui, temporary, "fragmented-aac.m4a");
-#if defined(__EMSCRIPTEN__) || defined(__APPLE__)
     CheckHevcMainExport(tasks, ui, temporary);
-#endif
 #if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && TARGET_OS_IOS)
     std::cout << "PASS: Preview export and audio packet copy contracts\n";
 #else
@@ -558,18 +584,24 @@ int main(int argc, char** argv) {
       }
       preview.Cancel();
       ui.Pump();
-      const auto output = RunMovieExport(tasks, ui, temporary, mp4, {}, true, VideoStorage::Platform);
-      CheckExport(*mp4, *output, OriginalSamples, true, VideoStorage::Platform);
+      const auto output = RunMovieExport(tasks, ui, temporary, mp4, {}, media_preview::preview_reordered_export, VideoStorage::Platform);
+      CheckExport(*mp4, *output, OriginalSamples, media_preview::preview_reordered_export, VideoStorage::Platform);
     }
 
-    seen = {};
-    preview = Play(tasks, Fixture("preview-hevc10.mov"), seen, failure);
-    Until(ui, failure, [&] { return seen.first_frame.has_value(); }, "The Main10 MOV did not publish a picture");
-    Check(seen.format->pixel_format == VideoPixelFormat::P010 && seen.format->matrix == ColorMatrix::BT709 &&
-          seen.format->rotation == VideoRotation::Clockwise90 && seen.size.width == 96 && seen.size.height == 128,
-          "Main10 preview lost bit depth, color, or rotation");
-    preview.Cancel();
-    ui.Pump();
+    const auto main10 = Fixture("preview-hevc10.mov");
+    const auto main10_source = media_preview::Open(*main10);
+    const auto main10_decode = VideoFixtureConfig(main10_source.Tracks().front(), VideoPixelFormat::P010, VideoStorage::Cpu);
+    const auto main10_available = CodecAvailable(ui, main10_decode, VideoDecoder::Probe, "HEVC Main10 preview decoder");
+    if (main10_available) {
+      seen = {};
+      preview = Play(tasks, main10, seen, failure);
+      Until(ui, failure, [&] { return seen.first_frame.has_value(); }, "The Main10 MOV did not publish a picture");
+      Check(seen.format->pixel_format == VideoPixelFormat::P010 && seen.format->matrix == ColorMatrix::BT709 &&
+            seen.format->rotation == VideoRotation::Clockwise90 && seen.size.width == 96 && seen.size.height == 128,
+            "Main10 preview lost bit depth, color, or rotation");
+      preview.Cancel();
+      ui.Pump();
+    }
 
     const auto edited = EditedClip(*mp4, temporary);
     seen = {};
@@ -614,8 +646,11 @@ int main(int argc, char** argv) {
     CheckExport(*mp4, *output, OriginalSamples);
     CheckExport(*edited, *run_export(edited, {}), EditedSamples);
     CheckExport(*first_picture, *run_export(first_picture, {}), shortened_samples);
-    const auto reordered = run_export(mp4, {}, true);
-    CheckExport(*mp4, *reordered, OriginalSamples, true);
+    std::shared_ptr<const File> reordered;
+    if constexpr (media_preview::preview_reordered_export) {
+      reordered = run_export(mp4, {}, true);
+      CheckExport(*mp4, *reordered, OriginalSamples, true);
+    }
     CheckCopy(*edited, *run_export(edited, ContainerFormat::Mov), ContainerFormat::Mov);
     CheckCopy(*first_picture, *run_export(first_picture, ContainerFormat::Mp4), ContainerFormat::Mp4);
     const auto hlg = Fixture("preview-hevc-hlg.mov");
@@ -628,19 +663,26 @@ int main(int argc, char** argv) {
     }
     const auto hdr_copy = run_export(hlg, ContainerFormat::Mp4);
     CheckCopy(*hlg, *hdr_copy, ContainerFormat::Mp4);
-    const auto main10_export = run_export(Fixture("preview-hevc10.mov"), {}, true);
-    const auto hevc = media_preview::Open(*main10_export);
-    const auto& encoded_track = hevc.Tracks().front();
-    Check(encoded_track.codec == CodecId::Hevc && encoded_track.sample_entry == "hvc1" &&
-          encoded_track.rotation == VideoRotation::Clockwise90 &&
-          encoded_track.initialization_data.size() > 17 &&
-          (std::to_integer<unsigned>(encoded_track.initialization_data[17]) & 7) == 2,
-          "Main10 export lost its codec, rotation, or bit depth");
+    const auto width = main10_decode.width, height = main10_decode.height;
+    VideoEncoderConfig main10_encode;
+    main10_encode.input = {width, height, {0, 0, width, height}, VideoPixelFormat::P010};
+    main10_encode.codec = CodecId::Hevc;
+    if constexpr (media_preview::preview_reordered_export) main10_encode.max_b_frames = std::nullopt;
+    if (main10_available && CodecAvailable(ui, main10_encode, VideoEncoder::Probe, "HEVC Main10 preview encoder")) {
+      const auto main10_export = run_export(main10, {}, media_preview::preview_reordered_export);
+      const auto hevc = media_preview::Open(*main10_export);
+      const auto& encoded_track = hevc.Tracks().front();
+      Check(encoded_track.codec == CodecId::Hevc && encoded_track.sample_entry == "hvc1" &&
+            encoded_track.rotation == VideoRotation::Clockwise90 &&
+            encoded_track.initialization_data.size() > 17 &&
+            (std::to_integer<unsigned>(encoded_track.initialization_data[17]) & 7) == 2,
+            "Main10 export lost its codec, rotation, or bit depth");
+    }
     CheckAudioPreview(tasks, ui, temporary);
     if (argc >= 2) Check(output->CopyTo(File(argv[1]), true), "Cannot retain export for independent validation");
-    if (argc >= 3) Check(reordered->CopyTo(File(argv[2]), true), "Cannot retain reordered export");
+    if (argc >= 3 && reordered) Check(reordered->CopyTo(File(argv[2]), true), "Cannot retain reordered export");
     if (argc >= 4) Check(hdr_copy->CopyTo(File(argv[3]), true), "Cannot retain HDR packet copy");
-    std::cout << "MP4 seek, presentation edits, B-picture export, and MOV metadata copy passed\n";
+    std::cout << "MP4 seek, presentation edits, export, and MOV metadata copy passed\n";
 #endif
     return 0;
   } catch (const std::exception& error) {

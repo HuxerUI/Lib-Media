@@ -1,6 +1,7 @@
 #include "codec/decoder/backend.h"
 #include "codec/decoder/copy.h"
 #include "codec/hevc.h"
+#include "container/container_io.h"
 #include "media_codec_transform_windows.h"
 #include "media_video_windows.h"
 
@@ -29,14 +30,45 @@ template<class T, class Function> CodecResult<T> Guard(Function function) {
     else return CodecResult<T>::Success(function());
   } catch (const MfFailure& error) { return CodecResult<T>::Failure(error.error); }
 }
+
+GUID AudioSubtype(CodecId codec) {
+  switch (codec) {
+    case CodecId::Aac: return MFAudioFormat_AAC;
+    case CodecId::Opus: return MFAudioFormat_Opus;
+    case CodecId::Flac: return MFAudioFormat_FLAC;
+    case CodecId::Mp3: return MFAudioFormat_MP3;
+    default: throw MfFailure{Error(CodecErrorCode::Unsupported, "Unsupported Media Foundation audio codec")};
+  }
+}
+
+void ConfigureAudioInput(IMFMediaType& input, const AudioDecoderConfig& config) {
+  Require(input.SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, config.output.ChannelCount()), "Cannot set audio input channels");
+  Require(input.SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, config.output.sample_rate), "Cannot set audio input rate");
+  if (config.codec == CodecId::Aac) {
+    Require(input.SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, config.output.BytesPerSample() * 8), "Cannot set AAC output precision");
+    Require(input.SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0), "Cannot configure raw AAC");
+    std::vector<UINT8> cookie(12, 0);
+    cookie[2] = 0xfe;
+    for (auto byte : config.initialization_data) cookie.push_back(std::to_integer<UINT8>(byte));
+    Require(input.SetBlob(MF_MT_USER_DATA, cookie.data(), static_cast<UINT32>(cookie.size())), "Cannot set AAC initialization data");
+  } else if (config.codec == CodecId::Flac) {
+    const auto stream = ParseFlacStreamInfo(config.initialization_data, ContainerErrorCode::InvalidArgument);
+    Require(input.SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, stream.bits), "Cannot set FLAC precision");
+  } else if (config.codec == CodecId::Opus) {
+    const auto header = AudioDecoderHeader(config);
+    Require(input.SetBlob(MF_MT_USER_DATA, reinterpret_cast<const UINT8*>(header.data()), static_cast<UINT32>(header.size())),
+        "Cannot set Opus initialization data");
+  } else {
+    Require(input.SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 1), "Cannot set MP3 block alignment");
+  }
+}
+
 class WindowsDecoder final : public DecoderBackend {
 public:
   std::uint32_t PresentationTimescale() const noexcept override { return 10000000; }
   bool PresentationOrdered() const noexcept override { return bool(device_); }
 
   CodecResult<void> Open(const DecoderConfig& config) override {
-    if (const auto* audio = std::get_if<AudioDecoderConfig>(&config); audio && audio->codec != CodecId::Aac)
-      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "The Media Foundation adapter currently requires AAC-LC"));
     return Guard<void>([&] {
       config_ = config;
       Require(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "COM initialization failed"); com_ = true;
@@ -44,8 +76,13 @@ public:
       const auto* audio = std::get_if<AudioDecoderConfig>(&config_);
       const auto* video = std::get_if<VideoDecoderConfig>(&config_);
       const bool hevc = video && video->codec == CodecId::Hevc;
-      if (hevc) {
-        const MFT_REGISTER_TYPE_INFO type{MFMediaType_Video, MFVideoFormat_HEVC};
+      const GUID subtype = audio ? AudioSubtype(audio->codec) : hevc ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+      if (audio && audio->codec != CodecId::Aac) {
+        const MFT_REGISTER_TYPE_INFO type{MFMediaType_Audio, subtype};
+        Require(OpenSynchronousTransform(MFT_CATEGORY_AUDIO_DECODER, &type, nullptr, decoder_),
+            "No synchronous Media Foundation audio decoder for this codec", CodecErrorCode::Unsupported);
+      } else if (hevc) {
+        const MFT_REGISTER_TYPE_INFO type{MFMediaType_Video, subtype};
         Require(OpenSynchronousTransform(MFT_CATEGORY_VIDEO_DECODER, &type, nullptr, decoder_),
             "No synchronous Media Foundation HEVC decoder", CodecErrorCode::Unsupported);
       } else {
@@ -60,17 +97,10 @@ public:
       ComPtr<IMFMediaType> input;
       Require(MFCreateMediaType(&input), "Cannot allocate decoder input type");
       Require(input->SetGUID(MF_MT_MAJOR_TYPE, audio ? MFMediaType_Audio : MFMediaType_Video), "Cannot set input major type");
-      Require(input->SetGUID(MF_MT_SUBTYPE, audio ? MFAudioFormat_AAC : hevc ? MFVideoFormat_HEVC : MFVideoFormat_H264),
-          "Cannot set input subtype");
+      Require(input->SetGUID(MF_MT_SUBTYPE, subtype), "Cannot set input subtype");
       if (audio) {
-        Require(input->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, audio->output.ChannelCount()), "Cannot set AAC channels");
-        Require(input->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, audio->output.sample_rate), "Cannot set AAC rate");
-        Require(input->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, audio->output.BytesPerSample() * 8), "Cannot set AAC output precision");
-        Require(input->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0), "Cannot configure raw AAC");
-        std::vector<UINT8> cookie(12, 0);
-        cookie[2] = 0xfe;
-        for (auto byte : audio->initialization_data) cookie.push_back(std::to_integer<UINT8>(byte));
-        Require(input->SetBlob(MF_MT_USER_DATA, cookie.data(), static_cast<UINT32>(cookie.size())), "Cannot set AAC initialization data");
+        ConfigureAudioInput(*input.Get(), *audio);
+        if (audio->codec == CodecId::Flac) parameters_ = AudioDecoderHeader(*audio);
       } else {
         ComPtr<IMFAttributes> attributes;
         Require(decoder_->GetAttributes(&attributes), "Cannot configure video buffering");
@@ -94,6 +124,8 @@ public:
       }
       Require(decoder_->SetInputType(0, input.Get(), 0), "Decoder rejected input format");
       Negotiate();
+      if (audio && audio->codec == CodecId::Mp3)
+        mp3_.emplace(audio->output, AudioSampleLimit(*audio).Value());
       Require(decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0), "Cannot begin decoder streaming");
       Require(decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0), "Cannot start decoder stream");
     });
@@ -101,35 +133,37 @@ public:
   CodecResult<SubmitStatus> Submit(const EncodedPacket& packet) override {
     return Guard<SubmitStatus>([&] {
       auto bytes = packet.data.AsBytes();
-      Bytes annex;
-      if (std::holds_alternative<VideoDecoderConfig>(config_)) {
+      const auto* audio = std::get_if<AudioDecoderConfig>(&config_);
+      unsigned audio_samples = 0;
+      if (audio && !mp3_) {
+        const auto count = AudioPacketSamples(*audio, bytes);
+        if (!count.Succeeded()) throw MfFailure{count.Error()};
+        audio_samples = count.Value();
+      }
+      Bytes formatted;
+      if (!audio) {
         auto converted = AnnexB(packet, length_size_);
         if (!converted.Succeeded()) throw MfFailure{converted.Error()};
-        annex = std::move(converted).Value();
-        if (first_) annex.insert(annex.begin(), parameters_.begin(), parameters_.end());
-        bytes = annex;
+        formatted = std::move(converted).Value();
+        bytes = formatted;
       }
-      if (bytes.size() > MAXDWORD) throw MfFailure{Error(CodecErrorCode::InvalidData, "Packet exceeds Media Foundation buffer range")};
-      ComPtr<IMFSample> sample;
-      ComPtr<IMFMediaBuffer> buffer;
-      Require(MFCreateSample(&sample), "Cannot allocate encoded sample");
-      Require(MFCreateMemoryBuffer(static_cast<DWORD>(bytes.size()), &buffer), "Cannot allocate encoded bytes");
-      BYTE* target = nullptr;
-      Require(buffer->Lock(&target, nullptr, nullptr), "Cannot map encoded bytes");
-      std::memcpy(target, bytes.data(), bytes.size());
-      Require(buffer->Unlock(), "Cannot unmap encoded bytes");
-      Require(buffer->SetCurrentLength(static_cast<DWORD>(bytes.size())), "Cannot set packet size");
-      Require(sample->AddBuffer(buffer.Get()), "Cannot attach packet bytes");
+      if (first_ && !parameters_.empty()) {
+        if (audio) formatted.assign(bytes.begin(), bytes.end());
+        formatted.insert(formatted.begin(), parameters_.begin(), parameters_.end());
+        bytes = formatted;
+      }
       const auto pts = packet.pts.Rescale(PresentationTimescale());
       const auto duration = packet.duration ? packet.duration->Rescale(PresentationTimescale()) : std::optional<MediaTimestamp>{};
       if (!pts || (packet.duration && !duration)) throw MfFailure{Error(CodecErrorCode::InvalidData, "Timestamp exceeds Media Foundation range")};
-      Require(sample->SetSampleTime(pts->ticks), "Cannot set packet PTS");
-      if (duration) Require(sample->SetSampleDuration(duration->ticks), "Cannot set packet duration");
-      Require(sample->SetUINT32(MFSampleExtension_CleanPoint, packet.key_frame), "Cannot set packet random-access flag");
-      const auto status = decoder_->ProcessInput(0, sample.Get(), 0);
-      if (status == MF_E_NOTACCEPTING) return SubmitStatus::WouldBlock;
-      Require(status, "Decoder rejected access unit");
-      if (std::holds_alternative<AudioDecoderConfig>(config_)) audio_timing_.push_back(pts->ticks);
+      const auto status = Push(bytes, pts->ticks, duration ? std::optional{duration->ticks} : std::nullopt, packet.key_frame);
+      if (status == SubmitStatus::WouldBlock) return status;
+      if (mp3_) {
+        if (mp3_drain_frame_.empty()) mp3_drain_frame_ = Mp3DrainFrame(bytes);
+        mp3_->Expect(packet.pts);
+        mp3_last_pts_ = pts->ticks;
+      } else if (audio) {
+        audio_timing_.push_back({pts->ticks, audio_samples});
+      }
       first_ = false;
       return SubmitStatus::Accepted;
     });
@@ -137,6 +171,9 @@ public:
   CodecResult<std::optional<BackendOutput>> Poll() override {
     return Guard<std::optional<BackendOutput>>([&]() -> std::optional<BackendOutput> {
       if (eos_) return std::nullopt;
+      if (mp3_) {
+        if (auto frame = mp3_->Read()) return BackendOutput{DecodedFrame{std::move(*frame)}};
+      }
       MFT_OUTPUT_STREAM_INFO info{};
       Require(decoder_->GetOutputStreamInfo(0, &info), "Cannot query decoder output requirements");
       ComPtr<IMFSample> sample;
@@ -144,8 +181,11 @@ public:
         if (!(info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)))
           throw MfFailure{Error(CodecErrorCode::Unsupported, "The decoder cannot supply DXGI output samples")};
       } else if (!(info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
-        // The system AAC MFT requests 48 KiB even for one mono/stereo AAC-LC frame.
-        const auto maximum = std::max<std::size_t>(ValidateConfig(config_).Value() * 4, 64 * 1024);
+        const auto* audio = std::get_if<AudioDecoderConfig>(&config_);
+        // The MFT can reserve scratch for its maximum PCM format independently of the negotiated stream.
+        auto maximum = std::max<std::size_t>(ValidateConfig(config_).Value() * 4, 64 * 1024);
+        if (audio && audio->codec == CodecId::Flac) maximum = 65535 * 8 * sizeof(float);
+        if (audio && audio->codec == CodecId::Opus) maximum = 512 * 1024;
         if (info.cbSize > maximum) throw MfFailure{Error(CodecErrorCode::ResourceExhausted,
             "Media Foundation output allocation exceeds configured frame bound", std::to_string(info.cbSize) + "/" + std::to_string(maximum))};
         ComPtr<IMFMediaBuffer> buffer;
@@ -160,16 +200,32 @@ public:
       if (!sample && output.pSample) sample.Attach(output.pSample);
       if (result == MF_E_TRANSFORM_STREAM_CHANGE) { Negotiate(); return std::nullopt; }
       if (result == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-        if (finished_) { eos_ = true; return BackendOutput{EndOfStream{}}; }
+        if (finished_) {
+          if (mp3_ && !mp3_->Drained())
+            throw MfFailure{Error(CodecErrorCode::InvalidData, "Media Foundation MP3 drain has missing samples")};
+          eos_ = true;
+          return BackendOutput{EndOfStream{}};
+        }
         return std::nullopt;
       }
       Require(result, "Media Foundation decoding failed");
       if (!sample) throw MfFailure{Error(CodecErrorCode::InvalidData, "Decoder returned no output sample")};
-      return BackendOutput{ReadSample(sample.Get())};
+      auto frame = ReadSample(sample.Get());
+      if (frame) return BackendOutput{std::move(*frame)};
+      return std::nullopt;
     });
   }
   CodecResult<SubmitStatus> Finish() override {
     return Guard<SubmitStatus>([&] {
+      if (!mp3_drain_frame_.empty()) {
+        const auto& audio = std::get<AudioDecoderConfig>(config_);
+        const auto duration = MediaTimestamp{AudioSampleLimit(audio).Value(), audio.output.sample_rate}.Rescale(PresentationTimescale())->ticks;
+        if (mp3_last_pts_ > INT64_MAX - duration)
+          throw MfFailure{Error(CodecErrorCode::InvalidData, "MP3 drain timestamp overflow")};
+        if (Push(mp3_drain_frame_, mp3_last_pts_ + duration, duration, true) == SubmitStatus::WouldBlock)
+          return SubmitStatus::WouldBlock;
+        mp3_drain_frame_.clear();
+      }
       Require(decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0), "Decoder rejected end-of-stream");
       Require(decoder_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0), "Decoder drain failed");
       finished_ = true;
@@ -189,15 +245,72 @@ public:
     device_manager_.Reset();
     device_.reset();
     audio_timing_.clear();
+    mp3_.reset();
+    mp3_drain_frame_.clear();
     if (mf_) { record(MFShutdown(), "Media Foundation release failed"); mf_ = false; }
     if (com_) { CoUninitialize(); com_ = false; }
     return error ? CodecResult<void>::Failure(*error) : CodecResult<void>::Success();
   }
 private:
+  SubmitStatus Push(std::span<const std::byte> bytes, LONGLONG pts, std::optional<LONGLONG> duration, bool sync) {
+    if (bytes.size() > MAXDWORD) throw MfFailure{Error(CodecErrorCode::InvalidData, "Packet exceeds Media Foundation buffer range")};
+    ComPtr<IMFSample> sample;
+    ComPtr<IMFMediaBuffer> buffer;
+    Require(MFCreateSample(&sample), "Cannot allocate encoded sample");
+    Require(MFCreateMemoryBuffer(static_cast<DWORD>(bytes.size()), &buffer), "Cannot allocate encoded bytes");
+    BYTE* target = nullptr;
+    Require(buffer->Lock(&target, nullptr, nullptr), "Cannot map encoded bytes");
+    std::memcpy(target, bytes.data(), bytes.size());
+    Require(buffer->Unlock(), "Cannot unmap encoded bytes");
+    Require(buffer->SetCurrentLength(static_cast<DWORD>(bytes.size())), "Cannot set packet size");
+    Require(sample->AddBuffer(buffer.Get()), "Cannot attach packet bytes");
+    Require(sample->SetSampleTime(pts), "Cannot set packet PTS");
+    if (duration) Require(sample->SetSampleDuration(*duration), "Cannot set packet duration");
+    Require(sample->SetUINT32(MFSampleExtension_CleanPoint, sync), "Cannot set packet random-access flag");
+    const auto status = decoder_->ProcessInput(0, sample.Get(), 0);
+    if (status == MF_E_NOTACCEPTING) return SubmitStatus::WouldBlock;
+    Require(status, "Decoder rejected access unit");
+    return SubmitStatus::Accepted;
+  }
+
+  void NegotiateAudioOutput(const AudioDecoderConfig& audio) {
+    ComPtr<IMFMediaType> selected;
+    AudioSampleFormat selected_format = audio.output.sample_format;
+    for (DWORD i = 0;; ++i) {
+      ComPtr<IMFMediaType> type;
+      const auto status = decoder_->GetOutputAvailableType(0, i, &type);
+      if (status == MF_E_NO_MORE_TYPES) break;
+      Require(status, "Cannot enumerate decoder PCM formats");
+      GUID subtype{};
+      Require(type->GetGUID(MF_MT_SUBTYPE, &subtype), "PCM subtype is missing");
+      const auto bits = MFGetAttributeUINT32(type.Get(), MF_MT_AUDIO_BITS_PER_SAMPLE, 0);
+      if ((subtype != MFAudioFormat_PCM || bits != 16) && (subtype != MFAudioFormat_Float || bits != 32)) continue;
+      const auto format = subtype == MFAudioFormat_Float ? AudioSampleFormat::F32 : AudioSampleFormat::S16;
+      if (MFGetAttributeUINT32(type.Get(), MF_MT_AUDIO_SAMPLES_PER_SECOND, 0) != audio.output.sample_rate ||
+          MFGetAttributeUINT32(type.Get(), MF_MT_AUDIO_NUM_CHANNELS, 0) != audio.output.ChannelCount()) continue;
+      if (format == audio.output.sample_format) {
+        selected = std::move(type);
+        selected_format = format;
+        break;
+      }
+      if (!selected && audio.codec != CodecId::Aac) {
+        selected = std::move(type);
+        selected_format = format;
+      }
+    }
+    if (!selected) throw MfFailure{Error(CodecErrorCode::Unsupported, "No compatible Media Foundation PCM output format")};
+    Require(decoder_->SetOutputType(0, selected.Get(), 0), "Decoder rejected PCM output");
+    output_type_ = std::move(selected);
+    audio_sample_format_ = selected_format;
+  }
+
   void Negotiate() {
-    const auto* audio = std::get_if<AudioDecoderConfig>(&config_);
-    const GUID wanted = audio ? (audio->output.sample_format == AudioSampleFormat::F32 ? MFAudioFormat_Float : MFAudioFormat_PCM) :
-        std::get<VideoDecoderConfig>(config_).output == VideoPixelFormat::P010 ? MFVideoFormat_P010 : MFVideoFormat_NV12;
+    if (const auto* audio = std::get_if<AudioDecoderConfig>(&config_)) {
+      NegotiateAudioOutput(*audio);
+      return;
+    }
+    const auto& config = std::get<VideoDecoderConfig>(config_);
+    const GUID wanted = config.output == VideoPixelFormat::P010 ? MFVideoFormat_P010 : MFVideoFormat_NV12;
     for (DWORD i = 0;; ++i) {
       ComPtr<IMFMediaType> type;
       const auto status = decoder_->GetOutputAvailableType(0, i, &type);
@@ -206,24 +319,16 @@ private:
       GUID subtype{};
       Require(type->GetGUID(MF_MT_SUBTYPE, &subtype), "Output subtype is missing");
       if (subtype != wanted) continue;
-      if (audio) {
-        UINT32 rate, channels;
-        Require(type->GetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, &rate), "PCM rate is missing");
-        Require(type->GetUINT32(MF_MT_AUDIO_NUM_CHANNELS, &channels), "PCM channel count is missing");
-        if (rate != audio->output.sample_rate || channels != audio->output.ChannelCount()) continue;
-      } else {
-        UINT32 width, height;
-        Require(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width, &height), "Video size is missing");
-        const auto& config = std::get<VideoDecoderConfig>(config_);
-        if (!width || !height || width > config.width || height > config.height) continue;
-      }
+      UINT32 width, height;
+      Require(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width, &height), "Video size is missing");
+      if (!width || !height || width > config.width || height > config.height) continue;
       Require(decoder_->SetOutputType(0, type.Get(), 0), "Decoder rejected output format");
       output_type_ = std::move(type);
       return;
     }
     throw MfFailure{Error(CodecErrorCode::Unsupported, "No compatible Media Foundation output format")};
   }
-  DecodedFrame ReadSample(IMFSample* sample) {
+  std::optional<DecodedFrame> ReadSample(IMFSample* sample) {
     LONGLONG time;
     Require(sample->GetSampleTime(&time), "Decoded sample has no PTS");
     const MediaTimestamp pts{time, PresentationTimescale()};
@@ -249,13 +354,28 @@ private:
     const auto data = Own(std::move(bytes));
     if (const auto* audio = std::get_if<AudioDecoderConfig>(&config_)) {
       auto format = audio->output; format.packing = AudioPacking::Interleaved;
+      format.sample_format = audio_sample_format_;
       const auto stride = format.BytesPerSample() * format.ChannelCount();
-      if (size % stride || size / stride != 1024 || audio_timing_.empty())
-        throw MfFailure{Error(CodecErrorCode::InvalidData, "Unexpected AAC output count")};
-      const auto expected = audio_timing_.front();
-      // The AAC MFT can truncate a drained timestamp by one 100 ns tick.
-      if (time != expected && !(time < INT64_MAX && time + 1 == expected) && !(time > INT64_MIN && time - 1 == expected))
-        throw MfFailure{Error(CodecErrorCode::InvalidData, "AAC output timing does not match the accepted access unit")};
+      if (mp3_) {
+        if (!size || size % stride)
+          throw MfFailure{Error(CodecErrorCode::InvalidData, "Unexpected Media Foundation MP3 PCM alignment")};
+        auto pcm = CopyAudio({format, pts, size / stride, {data}}, audio->output);
+        if (!pcm.Succeeded()) throw MfFailure{pcm.Error()};
+        const auto buffered = mp3_->Append(pcm.Value(), finished_);
+        if (!buffered.Succeeded()) throw MfFailure{buffered.Error()};
+        if (auto frame = mp3_->Read()) return DecodedFrame{std::move(*frame)};
+        return std::nullopt;
+      }
+      if (audio_timing_.empty() || size % stride || size / stride != audio_timing_.front().samples)
+        throw MfFailure{Error(CodecErrorCode::InvalidData, "Unexpected Media Foundation PCM sample count",
+            std::to_string(size / stride) + "/" + (audio_timing_.empty() ? "none" : std::to_string(audio_timing_.front().samples)))};
+      const auto expected = audio_timing_.front().pts;
+      // The FLAC MFT can stamp a buffered block with the input that made it available.
+      // Its output is in frame order and the sample count identifies the submitted block boundary.
+      if (audio->codec != CodecId::Flac && time != expected &&
+          !(time < INT64_MAX && time + 1 == expected) && !(time > INT64_MIN && time - 1 == expected))
+        throw MfFailure{Error(CodecErrorCode::InvalidData, "PCM timing does not match the accepted access unit",
+            std::to_string(time) + "/" + std::to_string(expected))};
       auto result = CopyAudio({format, {expected, PresentationTimescale()}, size / stride, {data}}, audio->output);
       if (!result.Succeeded()) throw MfFailure{result.Error()};
       audio_timing_.pop_front();
@@ -304,7 +424,12 @@ private:
   std::shared_ptr<WindowsVideoDevice> device_;
   ComPtr<IMFDXGIDeviceManager> device_manager_;
   Bytes parameters_;
-  std::deque<LONGLONG> audio_timing_;
+  struct AudioTiming { LONGLONG pts; unsigned samples; };
+  std::deque<AudioTiming> audio_timing_;
+  std::optional<PcmPackets> mp3_;
+  Bytes mp3_drain_frame_;
+  LONGLONG mp3_last_pts_ = 0;
+  AudioSampleFormat audio_sample_format_ = AudioSampleFormat::S16;
   unsigned length_size_ = 4;
   bool com_ = false, mf_ = false, first_ = true, finished_ = false, eos_ = false;
 };

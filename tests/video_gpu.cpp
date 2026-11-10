@@ -81,7 +81,7 @@ template<class T, class E> T Take(Result<T, E> result) {
 #ifdef _WIN32
 struct MissingHardware {};
 
-template<class Codec, class Config> void CheckHardware(const Config& config) {
+template<class Codec, class Config> bool CodecAvailable(const Config& config) {
   auto outcome = std::make_shared<std::promise<CodecResult<void>>>();
   auto future = outcome->get_future();
   Codec::Probe(config, [outcome](auto result) { outcome->set_value(std::move(result)); });
@@ -89,9 +89,10 @@ template<class Codec, class Config> void CheckHardware(const Config& config) {
   auto result = future.get();
   if (!result.Succeeded() && result.Error().code == CodecErrorCode::Unsupported) {
     std::cout << result.Error().message << '\n';
-    throw MissingHardware{};
+    return false;
   }
   Take(std::move(result));
+  return true;
 }
 #endif
 
@@ -535,6 +536,16 @@ void CheckWatermark(const Clip& clip) {
 
 void Transcode(const Clip& clip, const File& file, unsigned width, unsigned height, bool gpu, bool regression,
     std::uint32_t bitrate, bool texture_input) {
+#ifdef _WIN32
+  constexpr bool allow_pts_as_dts = true;
+#else
+  constexpr bool allow_pts_as_dts = false;
+#endif
+#if defined(_WIN32) || (defined(__APPLE__) && TARGET_OS_IOS && TARGET_OS_SIMULATOR)
+  const bool reorder = clip.track.codec == CodecId::Hevc;
+#else
+  constexpr bool reorder = false;
+#endif
   auto decoder_config = DecoderConfig(clip.track, gpu);
   VideoFormat watermark_format{width, height, {0, 0, width, height}, decoder_config.output};
 #ifdef _WIN32
@@ -543,31 +554,28 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
     watermark_format.range = ColorRange::Limited;
   }
   if (gpu) {
-    CheckHardware<VideoDecoder>(decoder_config);
+    if (!texture_input && !CodecAvailable<VideoDecoder>(decoder_config)) throw MissingHardware{};
     VideoEncoderConfig config{.input = watermark_format, .bitrate = bitrate,
         .profile = H264Profile::Baseline, .codec = clip.track.codec, .input_storage = VideoStorage::Platform};
-    CheckHardware<VideoEncoder>(config);
+    if (reorder) config.max_b_frames = std::nullopt;
+    if (!CodecAvailable<VideoEncoder>(config)) throw MissingHardware{};
   }
 #else
   PixelAudit audit;
 #endif
   const auto start = std::chrono::steady_clock::now();
   const auto start_cpu = ProcessCpuSeconds();
-#if defined(__APPLE__) && TARGET_OS_IOS && TARGET_OS_SIMULATOR
-  const bool reorder = clip.track.codec == CodecId::Hevc;
-#else
-  constexpr bool reorder = false;
-#endif
   const auto source_clock = *clip.track.timescale;
   const auto wide_clock = reorder ? std::lcm(std::uint64_t(source_clock), 1'000'000ull) : source_clock;
   Check(wide_clock <= UINT32_MAX, "Video timestamp grids have no compatible clock");
   const auto clock = std::uint32_t(wide_clock);
-  TestSession<VideoDecoder> source(decoder_config);
-  auto& decoder = source.codec;
+  std::optional<TestSession<VideoDecoder>> source;
+  if (!texture_input) source.emplace(decoder_config);
   media::detail::VideoFrameTransformer transformer;
   std::optional<TestSession<VideoEncoder>> encoder;
   std::optional<MediaMuxer> mux;
   std::optional<ContainerPacket> last_packet;
+  std::optional<bool> platform_dts;
   std::int64_t first_dts = 0, total_duration = 0;
   std::optional<VideoFrame> pending, retained;
   std::optional<std::array<VideoFrame, 2>> watermarks;
@@ -594,7 +602,14 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
           ContainerPacket sample{1, packet->data, packet->pts, reorder ? packet->dts : std::optional{packet->pts},
               packet->duration, packet->key_frame};
           if (reorder) {
-            Check(sample.dts.has_value(), "Reordered encoder output has no decode timestamp");
+            if (!platform_dts) platform_dts = sample.dts.has_value();
+            Check(*platform_dts == sample.dts.has_value(), "Platform decode timestamp availability changed");
+            if (!sample.dts) {
+              // Some Windows encoders use low-delay B pictures with the same decode and presentation order.
+              Check(allow_pts_as_dts && (!last_packet || packet->pts.Compare(*last_packet->pts) > 0),
+                    "Reordered encoder output has no decode timestamp");
+              sample.dts = sample.pts;
+            }
             const auto exact = sample.dts->Rescale(source_clock);
             if (exact && exact->Rescale(sample.dts->timescale) == sample.dts) sample.dts = exact;
             const auto dts = sample.dts->Rescale(clock)->ticks;
@@ -616,7 +631,19 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
       }
     }
     if (!pending && !decode_end) {
-      if (auto result = Take(decoder.TryRead())) {
+      if (watermarks) {
+        decode_end = decoded == clip.times.size();
+        if (!decode_end) {
+          pending = (*watermarks)[decoded % watermarks->size()];
+          pending->pts = clip.times[decoded];
+          if (decoded + 1 == clip.times.size()) {
+            const auto last = std::ranges::find(clip.packets, pending->pts, &EncodedPacket::pts);
+            Check(last != clip.packets.end(), "The fixture has no last presentation packet");
+            pending->duration = last->duration;
+          }
+          SetDuration(*pending, clip, decoded++);
+        }
+      } else if (auto result = Take(source->codec.TryRead())) {
         progress = true;
         if (auto* frame = std::get_if<VideoFrame>(&*result)) {
           Check(frame->Validate() && frame->Storage() == decoder_config.output_storage &&
@@ -628,26 +655,22 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
             retained = *frame;
             texture = Take(MakeExternalTexture(*frame));
           }
-          if (watermarks) {
-            pending = (*watermarks)[(decoded - 1) % watermarks->size()];
-            pending->pts = frame->pts;
-            pending->duration = frame->duration;
-          } else {
-            pending = gpu ? Take(transformer.Transform(*frame, width, height)) : ScaleCpu(*frame, width, height);
-          }
-          Check(pending->Validate() && pending->Storage() == decoder_config.output_storage &&
-                (gpu ? pending->planes.empty() : !pending->planes.empty()), "Transform returned the wrong frame storage");
-          if (!encoder) {
-            VideoEncoderConfig config{.input = pending->format, .bitrate = bitrate, .profile = H264Profile::Baseline,
-                .codec = clip.track.codec, .input_storage = decoder_config.output_storage};
-#ifdef __APPLE__
-            if (gpu && regression && clip.track.codec == CodecId::H264) config.limits.input_items = 1;
-#endif
-            if (reorder) config.max_b_frames = std::nullopt;
-            encoder.emplace(config);
-          }
+          pending = gpu ? Take(transformer.Transform(*frame, width, height)) : ScaleCpu(*frame, width, height);
         } else if (std::holds_alternative<EndOfStream>(*result)) {
           decode_end = true;
+        }
+      }
+      if (pending) {
+        Check(pending->Validate() && pending->Storage() == decoder_config.output_storage &&
+              (gpu ? pending->planes.empty() : !pending->planes.empty()), "Unexpected encoder input frame storage");
+        if (!encoder) {
+          VideoEncoderConfig config{.input = pending->format, .bitrate = bitrate, .profile = H264Profile::Baseline,
+              .codec = clip.track.codec, .input_storage = decoder_config.output_storage};
+#ifdef __APPLE__
+          if (gpu && regression && clip.track.codec == CodecId::H264) config.limits.input_items = 1;
+#endif
+          if (reorder) config.max_b_frames = std::nullopt;
+          encoder.emplace(config);
         }
       }
     }
@@ -656,12 +679,12 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
       pending.reset();
     }
     if (decode_end && !pending && !sealed) {
-      Check(encoder.has_value(), "Decoder produced no frames");
+      Check(encoder.has_value(), "No frames reached the encoder");
       Take(encoder->codec.Finish());
       sealed = true;
       progress = true;
     }
-    if (!decode_end) progress |= feed.Pump(decoder, clip);
+    if (source && !decode_end) progress |= feed.Pump(source->codec, clip);
     if (progress) deadline = std::chrono::steady_clock::now() + 25s;
     else std::this_thread::sleep_for(1ms);
   }
@@ -678,13 +701,13 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
     for (const auto target : {clip.packets.size() / 2, std::size_t(0)}) {
       auto first = target;
       while (first && !clip.packets[first].key_frame) --first;
-      Take(decoder.Reset());
-      const auto picture = FirstPicture(decoder, clip, first);
+      Take(source->codec.Reset());
+      const auto picture = FirstPicture(source->codec, clip, first);
       Check(picture.Storage() == VideoStorage::Platform && picture.pts == clip.packets[first].pts,
             "Reset did not return a picture from the new key frame");
     }
   }
-  Check(source.Close() && encoder->Close(), "Codec did not retire with a retained image");
+  Check((!source || source->Close()) && encoder->Close(), "Codec did not retire with a retained image");
   if (retained) {
     const auto format = retained->format;
     const auto image = Take(transformer.Transform(*retained, width, height));
@@ -708,11 +731,18 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
             VideoRectangle{0, 0, width, height}, "MP4 readback changed codec, visible geometry, or PTS");
   std::optional<MediaTimestamp> previous_dts;
   for (const auto& packet : readback.packets) {
-    Check(packet.dts && (!previous_dts || packet.dts->Compare(*previous_dts) > 0) && (reorder || packet.dts == packet.pts) &&
+    Check(packet.dts && (!previous_dts || packet.dts->Compare(*previous_dts) > 0) &&
+        (platform_dts.value_or(false) || packet.dts == packet.pts) &&
         packet.duration && packet.duration->ticks > 0, "MP4 readback lost decode timing");
     previous_dts = packet.dts;
   }
   if (texture_input) {
+#ifdef _WIN32
+    if (readback.track.codec == CodecId::Hevc && !CodecAvailable<VideoDecoder>(DecoderConfig(readback.track, false))) {
+      std::cout << "HEVC SDK texture encoding and MP4 timing passed. Watermark decode requires an HEVC decoder.\n";
+      return;
+    }
+#endif
     CheckWatermark(readback);
     std::cout << "SDK texture watermark and MP4 timing passed\n";
   } else if (regression) {

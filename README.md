@@ -30,9 +30,9 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`media_player.h`](include/huxerui/media_player.h) |
 | Platform image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
-| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, and HEVC. See [decoder validation](#media-decoding). | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
-| HEVC encoding and decoding | Main and Main10 adapters for all six platforms. Device and runtime support varies. See the [HEVC matrix](docs/media-codec.md#hevc). | `CodecId::Hevc`, `VideoEncoder`, `VideoDecoder`, and `VideoPixelFormat::P010` |
-| GPU video | SDR H.264 and HEVC Main platform frames and SDK texture input on macOS, Android, iOS, Windows, and supported Web browsers. Windows x64 H.264 GPU transcode and SDK texture encoding passed on hardware. See [GPU video](docs/gpu-video.md) for platform coverage. | `VideoStorage::Platform`, `MakeExternalTexture()`, and `MakeVideoFrame()` |
+| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, and HEVC. Opus, FLAC, and MP3 also pass native decoding on Windows and Linux. See [decoder validation](#media-decoding). | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
+| HEVC encoding and decoding | Main and Main10 adapters for all six platforms. Linux Main/Main10 CPU round trips and preview export passed under WSL. See the [HEVC matrix](docs/media-codec.md#hevc) for device and runtime coverage. | `CodecId::Hevc`, `VideoEncoder`, `VideoDecoder`, and `VideoPixelFormat::P010` |
+| GPU video | SDR H.264 and HEVC Main platform frames and SDK texture input on macOS, Android, iOS, Windows, and supported Web browsers. Windows x64 passed H.264 GPU transcode and SDK texture encoding for H.264 and HEVC Main. See [GPU video](docs/gpu-video.md) for platform coverage. | `VideoStorage::Platform`, `MakeExternalTexture()`, and `MakeVideoFrame()` |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; macOS native tests passed; iOS validation pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; macOS native tests passed; iOS validation pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
@@ -313,14 +313,15 @@ produces CPU YUV by default from length-prefixed H.264 or HEVC. macOS, Android, 
   after admitted wakeups return. On desktop and mobile platforms, it also follows worker exit.
 
 Each desktop or mobile session and probe has its own worker. Web sessions run on the event loop that created them. Linux uses
-GStreamer 1.24+ with installed AAC/H.264 parser and decoder plugins.
+GStreamer 1.24+ with the installed parser and decoder plugins for the requested codec.
 
 AAC/H.264 fixture decoding passed on an Android 12 device, an iOS simulator, Apple Silicon macOS, Windows 11,
 Ubuntu 24.04 under WSL, and Chrome through the C++/WASM API. Windows and Linux also check the longer synchronization
 fixtures with tight output pools. Physical iOS decoding remains unvalidated. See the [decoding guide](docs/media-codec.md) for examples, queue limits,
 platform requirements, and validation instructions.
 
-See the [six-platform Opus, FLAC, and MP3 matrix](docs/media-codec.md#opus-flac-and-mp3) for adapters and validation results.
+Windows and Linux also pass Opus, FLAC, and MP3 packet decoding and PCM preview checks. See the
+[six-platform audio decoder matrix](docs/media-codec.md#opus-flac-and-mp3) for adapters and validation results.
 
 ## Media encoding
 
@@ -468,17 +469,18 @@ authored edits, and supported visual metadata. This includes HLG and Dolby Visio
 HEVC packet-copy path. “Encode MP4” encodes SDR H.264 or HEVC using the source codec and writes fast-start MP4. macOS allows B pictures
 and uses explicit encoder DTS, as does HEVC on the iOS Simulator. Web HEVC uses automatic B-picture selection and
 can export when encoder output has strictly increasing presentation timestamps. The zero-B-picture H.264 path
-uses Baseline. The output container preserves the display pixel aspect ratio. Android, Windows, and Web pass AAC
-packets through. The other platforms encode PCM and require a known AAC trim summary.
+uses Baseline. The output container preserves the display pixel aspect ratio. Android, Windows, Linux, and Web pass AAC
+packets through. The Apple platforms encode PCM and require a known AAC trim summary.
 
 Both actions reopen the finished file before “Save Movie” can publish it. Changing the source or preparing another
 result clears the previous export. The separate save action lets the browser picker start from a fresh click.
 Browser input is staged in memory and limited to 128 MiB.
 
-The [macOS integration test](tests/container_preview.cpp) checks seeks, presentation edits, DTS export, and packet
-copy with the bundled MP4 and rotated Main10 MOV fixtures. The [texture contract test](tests/frame_texture_contract.cpp)
-checks cropped, padded CPU frames and successive publications. Android 12 and iOS Simulator passed headless
-cross-fragment seek and HLG MOV packet-copy checks. iOS Simulator also decoded the SDR Main10 fixture to P010.
+The [shared preview integration test](tests/container_preview.cpp) checks seeks, presentation edits, export, and
+packet copy on macOS, Windows, and Linux. The HEVC fixture cases require the matching codec configurations to pass
+`Probe()`. The [texture contract test](tests/frame_texture_contract.cpp) checks cropped, padded CPU frames and successive
+publications. Android 12 and iOS Simulator passed headless cross-fragment seek and HLG MOV packet-copy checks.
+iOS Simulator also decoded the SDR Main10 fixture to P010.
 The [roadmap](docs/media-roadmap.md#delivery-order) tracks iPhone camera-original and HDR display acceptance.
 
 ### Build and run
@@ -526,10 +528,11 @@ a real source, run `build/tests/tests/media_windows_video.exe /path/to/video.mp4
 It uses an off-screen window, resizes the surface, and waits for natural completion without modifying the source.
 
 Linux Release tests passed on Ubuntu 24.04 under WSL with GStreamer 1.24.2, libpulse 16.1, and WSLg's PulseAudio server.
-They cover platform AAC/AVC decoding, PCM/AAC playback, video/A/V scheduling, texture publication, 48 kHz stereo and
-44.1 kHz mono cork/drain boundaries, and missing-server cleanup. The full Linux preview also builds with the installed
-SDK. Physical Linux output routes, PipeWire's PulseAudio service, and measured display/audio synchronization remain
-device acceptance work.
+They cover CPU HEVC Main/Main10 and H.264 round trips, AAC/Opus/FLAC/MP3 decoding, PCM playback, and texture
+publication. The standalone preview built with a HuxerUI SDK providing random-access streams. With `HuxerUI::testing`
+available, CTest adds `media_container_preview` on Windows and Linux to exercise repeated seeks, MP4/MOV export and
+readback, audio packet copy, and WAV sample counts. Physical Linux output routes, PipeWire's PulseAudio service, and
+measured display/audio synchronization remain device acceptance work.
 
 Device acceptance should cover local/reference/HTTPS playback, seek/end/loop, source replacement, fitting, and platform
 interruptions; image/video/mixed selection, platform count limits, dismissal, and reading retained references; and

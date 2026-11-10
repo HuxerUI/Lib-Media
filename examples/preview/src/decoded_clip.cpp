@@ -870,7 +870,7 @@ Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, F
   std::optional<ExportTrack<AudioDecoder, AudioEncoder, AudioFrame>> audio;
   ExportQueue audio_copy;
   if (clip.audio) {
-#if defined(__EMSCRIPTEN__) || defined(__ANDROID__) || defined(_WIN32)
+#if defined(__EMSCRIPTEN__) || defined(__ANDROID__) || defined(_WIN32) || defined(__linux__)
     // Preserve source trim on backends that can omit AAC encoder delay and padding.
     audio_copy.track = clip.audio->track;
 #else

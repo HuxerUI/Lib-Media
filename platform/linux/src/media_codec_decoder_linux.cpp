@@ -1,5 +1,6 @@
 #include "codec/decoder/backend.h"
 #include "codec/decoder/copy.h"
+#include "codec/hevc.h"
 
 #include <algorithm>
 #include <array>
@@ -64,6 +65,7 @@ public:
     GstCaps* input;
     const char* parser_name = "h264parse";
     bool headers_ok;
+    std::optional<HevcSequence> sequence;
     if (audio) {
       audio_sample_limit_ = AudioSampleLimit(*audio).Value();
       const auto rate = int(audio->output.sample_rate), channels = int(audio->output.ChannelCount());
@@ -91,6 +93,8 @@ public:
         case CodecId::Mp3:
           input = gst_caps_new_simple("audio/mpeg", "mpegversion", G_TYPE_INT, 1, "layer", G_TYPE_INT, 3,
               "parsed", G_TYPE_BOOLEAN, TRUE, "rate", G_TYPE_INT, rate, "channels", G_TYPE_INT, channels, nullptr);
+          // Raw Layer III packets leave the decoder's synthesis delay in the output PCM.
+          mp3_.emplace(audio->output, audio_sample_limit_, Mp3SynthesisDelay);
           headers_ok = true;
           break;
         default:
@@ -99,7 +103,18 @@ public:
     } else {
       const auto& video = std::get<VideoDecoderConfig>(config_);
       const bool hevc = video.codec == CodecId::Hevc;
-      if (hevc) parser_name = "h265parse";
+      if (hevc) {
+        parser_name = "h265parse";
+        try {
+          const auto description = ParseHevcConfiguration(video.initialization_data, true, true);
+          const auto sps = std::ranges::find_if(description.parameters, [](const auto& nal) { return HevcNalType(nal) == 33; });
+          sequence = ReadHevcSequence(*sps);
+        } catch (const std::invalid_argument& error) {
+          return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidArgument, error.what()));
+        }
+        if (sequence->visible_width > video.width || sequence->visible_height > video.height)
+          return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "HEVC picture exceeds the GStreamer decoder bounds"));
+      }
       input = gst_caps_new_simple(hevc ? "video/x-h265" : "video/x-h264", "stream-format", G_TYPE_STRING,
           hevc ? "hvc1" : "avc", "alignment", G_TYPE_STRING, "au", nullptr);
       headers_ok = SetDescription(input, video.initialization_data, false);
@@ -110,7 +125,14 @@ public:
     }
     auto* factories = gst_element_factory_list_get_elements(GST_ELEMENT_FACTORY_TYPE_DECODER
         | (audio ? GST_ELEMENT_FACTORY_TYPE_MEDIA_AUDIO : GST_ELEMENT_FACTORY_TYPE_MEDIA_VIDEO), GST_RANK_MARGINAL);
-    auto* compatible = gst_element_factory_list_filter(factories, input, GST_PAD_SINK, FALSE);
+    auto* decoder_caps = sequence ? gst_caps_copy(input) : input;
+    if (sequence) {
+      // Filter on the format the parser will negotiate, not just the compressed media type.
+      gst_caps_set_simple(decoder_caps, "width", G_TYPE_INT, int(sequence->visible_width), "height", G_TYPE_INT,
+          int(sequence->visible_height), "profile", G_TYPE_STRING, sequence->luma_bits == 10 ? "main-10" : "main", nullptr);
+    }
+    auto* compatible = gst_element_factory_list_filter(factories, decoder_caps, GST_PAD_SINK, FALSE);
+    if (sequence) gst_caps_unref(decoder_caps);
     GstElement* decoder = nullptr;
     for (auto* item = compatible; item && !decoder; item = item->next)
       decoder = gst_element_factory_create(GST_ELEMENT_FACTORY(item->data), nullptr);
@@ -162,15 +184,6 @@ public:
   CodecResult<SubmitStatus> Submit(const EncodedPacket& packet) override {
     using R = CodecResult<SubmitStatus>;
     const auto bytes = packet.data.AsBytes();
-    const auto limits = std::visit([](const auto& c) { return c.limits; }, config_);
-    auto* source = GST_APP_SRC(source_);
-    // Only the codec worker pushes; the streaming thread can only lower these levels.
-    // Keep pushes nonblocking so this worker can still drain appsink.
-    const auto queued_bytes = gst_app_src_get_current_level_bytes(source);
-    if (gst_app_src_get_current_level_buffers(source) >= limits.input_items ||
-        queued_bytes > limits.input_bytes || bytes.size() > limits.input_bytes - queued_bytes)
-      return R::Success(SubmitStatus::WouldBlock);
-
     const auto pts = packet.pts.Rescale(GST_SECOND);
     const auto dts = packet.dts ? packet.dts->Rescale(GST_SECOND) : pts;
     const auto duration = packet.duration ? packet.duration->Rescale(GST_SECOND) : std::optional<MediaTimestamp>{};
@@ -192,17 +205,13 @@ public:
     const auto platform_pts = encode(pts->ticks), platform_dts = encode(dts->ticks);
     if (!platform_pts || !platform_dts)
       return R::Failure(Error(CodecErrorCode::InvalidData, "Timestamp precedes the first decoding time or exceeds GstClockTime"));
-    auto* buffer = gst_buffer_new_allocate(nullptr, bytes.size(), nullptr);
-    if (!buffer) return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot allocate GStreamer input"));
-    if (gst_buffer_fill(buffer, 0, bytes.data(), bytes.size()) != bytes.size()) {
-      gst_buffer_unref(buffer); return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot copy GStreamer input"));
+    auto pushed = Push(bytes, *platform_pts, *platform_dts, duration ? duration->ticks : GST_CLOCK_TIME_NONE, packet.key_frame);
+    if (mp3_ && pushed.Succeeded() && pushed.Value() == SubmitStatus::Accepted) {
+      if (mp3_drain_frame_.empty()) mp3_drain_frame_ = Mp3DrainFrame(bytes);
+      mp3_->Expect(packet.pts);
+      mp3_last_pts_ = *platform_pts;
     }
-    GST_BUFFER_PTS(buffer) = *platform_pts; GST_BUFFER_DTS(buffer) = *platform_dts;
-    GST_BUFFER_DURATION(buffer) = duration ? duration->ticks : GST_CLOCK_TIME_NONE;
-    if (!packet.key_frame) GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
-    const auto status = gst_app_src_push_buffer(source, buffer);
-    if (status != GST_FLOW_OK) return R::Failure(Error(CodecErrorCode::PlatformFailure, "GStreamer input rejected", gst_flow_get_name(status)));
-    return R::Success(SubmitStatus::Accepted);
+    return pushed;
   }
   CodecResult<std::optional<BackendOutput>> Poll() override {
     using R = CodecResult<std::optional<BackendOutput>>;
@@ -217,19 +226,41 @@ public:
     }
     auto* sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink_), 0);
     if (!sample) {
-      if (finished_ && !eos_ && gst_app_sink_is_eos(GST_APP_SINK(sink_))) { eos_ = true; return R::Success(BackendOutput{EndOfStream{}}); }
+      if (finished_ && !eos_ && gst_app_sink_is_eos(GST_APP_SINK(sink_))) {
+        if (mp3_ && !mp3_->Drained())
+          return R::Failure(Error(CodecErrorCode::InvalidData, "GStreamer MP3 drain has missing PCM samples"));
+        eos_ = true;
+        return R::Success(BackendOutput{EndOfStream{}});
+      }
       return R::Success(std::nullopt);
     }
     std::unique_ptr<GstSample, decltype(&gst_sample_unref)> owned_sample(sample, gst_sample_unref);
     auto result = Copy(owned_sample.get());
     if (!result.Succeeded()) return R::Failure(result.Error());
+    if (mp3_) {
+      const auto buffered = mp3_->Append(std::get<AudioFrame>(result.Value()), finished_);
+      if (!buffered.Succeeded()) return R::Failure(buffered.Error());
+      if (auto frame = mp3_->Read()) return R::Success(BackendOutput{DecodedFrame{std::move(*frame)}});
+      return R::Success(std::nullopt);
+    }
     return R::Success(BackendOutput{std::move(result).Value()});
   }
   CodecResult<SubmitStatus> Finish() override {
+    using R = CodecResult<SubmitStatus>;
+    if (!mp3_drain_frame_.empty()) {
+      const auto& audio = std::get<AudioDecoderConfig>(config_);
+      const auto duration = gst_util_uint64_scale_round(audio_sample_limit_, GST_SECOND, audio.output.sample_rate);
+      if (duration >= GST_CLOCK_TIME_NONE - mp3_last_pts_)
+        return R::Failure(Error(CodecErrorCode::InvalidData, "MP3 drain timestamp overflow"));
+      const auto pts = mp3_last_pts_ + duration;
+      auto pushed = Push(mp3_drain_frame_, pts, pts, duration, true);
+      if (!pushed.Succeeded() || pushed.Value() == SubmitStatus::WouldBlock) return pushed;
+      mp3_drain_frame_.clear();
+    }
     const auto status = gst_app_src_end_of_stream(GST_APP_SRC(source_));
-    if (status != GST_FLOW_OK) return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::PlatformFailure, "GStreamer EOS rejected", gst_flow_get_name(status)));
+    if (status != GST_FLOW_OK) return R::Failure(Error(CodecErrorCode::PlatformFailure, "GStreamer EOS rejected", gst_flow_get_name(status)));
     finished_ = true;
-    return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
+    return R::Success(SubmitStatus::Accepted);
   }
   CodecResult<void> Close() override {
     bool failed = false;
@@ -242,6 +273,30 @@ public:
     return CodecResult<void>::Success();
   }
 private:
+  CodecResult<SubmitStatus> Push(std::span<const std::byte> bytes, GstClockTime pts, GstClockTime dts,
+      GstClockTime duration, bool key_frame) {
+    using R = CodecResult<SubmitStatus>;
+    const auto limits = std::visit([](const auto& c) { return c.limits; }, config_);
+    auto* source = GST_APP_SRC(source_);
+    // Only the codec worker pushes; the streaming thread can only lower these levels.
+    // Keep pushes nonblocking so this worker can still drain appsink.
+    const auto queued_bytes = gst_app_src_get_current_level_bytes(source);
+    if (gst_app_src_get_current_level_buffers(source) >= limits.input_items ||
+        queued_bytes > limits.input_bytes || bytes.size() > limits.input_bytes - queued_bytes)
+      return R::Success(SubmitStatus::WouldBlock);
+    auto* buffer = gst_buffer_new_allocate(nullptr, bytes.size(), nullptr);
+    if (!buffer) return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot allocate GStreamer input"));
+    if (gst_buffer_fill(buffer, 0, bytes.data(), bytes.size()) != bytes.size()) {
+      gst_buffer_unref(buffer); return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot copy GStreamer input"));
+    }
+    GST_BUFFER_PTS(buffer) = pts; GST_BUFFER_DTS(buffer) = dts;
+    GST_BUFFER_DURATION(buffer) = duration;
+    if (!key_frame) GST_BUFFER_FLAG_SET(buffer, GST_BUFFER_FLAG_DELTA_UNIT);
+    const auto status = gst_app_src_push_buffer(source, buffer);
+    if (status != GST_FLOW_OK) return R::Failure(Error(CodecErrorCode::PlatformFailure, "GStreamer input rejected", gst_flow_get_name(status)));
+    return R::Success(SubmitStatus::Accepted);
+  }
+
   CodecResult<DecodedFrame> Copy(GstSample* sample) {
     using R = CodecResult<DecodedFrame>;
     auto* buffer = gst_sample_get_buffer(sample);
@@ -326,6 +381,9 @@ private:
   GstElement* sink_ = nullptr;
   GstBus* bus_ = nullptr;
   std::optional<std::uint64_t> time_offset_;
+  std::optional<PcmPackets> mp3_;
+  Bytes mp3_drain_frame_;
+  GstClockTime mp3_last_pts_ = 0;
   bool finished_ = false, eos_ = false;
 };
 } // namespace

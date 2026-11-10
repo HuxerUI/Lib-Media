@@ -138,10 +138,13 @@ ctest --test-dir build/gpu -R 'media_video_(gpu|texture)' --output-on-failure
 
 Use the same CTest selection on Windows with the installed Windows SDK and a hardware graphics adapter.
 The texture cases publish colored BGRA8 watermarks from a separate D3D11 device on the same adapter. MP4
-readback checks the acquired frame's position, chroma, and timing. An unsupported codec or video processor
-skips the corresponding fixture. The H.264 GPU transcode and texture cases passed on Windows x64 hardware
-with 87 pictures each. HEVC runtime acceptance, additional hardware coverage, and performance measurements
-remain pending.
+readback checks packet timing, and decoding verifies watermark position and chroma. The texture input case
+can verify encoding and MP4 timing without a local decoder. The H.264 GPU transcode and texture cases passed on
+Windows x64 hardware with 87 pictures each. Intel hardware encoded 20 HEVC Main SDK texture pictures, and an
+independent GStreamer `avdec_h265` run under Linux verified all 20 decoded watermarks. With automatic B-picture
+selection (`max_b_frames = std::nullopt`), this Intel transform used low-delay B pictures with increasing PTS and
+omitted DTS. The test uses PTS as DTS only with strict output ordering.
+Windows HEVC GPU transcode, additional hardware coverage, and performance measurements remain pending.
 
 For the iOS Simulator, build the target using the iOS CMake configuration and run the executable with
 `xcrun simctl spawn booted`. Supply an absolute fixture path, `-` for temporary output, and `gpu` or `texture`.

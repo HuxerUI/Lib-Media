@@ -442,7 +442,7 @@ CodecResult<VideoEncodeFormat> ReadVideoEncodeFormatFromPacket(std::span<const s
   using R = CodecResult<VideoEncodeFormat>;
   try {
     Bytes description;
-    for (const auto nal : VideoNals(packet, 4)) {
+    for (const auto nal : VideoNals(packet, 4, config.codec)) {
       const auto header = std::to_integer<unsigned>(nal.front());
       const auto type = config.codec == CodecId::Hevc ? (header >> 1) & 63 : header & 31;
       const bool parameter = config.codec == CodecId::Hevc ? type >= 32 && type <= 34 : type == 7 || type == 8;

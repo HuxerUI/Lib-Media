@@ -8,12 +8,12 @@ record current support. Each planned capability has its own format, direction, p
 
 | Order | Work | Acceptance |
 | --- | --- | --- |
-| Current | GPU video | macOS and Android 12 exercise retained H.264 and HEVC Main frames, GPU crop and scale, preview, and MP4 readback. Android has a direct Surface preview. The iOS Simulator exercises the independent Apple adapter. Windows x64 H.264 GPU transcode and SDK texture encoding both passed MP4 readback on hardware. Web publishes and encodes retained browser frames. See [GPU video](gpu-video.md) for validation and performance. |
-| Delivered | HEVC encode/decode and M4A | Main and Main10 MP4 round trips on macOS, Main on Android 12 and Chrome, and reordered Main/Main10 on the iOS Simulator. Main preview export passes on Chrome and the iOS Simulator. AAC-LC and ALAC M4A preserve the packet timeline, tags, and cover. Fragmented AAC can be copied into regular M4A. See the [HEVC matrix](media-codec.md#hevc) for remaining platform checks. |
-| Delivered | Chained Ogg, Opus/FLAC/MP3 decoding, native audio packet copy, and WAV export | macOS and Android 12 hardware pass preview, repeated seek, packet copy, and WAV readback. Independent checks verify compressed frames, tag and cover retention, and sample counts. See the [six-platform audio matrix](media-codec.md#opus-flac-and-mp3). |
-| Delivered | Track presentation intervals, local fMP4 seek, MP4/MOV packet copy and reordered export | macOS passes fixture integration and independent B-picture readback. Android 12 hardware and iOS Simulator pass headless FFmpeg-generated fMP4 seek and HLG HEVC MOV-to-MP4 copy with identical access units and supported metadata. iOS Simulator decodes SDR Main10 MOV to P010. |
-| Remaining acceptance | iPhone camera originals and additional desktop and browser runs | On an iPhone, import a camera-original MOV, verify SDR preview and repeated seeks, then save a packet copy and check its display transform, timing and color metadata independently. Validate HDR presentation separately from metadata retention. Expand Windows, Linux and browser checks. |
-| Remaining audio acceptance | Expand native audio backend coverage | Check physical iOS, Linux plugins, and additional browsers. Add Windows decoder mappings when the selected transforms meet the packet and PCM timing contract. |
+| Current | GPU video | macOS and Android 12 exercise retained H.264 and HEVC Main frames, GPU crop and scale, preview, and MP4 readback. Android has a direct Surface preview. The iOS Simulator exercises the independent Apple adapter. Windows x64 passed H.264 GPU transcode and SDK texture encoding for H.264 and HEVC Main. Web publishes and encodes retained browser frames. See [GPU video](gpu-video.md) for validation and performance. |
+| Delivered | HEVC encode/decode and M4A | Main and Main10 MP4 round trips on macOS and Ubuntu 24.04/WSL, Main on Android 12 and Chrome, and reordered Main/Main10 on the iOS Simulator. Main preview export passes on Linux, Chrome, and the iOS Simulator. Linux also passes rotated Main10 preview and export. AAC-LC and ALAC M4A preserve the packet timeline, tags, and cover. Fragmented AAC can be copied into regular M4A. See the [HEVC matrix](media-codec.md#hevc) for remaining platform checks. |
+| Delivered | Chained Ogg, Opus/FLAC/MP3 decoding, native audio packet copy, and WAV export | macOS, Android 12 hardware, Windows 11, and Ubuntu 24.04/WSL pass preview, repeated seek, packet copy, and WAV readback. Windows and Linux also check exact packet PTS, drain, and reset. See the [six-platform audio matrix](media-codec.md#opus-flac-and-mp3). |
+| Delivered | Track presentation intervals, local fMP4 seek, MP4/MOV packet copy and reordered export | The shared preview integration passes on macOS, Windows, and Linux. macOS also passes independent B-picture readback. Android 12 hardware and iOS Simulator pass headless FFmpeg-generated fMP4 seek and HLG HEVC MOV-to-MP4 copy with identical access units and supported metadata. iOS Simulator decodes SDR Main10 MOV to P010. |
+| Remaining acceptance | iPhone camera originals and additional desktop and browser runs | On an iPhone, import a camera-original MOV, verify SDR preview and repeated seeks, then save a packet copy and check its display transform, timing, and color metadata independently. Validate HDR presentation separately. Run Windows HEVC CPU round trips and GPU transcode with installed HEVC transforms, and expand physical Linux and browser checks. |
+| Remaining audio acceptance | Expand native audio backend coverage | Check physical iOS, additional Linux plugin and audio server combinations, and additional browsers. |
 
 ## File and URL playback
 
@@ -48,11 +48,11 @@ See the [decoded playback design](codec-design.md#decoded-playback-boundary) and
 - Exercise H.264 profile and B-picture controls, keyframe requests, variable frame intervals, and codec configuration
   changes. Preserve PTS, DTS, duration, and the evidence for independently decodable output. Android and Web H.264
   encoding currently omit DTS. Windows may omit DTS when variable timing makes its codec clock unsuitable.
-- Complete HEVC platform acceptance on physical iOS, Windows, Linux, and additional Android and browser configurations.
-  Verify Main10 CPU paths and ordered/reordered output where supported. Evaluate ProRes, AV1, VP8/VP9, and Vorbis by
-  platform and direction. Add capability and configuration coverage with each codec.
-- Validate the [SDR GPU path](gpu-video.md) on physical iOS and expand Windows coverage to HEVC and additional
-  hardware. Expand browser coverage and extend the path to Linux. Verify ten-bit storage, HDR metadata, and
+- Complete HEVC platform acceptance on physical iOS, Windows with HEVC transforms installed, physical Linux, and
+  additional Android and browser configurations. Verify Main10 CPU paths and ordered/reordered output where supported.
+  Evaluate ProRes, AV1, VP8/VP9, and Vorbis by platform and direction. Add capability and configuration coverage with each codec.
+- Validate the [SDR GPU path](gpu-video.md) on physical iOS and test Windows HEVC transcode across more hardware.
+  Expand browser coverage and extend the path to Linux. Verify ten-bit storage, HDR metadata, and
   presentation separately. Measure GPU copies, synchronization, buffer reuse, and resource release for each backend
   and renderer.
 

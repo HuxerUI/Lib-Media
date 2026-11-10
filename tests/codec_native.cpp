@@ -1,5 +1,11 @@
 #include <huxerui/media_codec.h>
 
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+#include <huxerui/file.h>
+#include <huxerui/media_container.h>
+#include <future>
+#endif
+
 #if defined(__linux__) && !defined(__ANDROID__)
 #include "codec/decoder/backend.h"
 #endif
@@ -114,7 +120,8 @@ struct Signal {
   void Wait() { std::unique_lock lock(mutex); changed.wait_for(lock, std::chrono::milliseconds(10)); }
 };
 template<class Decoder, class Config, class Frame>
-void Decode(Config config, const std::vector<EncodedPacket>& packets, std::size_t expected) {
+void Decode(Config config, const std::vector<EncodedPacket>& packets, std::size_t expected,
+    std::optional<std::size_t> pcm_samples = {}) {
   auto presentation_order = packets;
   std::stable_sort(presentation_order.begin(), presentation_order.end(),
                    [](const auto& left, const auto& right) { return left.pts.Compare(right.pts) == -1; });
@@ -181,7 +188,8 @@ void Decode(Config config, const std::vector<EncodedPacket>& packets, std::size_
       throw std::runtime_error("Timed out waiting for EOS: submitted=" + std::to_string(submitted) + ", frames=" + std::to_string(frames) + ", pass=" + std::to_string(pass));
     }
     Check(frames == expected, "Unexpected frame count: " + std::to_string(frames) + "/" + std::to_string(expected));
-    if constexpr (std::is_same_v<Frame, AudioFrame>) Check(samples == expected * 1024, "Unexpected PCM sample count");
+    if constexpr (std::is_same_v<Frame, AudioFrame>)
+      Check(samples == pcm_samples.value_or(expected * 1024), "Unexpected PCM sample count");
     Check(decoder.Finish().Succeeded(), "Repeated Finish failed");
     auto empty = decoder.TryRead();
     Check(empty.Succeeded() && !empty.Value(), "EOS repeated");
@@ -204,9 +212,61 @@ void Decode(Config config, const std::vector<EncodedPacket>& packets, std::size_
   }
   Check(held && held->Validate(), "Retained frame invalid after cleanup");
 }
+
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+int DecodeAudioFixture(const std::filesystem::path& path) {
+  auto opened = File(path.u8string()).OpenRandomAccess();
+  Check(opened.Succeeded(), "Cannot open audio fixture");
+  auto input = MediaDemuxer::Open(std::move(opened).Value());
+  Check(input.Succeeded(), "Cannot demux audio fixture");
+  auto reader = std::move(input).Value();
+  Check(reader.Tracks().size() == 1, "Expected one audio track");
+  const auto& track = reader.Tracks().front();
+  Check(track.sample_rate && track.channel_count && (*track.channel_count == 1 || *track.channel_count == 2),
+        "Audio fixture has an invalid rate or channel layout");
+  AudioDecoderConfig config{.initialization_data = track.initialization_data,
+      .output = {*track.sample_rate, AudioSampleFormat::S16, AudioPacking::Interleaved,
+                 *track.channel_count == 1 ? AudioChannelLayout::Mono : AudioChannelLayout::Stereo},
+      .codec = track.codec};
+  auto probe = std::make_shared<std::promise<CodecResult<void>>>();
+  auto ready = probe->get_future();
+  AudioDecoder::Probe(config, [probe](auto result) { probe->set_value(std::move(result)); });
+  Check(ready.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "Audio fixture probe timed out");
+  const auto support = ready.get();
+  if (!support.Succeeded()) {
+    const auto& error = support.Error();
+    if (error.code != CodecErrorCode::Unsupported)
+      throw std::runtime_error(error.message + " (" + error.platform_code + ")");
+    std::cout << error.message << '\n';
+    return 77;
+  }
+  std::vector<EncodedPacket> packets;
+  std::size_t samples = 0;
+  for (;;) {
+    auto result = reader.Read();
+    Check(result.Succeeded(), "Cannot read audio fixture packet");
+    auto item = std::move(result).Value();
+    if (!item) break;
+    const auto& packet = std::get<ContainerPacket>(*item);
+    Check(packet.pts && packet.duration, "Audio fixture has incomplete timing");
+    const auto duration = packet.duration->Rescale(config.output.sample_rate);
+    Check(duration && duration->ticks > 0, "Audio fixture has an invalid packet duration");
+    samples += std::size_t(duration->ticks);
+    packets.push_back({packet.data, *packet.pts, packet.dts, packet.duration, true});
+  }
+  Check(!packets.empty(), "Audio fixture has no packets");
+  Decode<AudioDecoder, AudioDecoderConfig, AudioFrame>(config, packets, packets.size(), samples);
+  std::cout << path.filename().string() << " decoded " << packets.size() << " packets and " << samples
+            << " samples with exact timestamps and reset\n";
+  return 0;
+}
+#endif
 } // namespace
 int main(int argc, char** argv) {
   try {
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+    if (argc == 3 && std::string_view(argv[1]) == "--audio") return DecodeAudioFixture(argv[2]);
+#endif
     const std::filesystem::path root = argc > 1 ? argv[1] : MEDIA_CODEC_FIXTURES;
     AudioDecoderConfig audio;
     audio.initialization_data = Read(root / "aac.config");

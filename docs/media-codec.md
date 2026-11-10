@@ -116,8 +116,8 @@ existing adapter restrictions. Platform compilation and runtime validation are r
 | macOS | AudioConverter | AudioConverter | AudioConverter | Native decode, PCM preview, repeated seeks, and WAV readback on Apple Silicon |
 | Android API 23+ | NDK MediaCodec | NDK MediaCodec | NDK MediaCodec | Huawei Android 12 device passed file selection, PCM preview, repeated seeks, and WAV readback. PCM preview uses AAudio on API 26+. |
 | iOS 15+ | AudioConverter | AudioConverter | AudioConverter | Native packet decode on iOS Simulator. Physical device playback remains pending. |
-| Windows | Unsupported by the current adapter | Unsupported by the current adapter | Unsupported by the current adapter | The existing synchronous Media Foundation adapter continues to decode AAC. |
-| Linux | GStreamer `audio/x-opus` | GStreamer `audio/x-flac` | GStreamer `audio/mpeg` Layer III | Requires an installed decoder accepting the packet caps. Runtime acceptance for these mappings is pending. |
+| Windows | Synchronous Media Foundation | Synchronous Media Foundation | Synchronous Media Foundation | Windows 11 passed exact packet PTS and PCM counts after drain and reset, repeated preview seeks, and WAV readback. |
+| Linux | GStreamer `audio/x-opus` | GStreamer `audio/x-flac` | GStreamer `audio/mpeg` Layer III | Ubuntu 24.04 under WSL passed packet decode and reset, repeated preview seeks, and WAV readback with the installed plugins. |
 | Web | WebCodecs `opus` | WebCodecs `flac` | WebCodecs `mp3` | Chrome ran the WASM preview, repeated seeks, and WAV export and save. Runtime support depends on the browser. |
 
 The container mappings, metadata, and packet-copy paths are independent of the platform decoder. Use
@@ -129,20 +129,19 @@ promise that a subsequent access unit is valid. Decode-time output negotiation c
 used by Probe. A desktop or mobile probe uses its own worker and dispatches completion after it exits. Web dispatches
 completion on the owning event loop. There is no UI dispatcher.
 
-Windows currently uses the system synchronous transforms, without DXVA or third-party asynchronous MFT enumeration.
-The AVC transform uses `MF_LOW_LATENCY` to keep startup buffering within the shared output reservation bound.
-Its platform output allocation and CPU-copy scratch are bounded by the larger of four configured frames and 64 KiB;
-the system AAC transform requests 48 KiB even for mono/stereo AAC-LC. Normalized output still uses the configured
-single-frame reservation. AAC output must contain exactly 1024 samples and match the next accepted timestamp within
-one 100 ns Media Foundation tick; that Media Foundation truncation is normalized before restoring the original exact packet timestamp.
+Windows uses synchronous Media Foundation decoders. The AVC transform uses `MF_LOW_LATENCY` to bound startup buffering.
+The backend bounds CPU copies by the larger of four configured frames and 64 KiB. Separate FLAC and Opus scratch limits
+accommodate the transforms' maximum working buffers. Normalized output still uses the configured single-frame reservation.
+AAC and Opus check PCM size and the next submitted PTS, with a tolerance of one 100 ns Media Foundation tick. FLAC
+associates decoded blocks with the submitted frame order and sample counts. MP3 reassembles PCM at packet boundaries and
+drains the final synthesis samples at end of stream. The decoder returns the original packet timestamps in all cases.
 Android rejects opaque/vendor CPU layouts it cannot interpret safely. Apple/Android/Web actual fixture tests do not
 validate every hardware model or supported profile/level. Discovery reports hardware facts only where reliably known;
 session implementation identity and hardware selection remain unexposed.
 
-Linux builds require GStreamer app/audio/video development packages 1.24+. Decoding uses installed AAC/H.264
-parser/decoder plugins. Dependencies are explicit; Lib-Media does not install
-packages or bundle FFmpeg. GTK remains a dependency of the existing playback target, but the codec adapter never
-initializes GTK or creates a display connection. The adapter checks appsrc item and byte capacity before each
+Linux builds require GStreamer app/audio/video development packages 1.24+. Decoding uses the installed plugins for
+the configured codec. Lib-Media leaves plugin installation to the host. GTK is a dependency of the playback target.
+The codec adapter runs without a display connection and checks appsrc item and byte capacity before each
 nonblocking push so the codec worker can continue draining appsink. GStreamer is not globally deinitialized on close.
 
 Web requires WebCodecs and the browser's codec support, normally in a secure context. All session methods run on the
@@ -161,7 +160,8 @@ cleanup and final callback dispatch. There is no blocking proxy to another event
   [AudioConverter priming information](https://developer.apple.com/documentation/audiotoolbox/audioconverterprimeinfo)
 - FLAC takes complete native frames and the 34-byte STREAMINFO payload. Sample rate and mono/stereo layout must
   match STREAMINFO. MP3 takes complete MPEG Layer III frames with empty initialization data. After a seek, start at
-  the demuxer's `decode_start` to rebuild the MP3 bit reservoir. Apply the track's presentation interval to decoded PCM.
+  the demuxer's `decode_start` to rebuild the MP3 bit reservoir. Linux and Web remove synthesis delay from raw MP3
+  PCM and recover the trailing samples during drain. Apply the track's presentation interval to the resulting PCM.
 - AVC uses avcC and its 1-, 2-, or 4-byte NAL lengths. The initial subset is progressive 8-bit 4:2:0 Baseline/Main/High,
   continuous complete input, at most 16 reference pictures. An SPS may declare frame-number gaps allowed; that flag
   alone does not imply missing pictures or make incomplete input supported. SPS dimensions and in-band SPS updates are validated against
@@ -358,8 +358,8 @@ when VideoToolbox rejects `MaxFrameDelayCount`. End of stream drains any remaini
 | Android | NDK MediaCodec, CPU byte buffers. P010 requires API 33+ and a codec exposing that layout. Encoding requires API 28+. | Main encode, `hvc1` MP4 readback, and decode on Android 12 hardware. The system software encoder was used. |
 | iOS | Independent VideoToolbox adapter. Physical device availability is configuration dependent. The simulator requires automatic B-picture selection. | Main and Main10 `hvc1` MP4 round trips with reordered PTS and platform DTS, plus Main preview export, on the iOS Simulator. |
 | macOS | Independent VideoToolbox adapter. Zero or automatic B pictures. | Main and Main10 encode, `hvc1` MP4 readback, and decode on Apple Silicon. |
-| Windows | Synchronous Media Foundation HEVC transforms. Main10 depends on the installed transform accepting P010. Decoder output retains signaled BT.2020 primaries and matrix, PQ or HLG transfer, and nominal range. | Windows runtime validation pending. |
-| Linux | GStreamer `h265parse` with an installed decoder and `x265enc` for encoding. CPU P010 uses GStreamer conversion. | Main and Main10 round trips with the Linux adapter, `x265enc`, and `avdec_h265` in a macOS GStreamer test harness. Native Linux validation pending. |
+| Windows | Synchronous Media Foundation CPU transforms and D3D11 hardware encoding for SDR Main. Main10 depends on the CPU transform accepting P010. Decoder output retains signaled BT.2020 primaries and matrix, PQ or HLG transfer, and nominal range. | Intel hardware encoded 20 SDK texture pictures to MP4, and Linux independently decoded and verified the watermarks. Windows CPU round trips and GPU transcode require a suitable installed HEVC decoder and remain pending. |
+| Linux | GStreamer `h265parse` with an installed decoder and `x265enc` for encoding. CPU P010 uses GStreamer conversion. | Main and Main10 CPU round trips and preview export passed under Ubuntu 24.04/WSL with GStreamer 1.24.2. The Main10 preview and export retain the rotated MOV's presentation geometry. |
 | Web | WebCodecs with automatic B-picture selection. Main10 decode requires CPU `I420P10` frames. Main10 encode requires the browser to accept the profile and ten-bit input. | Main C++/WASM encode/decode and preview export passed in Chrome. The test browser rejected Main10 encoding and decoded Main10 without exposing CPU YUV planes. |
 
 ### GPU video
@@ -444,6 +444,10 @@ order, format events, EOS, repeated reset, move/destructor retirement, and CPU d
 cases exercise allocation failures, matching 100 ns PTS, session worker isolation and exit, tight Apple AAC input
 credit, legacy Android output metadata, and appsrc backpressure when GStreamer tests are enabled.
 
+On Windows and Linux, `media_codec_native_mp3`, `media_codec_native_flac`, and `media_codec_native_opus` demux
+complete audio fixtures and compare decoded packet counts, exact PTS, and PCM sample totals across a reset and second
+drain. The cases report a skip when the configuration is unsupported by the installed media components.
+
 For the browser bridge, serve the repository over localhost and open
 [tests/codec_web_native.html](../tests/codec_web_native.html). It decodes the same AAC/AVC fixtures through WebCodecs,
 checks CPU copies/counts/EOS, and releases the codecs. With Web tests enabled, build `media_codec_web_native` and serve
@@ -455,10 +459,12 @@ completions after retirement. Controlled worker shutdown
 still needs dedicated validation. Physical iOS devices, Linux hardware/plugin diversity, stress/RSS, and release-failure injection
 in platform APIs remain validation work; shared fake-backend failure tests do not replace those checks.
 
-On macOS, `media_container_preview` verifies PCM across a zero-pre-skip Ogg link and WAV export from WebM without
-Cues. For Web, build `media_container_preview_tests` and serve the generated `tests/container_preview_wasm.html`
-with its JS/WASM/data files. The test checks that an application callback runs during audio packet copy, that regular
-and fragmented AAC retain their packets and timing, and that the Web M4A has its index after the media data. The Web
+On macOS, Windows, and Linux with `HuxerUI::testing` available, `media_container_preview` verifies repeated seeks,
+PCM across a zero-pre-skip Ogg link, WAV sample counts, and movie export and readback. Windows and Linux check that the
+MP3 waveform begins at the start of the trimmed WAV. The Linux run also verifies Main and rotated Main10 preview export.
+For Web, build `media_container_preview_tests` and serve the generated `tests/container_preview_wasm.html` with its
+JS/WASM/data files. The test checks that an application callback runs during audio packet copy, that regular and fragmented
+AAC retain their packets and timing, and that the Web M4A has its index after the media data. The Web
 and iOS Simulator runs also encode the Main HEVC fixture and compare the exported picture timestamps.
 
 A local Apple Silicon Release archive comparison against the pre-codec commit grew from approximately 0.54 MiB to

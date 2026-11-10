@@ -160,6 +160,13 @@ Bytes AudioDecoderHeader(const AudioDecoderConfig& config) {
   return header;
 }
 
+Bytes Mp3DrainFrame(std::span<const std::byte> packet) {
+  Bytes frame(packet.size());
+  std::ranges::copy(packet.first(4), frame.begin());
+  frame[1] |= std::byte{1};
+  return frame;
+}
+
 CodecResult<Bytes> AnnexB(const EncodedPacket& packet, unsigned length_size) {
   const auto data = packet.data.AsBytes();
   Bytes result;

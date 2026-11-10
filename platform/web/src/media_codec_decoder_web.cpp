@@ -43,7 +43,7 @@ public:
         case CodecId::Mp3:
           options.set("codec", std::string("mp3"));
           // Raw MP3 WebCodecs chunks carry the synthesis delay, which the file trim does not include.
-          mp3_.emplace(audio->output, AudioSampleLimit(*audio).Value(), 529);
+          mp3_.emplace(audio->output, AudioSampleLimit(*audio).Value(), Mp3SynthesisDelay);
           break;
         default: return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Unsupported WebCodecs audio codec"));
       }
@@ -82,9 +82,7 @@ public:
     if (mp3_) {
       if (mp3_drain_frame_.empty()) {
         // An empty, reservoir-free frame releases the decoder's final synthesis samples.
-        mp3_drain_frame_.resize(bytes.size());
-        std::ranges::copy(bytes.first(4), mp3_drain_frame_.begin());
-        mp3_drain_frame_[1] |= std::byte{1};
+        mp3_drain_frame_ = Mp3DrainFrame(bytes);
       }
       mp3_->Expect(packet.pts);
     }

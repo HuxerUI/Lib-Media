@@ -205,7 +205,7 @@ public:
       Require(encoder_.As(&controls_), "Video encoder has no control interface", CodecErrorCode::Unsupported);
       if ((!device_ && !hevc) || controls_->IsSupported(&CODECAPI_AVEncMPVDefaultBPictureCount) == S_OK) {
         Set(CODECAPI_AVEncMPVDefaultBPictureCount, bframes);
-      } else if (config.max_b_frames.value_or(0)) {
+      } else if (config.max_b_frames.value_or(0) || (hevc && device_ && config.max_b_frames)) {
         throw EncoderFailure{Error(CodecErrorCode::Unsupported, "Video encoder cannot enforce the requested B-picture bound")};
       }
       Set(CODECAPI_AVEncMPVGOPSize, config.key_frame_interval);
@@ -360,7 +360,7 @@ public:
       BYTE* data = nullptr;
       Require(buffer->Lock(&data, nullptr, nullptr), "Cannot map video packet");
       auto normalized = NormalizeVideoEncoderPacket({reinterpret_cast<std::byte*>(data), size}, 0, config_.max_packet_bytes,
-          config_.codec, false, HardwareAvc() ? &config_ : nullptr);
+          config_.codec, false, config_.codec == CodecId::H264 ? &config_ : nullptr);
       Require(buffer->Unlock(), "Cannot unmap video packet");
       if (!normalized.Succeeded()) throw EncoderFailure{normalized.Error()};
       EncodedPacket packet{Own(std::move(normalized).Value()), {original_pts, 1000000}, std::nullopt, std::nullopt, false};
@@ -556,7 +556,7 @@ private:
     if (!size || size > 65536) throw EncoderFailure{Error(CodecErrorCode::ResourceExhausted, "Video parameter sets exceed 64 KiB")};
     Bytes bytes(size);
     Require(type->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, reinterpret_cast<UINT8*>(bytes.data()), size, &size), "Cannot read video parameter sets");
-    auto format = ReadVideoEncodeFormat(bytes, config_, HardwareAvc());
+    auto format = ReadVideoEncodeFormat(bytes, config_, config_.codec == CodecId::H264);
     if (!format.Succeeded()) throw EncoderFailure{format.Error()};
     return std::move(format).Value();
   }
