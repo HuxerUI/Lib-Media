@@ -95,7 +95,10 @@ VideoDecoder& VideoDecoder::operator=(VideoDecoder&& other) noexcept {
 }
 VideoDecoder::~VideoDecoder() { Close(); }
 CodecResult<VideoDecoder> VideoDecoder::Create(const VideoDecoderConfig& config) {
-  auto state = detail::DecoderState<VideoDecodeOutput>::Create(config);
+  return detail::VideoDecoderAccess::Create(config, detail::MakeDecoderBackend);
+}
+CodecResult<VideoDecoder> detail::VideoDecoderAccess::Create(const VideoDecoderConfig& config, BackendFactory factory) {
+  auto state = DecoderState<VideoDecodeOutput>::Create(config, std::move(factory));
   if (!state.Succeeded()) return CodecResult<VideoDecoder>::Failure(state.Error());
   return CodecResult<VideoDecoder>::Success(VideoDecoder(std::move(state).Value()));
 }

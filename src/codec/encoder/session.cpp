@@ -1,4 +1,5 @@
 #include "session.h"
+#include "format/platform_video_storage.h"
 
 #include <algorithm>
 #include <cstring>
@@ -483,6 +484,7 @@ CodecResult<SubmitStatus> VideoEncoderState::Submit(const VideoFrame& frame) {
   const auto pts = frame.pts.Rescale(1000000);
   const auto duration = frame.duration ? frame.duration->Rescale(1000000) : std::optional<MediaTimestamp>{};
   if (!frame.Validate() || frame.format != config_.input || !pts ||
+      frame.Storage() != config_.input_storage ||
       (frame.duration && (!duration || duration->ticks <= 0)) ||
       (last_input_pts_ && frame.pts.Compare(*last_input_pts_) != 1) ||
       (last_micro_pts_ && pts->ticks <= *last_micro_pts_) ||
@@ -491,27 +493,33 @@ CodecResult<SubmitStatus> VideoEncoderState::Submit(const VideoFrame& frame) {
   try {
     auto credit = Reserve(input_budget_, frame_bytes_, config_.limits.input_items, config_.limits.input_bytes);
     if (!credit) return R::Success(SubmitStatus::WouldBlock);
-    struct Storage { std::shared_ptr<Credit> credit; Bytes bytes; };
-    auto owner = std::make_shared<Storage>(Storage{credit, Bytes(frame_bytes_)});
-    CopyVideoEncoderPixels(frame, config_.input.pixel_format, owner->bytes);
-    const auto layout = config_.input.pixel_format;
-    const auto sample = layout == VideoPixelFormat::P010 ? 2u : 1u;
-    const auto row = std::size_t(config_.input.width) * sample;
-    const auto luma = row * config_.input.height;
-    BufferReference pixels(owner->bytes, owner);
-    VideoFrame copy{config_.input, frame.pts, frame.duration, {{pixels.Slice(0, luma), row, sample}}};
-    if (layout != VideoPixelFormat::I420)
-      copy.planes.push_back({pixels.Slice(luma, luma / 2), row, sample * 2});
-    else {
-      copy.planes.push_back({pixels.Slice(luma, luma / 4), row / 2, 1});
-      copy.planes.push_back({pixels.Slice(luma + luma / 4, luma / 4), row / 2, 1});
+    VideoFrame copy{config_.input, frame.pts, frame.duration, {}};
+    if (frame.Storage() == VideoStorage::Platform) {
+      copy = frame;
+      VideoFrameAccess::RetainPlatformStorage(copy, credit);
+    } else {
+      struct Storage { std::shared_ptr<Credit> credit; Bytes bytes; };
+      auto owner = std::make_shared<Storage>(Storage{credit, Bytes(frame_bytes_)});
+      const auto layout = config_.input.pixel_format;
+      CopyVideoEncoderPixels(frame, layout, owner->bytes);
+      const auto sample = layout == VideoPixelFormat::P010 ? 2u : 1u;
+      const auto row = std::size_t(config_.input.width) * sample;
+      const auto luma = row * config_.input.height;
+      BufferReference pixels(owner->bytes, owner);
+      copy.planes.push_back({pixels.Slice(0, luma), row, sample});
+      if (layout != VideoPixelFormat::I420)
+        copy.planes.push_back({pixels.Slice(luma, luma / 2), row, sample * 2});
+      else {
+        copy.planes.push_back({pixels.Slice(luma, luma / 4), row / 2, 1});
+        copy.planes.push_back({pixels.Slice(luma + luma / 4, luma / 4), row / 2, 1});
+      }
     }
     ScheduleLocked(); input_.push_back(std::move(copy));
     if (!origin_) origin_ = pts->ticks;
     last_micro_pts_ = pts->ticks; last_input_pts_ = frame.pts; credit->notify = true;
     return R::Success(SubmitStatus::Accepted);
   } catch (const std::bad_alloc&) {
-    return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot copy video encoder input"));
+    return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot retain video encoder input"));
   }
 }
 CodecResult<std::optional<VideoEncodeOutput>> VideoEncoderState::Read() {

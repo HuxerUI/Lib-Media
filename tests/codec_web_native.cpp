@@ -1,4 +1,5 @@
 #include <huxerui/media_codec.h>
+#include <huxerui/web/external_texture.h>
 #include <emscripten.h>
 #include <fstream>
 #include <iostream>
@@ -34,10 +35,12 @@ struct Test : std::enable_shared_from_this<Test> {
   std::vector<EncodedPacket> aac, avc;
   std::optional<AudioFrame> held_audio;
   std::optional<VideoFrame> held_video;
+  std::shared_ptr<ExternalTexture> held_texture;
+  std::optional<MediaTimestamp> texture_pts;
   std::size_t a = 0, v = 0, audio_frames = 0, video_frames = 0;
   bool audio_finish = false, video_finish = false, audio_eos = false, video_eos = false;
   int cleaned = 0, pass = 0;
-  bool closing = false;
+  bool closing = false, platform = false;
   std::string failure;
   double deadline = emscripten_get_now() + 15000;
   void Start() {
@@ -53,6 +56,14 @@ struct Test : std::enable_shared_from_this<Test> {
     audio.emplace(std::move(created_audio).Value());
     VideoDecoderConfig vc;
     vc.initialization_data = Read("avc.config"); vc.width = 64; vc.height = 48; vc.cleanup_completed = completion;
+    platform = EM_ASM_INT({ return new URLSearchParams(location.search).get('storage') === 'platform'; });
+    if (platform) {
+      vc.output_storage = VideoStorage::Platform;
+      vc.output = VideoPixelFormat::Opaque;
+      EM_ASM({
+        VideoFrame.prototype.copyTo = function() { throw new Error('Platform output called VideoFrame.copyTo'); };
+      });
+    }
     auto created_video = VideoDecoder::Create(vc);
     if (!created_video.Succeeded()) throw std::runtime_error(created_video.Error().message);
     video.emplace(std::move(created_video).Value());
@@ -90,7 +101,18 @@ struct Test : std::enable_shared_from_this<Test> {
           if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
           if (!result.Value()) break;
           if (auto* frame = std::get_if<VideoFrame>(&*result.Value())) {
-            if (!frame->Validate()) throw std::runtime_error("Invalid WASM YUV output");
+            if (!frame->Validate() || frame->Storage() != (platform ? VideoStorage::Platform : VideoStorage::Cpu))
+              throw std::runtime_error("Invalid WASM video output");
+            if (platform) {
+              if (frame->format.pixel_format != VideoPixelFormat::Opaque || !frame->planes.empty())
+                throw std::runtime_error("WASM platform output exposed CPU planes");
+              if (!held_texture) {
+                auto texture = MakeExternalTexture(*frame);
+                if (!texture.Succeeded()) throw std::runtime_error(texture.Error().message);
+                held_texture = std::move(texture).Value();
+                texture_pts = frame->pts.Rescale(1000000);
+              }
+            }
             held_video = *frame; ++video_frames;
           } else if (std::holds_alternative<EndOfStream>(*result.Value())) video_eos = true;
         }
@@ -107,7 +129,27 @@ struct Test : std::enable_shared_from_this<Test> {
     } catch (const std::exception& error) { failure = error.what(); Close(); }
     if (closing && cleaned == 2) {
       if (failure.empty() && (!held_audio || !held_video || !held_audio->Validate() || !held_video->Validate())) failure = "Retained WASM output became invalid";
-      const auto message = failure.empty() ? "PASS: C++ WASM AAC/AVC sessions, CPU output, EOS, reset and cleanup" : "FAIL: " + failure;
+      if (failure.empty() && platform) {
+        held_video.reset();
+        auto* texture = dynamic_cast<web::VideoFrameTexture*>(held_texture.get());
+        if (!texture || texture->Revision() != 1 || !texture_pts) failure = "Missing SDK VideoFrameTexture publication";
+        else {
+          const auto frame = texture->AcquireFrame();
+          if (frame.isUndefined() || frame.isNull()) failure = "SDK texture lost its retained frame";
+          else {
+            const auto size = texture->IntrinsicSize();
+            const auto visible = frame["visibleRect"];
+            if (frame["timestamp"].as<double>() != texture_pts->ticks || visible["width"].as<unsigned>() != 64 ||
+                visible["height"].as<unsigned>() != 48 || frame["displayWidth"].as<float>() != size.width ||
+                frame["displayHeight"].as<float>() != size.height)
+              failure = "SDK texture changed the browser frame geometry or timestamp";
+            frame.call<void>("close");
+          }
+        }
+        held_texture.reset();
+      }
+      const auto message = failure.empty() ? std::string("PASS: C++ WASM AAC/AVC sessions, ") +
+          (platform ? "platform texture without pixel readback" : "CPU output") + ", EOS, reset and cleanup" : "FAIL: " + failure;
       EM_ASM({ document.body.textContent = UTF8ToString($0); }, message.c_str());
       std::cout << message << '\n';
       emscripten_cancel_main_loop();

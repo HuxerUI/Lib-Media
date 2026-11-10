@@ -1,5 +1,6 @@
 #include "codec/encoder/backend.h"
 #include "media_codec_transform_windows.h"
+#include "media_video_windows.h"
 
 #include <algorithm>
 #include <codecapi.h>
@@ -184,7 +185,12 @@ public:
         throw EncoderFailure{Error(CodecErrorCode::Unsupported, "Media Foundation H.264 supports at most two consecutive B pictures")};
       Require(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "Cannot initialize video encoder COM"); com_ = true;
       Require(MFStartup(MF_VERSION, MFSTARTUP_FULL), "Cannot initialize video encoder Media Foundation"); mf_ = true;
-      if (hevc) {
+      if (config.input_storage == VideoStorage::Platform) {
+        Require(OpenVideoDevice(device_), "No compatible D3D11 video device", CodecErrorCode::Unsupported);
+        auto status = OpenHardwareEncoder(hevc ? MFVideoFormat_HEVC : MFVideoFormat_H264);
+        if (hevc && FAILED(status)) status = OpenHardwareEncoder(MFVideoFormat_H265);
+        Require(status, "No D3D11-aware hardware video encoder", CodecErrorCode::Unsupported);
+      } else if (hevc) {
         const MFT_REGISTER_TYPE_INFO type{MFMediaType_Video, MFVideoFormat_HEVC};
         auto status = OpenSynchronousTransform(MFT_CATEGORY_VIDEO_ENCODER, nullptr, &type, encoder_);
         if (FAILED(status)) {
@@ -197,13 +203,13 @@ public:
             "Media Foundation H.264 encoder is unavailable", CodecErrorCode::Unsupported);
       }
       Require(encoder_.As(&controls_), "Video encoder has no control interface", CodecErrorCode::Unsupported);
-      if (!hevc || controls_->IsSupported(&CODECAPI_AVEncMPVDefaultBPictureCount) == S_OK) {
+      if ((!device_ && !hevc) || controls_->IsSupported(&CODECAPI_AVEncMPVDefaultBPictureCount) == S_OK) {
         Set(CODECAPI_AVEncMPVDefaultBPictureCount, bframes);
       } else if (config.max_b_frames.value_or(0)) {
-        throw EncoderFailure{Error(CodecErrorCode::Unsupported, "HEVC encoder cannot enforce the requested B-picture bound")};
+        throw EncoderFailure{Error(CodecErrorCode::Unsupported, "Video encoder cannot enforce the requested B-picture bound")};
       }
       Set(CODECAPI_AVEncMPVGOPSize, config.key_frame_interval);
-      if (!hevc) Set(CODECAPI_AVEncNumWorkerThreads, 1);
+      if (!hevc && !device_) Set(CODECAPI_AVEncNumWorkerThreads, 1);
       VARIANT latency{}; latency.vt = VT_BOOL;
       latency.boolVal = (hevc ? !config.max_b_frames || bframes : bframes != 0) ? VARIANT_FALSE : VARIANT_TRUE;
       Require(controls_->SetValue(&CODECAPI_AVLowLatencyMode, &latency), "Cannot configure video latency", CodecErrorCode::Unsupported);
@@ -224,30 +230,32 @@ public:
           config.profile == H264Profile::Baseline ? eAVEncH264VProfile_Base :
           config.profile == H264Profile::Main ? eAVEncH264VProfile_Main : eAVEncH264VProfile_High;
       Require(output->SetUINT32(MF_MT_MPEG2_PROFILE, profile), "Cannot select video profile");
-      auto status = encoder_->SetOutputType(0, output.Get(), 0);
+      auto status = encoder_->SetOutputType(output_stream_, output.Get(), 0);
       if (hevc && FAILED(status)) {
         Require(output->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H265), "Cannot select alternate HEVC output");
-        status = encoder_->SetOutputType(0, output.Get(), 0);
+        status = encoder_->SetOutputType(output_stream_, output.Get(), 0);
       }
       Require(status, "Video encoder rejected output configuration", CodecErrorCode::Unsupported);
       const auto row = config.input.width * (ten_bit ? 2 : 1);
-      Require(input->SetGUID(MF_MT_SUBTYPE, ten_bit ? MFVideoFormat_P010 : MFVideoFormat_NV12), "Cannot select CPU YUV input");
-      Require(input->SetUINT32(MF_MT_DEFAULT_STRIDE, row), "Cannot set YUV stride");
-      Require(encoder_->SetInputType(0, input.Get(), 0), "Video encoder rejected CPU YUV input", CodecErrorCode::Unsupported);
+      Require(input->SetGUID(MF_MT_SUBTYPE, ten_bit ? MFVideoFormat_P010 : MFVideoFormat_NV12), "Cannot select video input layout");
+      if (!device_) Require(input->SetUINT32(MF_MT_DEFAULT_STRIDE, row), "Cannot set YUV stride");
+      Require(encoder_->SetInputType(input_stream_, input.Get(), 0), "Video encoder rejected its input format", CodecErrorCode::Unsupported);
       ComPtr<IMFMediaType> actual;
-      Require(encoder_->GetOutputCurrentType(0, &actual), "Cannot query video output configuration");
+      Require(encoder_->GetOutputCurrentType(output_stream_, &actual), "Cannot query video output configuration");
       UINT32 bitrate = 0, actual_profile = 0;
       Require(actual->GetUINT32(MF_MT_AVG_BITRATE, &bitrate), "Video bitrate is missing");
       Require(actual->GetUINT32(MF_MT_MPEG2_PROFILE, &actual_profile), "Video profile is missing");
       if (bitrate != config.bitrate || actual_profile != UINT32(profile))
         throw EncoderFailure{Error(CodecErrorCode::Unsupported, "Video encoder changed requested controls")};
       Require(encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0), "Cannot begin video encoding");
+      streaming_ = true;
       Require(encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0), "Cannot start video encoding");
       frame_bytes_ = std::size_t(row) * config.input.height * 3 / 2;
     });
   }
   CodecResult<SubmitStatus> Submit(const VideoFrame& frame) override {
     return Guard<SubmitStatus>([&] {
+      if (events_ && !need_input_) return SubmitStatus::WouldBlock;
       if (submitted_frames_ > std::uint64_t(INT64_MAX) / config_.frame_rate_denominator)
         throw EncoderFailure{Error(CodecErrorCode::InvalidData, "Video picture identity exceeds the codec timeline")};
       // Use a fixed codec clock for picture identity; Media Foundation interpolates B-picture timestamps.
@@ -260,20 +268,25 @@ public:
         throw EncoderFailure{Error(CodecErrorCode::InvalidData, "Video timing exceeds Media Foundation range")};
       ComPtr<IMFSample> sample; ComPtr<IMFMediaBuffer> buffer;
       Require(MFCreateSample(&sample), "Cannot create video input sample");
-      Require(MFCreateMemoryBuffer(static_cast<DWORD>(frame_bytes_), &buffer), "Cannot allocate YUV input");
-      BYTE* target = nullptr;
-      Require(buffer->Lock(&target, nullptr, nullptr), "Cannot map YUV input");
-      const auto layout = config_.input.pixel_format == VideoPixelFormat::P010 ? VideoPixelFormat::P010 : VideoPixelFormat::NV12;
-      CopyVideoEncoderPixels(frame, layout, {reinterpret_cast<std::byte*>(target), frame_bytes_});
-      Require(buffer->Unlock(), "Cannot unmap YUV input");
-      Require(buffer->SetCurrentLength(static_cast<DWORD>(frame_bytes_)), "Cannot set YUV input length");
+      if (device_) {
+        Require(MakeVideoInputBuffer(frame, *device_, buffer), "Cannot attach D3D11 encoder input");
+      } else {
+        Require(MFCreateMemoryBuffer(static_cast<DWORD>(frame_bytes_), &buffer), "Cannot allocate YUV input");
+        BYTE* target = nullptr;
+        Require(buffer->Lock(&target, nullptr, nullptr), "Cannot map YUV input");
+        const auto layout = config_.input.pixel_format == VideoPixelFormat::P010 ? VideoPixelFormat::P010 : VideoPixelFormat::NV12;
+        CopyVideoEncoderPixels(frame, layout, {reinterpret_cast<std::byte*>(target), frame_bytes_});
+        Require(buffer->Unlock(), "Cannot unmap YUV input");
+        Require(buffer->SetCurrentLength(static_cast<DWORD>(frame_bytes_)), "Cannot set YUV input length");
+      }
       Require(sample->AddBuffer(buffer.Get()), "Cannot attach YUV input");
       Require(sample->SetSampleTime(pts->ticks), "Cannot set video input PTS");
       Require(sample->SetSampleDuration(duration->ticks), "Cannot set video input duration");
       if (key_requested_) Set(CODECAPI_AVEncVideoForceKeyFrame, 1);
-      const auto status = encoder_->ProcessInput(0, sample.Get(), 0);
-      if (status == MF_E_NOTACCEPTING) return SubmitStatus::WouldBlock;
+      const auto status = encoder_->ProcessInput(input_stream_, sample.Get(), 0);
+      if (status == MF_E_NOTACCEPTING && !events_) return SubmitStatus::WouldBlock;
       Require(status, "Video encoder rejected input");
+      if (events_) --need_input_;
       input_submitted_ = true;
       variable_timing_ |= !expected || frame.pts.ticks != expected->ticks || (frame.duration && *frame.duration != interval);
       input_times_.emplace(pts->ticks, frame.pts.ticks);
@@ -286,8 +299,16 @@ public:
     return Guard<std::optional<VideoEncoderBackendOutput>>([&]() -> std::optional<VideoEncoderBackendOutput> {
       if (pending_) { auto value = std::move(*pending_); pending_.reset(); return value; }
       if (eos_) return std::nullopt;
+      if (events_) {
+        ReadEvents();
+        if (!have_output_) {
+          if (drained_) { eos_ = true; return VideoEncoderEnd{}; }
+          return std::nullopt;
+        }
+        --have_output_;
+      }
       MFT_OUTPUT_STREAM_INFO info{};
-      Require(encoder_->GetOutputStreamInfo(0, &info), "Cannot query video output storage");
+      Require(encoder_->GetOutputStreamInfo(output_stream_, &info), "Cannot query video output storage");
       if (info.cbSize > std::max(config_.max_packet_bytes, frame_bytes_ + 65536))
         throw EncoderFailure{Error(CodecErrorCode::ResourceExhausted, "Video output scratch exceeds configured bounds")};
       ComPtr<IMFSample> sample;
@@ -297,12 +318,12 @@ public:
         Require(MFCreateAlignedMemoryBuffer(info.cbSize, info.cbAlignment ? info.cbAlignment - 1 : 0, &buffer), "Cannot allocate video output scratch");
         Require(sample->AddBuffer(buffer.Get()), "Cannot attach video output scratch");
       }
-      MFT_OUTPUT_DATA_BUFFER output{0, sample.Get(), 0, nullptr}; DWORD flags = 0;
+      MFT_OUTPUT_DATA_BUFFER output{output_stream_, sample.Get(), 0, nullptr}; DWORD flags = 0;
       const auto status = encoder_->ProcessOutput(0, 1, &output, &flags);
       if (output.pEvents) output.pEvents->Release();
       if (!sample && output.pSample) sample.Attach(output.pSample);
       if (status == MF_E_TRANSFORM_NEED_MORE_INPUT) {
-        if (finished_) { eos_ = true; return VideoEncoderEnd{}; }
+        if (finished_ && !events_) { eos_ = true; return VideoEncoderEnd{}; }
         return std::nullopt;
       }
       Require(status, "Video encoding failed");
@@ -350,7 +371,7 @@ public:
       UINT64 dts;
       if (!variable_timing_ && SUCCEEDED(sample->GetUINT64(MFSampleExtension_DecodeTimestamp, &dts)))
         packet.dts = MediaTimestamp{InputTime(static_cast<std::int64_t>(dts)), 10000000};
-      auto format = ReadFormat();
+      auto format = ReadFormat(packet.data.AsBytes());
       if (!format_) {
         format_ = format; pending_ = std::move(packet);
         return format;
@@ -362,7 +383,7 @@ public:
   CodecResult<void> RequestKeyFrame() override { key_requested_ = true; return CodecResult<void>::Success(); }
   CodecResult<SubmitStatus> Finish() override {
     return Guard<SubmitStatus>([&] {
-      Require(encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0), "Video encoder rejected EOS");
+      Require(encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, input_stream_), "Video encoder rejected EOS");
       Require(encoder_->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0), "Video drain failed");
       finished_ = true;
       return SubmitStatus::Accepted;
@@ -370,13 +391,18 @@ public:
   }
   CodecResult<void> Close() override {
     std::optional<CodecError> failure;
-    if (encoder_ && input_submitted_) {
+    if (streaming_ && (input_submitted_ || device_)) {
       for (auto message : {MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_END_STREAMING}) {
         const auto status = encoder_->ProcessMessage(message, 0);
         if (FAILED(status)) failure = Error(CodecErrorCode::PlatformFailure, "Video encoder teardown failed", std::to_string(status));
       }
     }
+    if (activation_) {
+      const auto status = activation_->ShutdownObject();
+      if (FAILED(status) && !failure) failure = Error(CodecErrorCode::PlatformFailure, "Hardware video encoder shutdown failed", std::to_string(status));
+    }
     pending_.reset(); input_times_.clear(); controls_.Reset(); encoder_.Reset();
+    activation_.Reset(); events_.Reset(); device_manager_.Reset(); device_.reset();
     if (mf_) {
       const auto status = MFShutdown(); mf_ = false;
       if (FAILED(status)) failure = Error(CodecErrorCode::PlatformFailure, "Video encoder MFShutdown failed", std::to_string(status));
@@ -385,6 +411,73 @@ public:
     return failure ? CodecResult<void>::Failure(*failure) : CodecResult<void>::Success();
   }
 private:
+  HRESULT OpenHardwareEncoder(const GUID& subtype) {
+    const MFT_REGISTER_TYPE_INFO output{MFMediaType_Video, subtype};
+    const MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_NV12};
+    IMFActivate** candidates = nullptr;
+    UINT32 count = 0;
+    auto status = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+        &input, &output, &candidates, &count);
+    if (FAILED(status)) return status;
+    status = MF_E_TOPO_CODEC_NOT_FOUND;
+    for (UINT32 i = 0; i < count; ++i) {
+      ComPtr<IMFActivate> activation;
+      activation.Attach(candidates[i]);
+      if (encoder_) continue;
+      ComPtr<IMFTransform> candidate;
+      status = activation->ActivateObject(IID_PPV_ARGS(&candidate));
+      if (FAILED(status)) continue;
+      status = ConfigureHardwareEncoder(*candidate.Get());
+      if (SUCCEEDED(status)) {
+        activation_ = std::move(activation);
+        encoder_ = std::move(candidate);
+      } else {
+        events_.Reset();
+        device_manager_.Reset();
+        activation->ShutdownObject();
+      }
+    }
+    CoTaskMemFree(candidates);
+    return status;
+  }
+
+  HRESULT ConfigureHardwareEncoder(IMFTransform& encoder) {
+    ComPtr<IMFAttributes> attributes;
+    auto status = encoder.GetAttributes(&attributes);
+    if (FAILED(status)) return status;
+    if (MFGetAttributeUINT32(attributes.Get(), MF_TRANSFORM_ASYNC, FALSE)) {
+      status = attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
+      if (FAILED(status)) return status;
+      status = encoder.QueryInterface(IID_PPV_ARGS(&events_));
+      if (FAILED(status)) return status;
+    }
+    DWORD inputs = 0, outputs = 0;
+    status = encoder.GetStreamCount(&inputs, &outputs);
+    if (FAILED(status)) return status;
+    if (inputs != 1 || outputs != 1) return E_NOTIMPL;
+    input_stream_ = output_stream_ = 0;
+    status = encoder.GetStreamIDs(1, &input_stream_, 1, &output_stream_);
+    if (FAILED(status) && status != E_NOTIMPL) return status;
+    return BindVideoDevice(encoder, *device_, device_manager_);
+  }
+
+  void ReadEvents() {
+    for (;;) {
+      ComPtr<IMFMediaEvent> event;
+      const auto status = events_->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
+      if (status == MF_E_NO_EVENTS_AVAILABLE) return;
+      Require(status, "Cannot read hardware encoder event");
+      HRESULT result = S_OK;
+      Require(event->GetStatus(&result), "Cannot read hardware encoder event status");
+      Require(result, "Hardware video encoder failed");
+      MediaEventType type = MEUnknown;
+      Require(event->GetType(&type), "Cannot read hardware encoder event type");
+      if (type == METransformNeedInput && !finished_) ++need_input_;
+      else if (type == METransformHaveOutput) ++have_output_;
+      else if (type == METransformDrainComplete) drained_ = true;
+    }
+  }
+
   LONGLONG InputTime(LONGLONG value) const {
     const auto offset = time_offset_.value_or(0);
     if ((offset > 0 && value < INT64_MIN + offset) || (offset < 0 && value > INT64_MAX + offset))
@@ -413,11 +506,18 @@ private:
     if (input.range != ColorRange::Unknown)
       Require(type->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, input.range == ColorRange::Full ? MFNominalRange_0_255 : MFNominalRange_16_235), "Cannot set video range");
   }
-  VideoEncodeFormat ReadFormat() {
+  VideoEncodeFormat ReadFormat(std::span<const std::byte> access_unit) {
     ComPtr<IMFMediaType> type;
-    Require(encoder_->GetOutputCurrentType(0, &type), "Cannot query video configuration");
+    Require(encoder_->GetOutputCurrentType(output_stream_, &type), "Cannot query video configuration");
     UINT32 size = 0;
-    Require(type->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &size), "Video parameter sets are missing");
+    const auto status = type->GetBlobSize(MF_MT_MPEG_SEQUENCE_HEADER, &size);
+    if (FAILED(status) && device_) {
+      if (format_) return *format_;
+      auto format = ReadVideoEncodeFormatFromPacket(access_unit, config_);
+      if (!format.Succeeded()) throw EncoderFailure{format.Error()};
+      return std::move(format).Value();
+    }
+    Require(status, "Video parameter sets are missing");
     if (!size || size > 65536) throw EncoderFailure{Error(CodecErrorCode::ResourceExhausted, "Video parameter sets exceed 64 KiB")};
     Bytes bytes(size);
     Require(type->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, reinterpret_cast<UINT8*>(bytes.data()), size, &size), "Cannot read video parameter sets");
@@ -428,12 +528,19 @@ private:
   VideoEncoderConfig config_;
   ComPtr<IMFTransform> encoder_;
   ComPtr<ICodecAPI> controls_;
+  std::shared_ptr<WindowsVideoDevice> device_;
+  ComPtr<IMFDXGIDeviceManager> device_manager_;
+  ComPtr<IMFActivate> activation_;
+  ComPtr<IMFMediaEventGenerator> events_;
   std::optional<VideoEncodeFormat> format_;
   std::optional<EncodedPacket> pending_;
   std::map<LONGLONG, std::int64_t> input_times_;
   std::optional<LONGLONG> time_offset_;
   std::size_t frame_bytes_ = 0;
   std::uint64_t submitted_frames_ = 0;
+  DWORD input_stream_ = 0, output_stream_ = 0;
+  unsigned need_input_ = 0, have_output_ = 0;
+  bool streaming_ = false, drained_ = false;
   bool com_ = false, mf_ = false, input_submitted_ = false, variable_timing_ = false, key_requested_ = false, finished_ = false, eos_ = false;
 };
 }

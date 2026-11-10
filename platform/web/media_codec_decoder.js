@@ -10,6 +10,7 @@
   async function output(state, frame) {
     if (!state.active) { frame.close(); return; }
     ++state.copying;
+    let retained = false;
     try {
       const record = {pts: frame.timestamp, duration: frame.duration ?? null, planes: []};
       if (state.audio) {
@@ -24,18 +25,25 @@
           record.planes.push(bytes);
         }
       } else {
+        // The browser frame may include allocation padding beyond the stream's coded bounds.
         const width = Math.min(frame.codedWidth, state.width), height = Math.min(frame.codedHeight, state.height);
         if (frame.visibleRect.x + frame.visibleRect.width > width || frame.visibleRect.y + frame.visibleRect.height > height)
           throw new Error('WebCodecs visible frame exceeds configured dimensions');
-        const planar10 = frame.format === 'I420P10';
-        if (state.tenBit ? !planar10 : frame.format !== 'I420' && frame.format !== 'NV12')
-          throw new Error('WebCodecs did not expose the requested CPU YUV bit depth (' + frame.format + ')');
         record.width = width; record.height = height;
         record.visible = {x: frame.visibleRect.x, y: frame.visibleRect.y, width: frame.visibleRect.width, height: frame.visibleRect.height};
         record.format = frame.format;
         record.color = frame.colorSpace.toJSON();
         record.aspectWidth = frame.displayWidth * frame.visibleRect.height;
         record.aspectHeight = frame.displayHeight * frame.visibleRect.width;
+        if (state.platform) {
+          record.frame = frame;
+          state.output.push(record);
+          retained = true;
+          return;
+        }
+        const planar10 = frame.format === 'I420P10';
+        if (state.tenBit ? !planar10 : frame.format !== 'I420' && frame.format !== 'NV12')
+          throw new Error('WebCodecs did not expose the requested CPU YUV bit depth (' + frame.format + ')');
         const options = {rect: {x: 0, y: 0, width, height}};
         const bytes = new Uint8Array(frame.allocationSize(options));
         const layouts = await frame.copyTo(bytes, options);
@@ -70,7 +78,7 @@
       }
       if (state.active) state.output.push(record);
     } catch (error) { failure(state, error); }
-    finally { frame.close(); --state.copying; }
+    finally { if (!retained) frame.close(); --state.copying; }
   }
   root.HuxerMediaCodec = {
     open(config) {
@@ -118,6 +126,7 @@
       const state = sessions.get(id);
       if (!state) return '';
       state.active = false;
+      for (const record of state.output) record.frame?.close();
       state.output.length = 0;
       let error = '';
       try { if (state.decoder && state.decoder.state !== 'closed') state.decoder.close(); }

@@ -1,5 +1,6 @@
 #include "format.h"
 #include "../hevc.h"
+#include "format/platform_video_storage.h"
 
 #include <algorithm>
 #include <cstring>
@@ -256,6 +257,12 @@ CodecResult<std::size_t> ValidateVideoEncoderConfig(const VideoEncoderConfig& co
   const auto& input = config.input;
   const bool avc = config.codec == CodecId::H264;
   const bool ten_bit = input.pixel_format == VideoPixelFormat::P010;
+  const bool platform_storage = config.input_storage == VideoStorage::Platform;
+  if (config.input_storage != VideoStorage::Cpu && !platform_storage)
+    return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid video encoder storage"));
+  if ((platform_storage && (!PlatformVideoEncodeSupported || input.pixel_format != PlatformVideoLayout)) ||
+      (!platform_storage && input.pixel_format == VideoPixelFormat::Opaque))
+    return R::Failure(Error(CodecErrorCode::Unsupported, "Video encoder storage and pixel layout are incompatible"));
   if (!input.Validate() || input.width < 2 || input.height < 2 || input.width > 8192 || input.height > 8192 ||
       input.width % 2 || input.height % 2 || !config.frame_rate_numerator || !config.frame_rate_denominator ||
       std::uint64_t(config.frame_rate_numerator) > std::uint64_t(config.frame_rate_denominator) * 240 ||
@@ -273,13 +280,14 @@ CodecResult<std::size_t> ValidateVideoEncoderConfig(const VideoEncoderConfig& co
       input.transfer == ColorTransfer::PQ || input.transfer == ColorTransfer::HLG ||
       config.max_b_frames.value_or(0) > 16)
     return R::Failure(Error(CodecErrorCode::Unsupported, "Unsupported video encoder geometry, pixel format, or B-picture bound"));
-  const auto bytes = std::size_t(input.width) * input.height * (ten_bit ? 6 : 3) / 2;
+  const auto bytes = VideoImageBytes(input.width, input.height, input.pixel_format);
   if (bytes > config.limits.input_bytes || (config.max_b_frames &&
       std::size_t(*config.max_b_frames) + 2 > VideoEncoderWindow(config)))
     return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video encoder queues cannot fit a picture or the requested delay window"));
   return R::Success(bytes);
 }
 void CopyVideoEncoderPixels(const VideoFrame& frame, VideoPixelFormat layout, std::span<std::byte> target) {
+  if (frame.Storage() != VideoStorage::Cpu) throw std::invalid_argument("Expected a CPU video frame");
   const auto width = frame.format.width, height = frame.format.height;
   const auto base = std::size_t(width) * height;
   if (layout == VideoPixelFormat::P010) {
@@ -366,6 +374,25 @@ CodecResult<VideoEncodeFormat> ReadVideoEncodeFormat(std::span<const std::byte> 
   } catch (const VideoSyntaxFailure& failure) { return R::Failure(failure.error); }
   catch (const std::invalid_argument& failure) { return R::Failure(Error(CodecErrorCode::InvalidData, failure.what())); }
 }
+CodecResult<VideoEncodeFormat> ReadVideoEncodeFormatFromPacket(std::span<const std::byte> packet, const VideoEncoderConfig& config) {
+  using R = CodecResult<VideoEncodeFormat>;
+  try {
+    Bytes description;
+    for (const auto nal : VideoNals(packet, 4)) {
+      const auto header = std::to_integer<unsigned>(nal.front());
+      const auto type = config.codec == CodecId::Hevc ? (header >> 1) & 63 : header & 31;
+      const bool parameter = config.codec == CodecId::Hevc ? type >= 32 && type <= 34 : type == 7 || type == 8;
+      if (!parameter) continue;
+      if (nal.size() + 4 > 65536 - description.size())
+        return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Video parameter sets exceed 64 KiB"));
+      description.insert(description.end(), {std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}});
+      description.insert(description.end(), nal.begin(), nal.end());
+    }
+    return ReadVideoEncodeFormat(description, config);
+  } catch (const VideoSyntaxFailure& failure) { return R::Failure(failure.error); }
+  catch (const std::invalid_argument& failure) { return R::Failure(Error(CodecErrorCode::InvalidData, failure.what())); }
+}
+
 CodecResult<Bytes> NormalizeVideoEncoderPacket(std::span<const std::byte> bytes, unsigned length_size,
                                                std::size_t maximum, CodecId codec, bool strip_headers) {
   using R = CodecResult<Bytes>;

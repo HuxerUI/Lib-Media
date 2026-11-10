@@ -362,6 +362,14 @@ when VideoToolbox rejects `MaxFrameDelayCount`. End of stream drains any remaini
 | Linux | GStreamer `h265parse` with an installed decoder and `x265enc` for encoding. CPU P010 uses GStreamer conversion. | Main and Main10 round trips with the Linux adapter, `x265enc`, and `avdec_h265` in a macOS GStreamer test harness. Native Linux validation pending. |
 | Web | WebCodecs with automatic B-picture selection. Main10 decode requires CPU `I420P10` frames. Main10 encode requires the browser to accept the profile and ten-bit input. | Main C++/WASM encode/decode and preview export passed in Chrome. The test browser rejected Main10 encoding and decoded Main10 without exposing CPU YUV planes. |
 
+### GPU video
+
+For SDR H.264 and HEVC Main on macOS, iOS, Android, and Windows, select `VideoStorage::Platform` in the decoder and
+encoder configurations and probe the chosen codec. Read the storage kind through `VideoFrame::Storage()`.
+On Web, request `VideoStorage::Platform` and `VideoPixelFormat::Opaque` for SDR decode output. `MakeExternalTexture()`
+publishes the browser frame without reading its pixels. Web encoding uses CPU input.
+See [GPU video](gpu-video.md) for single-frame SDK textures, preview publication, and the validation matrix.
+
 ### Bounded encoding pump
 
 Configure a session from a supported `VideoFormat` and use a pending frame index or one pending source frame:
@@ -440,7 +448,9 @@ For the browser bridge, serve the repository over localhost and open
 checks CPU copies/counts/EOS, and releases the codecs. With Web tests enabled, build `media_codec_web_native` and serve
 its generated `tests/codec_wasm.html` beside the JS/WASM/data files. That test invokes the C++ AudioDecoder and
 VideoDecoder APIs, decodes both fixtures, resets both sessions, and observes cleanup while retaining CPU output.
-The separate Node test injects late support, flush, and copy completions after retirement. Controlled worker shutdown
+Open `tests/codec_wasm.html?storage=platform` to disable browser pixel reads and verify the SDK texture after reset
+and cleanup. The separate Node test checks platform frame ownership and injects late support, flush, and copy
+completions after retirement. Controlled worker shutdown
 still needs dedicated validation. Physical iOS devices, Linux hardware/plugin diversity, stress/RSS, and release-failure injection
 in platform APIs remain validation work; shared fake-backend failure tests do not replace those checks.
 

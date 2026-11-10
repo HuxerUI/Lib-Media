@@ -16,10 +16,16 @@ public:
   virtual CodecResult<std::optional<BackendOutput>> Poll() = 0;
   // Match input and output PTS in this timescale before restoring the original packet timestamp.
   virtual std::uint32_t PresentationTimescale() const noexcept { return 1000000; }
+  // A surface backend may use the platform's presentation order to keep its buffer leases small.
+  virtual bool PresentationOrdered() const noexcept { return false; }
   virtual CodecResult<SubmitStatus> Finish() = 0;
   // Cleanup is idempotent and waits for platform callbacks/copies on the control lane, never the caller.
   virtual CodecResult<void> Close() = 0;
 };
 std::unique_ptr<DecoderBackend> MakeDecoderBackend();
 using BackendFactory = std::function<std::unique_ptr<DecoderBackend>()>;
+
+struct VideoDecoderAccess {
+  static CodecResult<VideoDecoder> Create(const VideoDecoderConfig& config, BackendFactory factory);
+};
 } // namespace huxerui::media::detail

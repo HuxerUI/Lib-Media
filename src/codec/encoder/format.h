@@ -20,6 +20,7 @@ CodecResult<std::size_t> ValidateVideoEncoderConfig(const VideoEncoderConfig& co
 void CopyVideoEncoderPixels(const VideoFrame& frame, VideoPixelFormat layout, std::span<std::byte> target);
 // Reads a configuration record or Annex B parameter sets and returns geometry and a four-byte-length record.
 CodecResult<VideoEncodeFormat> ReadVideoEncodeFormat(std::span<const std::byte> description, const VideoEncoderConfig& config);
+CodecResult<VideoEncodeFormat> ReadVideoEncodeFormatFromPacket(std::span<const std::byte> packet, const VideoEncoderConfig& config);
 // A zero length_size denotes Annex B; 1, 2, or 4 denotes length-prefixed NAL units. Enforces the access-unit bound
 // and removes validated AVC base-layer extension prefixes. strip_headers also removes parameter sets and delimiters.
 CodecResult<Bytes> NormalizeVideoEncoderPacket(std::span<const std::byte> bytes, unsigned length_size, std::size_t maximum,

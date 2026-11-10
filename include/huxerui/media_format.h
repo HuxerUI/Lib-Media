@@ -1,18 +1,24 @@
 #pragma once
 
 /// @file
-/// @brief Shared codec identifiers, exact media timestamps, compressed access units, and CPU audio and video frames.
+/// @brief Shared codec identifiers, exact media timestamps, compressed access units, and decoded media frames.
 ///
 /// Include <huxerui/media_format.h> and link HuxerUI::Media. These values can be used in headless code.
-/// Use <huxerui/media_codec.h> to decode compressed packets or encode PCM/CPU video through bounded, headless sessions.
-/// When constructing frames yourself, call Validate() before using their format, timing, and planes.
+/// Use <huxerui/media_codec.h> to decode compressed packets or encode PCM and video through bounded, headless sessions.
+/// When constructing frames yourself, call Validate() before using their format, timing, and storage.
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 #include <huxerui/data.h>
 
 namespace huxerui::media {
+
+namespace detail {
+struct PlatformVideoStorage;
+struct VideoFrameAccess;
+}
 
 /// @brief An exact media timeline position or duration expressed as ticks / timescale seconds.
 ///
@@ -197,7 +203,7 @@ struct AudioFrame {
   [[nodiscard]] bool Validate() const noexcept;
 };
 
-/// @brief Supported CPU YUV layouts with 4:2:0 chroma subsampling.
+/// @brief Pixel layout of a video frame.
 ///
 /// Luma uses the coded width and height. Chroma uses half each coded dimension, rounded up.
 enum class VideoPixelFormat {
@@ -207,7 +213,17 @@ enum class VideoPixelFormat {
   NV12,
   /// Two planes with the same component order as NV12. Each component occupies a little-endian 16-bit word
   /// with its ten-bit value in the most significant bits.
-  P010
+  P010,
+  /// A platform image whose pixel layout is opaque to the caller.
+  Opaque
+};
+
+/// @brief Selects the storage used to exchange uncompressed video with a codec.
+enum class VideoStorage {
+  /// CPU-readable YUV planes.
+  Cpu,
+  /// A retained, GPU-accessible platform image. Probe the requested codec and layout.
+  Platform
 };
 
 /// @brief Color primaries describing the coded samples.
@@ -289,7 +305,7 @@ struct VideoRectangle {
   bool operator==(const VideoRectangle&) const = default;
 };
 
-/// @brief Coded CPU image geometry, storage layout, and presentation metadata.
+/// @brief Coded image geometry, pixel layout, and presentation metadata.
 ///
 /// Size the planes using the coded dimensions, then use visible, pixel aspect ratio, and rotation for display.
 /// Unavailable color metadata remains Unknown so the consumer can choose its own fallback.
@@ -343,15 +359,28 @@ struct VideoPlane {
   std::size_t pixel_stride = 0;
 };
 
-/// @brief A retained CPU video image and its timing on the presentation timeline.
+/// @brief A retained video image and its timing on the presentation timeline.
 ///
 /// Decoder output owns immutable plane bytes that survive Reset(), Close(), and cleanup completion. A copy,
 /// retained plane, or slice holds the frame's output reservation across resets until the last reference is released.
 /// For application-provided planes, keep their storage stable and synchronize writes with readers.
-/// VideoEncoder copies active samples on Accepted; the frame must match VideoEncoderConfig::input and use strictly
-/// increasing PTS. A supplied encoder-input duration must be positive and representable after microsecond rounding.
+/// Platform output retains an immutable image and its reservation through the last frame copy. Keep a frame copy
+/// until all GPU reads from the image have completed. VideoEncoder copies CPU pixels and retains platform images
+/// on Accepted. The frame must match VideoEncoderConfig::input and use increasing PTS.
 /// @see VideoFormat, VideoPlane, BufferReference, VideoEncoder::TrySubmit()
 struct VideoFrame {
+  /// Creates an empty frame for a caller to fill with CPU planes and metadata.
+  VideoFrame() = default;
+
+  /// @brief Creates a CPU frame from caller-provided metadata and plane references.
+  /// @param format Coded geometry and presentation metadata for the planes.
+  /// @param pts Presentation timestamp on the media timeline.
+  /// @param duration Optional display duration.
+  /// @param planes Pixel planes whose storage is retained through their buffer references.
+  /// Call Validate() before submitting the frame.
+  VideoFrame(VideoFormat format, MediaTimestamp pts, std::optional<MediaTimestamp> duration,
+      std::vector<VideoPlane> planes);
+
   /// Complete coded geometry and presentation metadata for these pixels.
   VideoFormat format;
   /// Required presentation timestamp with a positive timescale. Decoder output preserves the associated packet's
@@ -362,15 +391,22 @@ struct VideoFrame {
   /// duration when supplied and restores it on the corresponding encoded packet.
   std::optional<MediaTimestamp> duration;
   /// Y, U, V planes for I420. For NV12, a Y plane followed by one interleaved U/V plane.
-  /// Plane extents are based on the coded image.
+  /// Plane extents are based on the coded image. Empty for platform images.
   std::vector<VideoPlane> planes;
 
-  /// @brief Checks metadata, timing, and plane coverage for the full coded image.
+  /// Returns the storage kind. Use Validate() to check the frame's format, timing, and image.
+  VideoStorage Storage() const noexcept { return platform_storage_ ? VideoStorage::Platform : VideoStorage::Cpu; }
+
+  /// @brief Checks metadata, timing, and storage coverage for the full coded image.
   ///
   /// The luma plane covers the coded dimensions. Each chroma dimension is half its coded dimension rounded up.
   /// Each row must fit its samples and each range must cover the last sample without size or offset overflow.
-  /// @return True if the format and timestamps are valid and the plane count, strides, and sizes fit the layout.
+  /// @return True if format and timing are valid and the CPU planes or platform image fit the coded layout.
   [[nodiscard]] bool Validate() const noexcept;
+
+private:
+  friend struct detail::VideoFrameAccess;
+  std::shared_ptr<const detail::PlatformVideoStorage> platform_storage_;
 };
 
 } // namespace huxerui::media

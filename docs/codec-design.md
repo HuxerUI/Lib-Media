@@ -69,6 +69,9 @@ four names express different input/output types; they do not imply four copies o
 Use `DecodedPlayback` for the later combined audio/video consumer. Do not overload MediaPlayer with raw-frame inputs,
 introduce a public Session base class, or create separate AudioBuffer, PCMBuffer, and AudioFrame wrappers for the same data.
 
+Use `platform` for backend APIs and objects, including video storage. Use `system` for operating-system scheduling,
+tasks, requests, and assigned identifiers. Preserve established ABI and format names such as JNI and native byte order.
+
 Errors use the installed SDK's `Result<T, CodecError>`. `CodecError` owns codec-specific codes, a diagnostic message,
 and a platform diagnostic identifier. Reusing playback's `MediaError::fatal` or photo-library errors would import
 unrelated lifecycle meanings. Proposed categories are `Unsupported`, `InvalidArgument`, `InvalidState`, `InvalidData`,
@@ -116,9 +119,11 @@ and pixel stride. Validation accounts for subsampling, visible crop, the final a
 planes are never assumed tightly packed. The initial CPU layouts are I420 and NV12 for decoder output. Packed RGBA/BGRA
 are candidates for later presentation input, not a reason to convert every decoded frame to RGB.
 
-Initial output is CPU-readable and library-owned. Unsupported vendor layouts fail explicitly rather than exposing
-an incorrect YUV interpretation. Platform-owned frames and explicit CPU mapping can be added after a backend demonstrates
-a concrete benefit and the lease/synchronization contract is tested. An ExternalTexture is never the codec frame type.
+CPU output is library-owned. Platform SDR output retains an IOSurface-backed NV12 buffer on macOS and iOS,
+a hardware buffer lease on Android, a DXGI sample on Windows, or a WebCodecs frame on Web. Both storage modes
+use the same format and timing events. Android direct preview releases selected MediaCodec pictures into an SDK
+SurfaceStreamTexture.
+See [GPU video](gpu-video.md) for synchronization and retirement.
 
 ### Encoded packets and configuration
 
@@ -745,12 +750,15 @@ Consumers use the public installed package; no SDK source checkout is required.
 The installed Android texture API exposes BitmapTexture and a GL_TEXTURE_2D copy path. Apple exposes retained
 PixelBufferTexture and Metal copies; Windows/Linux expose pixel/platform texture paths. These are actual public contracts,
 not a generic promise that every codec output can be imported without conversion. The first CPU decoder milestone needs
-no new SDK interface. All six previews convert SDR NV12 and I420 to RGB on the CPU. Android
+no new SDK interface. The CPU preview converts SDR NV12 and I420 to RGB on the CPU. Android
 uses the public GL texture path. iOS and macOS each publish to their platform's pixel buffer texture. Windows and Linux
 publish copied RGBA rows through their platform's `PixelTexture`. Web creates
 a browser RGBA VideoFrame from the visible pixels and publishes it through the SDK's VideoFrameTexture. The texture
 retains its own clone, and the uploader closes the original after publication. The AVC fixture preview uses
 BT.601 and limited range when color metadata is unavailable and reports the fallback.
+
+The GPU preview uses PixelBufferTexture on macOS and iOS. Android can present directly through SurfaceStreamTexture
+or publish a GLES snapshot through GlTexture. The codec and GPU transform paths operate independently of presentation.
 
 A future platform frame optimization may require a generic renderer import capability, especially for Android hardware
 buffers or specific YUV/HDR layouts. Specify and test the exact missing resource, synchronization, and color contract

@@ -418,6 +418,7 @@ View FramesPage() {
   auto texture = UseState(std::shared_ptr<ExternalTexture>{});
   auto notice = UseState(std::string("Open a movie or audio file, or play the bundled MP4."));
   auto audio_mode = UseState(false);
+  auto video_storage = UseState(VideoStorage::Cpu);
   auto audio_copy = UseState(false);
   auto busy = UseState(false);
   auto paused = UseState(false);
@@ -426,7 +427,7 @@ View FramesPage() {
   auto requested_seek = UseState(std::optional<float>{});
   auto seek_draft = UseState(std::optional<float>{});
 
-  auto play = [=](std::shared_ptr<const File> staged, bool audio) {
+  auto play = [=](std::shared_ptr<const File> staged, bool audio, VideoStorage storage) {
     current->Cancel();
     source = staged;
     output = std::shared_ptr<const File>{};
@@ -441,8 +442,8 @@ View FramesPage() {
     current = tasks.Launch([=]() -> Task<void> {
       try {
         media_preview::ClipControls controls{
-            .reset_video = [texture](Size size) {
-              texture = media_preview::MakeFrameTexture(size);
+            .reset_video = [texture, storage](Size size, const std::shared_ptr<ExternalTexture>& surface) {
+              texture = surface ? surface : media_preview::MakeFrameTexture(size, storage);
             },
             .publish = [texture](const VideoFrame& frame) {
               const std::shared_ptr<ExternalTexture> image = texture;
@@ -462,7 +463,7 @@ View FramesPage() {
             },
         };
         if (audio) co_await media_preview::PlayAudio(staged, std::move(controls));
-        else co_await media_preview::PlayContainer(staged, std::move(controls));
+        else co_await media_preview::PlayContainer(staged, std::move(controls), storage);
       } catch (const std::exception& error) {
         notice = error.what();
       }
@@ -484,7 +485,7 @@ View FramesPage() {
         if (sample || chosen) {
           auto staged = co_await media_preview::StageClip(temporary, std::move(chosen), resources);
           notice = sample ? "Bundled H.264/AAC MP4" : audio ? "Selected audio" : "Selected movie";
-          play(std::move(staged), audio);
+          play(std::move(staged), audio, video_storage);
         }
       } catch (const std::exception& error) {
         notice = error.what();
@@ -494,6 +495,7 @@ View FramesPage() {
   };
 
   const std::shared_ptr<ExternalTexture> image = texture;
+  const auto storage = video_storage.Get();
   const auto prepare = [=](bool copy) {
     const std::shared_ptr<const File> input_file = source;
     const bool audio = audio_mode;
@@ -510,7 +512,7 @@ View FramesPage() {
           output = co_await media_preview::CopyClip(input_file, temporary);
           notice = "Movie copied and reopened successfully.";
         } else {
-          output = co_await media_preview::ExportClip(input_file, temporary, media_preview::preview_reordered_export);
+          output = co_await media_preview::ExportClip(input_file, temporary, media_preview::preview_reordered_export, storage);
           notice = "MP4 encoded and reopened successfully.";
         }
       } catch (const std::exception& error) {
@@ -533,6 +535,13 @@ View FramesPage() {
         .OnCanceled([seek_draft] { seek_draft = std::optional<float>{}; })
         .With(Enabled{duration > 0}, Semantics{.label = "Preview position"}),
     Flow {
+      (media_preview::gpu_video_supported ? Button(storage == VideoStorage::Platform ? "GPU video" : "CPU video")
+          .OnClick([=] {
+            const auto next = storage == VideoStorage::Platform ? VideoStorage::Cpu : VideoStorage::Platform;
+            video_storage = next;
+            const std::shared_ptr<const File> input_file = source;
+            if (input_file && !audio_mode) play(input_file, false, next);
+          }).With(Enabled{!busy && !audio_mode}) : View{}),
       Button("Open movie").OnClick([open] { open(false); })
           .With(Enabled{media_preview::frame_texture_supported && picker->CanOpenFiles() && !busy}),
       Button("Open audio").OnClick([open] { open(false, true); }).With(Enabled{picker->CanOpenFiles() && !busy}),
@@ -542,7 +551,8 @@ View FramesPage() {
           .With(Enabled{duration > 0 || (audio_mode && position > 0)}),
       Button(audio_mode ? "Copy Audio" : "Copy Movie").OnClick([prepare] { prepare(true); })
           .With(Enabled{can_prepare && (!audio_mode || audio_copy)}),
-      Button(audio_mode ? "Export WAV" : "Encode MP4").OnClick([prepare] { prepare(false); }).With(Enabled{can_prepare}),
+      Button(audio_mode ? "Export WAV" : storage == VideoStorage::Platform ? "Encode half-size MP4" : "Encode MP4")
+          .OnClick([prepare] { prepare(false); }).With(Enabled{can_prepare}),
       Button(audio_mode ? "Save Audio" : "Save Movie").OnClick([=] {
         const std::shared_ptr<const File> output_file = output;
         if (busy || !output_file) return;

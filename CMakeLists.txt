@@ -87,7 +87,7 @@ target_include_directories(huxerui_media PUBLIC
 target_include_directories(huxerui_media PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 if (ANDROID)
-    target_link_libraries(huxerui_media PRIVATE mediandk dl)
+    target_link_libraries(huxerui_media PRIVATE mediandk android dl EGL GLESv3)
 endif ()
 
 if (WIN32)
@@ -123,7 +123,7 @@ if (EMSCRIPTEN)
 endif ()
 
 if (APPLE)
-    target_link_libraries(huxerui_media PRIVATE "-framework AVFoundation" "-framework QuartzCore" "-framework CoreMedia" "-framework AudioToolbox" "-framework VideoToolbox" "-framework CoreVideo")
+    target_link_libraries(huxerui_media PRIVATE "-framework AVFoundation" "-framework QuartzCore" "-framework CoreMedia" "-framework AudioToolbox" "-framework VideoToolbox" "-framework CoreVideo" "-framework Metal")
     if (IOS)
         target_link_libraries(huxerui_media PRIVATE "-framework Photos" "-framework PhotosUI" "-framework UniformTypeIdentifiers")
     endif ()

@@ -1,6 +1,7 @@
 #include "format.h"
 #include "../hevc.h"
 #include "container/container_io.h"
+#include "format/platform_video_storage.h"
 
 #include <array>
 
@@ -231,7 +232,12 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
     const auto& video = std::get<VideoDecoderConfig>(config);
     if (!video.width || !video.height || video.width > 8192 || video.height > 8192)
       return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video dimensions must be in 1..8192"));
-    const bool eight_bit = video.output == VideoPixelFormat::NV12 || video.output == VideoPixelFormat::I420;
+    const bool platform_storage = video.output_storage == VideoStorage::Platform;
+    if (video.output_storage != VideoStorage::Cpu && !platform_storage)
+      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid video decoder storage"));
+    if (platform_storage && (!PlatformVideoDecodeSupported || video.output != PlatformVideoLayout))
+      return R::Failure(Error(CodecErrorCode::Unsupported, "Platform video output layout is unavailable"));
+    const bool eight_bit = platform_storage || video.output == VideoPixelFormat::NV12 || video.output == VideoPixelFormat::I420;
     if (video.codec == CodecId::H264) {
       const auto parsed = ParseAvc(video.initialization_data);
       if (!parsed.Succeeded()) return R::Failure(parsed.Error());
@@ -251,8 +257,7 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
     } else {
       return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video decoding requires H.264 or HEVC"));
     }
-    frame_bytes = std::size_t(video.width) * video.height + 2 * ((std::size_t(video.width) + 1) / 2) * ((std::size_t(video.height) + 1) / 2);
-    if (!eight_bit) frame_bytes *= 2;
+    frame_bytes = VideoImageBytes(video.width, video.height, video.output);
     minimum = 34;
   }
   const auto limits = std::visit([](const auto& c) { return c.limits; }, config);

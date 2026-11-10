@@ -1,4 +1,5 @@
 #include "codec/decoder/backend.h"
+#include "media_video_ios.h"
 #include "codec/decoder/copy.h"
 #include "codec/hevc.h"
 #include "container/container_io.h"
@@ -137,7 +138,11 @@ public:
       return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidArgument, "Video dimensions exceed configured bounds"));
     const auto pixel_type = video.output == VideoPixelFormat::P010
         ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    NSDictionary* attributes = @{(id)kCVPixelBufferPixelFormatTypeKey: @(pixel_type)};
+    NSDictionary* attributes = video.output_storage == VideoStorage::Platform ? @{
+      (__bridge NSString*)kCVPixelBufferPixelFormatTypeKey: @(pixel_type),
+      (__bridge NSString*)kCVPixelBufferMetalCompatibilityKey: @YES,
+      (__bridge NSString*)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    } : @{(id)kCVPixelBufferPixelFormatTypeKey: @(pixel_type)};
     VTDecompressionOutputCallbackRecord callback{Output, this};
     status = VTDecompressionSessionCreate(kCFAllocatorDefault, description_, nullptr, (__bridge CFDictionaryRef)attributes, &callback, &video_);
     if (status) return CodecResult<void>::Failure(AppleError(status, "VTDecompressionSessionCreate failed"));
@@ -350,6 +355,13 @@ private:
       if (attachment(kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2)) format.matrix = ColorMatrix::BT709;
       else if (attachment(kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4)) format.matrix = ColorMatrix::BT601;
       else if (attachment(kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020)) format.matrix = ColorMatrix::BT2020;
+      const auto duration_on_timeline = CMTIME_IS_NUMERIC(duration) ? std::optional(Timestamp(duration)) : std::nullopt;
+      if (config.output_storage == VideoStorage::Platform) {
+        auto retained = ios::RetainPixelBuffer(image, format, Timestamp(pts), duration_on_timeline);
+        if (!retained.Succeeded()) self.failure_ = retained.Error();
+        else self.output_.push_back(DecodedFrame{std::move(retained).Value()});
+        return;
+      }
       auto owner = std::make_shared<PixelMapping>(image, &self.failure_);
       const auto locked = CVPixelBufferLockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
       if (locked) { self.failure_ = AppleError(locked, "Cannot map decoded pixels"); return; }
@@ -361,8 +373,7 @@ private:
         auto* base = static_cast<const std::byte*>(CVPixelBufferGetBaseAddressOfPlane(image, i));
         planes.push_back({BufferReference({base, size}, owner), stride, (i ? 2u : 1u) * (ten_bit ? 2u : 1u)});
       }
-      auto copied = CopyVideo(format, Timestamp(pts), CMTIME_IS_NUMERIC(duration) ? std::optional(Timestamp(duration)) : std::nullopt,
-          std::move(planes), config.output);
+      auto copied = CopyVideo(format, Timestamp(pts), duration_on_timeline, std::move(planes), config.output);
       owner.reset();
       if (!copied.Succeeded()) self.failure_ = copied.Error();
       else if (!self.failure_) self.output_.push_back(DecodedFrame{std::move(copied).Value()});

@@ -14,7 +14,7 @@ void Check(bool condition, const char* message) {
 }
 
 VideoFrame Frame(std::int64_t pts, std::int64_t duration = 40) {
-  return {.pts = {pts, 1000}, .duration = MediaTimestamp{duration, 1000}};
+  return {{}, {pts, 1000}, MediaTimestamp{duration, 1000}, {}};
 }
 
 struct Harness {

@@ -2,6 +2,7 @@
 #include "codec/decoder/copy.h"
 #include "codec/hevc.h"
 #include "media_codec_transform_windows.h"
+#include "media_video_windows.h"
 
 #include <algorithm>
 #include <cstring>
@@ -31,6 +32,7 @@ template<class T, class Function> CodecResult<T> Guard(Function function) {
 class WindowsDecoder final : public DecoderBackend {
 public:
   std::uint32_t PresentationTimescale() const noexcept override { return 10000000; }
+  bool PresentationOrdered() const noexcept override { return bool(device_); }
 
   CodecResult<void> Open(const DecoderConfig& config) override {
     if (const auto* audio = std::get_if<AudioDecoderConfig>(&config); audio && audio->codec != CodecId::Aac)
@@ -49,6 +51,11 @@ public:
       } else {
         Require(CoCreateInstance(audio ? CLSID_CMSAACDecMFT : CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER,
             IID_PPV_ARGS(&decoder_)), "System AAC/AVC decoder is unavailable");
+      }
+      if (video && video->output_storage == VideoStorage::Platform) {
+        Require(OpenVideoDevice(device_), "No compatible D3D11 video device", CodecErrorCode::Unsupported);
+        Require(BindVideoDevice(*decoder_.Get(), *device_, device_manager_),
+            "The Media Foundation decoder rejected D3D11 output", CodecErrorCode::Unsupported);
       }
       ComPtr<IMFMediaType> input;
       Require(MFCreateMediaType(&input), "Cannot allocate decoder input type");
@@ -133,7 +140,10 @@ public:
       MFT_OUTPUT_STREAM_INFO info{};
       Require(decoder_->GetOutputStreamInfo(0, &info), "Cannot query decoder output requirements");
       ComPtr<IMFSample> sample;
-      if (!(info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
+      if (device_) {
+        if (!(info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)))
+          throw MfFailure{Error(CodecErrorCode::Unsupported, "The decoder cannot supply DXGI output samples")};
+      } else if (!(info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES)) {
         // The system AAC MFT requests 48 KiB even for one mono/stereo AAC-LC frame.
         const auto maximum = std::max<std::size_t>(ValidateConfig(config_).Value() * 4, 64 * 1024);
         if (info.cbSize > maximum) throw MfFailure{Error(CodecErrorCode::ResourceExhausted,
@@ -155,7 +165,7 @@ public:
       }
       Require(result, "Media Foundation decoding failed");
       if (!sample) throw MfFailure{Error(CodecErrorCode::InvalidData, "Decoder returned no output sample")};
-      return BackendOutput{Copy(sample.Get())};
+      return BackendOutput{ReadSample(sample.Get())};
     });
   }
   CodecResult<SubmitStatus> Finish() override {
@@ -176,6 +186,8 @@ public:
       record(decoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0), "Decoder end-streaming failed during cleanup");
       output_type_.Reset(); decoder_.Reset();
     }
+    device_manager_.Reset();
+    device_.reset();
     audio_timing_.clear();
     if (mf_) { record(MFShutdown(), "Media Foundation release failed"); mf_ = false; }
     if (com_) { CoUninitialize(); com_ = false; }
@@ -205,16 +217,24 @@ private:
         const auto& config = std::get<VideoDecoderConfig>(config_);
         if (!width || !height || width > config.width || height > config.height) continue;
       }
-      Require(decoder_->SetOutputType(0, type.Get(), 0), "Decoder rejected CPU output format");
+      Require(decoder_->SetOutputType(0, type.Get(), 0), "Decoder rejected output format");
       output_type_ = std::move(type);
       return;
     }
-    throw MfFailure{Error(CodecErrorCode::Unsupported, "No compatible Media Foundation CPU output format")};
+    throw MfFailure{Error(CodecErrorCode::Unsupported, "No compatible Media Foundation output format")};
   }
-  DecodedFrame Copy(IMFSample* sample) {
+  DecodedFrame ReadSample(IMFSample* sample) {
     LONGLONG time;
     Require(sample->GetSampleTime(&time), "Decoded sample has no PTS");
     const MediaTimestamp pts{time, PresentationTimescale()};
+    if (device_) {
+      LONGLONG duration = 0;
+      const auto timed = SUCCEEDED(sample->GetSampleDuration(&duration)) ?
+          std::optional(MediaTimestamp{duration, PresentationTimescale()}) : std::nullopt;
+      auto image = RetainVideoSample(*sample, device_, VideoOutputFormat(), pts, timed);
+      if (!image.Succeeded()) throw MfFailure{image.Error()};
+      return DecodedFrame{std::move(image).Value()};
+    }
     ComPtr<IMFMediaBuffer> buffer;
     Require(sample->ConvertToContiguousBuffer(&buffer), "Cannot access decoded CPU bytes");
     DWORD size;
@@ -241,12 +261,9 @@ private:
       audio_timing_.pop_front();
       return DecodedFrame{std::move(result).Value()};
     }
-    VideoFormat format;
-    Require(MFGetAttributeSize(output_type_.Get(), MF_MT_FRAME_SIZE, &format.width, &format.height), "Decoded geometry is missing");
-    format.visible = {0, 0, format.width, format.height};
+    const auto format = VideoOutputFormat();
     const auto output = std::get<VideoDecoderConfig>(config_).output;
     const auto component = output == VideoPixelFormat::P010 ? 2u : 1u;
-    format.pixel_format = output == VideoPixelFormat::P010 ? VideoPixelFormat::P010 : VideoPixelFormat::NV12;
     const auto row = (format.width + 1) / 2 * 2 * component;
     const auto raw_stride = MFGetAttributeUINT32(output_type_.Get(), MF_MT_DEFAULT_STRIDE, row);
     const auto stride = static_cast<LONG>(raw_stride);
@@ -254,6 +271,19 @@ private:
     const auto ysize = std::size_t(stride) * format.height;
     const auto csize = std::size_t(stride) * ((format.height + 1) / 2);
     if (ysize > size || csize > size - ysize) throw MfFailure{Error(CodecErrorCode::InvalidData, "YUV planes exceed output bytes")};
+    LONGLONG duration;
+    const auto timed = SUCCEEDED(sample->GetSampleDuration(&duration)) ? std::optional(MediaTimestamp{duration, PresentationTimescale()}) : std::nullopt;
+    auto result = CopyVideo(format, pts, timed, {{data.Slice(0, ysize), std::size_t(stride), component},
+        {data.Slice(ysize, csize), std::size_t(stride), component * 2}}, output);
+    if (!result.Succeeded()) throw MfFailure{result.Error()};
+    return DecodedFrame{std::move(result).Value()};
+  }
+  VideoFormat VideoOutputFormat() const {
+    VideoFormat format;
+    Require(MFGetAttributeSize(output_type_.Get(), MF_MT_FRAME_SIZE, &format.width, &format.height), "Decoded geometry is missing");
+    format.visible = {0, 0, format.width, format.height};
+    const auto layout = std::get<VideoDecoderConfig>(config_).output;
+    format.pixel_format = layout == VideoPixelFormat::P010 ? VideoPixelFormat::P010 : VideoPixelFormat::NV12;
     UINT32 aspect_width, aspect_height;
     if (SUCCEEDED(MFGetAttributeRatio(output_type_.Get(), MF_MT_PIXEL_ASPECT_RATIO, &aspect_width, &aspect_height))) {
       format.aspect_width = aspect_width; format.aspect_height = aspect_height;
@@ -266,16 +296,13 @@ private:
       format.visible = {UINT32(area.OffsetX.value), UINT32(area.OffsetY.value), UINT32(area.Area.cx), UINT32(area.Area.cy)};
     }
     ReadMediaFoundationVideoColor(output_type_.Get(), format);
-    LONGLONG duration;
-    const auto timed = SUCCEEDED(sample->GetSampleDuration(&duration)) ? std::optional(MediaTimestamp{duration, PresentationTimescale()}) : std::nullopt;
-    auto result = CopyVideo(format, pts, timed, {{data.Slice(0, ysize), std::size_t(stride), component},
-        {data.Slice(ysize, csize), std::size_t(stride), component * 2}}, output);
-    if (!result.Succeeded()) throw MfFailure{result.Error()};
-    return DecodedFrame{std::move(result).Value()};
+    return format;
   }
   DecoderConfig config_;
   ComPtr<IMFTransform> decoder_;
   ComPtr<IMFMediaType> output_type_;
+  std::shared_ptr<WindowsVideoDevice> device_;
+  ComPtr<IMFDXGIDeviceManager> device_manager_;
   Bytes parameters_;
   std::deque<LONGLONG> audio_timing_;
   unsigned length_size_ = 4;

@@ -32,6 +32,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
 | Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, and HEVC. See [decoder validation](#media-decoding). | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
 | HEVC encoding and decoding | Main and Main10 adapters for all six platforms. Device and runtime support varies. See the [HEVC matrix](docs/media-codec.md#hevc). | `CodecId::Hevc`, `VideoEncoder`, `VideoDecoder`, and `VideoPixelFormat::P010` |
+| GPU video | SDR H.264 and HEVC Main paths for macOS, Android, iOS, and Windows. Web publishes retained WebCodecs decode output as SDK textures. See [GPU video](docs/gpu-video.md) for device and validation status. | `VideoStorage::Platform`, `VideoFrame::Storage()`, and `MakeExternalTexture()` |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; macOS native tests passed; iOS validation pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; macOS native tests passed; iOS validation pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
@@ -298,8 +299,8 @@ See the [media library guide](docs/media-library.md) and [`media_library.h`](inc
 
 `AudioDecoder` and `VideoDecoder` are move-only sessions with bounded queues. Supply complete access units from a source
 or demuxer. The audio decoder produces mono/stereo S16 or F32 PCM from AAC-LC, Opus, FLAC, or MP3. The video decoder
-produces CPU YUV from length-prefixed H.264 or HEVC. Returned frames own immutable CPU storage and remain readable after
-reset and close.
+produces CPU YUV by default from length-prefixed H.264 or HEVC. macOS, Android, iOS, and Windows can also return
+[retained platform images](docs/gpu-video.md) for SDR video. Returned frames remain valid after reset and close.
 
 - `QueryCapabilities(completion)` discovers candidates and known limits; see [capability queries](docs/media-codec.md#capability-queries).
   The audio decoder also accepts `QueryCapabilities(codec, completion)`.
@@ -326,7 +327,8 @@ See the [six-platform Opus, FLAC, and MP3 matrix](docs/media-codec.md#opus-flac-
 `AudioEncoder` accepts contiguous interleaved S16 mono/stereo PCM at 44.1 or 48 kHz and emits raw AAC-LC packets,
 AudioSpecificConfig, and a final sample summary. `VideoEncoder` emits H.264 or HEVC access units with four-byte NAL
 lengths and a separate `avcC` or `hvcC` description. It takes I420/NV12 for H.264 and HEVC Main, and P010 for
-HEVC Main10. Encoded packets can be written through `MediaMuxer`.
+HEVC Main10. macOS, Android, iOS, and Windows can encode [platform SDR frames](docs/gpu-video.md) with compatible
+codecs. Encoded packets can be written through `MediaMuxer`.
 
 H.264 supports Baseline, Main, and High profiles independently of its B-picture policy: `max_b_frames = 0` forbids B
 pictures, a positive value requests an upper bound, and `std::nullopt` allows platform selection. Defaults are High
@@ -335,8 +337,8 @@ cannot enforce a numeric bound. Use `RequestKeyFrame()` to request a later IDR w
 
 Submit strictly increasing video PTS and drain output in decode order. With B pictures, output PTS can move backward;
 the encoder restores the corresponding input PTS and duration. DTS is present only when reliable platform timing is
-available. Accepted input is copied, and returned packet slices keep output credit across reset and close.
-Continue draining while submitting to avoid filling either bounded queue.
+available. Accepted CPU input is copied and platform images are retained. Returned packet slices keep output credit
+across reset and close. Continue draining while submitting to avoid filling either bounded queue.
 
 Linux H.264 encoding requires the installed `x264enc` and `h264parse` plugins. Android video encoding requires API 28+;
 Main/High numeric B-picture bounds require API 29+. Apple supports zero or automatic B pictures and has independent
@@ -446,6 +448,11 @@ The Frames tab decodes files through `MediaDemuxer` and `DecodedPlayback`. Local
 can use a seek index to restart the decoders and replace the texture for each playback epoch. Effective track ranges
 limit visible pictures and PCM to the intersection of sample coverage and edits. The bundled file has reordered H.264
 pictures, uneven frame intervals, and AAC priming. The Frames preview can also present rotated SDR HEVC when the selected decoder exposes CPU I420, NV12, or P010.
+
+On macOS, Android, iOS, and supported Windows setups, switch **CPU video** to **GPU video** to preview SDR frames on the GPU.
+Android can send the selected picture directly to `SurfaceStreamTexture`. **Encode half-size MP4** uses retained frames,
+GPU scaling, and platform encoder input, then reopens the result for the same Save Movie flow.
+See the [frame storage contract and GPU performance comparison](docs/gpu-video.md).
 
 “Open audio” reuses the Frames controls for Ogg Opus, audio in WebM/MKA, native FLAC, MP3, and M4A. It plays decoded PCM
 and supports repeated seeks, including across chained Ogg links. Sequential preview and WAV export also work with

@@ -6,16 +6,21 @@
 
 #if defined(__ANDROID__)
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
 #include <huxerui/android/external_texture.h>
+#include "media_video_android.h"
 #elif defined(__APPLE__) && TARGET_OS_OSX
 #include <CoreVideo/CoreVideo.h>
 #include <huxerui/macos/external_texture.h>
+#include "media_video_macos.h"
 #elif defined(__EMSCRIPTEN__)
 #include <emscripten.h>
 #include <huxerui/web/external_texture.h>
 #elif defined(_WIN32)
 #include <huxerui/windows/external_texture.h>
+#include "media_video_windows.h"
 #elif defined(__linux__)
 #include <huxerui/linux/external_texture.h>
 #endif
@@ -38,7 +43,7 @@ unsigned Sample(const VideoPlane& plane, unsigned x, unsigned y, bool ten_bit, u
 } // namespace
 
 Bytes ConvertFramePixels(const VideoFrame& frame) {
-  if (!frame.Validate()) throw std::runtime_error("Invalid VideoFrame");
+  if (frame.Storage() != VideoStorage::Cpu || !frame.Validate()) throw std::runtime_error("Expected a CPU video frame");
   if (frame.format.transfer == ColorTransfer::PQ || frame.format.transfer == ColorTransfer::HLG)
     throw std::runtime_error("HDR frames require an HDR display path");
   const auto matrix = frame.format.matrix == ColorMatrix::Unknown ? ColorMatrix::BT601 : frame.format.matrix;
@@ -135,6 +140,13 @@ private:
   bool current_ = false;
 };
 
+void PublishGl(ExternalTexture& texture, GLuint name, unsigned width, unsigned height) {
+  using Texture = huxerui::android::GlTexture;
+  if (glGetError() != GL_NO_ERROR) throw std::runtime_error("Cannot prepare the video texture");
+  static_cast<Texture&>(texture).PublishCurrent({name, int(width), int(height), -1,
+      Texture::Origin::TopLeft, Texture::Alpha::Opaque});
+}
+
 void Upload(ExternalTexture& texture, const Bytes& pixels, unsigned width, unsigned height) {
   UploadContext context;
   context.Open();
@@ -143,9 +155,47 @@ void Upload(ExternalTexture& texture, const Bytes& pixels, unsigned width, unsig
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-  if (glGetError() != GL_NO_ERROR) throw std::runtime_error("Cannot upload the RGBA frame");
-  static_cast<android::GlTexture&>(texture).PublishCurrent({context.name, int(width), int(height), -1,
-      android::GlTexture::Origin::TopLeft, android::GlTexture::Alpha::Opaque});
+  PublishGl(texture, context.name, width, height);
+}
+
+void PublishPlatformFrame(ExternalTexture& texture, const VideoFrame& frame) {
+  if (dynamic_cast<huxerui::android::SurfaceStreamTexture*>(&texture)) {
+    Require(media::detail::PresentSurfaceFrame(frame));
+    return;
+  }
+  UploadContext context;
+  context.Open();
+  const auto client = reinterpret_cast<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>(eglGetProcAddress("eglGetNativeClientBufferANDROID"));
+  const auto create = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
+  const auto destroy = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(eglGetProcAddress("eglDestroyImageKHR"));
+  const auto bind = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+  const auto buffer = media::detail::HardwareBuffer(frame);
+  if (!buffer || !client || !create || !destroy || !bind) throw std::runtime_error("Cannot import the scaled Android image");
+  const auto display = eglGetCurrentDisplay();
+  const EGLint attributes[]{EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+  const auto image = create(display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, client(buffer), attributes);
+  if (image == EGL_NO_IMAGE_KHR) throw std::runtime_error("Cannot create the Android preview image");
+  const auto release = [display, destroy](EGLImageKHR value) { destroy(display, value); };
+  const std::unique_ptr<std::remove_pointer_t<EGLImageKHR>, decltype(release)> lease(image, release);
+  GLuint source = 0, framebuffer = 0;
+  glGenTextures(1, &source);
+  glBindTexture(GL_TEXTURE_2D, source);
+  bind(GL_TEXTURE_2D, image);
+  glGenFramebuffers(1, &framebuffer);
+  glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
+  const bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  if (complete) {
+    // The SDK exports a new EGL image, which requires a texture with its own storage.
+    glGenTextures(1, &context.name);
+    glBindTexture(GL_TEXTURE_2D, context.name);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 0, 0, frame.format.width, frame.format.height, 0);
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  glDeleteFramebuffers(1, &framebuffer);
+  glDeleteTextures(1, &source);
+  if (!complete) throw std::runtime_error("Cannot attach the scaled Android preview image");
+  PublishGl(texture, context.name, frame.format.width, frame.format.height);
 }
 #else
 void Upload(ExternalTexture& texture, const Bytes& pixels, unsigned width, unsigned height) {
@@ -178,20 +228,30 @@ void Upload(ExternalTexture& texture, const Bytes& pixels, unsigned width, unsig
     }
   }
   CVPixelBufferUnlockBaseAddress(buffer, 0);
-  static_cast<macos::PixelBufferTexture&>(texture).Publish(buffer);
+  static_cast<huxerui::macos::PixelBufferTexture&>(texture).Publish(buffer);
+}
+
+void PublishPlatformFrame(ExternalTexture& texture, const VideoFrame& frame) {
+  const auto buffer = huxerui::media::macos::PixelBuffer(frame);
+  if (!buffer) throw std::runtime_error("Cannot import the scaled macOS image");
+  static_cast<huxerui::macos::PixelBufferTexture&>(texture).Publish(buffer);
 }
 #endif
 } // namespace
 
-std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size) {
+std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size, VideoStorage) {
 #if defined(__ANDROID__)
-  return std::make_shared<android::GlTexture>(size);
+  return std::make_shared<huxerui::android::GlTexture>(size);
 #else
-  return std::make_shared<macos::PixelBufferTexture>(size);
+  return std::make_shared<huxerui::macos::PixelBufferTexture>(size);
 #endif
 }
 
 void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
+  if (frame.Storage() == VideoStorage::Platform) {
+    PublishPlatformFrame(texture, frame);
+    return;
+  }
   const auto [width, height] = DisplayDimensions(frame.format.visible, frame.format.rotation);
   Upload(texture, ConvertFramePixels(frame), width, height);
 }
@@ -211,7 +271,7 @@ EM_JS(emscripten::EM_VAL, CreatePreviewVideoFrame,
 
 } // namespace
 
-std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size) {
+std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size, VideoStorage) {
   if (emscripten::val::global("VideoFrame").isUndefined())
     throw std::runtime_error("Web VideoFrame requires a supported browser and a secure context");
   return std::make_shared<web::VideoFrameTexture>(size);
@@ -244,11 +304,20 @@ namespace pixel_platform = huxerui::windows;
 namespace pixel_platform = huxerui::linux;
 #endif
 
-std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size) {
+std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size, [[maybe_unused]] VideoStorage storage) {
+#if defined(_WIN32) && !defined(HUXERUI_WINDOWS_7_COMPAT)
+  if (storage == VideoStorage::Platform) return std::make_shared<huxerui::windows::D3D11Texture>(size);
+#endif
   return std::make_shared<pixel_platform::PixelTexture>(size);
 }
 
 void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
+#if defined(_WIN32)
+  if (frame.Storage() == VideoStorage::Platform) {
+    Require(media::detail::PublishWindowsVideo(texture, frame));
+    return;
+  }
+#endif
   const auto pixels = ConvertFramePixels(frame);
   const auto [width, height] = DisplayDimensions(frame.format.visible, frame.format.rotation);
   static_cast<pixel_platform::PixelTexture&>(texture).Publish({
@@ -257,6 +326,6 @@ void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
       .format = pixel_platform::PixelFormat::Rgba8888, .pixels = pixels});
 }
 #elif !defined(__APPLE__) || !TARGET_OS_IOS
-std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size) { return {}; }
+std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size, VideoStorage) { return {}; }
 #endif
 } // namespace media_preview

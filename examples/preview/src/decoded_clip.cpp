@@ -1,9 +1,15 @@
 #include "decoded_preview.h"
+#include "video_frame_transformer.h"
 
 #include <fixture_resources.h>
 #include <huxerui/media_codec.h>
 #include <huxerui/media_container.h>
 #include <huxerui/media_playback.h>
+
+#ifdef __ANDROID__
+#include "media_video_android.h"
+#include <huxerui/platform_registry.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -267,12 +273,13 @@ AudioFormat PlaybackFormat(const MediaTrack& track) {
           track.channel_count == 1 ? AudioChannelLayout::Mono : AudioChannelLayout::Stereo};
 }
 
-VideoDecoderConfig VideoConfig(const MediaTrack& track) {
+VideoDecoderConfig VideoConfig(const MediaTrack& track, VideoStorage storage) {
   VideoDecoderConfig video_config;
   video_config.codec = track.codec;
   video_config.initialization_data = track.initialization_data;
   video_config.width = *track.coded_width;
   video_config.height = *track.coded_height;
+  video_config.output_storage = storage;
   if (track.codec == CodecId::H264) {
     video_config.width = (video_config.width + 15) & ~15u;
     video_config.height = (video_config.height + 15) & ~15u;
@@ -286,7 +293,12 @@ VideoDecoderConfig VideoConfig(const MediaTrack& track) {
     throw std::runtime_error("The preview supports coded dimensions up to 8192 pixels");
   const auto luma = std::size_t(video_config.width) * video_config.height;
   const auto chroma = std::size_t((video_config.width + 1) / 2) * ((video_config.height + 1) / 2);
-  const auto frame_bytes = (luma + 2 * chroma) * (video_config.output == VideoPixelFormat::P010 ? 2 : 1);
+#ifdef __ANDROID__
+  if (storage == VideoStorage::Platform && video_config.output != VideoPixelFormat::P010)
+    video_config.output = VideoPixelFormat::Opaque;
+#endif
+  const auto frame_bytes = video_config.output == VideoPixelFormat::Opaque ? luma * 4 :
+      (luma + 2 * chroma) * (video_config.output == VideoPixelFormat::P010 ? 2 : 1);
   video_config.limits.output_bytes = std::max(video_config.limits.output_bytes, 34 * frame_bytes);
   return video_config;
 }
@@ -365,12 +377,27 @@ Task<std::shared_ptr<const File>> StageClip(File temporary, std::optional<FileRe
   co_return file;
 }
 
-Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls) {
+Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls, VideoStorage storage) {
   auto clip = co_await OnFileThread([file] { return ClipInput(file); });
   const auto& video_track = clip.video->track;
   const auto video_range = clip.video->PresentationRange();
-  const auto video_config = VideoConfig(video_track);
-  auto video = Require(VideoDecoder::Create(video_config));
+  const auto coded = VideoRectangle{0, 0, *video_track.coded_width, *video_track.coded_height};
+  const auto visible = video_track.visible.value_or(coded);
+  const auto aspect = video_track.pixel_aspect_ratio.value_or(MediaTrack::PixelAspectRatio{});
+  auto size = PresentationSize(visible, video_track.rotation, double(aspect.width) / aspect.height);
+  const auto video_config = VideoConfig(video_track, storage);
+  std::shared_ptr<ExternalTexture> surface;
+  auto video = [&] {
+#ifdef __ANDROID__
+    if (video_config.output == VideoPixelFormat::Opaque && visible == coded && video_track.rotation == VideoRotation::None) {
+      auto preview = OpenPlatformModule<media::detail::SurfacePreview>(media::detail::surface_preview_type,
+          media::detail::SurfacePreviewOptions{video_config, size});
+      surface = std::move(preview.texture);
+      return std::move(preview.decoder);
+    }
+#endif
+    return Require(VideoDecoder::Create(video_config));
+  }();
   std::optional<AudioDecoder> audio;
   std::optional<AudioPlaybackConfig> audio_playback;
   if (clip.audio) {
@@ -388,18 +415,23 @@ Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls
   }
   auto playback = Require(DecodedPlayback::Create({.audio = std::move(audio_playback), .video = true}));
   auto epoch = playback.Epoch();
-  const auto visible = video_track.visible.value_or(VideoRectangle{0, 0, *video_track.coded_width, *video_track.coded_height});
-  const auto aspect = video_track.pixel_aspect_ratio.value_or(MediaTrack::PixelAspectRatio{});
-  auto size = PresentationSize(visible, video_track.rotation, double(aspect.width) / aspect.height);
-  controls.reset_video(size);
+  controls.reset_video(size, surface);
+  media::detail::VideoFrameTransformer transformer;
   const auto publish = [&](const VideoFrame& frame) {
     const auto& format = frame.format;
     const auto frame_size = PresentationSize(format.visible, format.rotation, double(format.aspect_width) / format.aspect_height);
     if (size != frame_size) {
       size = frame_size;
-      controls.reset_video(size);
+      controls.reset_video(size, surface);
     }
-    controls.publish(frame);
+    if (frame.Storage() == VideoStorage::Platform && !surface) {
+      const auto [width, height] = DisplayDimensions(format.visible, format.rotation);
+      const auto scale = std::min(1.0, 640.0 / std::max(width, height));
+      controls.publish(Require(transformer.Transform(frame, std::max(2u, unsigned(width * scale) & ~1u),
+          std::max(2u, unsigned(height * scale) & ~1u))));
+    } else {
+      controls.publish(frame);
+    }
   };
   auto target = TimeAt(0);
   bool running = true, playing = true;
@@ -435,7 +467,7 @@ Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls
       Require(video.Reset());
       if (audio) Require(audio->Reset());
       epoch = Require(playback.Reset());
-      controls.reset_video(size);
+      controls.reset_video(size, surface);
       playing = !controls.paused();
       if (playing) Require(playback.Play());
       running = true;
@@ -621,6 +653,7 @@ struct ExportQueue {
 
 struct DecodeOrder {
   std::uint32_t scale;
+  std::uint32_t source_scale;
   bool ordered_pts = false;
   std::optional<ContainerPacket> pending;
   std::int64_t first_dts = 0;
@@ -631,6 +664,10 @@ struct DecodeOrder {
       if (!packet.pts || (pending && packet.pts->Compare(*pending->pts) <= 0))
         throw std::runtime_error("MP4 export cannot use presentation timestamps for reordered video without DTS");
       packet.dts = packet.pts;
+    } else if (packet.dts && source_scale < packet.dts->timescale) {
+      // Recover a source-clock tick only if it rounds back to the encoder's reported tick.
+      const auto exact = packet.dts->Rescale(source_scale);
+      if (exact && exact->Rescale(packet.dts->timescale) == packet.dts) packet.dts = exact;
     }
     if (!packet.dts || !packet.duration) throw std::runtime_error("MP4 export requires explicit DTS and duration");
     const auto dts = Ticks(*packet.dts, scale);
@@ -658,6 +695,15 @@ struct ExportTrack {
   static constexpr bool Audio = std::is_same_v<Decoder, AudioDecoder>;
   ExportTrack(std::shared_ptr<TrackInput> source, Decoder decoder)
       : source(std::move(source)), decoder(std::move(decoder)) {}
+
+  VideoFrame PrepareVideo(VideoFrame frame) {
+    if (frame.Storage() == VideoStorage::Cpu) return EncoderInput(std::move(frame));
+    const auto area = frame.format.visible;
+    auto scaled = Require(transformer.Transform(frame, std::max(2u, (area.width / 2) & ~1u),
+        std::max(2u, (area.height / 2) & ~1u)));
+    scaled.format.aspect_width = scaled.format.aspect_height = 1;
+    return scaled;
+  }
 
   Task<bool> Pump() {
     if (queue.packet || queue.ended) co_return false;
@@ -710,6 +756,9 @@ struct ExportTrack {
           VideoEncoderConfig config;
           config.input = frames.front().format;
           config.codec = source->track.codec;
+          config.input_storage = frames.front().Storage();
+          if (config.input_storage == VideoStorage::Platform)
+            config.bitrate = std::max(config.bitrate, config.input.width * config.input.height * 4u);
           config.profile = decode_order ? H264Profile::High : H264Profile::Baseline;
           config.max_b_frames = decode_order ? std::nullopt : std::optional<std::uint32_t>{0};
           encoder.emplace(Require(VideoEncoder::Create(config)));
@@ -741,7 +790,7 @@ struct ExportTrack {
             const auto scale = source->track.timescale.value_or(90000);
             const auto first = Ticks(lookahead->pts, scale), second = Ticks(next->pts, scale);
             lookahead->duration = MediaTimestamp{PositiveDistance(second, first), scale};
-            frames.push_back(EncoderInput(std::move(*lookahead)));
+            frames.push_back(PrepareVideo(std::move(*lookahead)));
           } else if (source->track.pixel_aspect_ratio || next->format.aspect_width != next->format.aspect_height) {
             pixel_aspect_ratio = MediaTrack::PixelAspectRatio{next->format.aspect_width, next->format.aspect_height};
           }
@@ -752,7 +801,7 @@ struct ExportTrack {
           if (lookahead) {
             if (!lookahead->duration || lookahead->duration->ticks <= 0)
               throw std::runtime_error("The final picture needs a positive duration");
-            frames.push_back(EncoderInput(std::move(*lookahead)));
+            frames.push_back(PrepareVideo(std::move(*lookahead)));
             lookahead.reset();
           }
         }
@@ -768,6 +817,7 @@ struct ExportTrack {
   std::optional<Encoder> encoder;
   PacketFeed feed;
   ExportQueue queue;
+  media::detail::VideoFrameTransformer transformer;
   std::optional<DecodeOrder> decode_order;
   std::deque<FrameType> frames;
   std::optional<FrameType> lookahead;
@@ -787,12 +837,13 @@ Task<std::shared_ptr<const File>> CopyClip(std::shared_ptr<const File> file, Fil
   co_return copy->output;
 }
 
-Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, File temporary, bool reorder) {
+Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, File temporary, bool reorder,
+    VideoStorage storage) {
   auto clip = co_await OnFileThread([file] { return ClipInput(file); });
   if (const auto range = clip.video->PresentationRange(); range && range->start == range->end)
     throw std::runtime_error("The video edit contains no pictures to export");
   ExportTrack<VideoDecoder, VideoEncoder, VideoFrame> video(
-      clip.video, Require(VideoDecoder::Create(VideoConfig(clip.video->track))));
+      clip.video, Require(VideoDecoder::Create(VideoConfig(clip.video->track, storage))));
   bool ordered_pts = false;
 #if defined(__EMSCRIPTEN__)
   ordered_pts = clip.video->track.codec == CodecId::Hevc;
@@ -802,7 +853,7 @@ Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, F
   const auto clock = clip.video->track.timescale.value_or(90000);
   if (ordered_pts || reorder)
     video.decode_order.emplace(DecodeOrder{.scale = ordered_pts ? clock : CommonClock(clock, 1000000),
-        .ordered_pts = ordered_pts});
+        .source_scale = clock, .ordered_pts = ordered_pts});
   std::optional<ExportTrack<AudioDecoder, AudioEncoder, AudioFrame>> audio;
   ExportQueue audio_copy;
   if (clip.audio) {

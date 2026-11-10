@@ -28,8 +28,15 @@ inline constexpr bool frame_texture_supported = true;
 inline constexpr bool frame_texture_supported = false;
 #endif
 
+#if defined(__ANDROID__) || (defined(_WIN32) && !defined(HUXERUI_WINDOWS_7_COMPAT)) || (defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS))
+inline constexpr bool gpu_video_supported = true;
+#else
+inline constexpr bool gpu_video_supported = false;
+#endif
+
 // Creates a texture for one preview run; publication copies or retains pixels through the public SDK.
-std::shared_ptr<huxerui::ExternalTexture> MakeFrameTexture(huxerui::Size size);
+std::shared_ptr<huxerui::ExternalTexture> MakeFrameTexture(huxerui::Size size,
+    huxerui::media::VideoStorage storage = huxerui::media::VideoStorage::Cpu);
 // Copies the visible CPU YUV region into owned RGBA bytes using the preview's SDR color policy.
 huxerui::Bytes ConvertFramePixels(const huxerui::media::VideoFrame& frame);
 inline std::pair<unsigned, unsigned> DisplayDimensions(
@@ -50,7 +57,7 @@ inline std::shared_ptr<PreviewAudioUse> RetainPreviewAudioSession(bool) { return
 #endif
 
 struct ClipControls {
-  std::function<void(huxerui::Size)> reset_video;
+  std::function<void(huxerui::Size, const std::shared_ptr<huxerui::ExternalTexture>&)> reset_video;
   std::function<void(const huxerui::media::VideoFrame&)> publish;
   std::function<bool()> paused;
   std::function<std::optional<float>()> take_seek;
@@ -84,7 +91,8 @@ std::shared_ptr<const huxerui::File> TemporaryFile(const huxerui::File& director
 huxerui::Task<std::shared_ptr<const huxerui::File>> StageClip(
     huxerui::File temporary, std::optional<huxerui::FileReference> selected,
     std::shared_ptr<huxerui::Resources> resources);
-huxerui::Task<void> PlayContainer(std::shared_ptr<const huxerui::File> file, ClipControls controls);
+huxerui::Task<void> PlayContainer(std::shared_ptr<const huxerui::File> file, ClipControls controls,
+    huxerui::media::VideoStorage storage = huxerui::media::VideoStorage::Cpu);
 huxerui::Task<void> PlayAudio(std::shared_ptr<const huxerui::File> file, ClipControls controls);
 huxerui::Task<std::shared_ptr<const huxerui::File>> CopyAudioClip(
     std::shared_ptr<const huxerui::File> file, huxerui::File temporary);
@@ -94,5 +102,6 @@ huxerui::Task<std::shared_ptr<const huxerui::File>> CopyClip(
     std::shared_ptr<const huxerui::File> file, huxerui::File temporary,
     std::optional<huxerui::media::ContainerFormat> format = {});
 huxerui::Task<std::shared_ptr<const huxerui::File>> ExportClip(
-    std::shared_ptr<const huxerui::File> file, huxerui::File temporary, bool reorder = false);
+    std::shared_ptr<const huxerui::File> file, huxerui::File temporary, bool reorder = false,
+    huxerui::media::VideoStorage storage = huxerui::media::VideoStorage::Cpu);
 }

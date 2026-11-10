@@ -119,20 +119,28 @@ struct Observations {
   bool paused = false;
 };
 
-TaskHandle Play(const TaskScope& tasks, std::shared_ptr<const File> file, Observations& seen, std::exception_ptr& error) {
-  return tasks.Launch([file = std::move(file), &seen, &error]() -> Task<void> {
+TaskHandle Play(const TaskScope& tasks, std::shared_ptr<const File> file, Observations& seen, std::exception_ptr& error,
+    VideoStorage storage = VideoStorage::Cpu) {
+  return tasks.Launch([file = std::move(file), &seen, &error, storage]() -> Task<void> {
     try {
+      std::shared_ptr<ExternalTexture> texture;
       co_await media_preview::PlayContainer(file, {
-          .reset_video = [&](Size size) {
+          .reset_video = [&](Size size, const std::shared_ptr<ExternalTexture>& surface) {
+            if (storage == VideoStorage::Platform) texture = surface ? surface : media_preview::MakeFrameTexture(size, storage);
             seen.size = size;
             seen.first_frame.reset();
             ++seen.epoch;
           },
           .publish = [&](const VideoFrame& frame) {
             if (!seen.first_frame) {
-              Check(frame.Validate(), "Preview published invalid frame planes");
-              const auto pixels = media_preview::ConvertFramePixels(frame);
-              Check(!pixels.empty(), "Preview could not convert the decoded picture");
+              Check(frame.Validate() && frame.Storage() == storage,
+                    "Preview published invalid frame storage");
+              if (texture) {
+                media_preview::PublishFrame(*texture, frame);
+                Check(texture->Revision() == 1, "The GPU preview did not publish its first image");
+              } else {
+                Check(!media_preview::ConvertFramePixels(frame).empty(), "Preview could not convert the decoded picture");
+              }
               seen.first_frame = frame.pts;
               seen.first_duration = frame.duration;
               seen.format = frame.format;
@@ -144,7 +152,7 @@ TaskHandle Play(const TaskScope& tasks, std::shared_ptr<const File> file, Observ
             seen.position = position;
             seen.duration = duration;
           },
-      });
+      }, storage);
     } catch (...) { error = std::current_exception(); }
   });
 }
@@ -165,7 +173,8 @@ void Until(testing::UiTest& ui, const std::exception_ptr& failure, Condition con
   Check(condition(), error);
 }
 
-void CheckExport(const File& source, const File& output, std::int64_t audio_samples, bool reorder = false) {
+void CheckExport(const File& source, const File& output, std::int64_t audio_samples, bool reorder = false,
+    VideoStorage storage = VideoStorage::Cpu) {
   auto input = Require(MediaDemuxer::Open(Require(source.OpenRandomAccess())));
   auto exported = Require(MediaDemuxer::Open(Require(output.OpenRead())));
   Check(exported.Format() == ContainerFormat::Mp4 && exported.Tracks().size() == 2,
@@ -177,8 +186,12 @@ void CheckExport(const File& source, const File& output, std::int64_t audio_samp
   const auto source_video = std::ranges::find(input.Tracks(), TrackKind::Video, &MediaTrack::kind);
   Check(source_video != input.Tracks().end() && source_video->coded_width && source_video->coded_height,
         "The source has no coded video dimensions");
-  const auto expected = source_video->visible.value_or(
+  auto expected = source_video->visible.value_or(
       VideoRectangle{0, 0, *source_video->coded_width, *source_video->coded_height});
+  if (storage == VideoStorage::Platform) {
+    expected.width = std::max(2u, (expected.width / 2) & ~1u);
+    expected.height = std::max(2u, (expected.height / 2) & ~1u);
+  }
   const auto actual = video->visible.value_or(VideoRectangle{0, 0, *video->coded_width, *video->coded_height});
   Check(actual == VideoRectangle{0, 0, expected.width, expected.height}, "Export lost the source's visible area");
   Check(video->pixel_aspect_ratio == source_video->pixel_aspect_ratio, "Export changed the display aspect ratio");
@@ -223,13 +236,14 @@ std::optional<ContainerPacket> ReadPacket(MediaDemuxer& demux) {
 }
 
 std::shared_ptr<const File> RunMovieExport(const TaskScope& tasks, testing::UiTest& ui, const File& temporary,
-    std::shared_ptr<const File> input, std::optional<ContainerFormat> copy, bool reorder = false) {
+    std::shared_ptr<const File> input, std::optional<ContainerFormat> copy, bool reorder = false,
+    VideoStorage storage = VideoStorage::Cpu) {
   std::shared_ptr<const File> output;
   std::exception_ptr failure;
   const auto exporting = tasks.Launch([&, input = std::move(input)]() -> Task<void> {
     try {
       if (copy) output = co_await media_preview::CopyClip(input, temporary, copy);
-      else output = co_await media_preview::ExportClip(input, temporary, reorder);
+      else output = co_await media_preview::ExportClip(input, temporary, reorder, storage);
     } catch (...) { failure = std::current_exception(); }
   });
   try {
@@ -319,15 +333,19 @@ void CheckAudioCopy(const TaskScope& tasks, testing::UiTest& ui, const File& tem
   }
 }
 
-#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && TARGET_OS_IOS)
+#if defined(__EMSCRIPTEN__) || defined(__APPLE__)
 void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+  constexpr auto storage = media_preview::gpu_video_supported ? VideoStorage::Platform : VideoStorage::Cpu;
   const auto input = Fixture("preview-hevc-main.mp4");
   auto source = media_preview::Open(*input);
   const auto& track = source.Tracks().front();
   VideoDecoderConfig decode{.initialization_data = track.initialization_data,
-      .width = *track.coded_width, .height = *track.coded_height, .codec = CodecId::Hevc};
+      .width = *track.coded_width, .height = *track.coded_height, .codec = CodecId::Hevc, .output_storage = storage};
+  const auto width = storage == VideoStorage::Platform ? (*track.coded_width / 2) & ~1u : *track.coded_width;
+  const auto height = storage == VideoStorage::Platform ? (*track.coded_height / 2) & ~1u : *track.coded_height;
   VideoEncoderConfig encode;
-  encode.input = {*track.coded_width, *track.coded_height, {0, 0, *track.coded_width, *track.coded_height}};
+  encode.input = {width, height, {0, 0, width, height}};
+  encode.input_storage = storage;
   encode.max_b_frames = std::nullopt;
   encode.codec = CodecId::Hevc;
   const auto supported = [&](const auto& config, auto probe) {
@@ -345,11 +363,30 @@ void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File
     std::cout << "HEVC Main preview export skipped for an unavailable codec\n";
     return;
   }
-  const auto output = RunMovieExport(tasks, ui, temporary, input, {}, media_preview::preview_reordered_export);
+  if constexpr (media_preview::gpu_video_supported) {
+    Observations seen;
+    std::exception_ptr failure;
+    const auto preview = Play(tasks, input, seen, failure, storage);
+    Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.15F; }, "HEVC GPU preview did not start");
+    preview.Cancel();
+    ui.Pump();
+  }
+  const auto output = RunMovieExport(tasks, ui, temporary, input, {}, media_preview::preview_reordered_export, storage);
   auto result = media_preview::Open(*output);
   const auto& encoded = result.Tracks().front();
-  Check(encoded.codec == CodecId::Hevc && encoded.sample_entry == "hvc1" &&
-        source.PresentationRange(track.id) == result.PresentationRange(encoded.id), "HEVC export lost its format or timeline");
+  Check(encoded.codec == CodecId::Hevc && encoded.sample_entry == "hvc1", "HEVC export changed its format");
+  const auto source_range = source.PresentationRange(track.id), result_range = result.PresentationRange(encoded.id);
+  if (source_range && result_range && source_range != result_range) {
+    const auto print = [](const MediaPresentationRange& range) {
+      std::cerr << range.start.ticks << '/' << range.start.timescale << " to "
+                << range.end.ticks << '/' << range.end.timescale << '\n';
+    };
+    print(*source_range);
+    print(*result_range);
+  }
+  Check(source_range == result_range, "HEVC export changed its presentation range");
+  const auto visible = encoded.visible.value_or(VideoRectangle{0, 0, *encoded.coded_width, *encoded.coded_height});
+  Check(visible == VideoRectangle{0, 0, width, height}, "HEVC export changed the requested visible dimensions");
   std::vector<MediaTimestamp> expected_pts, actual_pts;
   while (const auto packet = ReadPacket(source)) expected_pts.push_back(*packet->pts);
   std::optional<MediaTimestamp> last_dts;
@@ -475,8 +512,10 @@ int main(int argc, char** argv) {
     CheckAudioCopy(tasks, ui, temporary, "tagged-mp3.mp3");
     CheckAudioCopy(tasks, ui, temporary, "tagged-aac.m4a");
     CheckAudioCopy(tasks, ui, temporary, "fragmented-aac.m4a");
-#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && TARGET_OS_IOS)
+#if defined(__EMSCRIPTEN__) || defined(__APPLE__)
     CheckHevcMainExport(tasks, ui, temporary);
+#endif
+#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && TARGET_OS_IOS)
     std::cout << "PASS: Preview export and audio packet copy contracts\n";
 #else
     const auto mp4 = Fixture("preview-avc-aac.mp4");
@@ -503,6 +542,22 @@ int main(int argc, char** argv) {
           "Paused seek advanced the playback clock or showed an earlier frame");
     preview.Cancel();
     ui.Pump();
+
+    if constexpr (media_preview::gpu_video_supported) {
+      seen = {};
+      preview = Play(tasks, mp4, seen, failure, VideoStorage::Platform);
+      Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.15F; }, "GPU preview did not start");
+      for (const auto target : {2.1F, 0.6F}) {
+        const auto epoch = seen.epoch;
+        seen.seek = target;
+        Until(ui, failure, [&] { return seen.epoch > epoch && seen.first_frame && seen.position > target; },
+              "GPU seek did not publish a new picture");
+      }
+      preview.Cancel();
+      ui.Pump();
+      const auto output = RunMovieExport(tasks, ui, temporary, mp4, {}, true, VideoStorage::Platform);
+      CheckExport(*mp4, *output, OriginalSamples, true, VideoStorage::Platform);
+    }
 
     seen = {};
     preview = Play(tasks, Fixture("preview-hevc10.mov"), seen, failure);

@@ -1,4 +1,5 @@
 #include "codec/encoder/backend.h"
+#include "media_video_android.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -171,13 +172,14 @@ public:
     __system_property_get("ro.build.version.sdk", version);
     const auto api = std::strtol(version, nullptr, 10);
     const bool hevc = config.codec == CodecId::Hevc;
+    const bool surface_input = config.input_storage == VideoStorage::Platform;
     const bool ten_bit = config.input.pixel_format == VideoPixelFormat::P010;
     const bool baseline = !hevc && config.profile == H264Profile::Baseline;
     const auto* mime = hevc ? "video/hevc" : "video/avc";
     input_format_ = reinterpret_cast<AMediaFormat* (*)(AMediaCodec*)>(dlsym(RTLD_DEFAULT, "AMediaCodec_getInputFormat"));
     set_parameters_ = reinterpret_cast<media_status_t (*)(AMediaCodec*, const AMediaFormat*)>(dlsym(RTLD_DEFAULT, "AMediaCodec_setParameters"));
     if (api < 28 || !input_format_ || !set_parameters_)
-      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "CPU video encoding requires Android API 28 or later"));
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Video encoding requires Android API 28 or later"));
     if (ten_bit && api < 33)
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "P010 encoding requires Android API 33 or later"));
     if (api < 29 && !baseline && config.max_b_frames)
@@ -190,15 +192,19 @@ public:
     AMediaFormat_setString(format, "mime", mime);
     AMediaFormat_setInt32(format, "width", config.input.width); AMediaFormat_setInt32(format, "height", config.input.height);
     const auto row = config.input.width * (ten_bit ? 2 : 1);
-    AMediaFormat_setInt32(format, "color-format", ten_bit ? 54 : 21);
-    AMediaFormat_setInt32(format, "stride", row); AMediaFormat_setInt32(format, "slice-height", config.input.height);
+    if (surface_input) {
+      AMediaFormat_setInt32(format, "color-format", 0x7f000789);
+    } else {
+      AMediaFormat_setInt32(format, "color-format", ten_bit ? 54 : 21);
+      AMediaFormat_setInt32(format, "stride", row); AMediaFormat_setInt32(format, "slice-height", config.input.height);
+    }
     AMediaFormat_setInt32(format, "bitrate", config.bitrate);
     AMediaFormat_setFloat(format, "frame-rate", float(config.frame_rate_numerator) / config.frame_rate_denominator);
     AMediaFormat_setFloat(format, "i-frame-interval", float(config.key_frame_interval) * config.frame_rate_denominator / config.frame_rate_numerator);
     AMediaFormat_setInt32(format, "profile", hevc ? (ten_bit ? 2 : 1) :
         baseline ? 1 : config.profile == H264Profile::Main ? 2 : 8);
     frame_bytes_ = std::size_t(row) * config.input.height * 3 / 2;
-    AMediaFormat_setInt32(format, "max-input-size", static_cast<std::int32_t>(frame_bytes_));
+    if (!surface_input) AMediaFormat_setInt32(format, "max-input-size", static_cast<std::int32_t>(frame_bytes_));
     if (!baseline) {
       if (api >= 29) AMediaFormat_setInt32(format, "max-bframes", VideoEncoderBFrames(config));
       else AMediaFormat_setInt32(format, "latency", config.max_b_frames ? 1 : static_cast<std::int32_t>(VideoEncoderWindow(config) - 1));
@@ -241,8 +247,9 @@ public:
     std::unique_ptr<AMediaFormat, decltype(&AMediaFormat_delete)> actual_owner(actual, AMediaFormat_delete);
     std::int32_t layout = 0, stride = ten_bit ? 0 : row, rows = config.input.height;
     AMediaFormat_getInt32(actual, "stride", &stride); AMediaFormat_getInt32(actual, "slice-height", &rows);
-    if (!AMediaFormat_getInt32(actual, "color-format", &layout) || (ten_bit ? layout != 54 : layout != 19 && layout != 21) ||
-        stride != std::int32_t(row) || rows != std::int32_t(config.input.height))
+    if (!surface_input && (!AMediaFormat_getInt32(actual, "color-format", &layout) ||
+        (ten_bit ? layout != 54 : layout != 19 && layout != 21) ||
+        stride != std::int32_t(row) || rows != std::int32_t(config.input.height)))
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Android video input requires an identifiable packed CPU YUV layout"));
     layout_ = ten_bit ? VideoPixelFormat::P010 : layout == 19 ? VideoPixelFormat::I420 : VideoPixelFormat::NV12;
     std::int32_t latency = 0, max_b = 0;
@@ -251,6 +258,19 @@ public:
     if (config.max_b_frames && *config.max_b_frames && (!AMediaFormat_getInt32(actual, "max-bframes", &max_b) ||
         max_b < 0 || std::uint32_t(max_b) > *config.max_b_frames))
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Android did not confirm the requested B-picture bound"));
+    if (surface_input) {
+      const auto create_surface = reinterpret_cast<media_status_t (*)(AMediaCodec*, ANativeWindow**)>(
+          dlsym(RTLD_DEFAULT, "AMediaCodec_createInputSurface"));
+      surface_eos_ = reinterpret_cast<decltype(surface_eos_)>(dlsym(RTLD_DEFAULT, "AMediaCodec_signalEndOfInputStream"));
+      if (!create_surface || !surface_eos_)
+        return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "MediaCodec encoder surfaces are unavailable"));
+      ANativeWindow* window = nullptr;
+      status = create_surface(codec_, &window);
+      if (status != AMEDIA_OK || !window)
+        return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "MediaCodec rejected its encoder input surface", std::to_string(status)));
+      surface_.reset(window);
+      renderer_ = std::make_unique<AndroidVideoRenderer>(surface_.get());
+    }
     status = AMediaCodec_start(codec_);
     if (status != AMEDIA_OK) return CodecResult<void>::Failure(MediaCodecError(status, "Cannot start video encoder"));
     started_ = true;
@@ -262,6 +282,10 @@ public:
         MediaTimestamp{config_.frame_rate_denominator, config_.frame_rate_numerator}.Rescale(1000000);
     if (!duration || duration->ticks <= 0 || frame.pts.ticks > INT64_MAX - duration->ticks)
       return R::Failure(Error(CodecErrorCode::InvalidData, "Android video input timing exceeds signed bounds"));
+    if (renderer_) {
+      renderer_->DrawToSurface(frame);
+      return R::Success(SubmitStatus::Accepted);
+    }
     const auto index = AMediaCodec_dequeueInputBuffer(codec_, 0);
     if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER) return R::Success(SubmitStatus::WouldBlock);
     if (index < 0) return R::Failure(MediaCodecError(static_cast<media_status_t>(index), "Cannot dequeue video input"));
@@ -343,6 +367,12 @@ public:
     return CodecResult<void>::Success();
   }
   CodecResult<SubmitStatus> Finish() override {
+    if (renderer_) {
+      const auto status = surface_eos_(codec_);
+      if (status != AMEDIA_OK)
+        return CodecResult<SubmitStatus>::Failure(MediaCodecError(status, "Android rejected video Surface EOS"));
+      return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
+    }
     const auto index = AMediaCodec_dequeueInputBuffer(codec_, 0);
     if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER) return CodecResult<SubmitStatus>::Success(SubmitStatus::WouldBlock);
     if (index < 0) return CodecResult<SubmitStatus>::Failure(MediaCodecError(static_cast<media_status_t>(index), "Cannot dequeue video EOS input"));
@@ -352,6 +382,7 @@ public:
   }
   CodecResult<void> Close() override {
     std::optional<CodecError> failure;
+    renderer_.reset();
     if (codec_) {
       if (started_) {
         const auto status = AMediaCodec_stop(codec_);
@@ -360,6 +391,7 @@ public:
       const auto status = AMediaCodec_delete(codec_); codec_ = nullptr;
       if (status != AMEDIA_OK) failure = MediaCodecError(status, "Cannot delete video encoder");
     }
+    surface_.reset();
     pending_.reset(); Bytes{}.swap(partial_);
     return failure ? CodecResult<void>::Failure(*failure) : CodecResult<void>::Success();
   }
@@ -370,10 +402,13 @@ private:
     if (!format) return R::Failure(Error(CodecErrorCode::InvalidData, "Android video output format is missing"));
     std::unique_ptr<AMediaFormat, decltype(&AMediaFormat_delete)> owner(format, AMediaFormat_delete);
     std::int32_t actual = 0;
-    if ((AMediaFormat_getInt32(format, "bitrate", &actual) && actual != std::int32_t(config_.bitrate)) ||
-        (config_.max_b_frames && AMediaFormat_getInt32(format, "output-reorder-depth", &actual) &&
-            (actual < 0 || std::uint32_t(actual) > *config_.max_b_frames)))
-      return R::Failure(Error(CodecErrorCode::Unsupported, "Android changed video rate or reordering controls"));
+    if (AMediaFormat_getInt32(format, "bitrate", &actual) && actual != std::int32_t(config_.bitrate))
+      return R::Failure(Error(CodecErrorCode::Unsupported, "Android changed the requested video bitrate",
+          std::to_string(config_.bitrate) + " to " + std::to_string(actual)));
+    if (config_.max_b_frames && AMediaFormat_getInt32(format, "output-reorder-depth", &actual) &&
+        (actual < 0 || std::uint32_t(actual) > *config_.max_b_frames))
+      return R::Failure(Error(CodecErrorCode::Unsupported, "Android changed the requested video reorder depth",
+          std::to_string(actual)));
     Bytes description;
     for (const char* key : {"csd-0", "csd-1", "csd-2"}) {
       void* data = nullptr; std::size_t size = 0;
@@ -387,6 +422,9 @@ private:
   }
   VideoEncoderConfig config_;
   AMediaCodec* codec_ = nullptr;
+  std::unique_ptr<ANativeWindow, decltype(&ANativeWindow_release)> surface_{nullptr, ANativeWindow_release};
+  std::unique_ptr<AndroidVideoRenderer> renderer_;
+  media_status_t (*surface_eos_)(AMediaCodec*) = nullptr;
   AMediaFormat* (*input_format_)(AMediaCodec*) = nullptr;
   media_status_t (*set_parameters_)(AMediaCodec*, const AMediaFormat*) = nullptr;
   VideoPixelFormat layout_ = VideoPixelFormat::NV12;

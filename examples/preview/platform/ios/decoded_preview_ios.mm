@@ -1,4 +1,5 @@
 #include "decoded_preview.h"
+#include "media_video_ios.h"
 
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
@@ -51,12 +52,18 @@ std::shared_ptr<PreviewAudioUse> RetainPreviewAudioSession(bool activate) {
   return std::make_shared<PreviewAudioUse>(activate);
 }
 
-std::shared_ptr<huxerui::ExternalTexture> MakeFrameTexture(huxerui::Size size) {
+std::shared_ptr<huxerui::ExternalTexture> MakeFrameTexture(huxerui::Size size, huxerui::media::VideoStorage) {
   return std::make_shared<huxerui::ios::PixelBufferTexture>(size);
 }
 
 void PublishFrame(huxerui::ExternalTexture& texture, const huxerui::media::VideoFrame& frame) {
   @autoreleasepool {
+    if (frame.Storage() == huxerui::media::VideoStorage::Platform) {
+      const auto buffer = huxerui::media::ios::PixelBuffer(frame);
+      if (!buffer) throw std::runtime_error("Expected an iOS pixel buffer");
+      static_cast<huxerui::ios::PixelBufferTexture&>(texture).Publish(buffer);
+      return;
+    }
     const auto pixels = ConvertFramePixels(frame);
     const auto [width, height] = DisplayDimensions(frame.format.visible, frame.format.rotation);
     NSDictionary* attributes = @{

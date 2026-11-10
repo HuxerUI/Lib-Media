@@ -1,6 +1,9 @@
 #include <huxerui/media_format.h>
 
+#include "platform_video_storage.h"
+
 #include <limits>
+#include <utility>
 
 namespace huxerui::media {
 namespace {
@@ -79,15 +82,24 @@ bool VideoFormat::Validate() const noexcept {
   return width && height && visible.width && visible.height && visible.x < width && visible.y < height
       && visible.width <= width - visible.x && visible.height <= height - visible.y
       && aspect_width && aspect_height && (pixel_format == VideoPixelFormat::I420 ||
-          pixel_format == VideoPixelFormat::NV12 || pixel_format == VideoPixelFormat::P010)
+          pixel_format == VideoPixelFormat::NV12 || pixel_format == VideoPixelFormat::P010 ||
+          pixel_format == VideoPixelFormat::Opaque)
       && primaries >= ColorPrimaries::Unknown && primaries <= ColorPrimaries::BT2020
       && transfer >= ColorTransfer::Unknown && transfer <= ColorTransfer::HLG
       && matrix >= ColorMatrix::Unknown && matrix <= ColorMatrix::BT2020
       && range >= ColorRange::Unknown && range <= ColorRange::Full
       && rotation >= VideoRotation::None && rotation <= VideoRotation::Clockwise270;
 }
+VideoFrame::VideoFrame(VideoFormat format, MediaTimestamp pts, std::optional<MediaTimestamp> duration,
+    std::vector<VideoPlane> planes)
+    : format(format), pts(pts), duration(duration), planes(std::move(planes)) {}
+
 bool VideoFrame::Validate() const noexcept {
   if (!format.Validate() || !ValidTime(pts) || !ValidDuration(duration)) return false;
+  if (platform_storage_)
+    return planes.empty() && platform_storage_->width == format.width && platform_storage_->height == format.height &&
+        platform_storage_->layout == format.pixel_format;
+  if (format.pixel_format == VideoPixelFormat::Opaque) return false;
   const auto planar = format.pixel_format == VideoPixelFormat::I420;
   const auto bytes = format.pixel_format == VideoPixelFormat::P010 ? 2u : 1u;
   if (planes.size() != (planar ? 3 : 2)) return false;

@@ -1,12 +1,33 @@
 #include "codec/decoder/backend.h"
 #include "codec/decoder/copy.h"
 #include "codec/hevc.h"
+#include "format/platform_video_storage.h"
+#include "format/video_frame_transformer.h"
+#include <huxerui/web/external_texture.h>
 #include <algorithm>
+#include <emscripten/threading.h>
 #include <emscripten/val.h>
+#include <utility>
 
 namespace huxerui::media::detail {
 namespace {
 using emscripten::val;
+
+struct BrowserVideoFrame {
+  explicit BrowserVideoFrame(val value) : value(std::move(value)) {}
+  BrowserVideoFrame(BrowserVideoFrame&& other) : value(std::exchange(other.value, val::null())) {}
+  ~BrowserVideoFrame() {
+    if (!value.isNull() && !value.isUndefined()) value.call<void>("close");
+  }
+  val value;
+};
+
+struct WebVideoStorage final : PlatformVideoStorage {
+  WebVideoStorage(const VideoFormat& format, BrowserVideoFrame&& source)
+      : PlatformVideoStorage(format.width, format.height, format.pixel_format), frame(std::move(source)) {}
+  BrowserVideoFrame frame;
+};
+
 val Uint8(std::span<const std::byte> bytes) {
   return val(emscripten::typed_memory_view(bytes.size(), reinterpret_cast<const unsigned char*>(bytes.data()))).call<val>("slice");
 }
@@ -17,6 +38,12 @@ BufferReference Buffer(const val& array) {
 }
 class WebDecoder final : public DecoderBackend {
 public:
+  bool PresentationOrdered() const noexcept override {
+    // WebCodecs emits frames in presentation order. Only the asynchronous CPU copies can reorder them.
+    const auto* video = std::get_if<VideoDecoderConfig>(&config_);
+    return video && video->output_storage == VideoStorage::Platform;
+  }
+
   std::uint32_t PresentationTimescale() const noexcept override {
     // AudioData timestamps can be rounded from the decoder's sample clock back to microseconds.
     if (const auto* audio = std::get_if<AudioDecoderConfig>(&config_)) return audio->output.sample_rate;
@@ -46,8 +73,12 @@ public:
       options.set("sampleFormat", sample); options.set("description", Uint8(AudioDecoderHeader(*audio)));
     } else {
       const auto& video = std::get<VideoDecoderConfig>(config);
+      const bool platform = video.output_storage == VideoStorage::Platform;
+      if (platform && !emscripten_is_main_browser_thread())
+        return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Web platform video requires the browser main thread"));
       options.set("audio", false); options.set("width", video.width); options.set("height", video.height);
       if (video.codec == CodecId::Hevc) options.set("codec", HevcCodecString(video.initialization_data));
+      options.set("platform", platform);
       options.set("tenBit", video.output == VideoPixelFormat::P010);
       options.set("description", Uint8(video.initialization_data));
     }
@@ -93,6 +124,7 @@ public:
       }
       return R::Success(std::nullopt);
     }
+    BrowserVideoFrame browser_frame(value["frame"]);
     MediaTimestamp pts{static_cast<std::int64_t>(value["pts"].as<double>()), 1000000};
     auto planes = value["planes"];
     if (const auto* audio = std::get_if<AudioDecoderConfig>(&config_)) {
@@ -111,8 +143,6 @@ public:
     format.width = value["width"].as<unsigned>(); format.height = value["height"].as<unsigned>();
     auto rect = value["visible"];
     format.visible = {rect["x"].as<unsigned>(), rect["y"].as<unsigned>(), rect["width"].as<unsigned>(), rect["height"].as<unsigned>()};
-    const auto layout = value["format"].as<std::string>();
-    format.pixel_format = layout == "P010" ? VideoPixelFormat::P010 : layout == "I420" ? VideoPixelFormat::I420 : VideoPixelFormat::NV12;
     format.aspect_width = value["aspectWidth"].as<unsigned>(); format.aspect_height = value["aspectHeight"].as<unsigned>();
     auto color = value["color"];
     if (color["primaries"].equals(val("bt709"))) format.primaries = ColorPrimaries::BT709;
@@ -125,11 +155,20 @@ public:
     else if (color["matrix"].equals(val("smpte170m"))) format.matrix = ColorMatrix::BT601;
     else if (color["matrix"].equals(val("bt2020-ncl"))) format.matrix = ColorMatrix::BT2020;
     if (!color["fullRange"].isNull() && !color["fullRange"].isUndefined()) format.range = color["fullRange"].as<bool>() ? ColorRange::Full : ColorRange::Limited;
+    auto duration = value["duration"].isNull() ? std::nullopt : std::optional(MediaTimestamp{static_cast<std::int64_t>(value["duration"].as<double>()), 1000000});
+    if (config.output_storage == VideoStorage::Platform) {
+      if (browser_frame.value.isNull() || browser_frame.value.isUndefined())
+        return R::Failure(Error(CodecErrorCode::InvalidData, "WebCodecs did not return a platform frame"));
+      format.pixel_format = VideoPixelFormat::Opaque;
+      auto storage = std::make_shared<WebVideoStorage>(format, std::move(browser_frame));
+      return R::Success(BackendOutput{DecodedFrame{VideoFrameAccess::FromPlatform(format, pts, duration, std::move(storage))}});
+    }
+    const auto layout = value["format"].as<std::string>();
+    format.pixel_format = layout == "P010" ? VideoPixelFormat::P010 : layout == "I420" ? VideoPixelFormat::I420 : VideoPixelFormat::NV12;
     std::vector<VideoPlane> source_planes;
     const auto component = layout == "P010" ? 2u : 1u;
     for (unsigned i = 0; i < planes["length"].as<unsigned>(); ++i)
       source_planes.push_back({Buffer(planes[i]), value["strides"][i].as<unsigned>(), i && layout != "I420" ? component * 2 : component});
-    auto duration = value["duration"].isNull() ? std::nullopt : std::optional(MediaTimestamp{static_cast<std::int64_t>(value["duration"].as<double>()), 1000000});
     auto copied = CopyVideo(format, pts, duration, std::move(source_planes), config.output);
     if (!copied.Succeeded()) return R::Failure(copied.Error());
     return R::Success(BackendOutput{DecodedFrame{std::move(copied).Value()}});
@@ -162,4 +201,26 @@ private:
 };
 } // namespace
 std::unique_ptr<DecoderBackend> MakeDecoderBackend() { return std::make_unique<WebDecoder>(); }
+
+CodecResult<std::shared_ptr<ExternalTexture>> MakePlatformVideoTexture(const VideoFrame& frame) {
+  using R = CodecResult<std::shared_ptr<ExternalTexture>>;
+  if (!emscripten_is_main_browser_thread())
+    return R::Failure(Error(CodecErrorCode::Unsupported, "Web video textures require the browser main thread"));
+  const auto& storage = VideoFrameAccess::PlatformStorage(frame);
+  const auto* browser = dynamic_cast<const WebVideoStorage*>(storage.get());
+  if (!browser) return R::Failure(Error(CodecErrorCode::Unsupported, "Expected a WebCodecs video frame"));
+
+  struct TextureLease {
+    TextureLease(const std::shared_ptr<const PlatformVideoStorage>& source, Size size)
+        : source(source), texture(size) {}
+    std::shared_ptr<const PlatformVideoStorage> source;
+    web::VideoFrameTexture texture;
+  };
+  const auto& source = browser->frame.value;
+  auto lease = std::make_shared<TextureLease>(storage, Size{source["displayWidth"].as<float>(), source["displayHeight"].as<float>()});
+  lease->texture.Publish(source);
+  lease->texture.Finish();
+  auto* texture = &lease->texture;
+  return R::Success(std::shared_ptr<ExternalTexture>(std::move(lease), texture));
+}
 } // namespace huxerui::media::detail

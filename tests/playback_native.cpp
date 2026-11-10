@@ -184,8 +184,8 @@ void DecodeAndPlay(DecodedPlayback& playback, AudioFormat format, const std::fil
 
 VideoFrame Picture(std::int64_t pts, const std::shared_ptr<const Bytes>& bytes) {
   const BufferReference pixels(*bytes, bytes);
-  return {.format = {.width = 2, .height = 2, .visible = {0, 0, 2, 2}}, .pts = {pts, 1000},
-          .duration = MediaTimestamp{40, 1000}, .planes = {{pixels.Slice(0, 4), 2, 1}, {pixels.Slice(4, 2), 2, 2}}};
+  return {{.width = 2, .height = 2, .visible = {0, 0, 2, 2}}, {pts, 1000}, MediaTimestamp{40, 1000},
+          {{pixels.Slice(0, 4), 2, 1}, {pixels.Slice(4, 2), 2, 2}}};
 }
 
 void VideoOnly() {

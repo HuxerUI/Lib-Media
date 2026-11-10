@@ -1,4 +1,5 @@
 #include "copy.h"
+#include "format/platform_video_storage.h"
 
 #include <algorithm>
 #include <cmath>
@@ -116,6 +117,12 @@ void RetainFrame(DecodedFrame& frame, const std::shared_ptr<const void>& credit)
     bytes = BufferReference(owner->bytes.AsBytes(), owner);
   };
   std::visit([&](auto& value) {
+    if constexpr (std::is_same_v<std::decay_t<decltype(value)>, VideoFrame>) {
+      if (value.Storage() == VideoStorage::Platform) {
+        VideoFrameAccess::RetainPlatformStorage(value, credit);
+        return;
+      }
+    }
     for (auto& plane : value.planes) {
       if constexpr (std::is_same_v<std::decay_t<decltype(plane)>, BufferReference>) wrap(plane);
       else wrap(plane.data);
@@ -124,6 +131,10 @@ void RetainFrame(DecodedFrame& frame, const std::shared_ptr<const void>& credit)
 }
 std::size_t FrameBytes(const DecodedFrame& frame) {
   return std::visit([](const auto& value) {
+    if constexpr (std::is_same_v<std::decay_t<decltype(value)>, VideoFrame>) {
+      if (value.Storage() == VideoStorage::Platform)
+        return VideoImageBytes(value.format.width, value.format.height, value.format.pixel_format);
+    }
     std::size_t result = 0;
     for (const auto& plane : value.planes) {
       const auto size = [&] {

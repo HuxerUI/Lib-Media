@@ -1,11 +1,13 @@
 #include <huxerui/android/platform_registry.h>
 
+#include "media_video_android.h"
 #include "player/channel_player.h"
 #include "player/state.h"
 
 namespace huxerui::media::detail {
 
 void InstallPlatform(ApplicationContext& context) {
+  InstallSurfacePreview(context);
   android::JavaPlatformModuleFactory<std::shared_ptr<PlayerBackend>> module;
   module.class_name = "org.huxerui.lib.media.MediaPlayerModule$Factory";
   module.create = [](PlatformChannel channel) -> std::shared_ptr<PlayerBackend> {

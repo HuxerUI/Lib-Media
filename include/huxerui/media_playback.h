@@ -235,9 +235,9 @@ public:
 
   /// @brief Retain a decoded video frame for presentation in the given generation.
   /// @param epoch Current token from Epoch(). Retired and foreign tokens return InvalidState.
-  /// @param frame Valid CPU frame with a positive duration. Submit in nondecreasing PTS order and keep the
-  /// underlying plane bytes immutable while retained. The session retains the plane references without copying pixels.
-  /// A plane owner's final release may run during presentation or retirement. Keep it short and avoid reentering
+  /// @param frame Valid CPU or platform frame with a positive duration. Submit in nondecreasing PTS order and keep
+  /// its pixels immutable while retained. The session retains the frame's storage without copying pixels.
+  /// A storage owner's final release may run during presentation or retirement. Keep it short and avoid reentering
   /// the same session from its destructor.
   /// @return Accepted after retaining the frame or WouldBlock while opening, resetting, or at the two-frame limit.
   /// Disabled or sealed video input returns InvalidState. Invalid frame geometry or timing returns InvalidArgument.
@@ -259,7 +259,8 @@ public:
   /// The presenter owns the texture. Pause, Ended, Reset and Close leave an already published image available.
   /// Replace or clear the presentation target on the presentation thread if a new epoch should start blank.
   /// @param epoch Current token from Epoch(). Retired and foreign tokens return InvalidState.
-  /// @param publish Synchronous frame consumer, such as an upload to a caller-owned ExternalTexture.
+  /// @param publish Synchronous frame consumer, such as a publication to a caller-owned ExternalTexture.
+  /// Retain a platform frame copy through asynchronous GPU reads of its image.
   /// @return Publication and discard information. An empty lag means no frame was published.
   PlaybackResult<VideoPresentation> PresentVideo(
       const PlaybackEpoch& epoch, const std::function<void(const VideoFrame&)>& publish);

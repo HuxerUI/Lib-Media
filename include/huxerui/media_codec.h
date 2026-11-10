@@ -5,9 +5,10 @@
 ///
 /// Include <huxerui/media_codec.h> and link HuxerUI::Media. Use these sessions directly from headless code.
 /// Decoders accept initialization data and complete compressed access units in decode order, then emit format
-/// events and retained CPU frames. The audio encoder accepts contiguous PCM and emits AAC configuration, retained
-/// raw access units, and sample accounting. The video encoder accepts CPU YUV pictures and emits AVC configuration
-/// and retained access units in decode order. A successful drain ends with one EndOfStream event.
+/// events and retained frames. The audio encoder accepts contiguous PCM and emits AAC configuration, retained raw
+/// access units, and sample accounting. The video encoder accepts CPU YUV frames or supported platform images.
+/// It emits codec configuration and retained access units in decode order. A successful drain ends with one EndOfStream event.
+/// Platform video frames can be published as HuxerUI textures.
 
 #include <functional>
 #include <memory>
@@ -15,9 +16,14 @@
 #include <variant>
 #include <huxerui/media_format.h>
 
+namespace huxerui {
+class ExternalTexture;
+}
+
 namespace huxerui::media {
 namespace detail {
 template<class Output> class DecoderState;
+struct VideoDecoderAccess;
 class AudioEncoderState;
 class VideoEncoderState;
 }
@@ -61,22 +67,23 @@ template<class T> using CodecResult = Result<T, CodecError>;
 
 /// @brief Limits on retained input and output reservations for one session.
 ///
-/// Input capacity counts copied compressed packets for decoding or PCM/CPU video frames for encoding, including bytes still
-/// retained by an adapter. It becomes available when the last owner releases the copied storage. Output capacity is
+/// Input capacity counts compressed packets for decoding and PCM or video frames for encoding, including storage still
+/// retained by an adapter. It becomes available when the last owner releases the storage. Output capacity is
 /// reserved before platform conversion and covers in-flight, reordered, queued, and consumer-held frames or packets.
-/// Retaining a plane or slice keeps the entire originating output reservation, including across Reset(). Release
-/// retained output to let pending input advance when the output pool is full.
+/// Retaining a plane, slice, or platform frame keeps the entire originating output reservation across Reset().
+/// Release retained output to let pending input advance when the output pool is full.
 ///
 /// Decoders require at least two input slots and a positive input byte limit. Audio decoding requires four output
-/// slots sized for the largest access unit of the configured codec. Video requires 34 output slots sized for the coded bounds and 4:2:0 planes.
-/// Count one byte per coded luma sample and two bytes per subsampled chroma position for each video slot.
+/// slots sized for the largest access unit of the configured codec. Video requires 34 output slots sized for the coded bounds.
+/// Charge each video slot by its coded layout. I420 and NV12 use one byte per luma sample and two bytes per
+/// chroma position, P010 uses twice that, and Opaque reserves four bytes per coded pixel.
 /// Both output limits must accommodate the required slots. Platform codec and adapter scratch allocations are separate.
 /// AudioEncoderConfig and VideoEncoderConfig specify their respective input and compressed output minimums.
 /// @see AudioDecoderConfig::limits, VideoDecoderConfig::limits, AudioEncoderConfig::limits, VideoEncoderConfig::limits
 struct QueueLimits {
-  /// Maximum number of copied input packets or uncompressed frames still retained. Defaults to 48.
+  /// Maximum number of input packets or uncompressed frames still retained. Defaults to 48.
   std::size_t input_items = 48;
-  /// Maximum total retained input bytes. A larger single packet, PCM frame, or CPU picture is rejected. Defaults to 8 MiB.
+  /// Maximum total retained input bytes. A larger single packet or frame is rejected. Defaults to 8 MiB.
   std::size_t input_bytes = 8 * 1024 * 1024;
   /// Maximum number of output frame or packet reservations. Defaults to 48, subject to output_bytes.
   std::size_t output_items = 48;
@@ -118,11 +125,11 @@ struct AudioDecoderConfig {
   CodecId codec = CodecId::Aac;
 };
 
-/// @brief Configuration for decoding length-prefixed video access units to CPU YUV.
+/// @brief Configuration for decoding length-prefixed video access units to retained frames.
 ///
 /// AVC supports Baseline, Main, and High profiles with at most 16 reference pictures and continuous frame
 /// numbering. HEVC supports single-layer Main and Main10 4:2:0. Probe the concrete configuration for platform
-/// support and the requested CPU layout. A fresh or reset video session requires an IDR access unit.
+/// support, storage, and pixel layout. A fresh or reset video session requires an IDR access unit.
 /// @see VideoDecoder::Create(), VideoDecoder::Probe()
 struct VideoDecoderConfig {
   /// Decoder configuration of at most 64 KiB, either avcC with SPS/PPS or hvcC with complete VPS/SPS/PPS arrays.
@@ -133,21 +140,26 @@ struct VideoDecoderConfig {
   std::uint32_t width = 0;
   /// Maximum coded luma height in pixels, in [1, 8192], subject to the platform limit described for width.
   std::uint32_t height = 0;
-  /// Requested CPU layout. Use I420 or NV12 for 8-bit output and P010 for 10-bit HEVC output.
+  /// Requested pixel layout. Use I420 or NV12 for eight-bit CPU output and P010 for ten-bit CPU output.
+  /// SDR output with platform storage uses NV12 on macOS, iOS, and Windows, and Opaque on Android and Web.
   VideoPixelFormat output = VideoPixelFormat::NV12;
   /// Retained input and output bounds. See QueueLimits for the video minimum and byte accounting.
   QueueLimits limits;
   /// Optional readiness callback with the delivery, capture, and execution contract of AudioDecoderConfig::wakeup.
   std::function<void()> wakeup;
   /// Optional teardown callback with the resource and lifetime contract of AudioDecoderConfig::cleanup_completed.
+  /// Returned platform frames may retain their retired image pool independently of this callback.
   std::function<void(CodecResult<void>)> cleanup_completed;
   /// Coding of the supplied configuration and access units. Use CodecId::H264 or CodecId::Hevc.
   /// Other values return CodecErrorCode::InvalidArgument. QueryCapabilities() describes the H.264 adapter.
   /// Use Probe() to check a particular HEVC configuration.
   CodecId codec = CodecId::H264;
+  /// Selects the returned frame storage. Platform storage requires a compatible codec on macOS, iOS, Android,
+  /// Windows, or Web. On Web, create, use, and release a platform decoder and its frames on the browser main thread.
+  VideoStorage output_storage = VideoStorage::Cpu;
 };
 
-/// @brief H.264 profiles described by the CPU video codec APIs.
+/// @brief H.264 profiles described by the video codec APIs.
 enum class H264Profile {
   /// Baseline or Constrained Baseline, without B pictures.
   Baseline,
@@ -337,15 +349,15 @@ struct VideoEncoderCapabilities {
   CodecVideoLimits platform_limits;
 };
 
-/// @brief Fixed configuration for encoding CPU frames to H.264 or HEVC access units.
+/// @brief Fixed configuration for encoding video frames to H.264 or HEVC access units.
 ///
 /// Supply even dimensions in [2, 8192], a full visible rectangle, square pixels, no rotation, and SDR color facts.
-/// Every submitted frame must match input; plane strides may differ. No scaling or color-space conversion occurs.
-/// H.264 and HEVC Main take I420 or NV12. HEVC Main10 takes P010. Probe the concrete codec, pixel
-/// format, dimensions, rate, and B-picture policy because availability varies by device and runtime.
+/// Every submitted frame must match input. CPU plane strides may differ. CPU H.264 and HEVC Main take I420 or NV12.
+/// CPU HEVC Main10 takes P010.
+/// Probe the concrete codec, storage, layout, dimensions, rate, and B-picture policy.
 /// @see VideoEncoder::Create(), VideoEncoder::Probe(), VideoEncodeFormat
 struct VideoEncoderConfig {
-  /// Required CPU geometry, pixel layout, and SDR color metadata. The default unset VideoFormat is invalid.
+  /// Required geometry, pixel layout, and SDR color metadata. The default unset VideoFormat is invalid.
   VideoFormat input;
   /// Positive numerator of the expected frame rate. This guides rate control; input PTS remains authoritative.
   std::uint32_t frame_rate_numerator = 30;
@@ -382,6 +394,9 @@ struct VideoEncoderConfig {
   std::function<void(CodecResult<void>)> cleanup_completed;
   /// CodecId::H264 or CodecId::Hevc. Defaults to H.264.
   CodecId codec = CodecId::H264;
+  /// Selects submitted frame storage. Platform SDR input takes NV12 on macOS, iOS, and Windows, and Opaque on Android.
+  /// Check the complete configuration with Probe().
+  VideoStorage input_storage = VideoStorage::Cpu;
 };
 
 /// @brief Video configuration emitted before its dependent access units.
@@ -643,11 +658,12 @@ private:
   std::shared_ptr<detail::DecoderState<AudioDecodeOutput>> state_;
 };
 
-/// @brief Move-only video decoder with bounded queues and retained CPU YUV frames.
+/// @brief Move-only video decoder with bounded queues and retained video frames.
 ///
 /// Submit complete picture access units in decode order and begin each stream with a key-marked IDR. Output
-/// arrives in presentation order. The current 16-frame reordering window can hold frames until more input arrives
-/// or Finish() drains it. See AudioDecoder for the shared execution, callback, and handle ownership contract.
+/// arrives in presentation order. Backends that need a 16-frame reordering window can hold frames until more input
+/// arrives or Finish() drains it. Android MediaCodec publishes surface output in presentation order.
+/// See AudioDecoder for the shared execution, callback, and handle ownership contract.
 /// @see VideoDecoderConfig, VideoFrame, AudioDecoder
 class VideoDecoder final {
 public:
@@ -725,6 +741,7 @@ public:
 private:
   explicit VideoDecoder(std::shared_ptr<detail::DecoderState<VideoDecodeOutput>> state);
   std::shared_ptr<detail::DecoderState<VideoDecodeOutput>> state_;
+  friend struct detail::VideoDecoderAccess;
 };
 
 /// @brief Move-only AAC-LC encoder with bounded queues and independently retained compressed output.
@@ -847,8 +864,8 @@ private:
 
 /// @brief Move-only asynchronous H.264 and HEVC encoder with bounded queues and retained packet bytes.
 ///
-/// Submit CPU pictures matching the configuration and drain access units through TryRead(). The handle owns the
-/// session. No Runtime, window, texture, or capture device is required.
+/// Submit pictures matching the configured storage and layout and drain access units through TryRead().
+/// The codec owns its session and any platform input surface, independently of a Runtime or UI window.
 ///
 /// On desktop and mobile platforms, queue and control calls may run concurrently on a live handle. On Web, use the
 /// JavaScript event loop that created the session. Move or destroy a handle only after its concurrent callers have
@@ -899,13 +916,14 @@ public:
   /// @brief Retires the session as in Close(). Internal state remains alive through asynchronous teardown.
   ~VideoEncoder();
 
-  /// @brief Queues one CPU picture without waiting for platform encoding.
-  /// @param frame Valid VideoFrame matching VideoEncoderConfig::input. Keep the used plane bytes unchanged until
-  /// return. PTS must increase strictly in exact time and after microsecond rounding. Platform conversion and range
-  /// limits are checked separately.
+  /// @brief Queues one picture without waiting for platform encoding.
+  /// @param frame Valid VideoFrame matching the configured input geometry, layout, and storage. Keep CPU planes
+  /// stable through the call. For platform images, complete producer writes before submitting and keep the image
+  /// immutable while retained. PTS must increase strictly in exact time and after microsecond rounding.
+  /// Platform conversion and range limits are checked separately.
   /// Optional duration must be positive and representable when present. Variable frame intervals are allowed.
-  /// @return Accepted after copying active samples. WouldBlock leaves pixels and timing unconsumed while startup
-  /// or reset is pending or copied-input capacity is exhausted. Failure reports invalid input, copy resource
+  /// @return Accepted after copying CPU samples or retaining the platform image. WouldBlock leaves the frame unconsumed
+  /// while startup or reset is pending or input capacity is exhausted. Failure reports invalid input, resource
   /// exhaustion, InvalidState while draining or ended, Closed after retirement or on a moved-from handle, or the
   /// recorded operational error after fatal failure. Synchronous rejection leaves the session usable for valid
   /// input. Source planes can be reused as soon as Accepted returns.
@@ -970,5 +988,24 @@ private:
   explicit VideoEncoder(std::shared_ptr<detail::VideoEncoderState> state);
   std::shared_ptr<detail::VideoEncoderState> state_;
 };
+
+/// @brief Creates a HuxerUI texture containing one platform video frame.
+///
+/// The texture remains usable after the input frame is released and the decoder is reset or closed.
+/// macOS, iOS, Android, and Windows textures contain the full coded image. Use the frame's format to crop or rotate it
+/// for display. Web textures preserve the browser frame's visible rectangle and use its display dimensions as the
+/// texture's intrinsic size. The browser frame can include allocation padding beyond the configured coded dimensions.
+/// Use the VideoFrame for the media timestamp and any additional presentation metadata.
+///
+/// Include the SDK platform texture header to use the concrete macos::PixelBufferTexture,
+/// ios::PixelBufferTexture, android::GlTexture, windows::D3D11Texture, or web::VideoFrameTexture type.
+/// Apple and Web textures retain the source image and its decoder output credit. Android and Windows create a GPU
+/// snapshot in RGBA8 and BGRA8 respectively. Keep the texture alive through GPU use and treat the acquired pixels
+/// as read-only. Create, use, and release Web textures on the browser main thread.
+///
+/// @param frame Valid eight-bit SDR frame with VideoStorage::Platform. Producer writes must have completed.
+/// @return A texture with its frame published and further publication closed. InvalidArgument reports
+/// an invalid or CPU frame. Unsupported reports an unavailable backend or unsupported platform image.
+CodecResult<std::shared_ptr<ExternalTexture>> MakeExternalTexture(const VideoFrame& frame);
 
 } // namespace huxerui::media

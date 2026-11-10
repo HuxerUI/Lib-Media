@@ -275,7 +275,7 @@ template<class Output> void DecoderState<Output>::Run(bool credit_available) {
 }
 template<class Output> void DecoderState<Output>::PublishReordered(bool all) {
   constexpr bool video = std::is_same_v<Output, VideoDecodeOutput>;
-  const auto delay = video && !all ? 16u : 0u;
+  const auto delay = video && !all && !backend_->PresentationOrdered() ? 16u : 0u;
   while (reordered_.size() > delay) {
     auto earliest = std::min_element(reordered_.begin(), reordered_.end(), [](const auto& a, const auto& b) {
       const auto at = std::visit([](const auto& f) { return f.pts; }, a);

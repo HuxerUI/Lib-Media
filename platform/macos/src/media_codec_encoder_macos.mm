@@ -1,8 +1,11 @@
 #include "codec/encoder/backend.h"
+#include "format/platform_video_storage.h"
+#include "media_video_macos.h"
 
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <list>
 #include <mutex>
 #include <type_traits>
 #import <AudioToolbox/AudioToolbox.h>
@@ -177,8 +180,13 @@ public:
                   "VideoToolbox rejected AverageBitRate", CodecErrorCode::Unsupported);
       VideoStatus(SetInteger(kVTCompressionPropertyKey_MaxKeyFrameInterval, config.key_frame_interval),
                   "VideoToolbox rejected MaxKeyFrameInterval", CodecErrorCode::Unsupported);
+      frame_window_ = VideoEncoderWindow(config);
+      if (config.input_storage == VideoStorage::Platform) {
+        const auto bytes = VideoImageBytes(config.input.width, config.input.height, config.input.pixel_format);
+        frame_window_ = std::min({frame_window_, config.limits.input_items, config.limits.input_bytes / bytes});
+      }
       const auto delay_status = SetInteger(kVTCompressionPropertyKey_MaxFrameDelayCount,
-                                          static_cast<std::int32_t>(VideoEncoderWindow(config) - 1));
+                                          static_cast<std::int32_t>(frame_window_ - 1));
       needs_progress_flush_ = delay_status == kVTPropertyNotSupportedErr;
       if (!needs_progress_flush_) {
         VideoStatus(delay_status, "VideoToolbox rejected MaxFrameDelayCount", CodecErrorCode::Unsupported);
@@ -204,7 +212,8 @@ public:
       if (actual) CFRelease(actual);
       if (!matches) throw VideoToolboxFailure{Error(CodecErrorCode::Unsupported, "VideoToolbox changed the requested bitrate")};
       VideoStatus(VTCompressionSessionPrepareToEncodeFrames(session_), "Cannot prepare video compression", CodecErrorCode::Unsupported);
-      scratch_.resize(std::size_t(config.input.width) * config.input.height * (ten_bit ? 6 : 3) / 2);
+      if (config.input_storage == VideoStorage::Cpu)
+        scratch_.resize(std::size_t(config.input.width) * config.input.height * (ten_bit ? 6 : 3) / 2);
     });
   }
   CodecResult<SubmitStatus> Submit(const VideoFrame& frame) override {
@@ -212,46 +221,12 @@ public:
       {
         std::lock_guard lock(output_mutex_);
         if (failure_) throw VideoToolboxFailure{*failure_};
-        if (pending_frames_ >= VideoEncoderWindow(config_)) return SubmitStatus::WouldBlock;
+        if (pending_frames_.size() >= frame_window_) return SubmitStatus::WouldBlock;
       }
-      CVPixelBufferRef pixel = nullptr;
-      const bool ten_bit = config_.input.pixel_format == VideoPixelFormat::P010;
-      const bool full = config_.input.range == ColorRange::Full;
-      const auto type = ten_bit ?
-          (full ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) :
-          (full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
-      const auto row_bytes = std::size_t(config_.input.width) * (ten_bit ? 2 : 1);
-      auto surface = CFDictionaryCreate(kCFAllocatorDefault, nullptr, nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-      if (!surface) throw std::bad_alloc();
-      const void* keys[]{kCVPixelBufferIOSurfacePropertiesKey};
-      const void* values[]{surface};
-      auto attributes = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-      if (surface) CFRelease(surface);
-      if (!attributes) throw std::bad_alloc();
-      const auto created = CVPixelBufferCreate(kCFAllocatorDefault, config_.input.width, config_.input.height, type, attributes, &pixel);
-      if (attributes) CFRelease(attributes);
-      VideoStatus(created, "Cannot allocate video input");
-      std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)> owner(pixel, CVPixelBufferRelease);
-      VideoStatus(CVPixelBufferLockBaseAddress(pixel, 0), "Cannot map video input");
-      CopyVideoEncoderPixels(frame, ten_bit ? VideoPixelFormat::P010 : VideoPixelFormat::NV12, scratch_);
-      bool valid = CVPixelBufferGetPlaneCount(pixel) == 2;
-      for (std::size_t plane = 0; valid && plane < 2; ++plane) {
-        auto* target = static_cast<std::byte*>(CVPixelBufferGetBaseAddressOfPlane(pixel, plane));
-        const auto stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, plane);
-        const auto rows = plane ? config_.input.height / 2 : config_.input.height;
-        valid = target && stride >= row_bytes && CVPixelBufferGetHeightOfPlane(pixel, plane) >= rows;
-        if (valid) for (std::size_t y = 0; y < rows; ++y)
-          std::memcpy(target + y * stride, scratch_.data() + (plane ? row_bytes * config_.input.height : 0) +
-              y * row_bytes, row_bytes);
-      }
-      VideoStatus(CVPixelBufferUnlockBaseAddress(pixel, 0), "Cannot unmap video input");
-      if (!valid) throw VideoToolboxFailure{Error(CodecErrorCode::Unsupported, "VideoToolbox returned an unsupported input plane layout")};
-      if (config_.input.primaries != ColorPrimaries::Unknown)
-        CVBufferSetAttachment(pixel, kCVImageBufferColorPrimariesKey, Primaries(config_.input.primaries), kCVAttachmentMode_ShouldPropagate);
-      if (config_.input.transfer != ColorTransfer::Unknown)
-        CVBufferSetAttachment(pixel, kCVImageBufferTransferFunctionKey, Transfer(config_.input.transfer), kCVAttachmentMode_ShouldPropagate);
-      if (config_.input.matrix != ColorMatrix::Unknown)
-        CVBufferSetAttachment(pixel, kCVImageBufferYCbCrMatrixKey, Matrix(config_.input.matrix), kCVAttachmentMode_ShouldPropagate);
+      const bool platform_storage = frame.Storage() == VideoStorage::Platform;
+      auto owner = platform_storage ? PixelBufferOwner(nullptr, CVPixelBufferRelease) : CopyCpuInput(frame);
+      const auto pixel = platform_storage ? macos::PixelBuffer(frame) : owner.get();
+      if (!pixel) throw VideoToolboxFailure{Error(CodecErrorCode::InvalidArgument, "Missing VideoToolbox input image")};
       CFDictionaryRef properties = nullptr;
       if (key_requested_) {
         const void* option_keys[]{kVTEncodeFrameOptionKey_ForceKeyFrame};
@@ -259,21 +234,25 @@ public:
         properties = CFDictionaryCreate(kCFAllocatorDefault, option_keys, option_values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
         if (!properties) throw std::bad_alloc();
       }
+      const std::unique_ptr<std::remove_pointer_t<CFDictionaryRef>, decltype(&CFRelease)>
+          owned_properties(properties, CFRelease);
       const auto duration = frame.duration ? frame.duration->Rescale(1000000) : std::optional<MediaTimestamp>{};
+      void* source_frame;
       {
-        std::lock_guard lock(output_mutex_); ++pending_frames_;
+        std::lock_guard lock(output_mutex_);
+        // Keep the image and its queue reservations until this submission completes.
+        source_frame = &pending_frames_.emplace_back(VideoFrameAccess::PlatformStorage(frame));
       }
       VTEncodeInfoFlags flags = 0;
       const auto status = VTCompressionSessionEncodeFrame(session_, pixel, CMTimeMake(frame.pts.ticks, 1000000),
-          duration ? CMTimeMake(duration->ticks, 1000000) : kCMTimeInvalid, properties, nullptr, &flags);
-      if (properties) CFRelease(properties);
-      if (status) {
+          duration ? CMTimeMake(duration->ticks, 1000000) : kCMTimeInvalid, owned_properties.get(), source_frame, &flags);
+      if (status || (flags & kVTEncodeInfo_FrameDropped)) {
+        PlatformFrameLease completed;
         std::lock_guard lock(output_mutex_);
-        if (pending_frames_) --pending_frames_;
-        throw VideoToolboxFailure{Error(CodecErrorCode::PlatformFailure, "VideoToolbox rejected a picture", std::to_string(status))};
-      }
-      if (flags & kVTEncodeInfo_FrameDropped)
+        TakePendingFrame(source_frame, completed);
+        VideoStatus(status, "VideoToolbox rejected a picture");
         throw VideoToolboxFailure{Error(CodecErrorCode::InvalidData, "VideoToolbox dropped an accepted picture")};
+      }
       key_requested_ = false;
       return SubmitStatus::Accepted;
     });
@@ -283,7 +262,7 @@ public:
     using R = CodecResult<std::optional<VideoEncoderBackendOutput>>;
     if (failure_) return R::Failure(*failure_);
     if (!output_.empty()) { auto value = std::move(output_.front()); output_.pop_front(); return R::Success(std::move(value)); }
-    if (finished_ && !pending_frames_ && !eos_) { eos_ = true; return R::Success(VideoEncoderEnd{}); }
+    if (finished_ && pending_frames_.empty() && !eos_) { eos_ = true; return R::Success(VideoEncoderEnd{}); }
     return R::Success(std::nullopt);
   }
   CodecResult<void> RequestKeyFrame() override { key_requested_ = true; return CodecResult<void>::Success(); }
@@ -292,7 +271,7 @@ public:
       if (!needs_progress_flush_) return;
       {
         std::lock_guard lock(output_mutex_);
-        if (!pending_frames_) return;
+        if (pending_frames_.empty()) return;
       }
       // VideoToolbox can invoke the output callback while completing pending frames.
       VideoStatus(VTCompressionSessionCompleteFrames(session_, kCMTimeInvalid),
@@ -314,14 +293,71 @@ public:
       status = VTCompressionSessionCompleteFrames(session_, kCMTimeInvalid);
       VTCompressionSessionInvalidate(session_); CFRelease(session_); session_ = nullptr;
     }
+    std::list<PlatformFrameLease> retired;
     {
-      std::lock_guard lock(output_mutex_); output_.clear(); pending_frames_ = 0;
+      std::lock_guard lock(output_mutex_);
+      output_.clear();
+      retired.swap(pending_frames_);
     }
     Bytes{}.swap(scratch_);
     return status ? CodecResult<void>::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot retire video compression", std::to_string(status))) :
         CodecResult<void>::Success();
   }
 private:
+  using PixelBufferOwner = std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)>;
+  using PlatformFrameLease = std::shared_ptr<const PlatformVideoStorage>;
+
+  // Called under output_mutex_. The caller releases the lease after unlocking.
+  bool TakePendingFrame(void* source_frame, PlatformFrameLease& completed) {
+    const auto entry = std::find_if(pending_frames_.begin(), pending_frames_.end(),
+        [source_frame](const PlatformFrameLease& frame) { return &frame == source_frame; });
+    if (entry == pending_frames_.end()) return false;
+    completed = std::move(*entry);
+    pending_frames_.erase(entry);
+    return true;
+  }
+
+  PixelBufferOwner CopyCpuInput(const VideoFrame& frame) {
+  CVPixelBufferRef pixel = nullptr;
+  const bool ten_bit = config_.input.pixel_format == VideoPixelFormat::P010;
+  const bool full = config_.input.range == ColorRange::Full;
+  const auto type = ten_bit ?
+      (full ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) :
+      (full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+  const auto row_bytes = std::size_t(config_.input.width) * (ten_bit ? 2 : 1);
+  auto surface = CFDictionaryCreate(kCFAllocatorDefault, nullptr, nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+  if (!surface) throw std::bad_alloc();
+  const void* keys[]{kCVPixelBufferIOSurfacePropertiesKey};
+  const void* values[]{surface};
+  auto attributes = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+  if (surface) CFRelease(surface);
+  if (!attributes) throw std::bad_alloc();
+  const auto created = CVPixelBufferCreate(kCFAllocatorDefault, config_.input.width, config_.input.height, type, attributes, &pixel);
+  if (attributes) CFRelease(attributes);
+  VideoStatus(created, "Cannot allocate video input");
+  std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)> owner(pixel, CVPixelBufferRelease);
+  VideoStatus(CVPixelBufferLockBaseAddress(pixel, 0), "Cannot map video input");
+  CopyVideoEncoderPixels(frame, ten_bit ? VideoPixelFormat::P010 : VideoPixelFormat::NV12, scratch_);
+  bool valid = CVPixelBufferGetPlaneCount(pixel) == 2;
+  for (std::size_t plane = 0; valid && plane < 2; ++plane) {
+    auto* target = static_cast<std::byte*>(CVPixelBufferGetBaseAddressOfPlane(pixel, plane));
+    const auto stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, plane);
+    const auto rows = plane ? config_.input.height / 2 : config_.input.height;
+    valid = target && stride >= row_bytes && CVPixelBufferGetHeightOfPlane(pixel, plane) >= rows;
+    if (valid) for (std::size_t y = 0; y < rows; ++y)
+      std::memcpy(target + y * stride, scratch_.data() + (plane ? row_bytes * config_.input.height : 0) +
+          y * row_bytes, row_bytes);
+  }
+  VideoStatus(CVPixelBufferUnlockBaseAddress(pixel, 0), "Cannot unmap video input");
+  if (!valid) throw VideoToolboxFailure{Error(CodecErrorCode::Unsupported, "VideoToolbox returned an unsupported input plane layout")};
+  if (config_.input.primaries != ColorPrimaries::Unknown)
+    CVBufferSetAttachment(pixel, kCVImageBufferColorPrimariesKey, Primaries(config_.input.primaries), kCVAttachmentMode_ShouldPropagate);
+  if (config_.input.transfer != ColorTransfer::Unknown)
+    CVBufferSetAttachment(pixel, kCVImageBufferTransferFunctionKey, Transfer(config_.input.transfer), kCVAttachmentMode_ShouldPropagate);
+  if (config_.input.matrix != ColorMatrix::Unknown)
+    CVBufferSetAttachment(pixel, kCVImageBufferYCbCrMatrixKey, Matrix(config_.input.matrix), kCVAttachmentMode_ShouldPropagate);
+    return owner;
+  }
   void Property(CFStringRef key, CFTypeRef value) {
     const auto status = VTSessionSetProperty(session_, key, value);
     if (status) {
@@ -349,10 +385,11 @@ private:
   static CFStringRef Matrix(ColorMatrix value) {
     return value == ColorMatrix::BT709 ? kCVImageBufferYCbCrMatrix_ITU_R_709_2 : kCVImageBufferYCbCrMatrix_ITU_R_601_4;
   }
-  static void Output(void* context, void*, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sample) {
+  static void Output(void* context, void* source_frame, OSStatus status, VTEncodeInfoFlags flags, CMSampleBufferRef sample) {
     auto& self = *static_cast<MacOSVideoEncoder*>(context);
+    PlatformFrameLease completed;
     std::lock_guard lock(self.output_mutex_);
-    if (self.pending_frames_) --self.pending_frames_;
+    if (!self.TakePendingFrame(source_frame, completed)) return;
     if (self.closing_ || self.failure_) return;
     try {
       if (status || !sample || (flags & kVTEncodeInfo_FrameDropped) || CMSampleBufferGetNumSamples(sample) != 1)
@@ -409,7 +446,8 @@ private:
   std::optional<VideoEncodeFormat> format_;
   std::optional<CodecError> failure_;
   Bytes scratch_;
-  std::size_t pending_frames_ = 0;
+  std::list<PlatformFrameLease> pending_frames_;
+  std::size_t frame_window_ = 0;
   bool needs_progress_flush_ = false;
   bool key_requested_ = false, finished_ = false, eos_ = false, closing_ = false;
 };
