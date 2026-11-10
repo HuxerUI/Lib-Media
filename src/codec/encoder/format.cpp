@@ -1,6 +1,8 @@
 #include "format.h"
+#include "../hevc.h"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -71,10 +73,17 @@ private:
   std::vector<unsigned char> bytes_;
   std::size_t position_ = 0;
 };
-std::vector<std::span<const std::byte>> VideoNals(std::span<const std::byte> bytes, unsigned length_size) {
+std::vector<std::span<const std::byte>> VideoNals(std::span<const std::byte> bytes, unsigned length_size,
+                                                 CodecId codec = CodecId::H264) {
   std::vector<std::span<const std::byte>> result;
   auto append = [&](std::size_t first, std::size_t size) {
-    if (!size || result.size() >= 1024) VideoInvalid("Empty H.264 NAL or too many NAL units");
+    if (!size || result.size() >= 1024) VideoInvalid("Empty video NAL or too many NAL units");
+    if (codec == CodecId::Hevc) {
+      const auto nal = bytes.subspan(first, size);
+      HevcNalType(nal);
+      result.push_back(nal);
+      return;
+    }
     const auto header = std::to_integer<unsigned>(bytes[first]);
     const auto type = header & 31;
     if ((header & 128) || !type || (type > 12 && type != 14)) VideoInvalid("Unsupported H.264 NAL unit");
@@ -85,12 +94,12 @@ std::vector<std::span<const std::byte>> VideoNals(std::span<const std::byte> byt
     result.push_back(bytes.subspan(first, size));
   };
   if (length_size) {
-    if (length_size != 1 && length_size != 2 && length_size != 4) VideoInvalid("Invalid H.264 NAL length size");
+    if (length_size != 1 && length_size != 2 && length_size != 4) VideoInvalid("Invalid video NAL length size");
     for (std::size_t i = 0; i < bytes.size();) {
-      if (bytes.size() - i < length_size) VideoInvalid("Truncated H.264 NAL length");
+      if (bytes.size() - i < length_size) VideoInvalid("Truncated video NAL length");
       std::size_t size = 0;
       for (unsigned j = 0; j < length_size; ++j) size = (size << 8) | std::to_integer<unsigned>(bytes[i++]);
-      if (size > bytes.size() - i) VideoInvalid("Truncated H.264 NAL payload");
+      if (size > bytes.size() - i) VideoInvalid("Truncated video NAL payload");
       append(i, size); i += size;
     }
   } else {
@@ -100,15 +109,15 @@ std::vector<std::span<const std::byte>> VideoNals(std::span<const std::byte> byt
       if (bytes[i] == std::byte{0}) { ++zeros; continue; }
       if (bytes[i] == std::byte{1} && zeros >= 2) {
         if (found) append(first, i - zeros - first);
-        else if (i != zeros) VideoInvalid("Bytes precede the first H.264 start code");
+        else if (i != zeros) VideoInvalid("Bytes precede the first video start code");
         first = i + 1; found = true;
       }
       zeros = 0;
     }
-    if (!found) VideoInvalid("Missing H.264 start code");
+    if (!found) VideoInvalid("Missing video start code");
     append(first, bytes.size() - zeros - first);
   }
-  if (result.empty()) VideoInvalid("Empty H.264 encoder data");
+  if (result.empty()) VideoInvalid("Empty video encoder data");
   return result;
 }
 unsigned VideoProfileId(H264Profile profile) {
@@ -186,34 +195,85 @@ VideoEncodeFormat VideoGeometry(std::span<const std::byte> sps, const VideoEncod
     VideoUnsupported("H.264 encoder did not preserve requested color signaling");
   return format;
 }
+
+VideoEncodeFormat DescribeHevc(std::span<const std::byte> description, const VideoEncoderConfig& config) {
+  const auto nals = description.front() == std::byte{1} ? ParseHevcConfiguration(description, false, true).parameters :
+      VideoNals(description, 0, CodecId::Hevc);
+  std::array<std::vector<HevcBytes>, 3> sets;
+  for (const auto nal : nals) {
+    const auto type = HevcNalType(nal);
+    if (type < 32 || type > 34) continue;
+    if ((std::to_integer<unsigned>(nal[0]) & 1) || (std::to_integer<unsigned>(nal[1]) & 248))
+      VideoUnsupported("HEVC encoder returned multilayer parameter sets");
+    sets[type - 32].push_back(nal);
+  }
+  for (const auto& set : sets)
+    if (set.empty() || set.size() > 255) VideoInvalid("HEVC encoder configuration requires bounded VPS, SPS, and PPS");
+  const auto sequence = ReadHevcSequence(sets[1].front());
+  const unsigned depth = config.input.pixel_format == VideoPixelFormat::P010 ? 10 : 8;
+  const unsigned profile = depth == 10 ? 2 : 1;
+  for (const auto nal : sets[1]) {
+    const auto sps = ReadHevcSequence(nal);
+    const auto profile_id = std::to_integer<unsigned>(sps.profile[0]);
+    const bool compatible = (std::to_integer<unsigned>(sps.profile[1]) & (128u >> profile)) != 0;
+    if ((profile_id & 192) || ((profile_id & 31) != profile && !compatible) ||
+        sps.luma_bits != depth || sps.chroma_bits != depth)
+      VideoUnsupported("HEVC encoder changed the requested profile or bit depth");
+    if (sps.visible_width != config.input.width || sps.visible_height != config.input.height ||
+        sps.width > 8192 || sps.height > 8192 || sps.width != sequence.width || sps.height != sequence.height ||
+        sps.left != sequence.left || sps.top != sequence.top || sps.profile != sequence.profile ||
+        sps.temporal_layers != sequence.temporal_layers || sps.temporal_id_nested != sequence.temporal_id_nested)
+      VideoUnsupported("HEVC parameter sets changed the requested picture geometry or stream constraints");
+  }
+  Bytes data{std::byte{1}};
+  data.insert(data.end(), sequence.profile.begin(), sequence.profile.end());
+  data.insert(data.end(), {std::byte{0xf0}, std::byte{0}, std::byte{0xfc}, std::byte(0xfc | sequence.chroma_format),
+      std::byte(0xf8 | (depth - 8)), std::byte(0xf8 | (depth - 8)), std::byte{0}, std::byte{0},
+      std::byte((sequence.temporal_layers << 3) | (unsigned(sequence.temporal_id_nested) << 2) | 3), std::byte{3}});
+  for (unsigned i = 0; i < sets.size(); ++i) {
+    const auto& set = sets[i];
+    if (data.size() > 65533) VideoInvalid("HEVC configuration exceeds 64 KiB");
+    data.insert(data.end(), {std::byte(0xa0 | i), std::byte{0}, std::byte(set.size())});
+    for (const auto nal : set) {
+      if (nal.size() > 65535 || data.size() + 2 + nal.size() > 65536) VideoInvalid("HEVC configuration exceeds 64 KiB");
+      data.insert(data.end(), {std::byte(nal.size() >> 8), std::byte(nal.size())});
+      data.insert(data.end(), nal.begin(), nal.end());
+    }
+  }
+  return {sequence.width, sequence.height, {sequence.left, sequence.top, sequence.visible_width, sequence.visible_height},
+      std::move(data), CodecId::Hevc};
+}
 }
 std::size_t VideoEncoderWindow(const VideoEncoderConfig& config) {
   return std::min<std::size_t>({config.limits.output_items, config.limits.output_bytes / config.max_packet_bytes, 32});
 }
 std::uint32_t VideoEncoderBFrames(const VideoEncoderConfig& config) {
-  if (config.profile == H264Profile::Baseline) return 0;
+  if (config.codec == CodecId::H264 && config.profile == H264Profile::Baseline) return 0;
   return config.max_b_frames.value_or(static_cast<std::uint32_t>(std::min<std::size_t>(2, VideoEncoderWindow(config) - 2)));
 }
 CodecResult<std::size_t> ValidateVideoEncoderConfig(const VideoEncoderConfig& config) {
   using R = CodecResult<std::size_t>;
   const auto& input = config.input;
+  const bool avc = config.codec == CodecId::H264;
+  const bool ten_bit = input.pixel_format == VideoPixelFormat::P010;
   if (!input.Validate() || input.width < 2 || input.height < 2 || input.width > 8192 || input.height > 8192 ||
       input.width % 2 || input.height % 2 || !config.frame_rate_numerator || !config.frame_rate_denominator ||
       std::uint64_t(config.frame_rate_numerator) > std::uint64_t(config.frame_rate_denominator) * 240 ||
-      !config.bitrate || config.bitrate > INT32_MAX || !VideoProfileId(config.profile) || !config.key_frame_interval ||
+      !config.bitrate || config.bitrate > INT32_MAX || (avc && !VideoProfileId(config.profile)) || !config.key_frame_interval ||
       config.key_frame_interval > INT32_MAX || !config.max_packet_bytes || config.max_packet_bytes > INT32_MAX ||
       !config.limits.input_items || config.limits.output_items < 2 ||
       config.max_packet_bytes > config.limits.output_bytes / 2 ||
-      (config.profile == H264Profile::Baseline && config.max_b_frames.value_or(0)))
+      (!avc && config.codec != CodecId::Hevc) ||
+      (avc && config.profile == H264Profile::Baseline && config.max_b_frames.value_or(0)))
     return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid video encoder geometry, controls, or queue bounds"));
   if (input.visible != VideoRectangle{0, 0, input.width, input.height} ||
-      input.pixel_format == VideoPixelFormat::P010 ||
+      (avc && ten_bit) ||
       input.aspect_width != input.aspect_height || input.rotation != VideoRotation::None ||
       input.primaries == ColorPrimaries::BT2020 || input.matrix == ColorMatrix::BT2020 ||
       input.transfer == ColorTransfer::PQ || input.transfer == ColorTransfer::HLG ||
       config.max_b_frames.value_or(0) > 16)
-    return R::Failure(Error(CodecErrorCode::Unsupported, "H.264 encoding requires full SDR square-pixel pictures and bounded B frames"));
-  const auto bytes = std::size_t(input.width) * input.height * 3 / 2;
+    return R::Failure(Error(CodecErrorCode::Unsupported, "Unsupported video encoder geometry, pixel format, or B-picture bound"));
+  const auto bytes = std::size_t(input.width) * input.height * (ten_bit ? 6 : 3) / 2;
   if (bytes > config.limits.input_bytes || (config.max_b_frames &&
       std::size_t(*config.max_b_frames) + 2 > VideoEncoderWindow(config)))
     return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video encoder queues cannot fit a picture or the requested delay window"));
@@ -221,12 +281,36 @@ CodecResult<std::size_t> ValidateVideoEncoderConfig(const VideoEncoderConfig& co
 }
 void CopyVideoEncoderPixels(const VideoFrame& frame, VideoPixelFormat layout, std::span<std::byte> target) {
   const auto width = frame.format.width, height = frame.format.height;
-  if (target.size() < std::size_t(width) * height * 3 / 2) throw std::invalid_argument("Video encoder pixel destination is too small");
+  const auto base = std::size_t(width) * height;
+  if (layout == VideoPixelFormat::P010) {
+    if (frame.format.pixel_format != layout || target.size() < base * 3)
+      throw std::invalid_argument("Invalid P010 encoder pixel destination");
+    for (unsigned i = 0; i < 2; ++i) {
+      const auto& plane = frame.planes[i];
+      const auto bytes = plane.data.AsBytes();
+      const auto columns = i ? width / 2 : width, rows = i ? height / 2 : height;
+      const auto sample = i ? 4u : 2u;
+      auto* output = target.data() + (i ? base * 2 : 0);
+      for (std::size_t y = 0; y < rows; ++y) {
+        const auto* row = bytes.data() + y * plane.row_stride;
+        if (plane.pixel_stride == sample) {
+          std::memcpy(output, row, std::size_t(columns) * sample);
+          output += std::size_t(columns) * sample;
+        } else for (std::size_t x = 0; x < columns; ++x) {
+          std::memcpy(output, row + x * plane.pixel_stride, sample);
+          output += sample;
+        }
+      }
+    }
+    return;
+  }
+  if (frame.format.pixel_format == VideoPixelFormat::P010 || target.size() < base * 3 / 2)
+    throw std::invalid_argument("Invalid eight-bit encoder pixel destination");
   const auto& y_plane = frame.planes[0];
   const auto y_bytes = y_plane.data.AsBytes();
   for (std::size_t y = 0; y < height; ++y) for (std::size_t x = 0; x < width; ++x)
     target[y * width + x] = y_bytes[y * y_plane.row_stride + x * y_plane.pixel_stride];
-  const auto base = std::size_t(width) * height, chroma = base / 4;
+  const auto chroma = base / 4;
   for (std::size_t y = 0; y < height / 2; ++y) for (std::size_t x = 0; x < width / 2; ++x) {
     std::byte u, v;
     if (frame.format.pixel_format == VideoPixelFormat::NV12) {
@@ -247,7 +331,8 @@ void CopyVideoEncoderPixels(const VideoFrame& frame, VideoPixelFormat layout, st
 CodecResult<VideoEncodeFormat> ReadVideoEncodeFormat(std::span<const std::byte> description, const VideoEncoderConfig& config) {
   using R = CodecResult<VideoEncodeFormat>;
   try {
-    if (description.empty() || description.size() > 65536) VideoInvalid("H.264 configuration exceeds 64 KiB");
+    if (description.empty() || description.size() > 65536) VideoInvalid("Invalid video configuration size");
+    if (config.codec == CodecId::Hevc) return R::Success(DescribeHevc(description, config));
     AvcConfig parsed{4, {}};
     if (description[0] == std::byte{1}) {
       auto value = ParseAvc(description);
@@ -279,29 +364,49 @@ CodecResult<VideoEncodeFormat> ReadVideoEncodeFormat(std::span<const std::byte> 
     format.initialization_data = std::move(data);
     return R::Success(std::move(format));
   } catch (const VideoSyntaxFailure& failure) { return R::Failure(failure.error); }
+  catch (const std::invalid_argument& failure) { return R::Failure(Error(CodecErrorCode::InvalidData, failure.what())); }
 }
-CodecResult<Bytes> NormalizeVideoEncoderPacket(std::span<const std::byte> bytes, unsigned length_size, std::size_t maximum, bool strip_headers) {
+CodecResult<Bytes> NormalizeVideoEncoderPacket(std::span<const std::byte> bytes, unsigned length_size,
+                                               std::size_t maximum, CodecId codec, bool strip_headers) {
   using R = CodecResult<Bytes>;
   try {
-    if (bytes.size() > maximum) return R::Failure(Error(CodecErrorCode::ResourceExhausted, "H.264 packet exceeds configured byte bound"));
+    if (bytes.size() > maximum) return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Video packet exceeds configured byte bound"));
     Bytes result;
-    for (auto nal : VideoNals(bytes, length_size)) {
-      const auto type = std::to_integer<unsigned>(nal[0]) & 31;
+    const bool hevc = codec == CodecId::Hevc;
+    for (auto nal : VideoNals(bytes, length_size, codec)) {
+      const auto type = hevc ? HevcNalType(nal) : std::to_integer<unsigned>(nal[0]) & 31;
       // AVC base pictures decode independently of their optional, validated extension prefix.
-      if (type == 14) continue;
-      if (strip_headers && (type == 7 || type == 8 || type == 9)) continue;
+      if (!hevc && type == 14) continue;
+      if (strip_headers && (hevc ? type >= 32 && type <= 35 : type >= 7 && type <= 9)) continue;
       if (result.size() > maximum || maximum - result.size() < 4 || nal.size() > maximum - result.size() - 4)
-        return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Normalized H.264 packet exceeds configured byte bound"));
+        return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Normalized video packet exceeds configured byte bound"));
       const auto size = static_cast<std::uint32_t>(nal.size());
       for (auto shift : {24, 16, 8, 0}) result.push_back(std::byte(size >> shift));
       result.insert(result.end(), nal.begin(), nal.end());
     }
     return R::Success(std::move(result));
   } catch (const VideoSyntaxFailure& failure) { return R::Failure(failure.error); }
+  catch (const std::invalid_argument& failure) { return R::Failure(Error(CodecErrorCode::InvalidData, failure.what())); }
 }
 CodecResult<VideoEncoderPicture> InspectVideoEncoderPacket(const EncodedPacket& packet, const VideoEncodeFormat& format) {
   using R = CodecResult<VideoEncoderPicture>;
   try {
+    if (format.codec == CodecId::Hevc) {
+      const auto parameters = ParseHevcConfiguration(format.initialization_data, true, true).parameters;
+      const auto bytes = packet.data.AsBytes();
+      VideoEncoderPicture picture{IsHevcIdr(bytes, 4, false, true), false, false};
+      for (const auto nal : VideoNals(bytes, 4, CodecId::Hevc)) {
+        const auto type = HevcNalType(nal);
+        if (type < 32 && (std::to_integer<unsigned>(nal[2]) & 128))
+          picture.b_frame = HevcSliceIsB(nal, parameters);
+        if (type >= 32 && type <= 35) picture.headers = true;
+        if (type >= 32 && type <= 34 && std::ranges::none_of(parameters,
+            [nal](auto parameter) { return std::ranges::equal(nal, parameter); }))
+          VideoUnsupported("HEVC parameter sets changed inside the stream");
+      }
+      if (picture.key_frame && picture.b_frame) VideoInvalid("HEVC IDR cannot be a B picture");
+      return R::Success(picture);
+    }
     const auto config = ParseAvc(format.initialization_data);
     if (!config.Succeeded()) return R::Failure(config.Error());
     VideoEncoderPicture picture;
@@ -325,5 +430,6 @@ CodecResult<VideoEncoderPicture> InspectVideoEncoderPacket(const EncodedPacket& 
     if (!slices || starts != 1 || (picture.key_frame && picture.b_frame)) VideoInvalid("H.264 access unit must contain exactly one complete picture");
     return R::Success(picture);
   } catch (const VideoSyntaxFailure& failure) { return R::Failure(failure.error); }
+  catch (const std::invalid_argument& failure) { return R::Failure(Error(CodecErrorCode::InvalidData, failure.what())); }
 }
 } // namespace huxerui::media::detail

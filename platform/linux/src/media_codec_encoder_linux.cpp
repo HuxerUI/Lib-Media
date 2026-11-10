@@ -192,8 +192,10 @@ class GstreamerVideoEncoder final : public VideoEncoderBackend {
 public:
   CodecResult<void> Open(const VideoEncoderConfig& config) override {
     config_ = config; config_.wakeup = {}; config_.cleanup_completed = {};
+    const bool hevc = config.codec == CodecId::Hevc;
+    const bool ten_bit = config.input.pixel_format == VideoPixelFormat::P010;
     if (config.bitrate % 1000)
-      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "x264enc bitrate must be an integral number of kbit/s"));
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "GStreamer video encoder bitrate must be an integral number of kbit/s"));
     if (config.frame_rate_numerator > INT32_MAX || config.frame_rate_denominator > INT32_MAX)
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "GStreamer frame-rate components exceed signed integer range"));
     GError* error = nullptr;
@@ -205,27 +207,38 @@ public:
     pipeline_ = gst_pipeline_new(nullptr);
     source_ = gst_element_factory_make("appsrc", nullptr);
     sink_ = gst_element_factory_make("appsink", nullptr);
-    encoder_ = gst_element_factory_make("x264enc", nullptr);
-    auto* parser = gst_element_factory_make("h264parse", nullptr);
-    if (!pipeline_ || !source_ || !sink_ || !encoder_ || !parser) {
-      for (auto* element : {source_, sink_, encoder_, parser}) if (element) gst_object_unref(element);
+    encoder_ = gst_element_factory_make(hevc ? "x265enc" : "x264enc", nullptr);
+    auto* parser = gst_element_factory_make(hevc ? "h265parse" : "h264parse", nullptr);
+    auto* convert = hevc ? gst_element_factory_make("videoconvert", nullptr) : nullptr;
+    if (!pipeline_ || !source_ || !sink_ || !encoder_ || !parser || (hevc && !convert)) {
+      for (auto* element : {source_, sink_, encoder_, parser, convert}) if (element) gst_object_unref(element);
       source_ = sink_ = encoder_ = nullptr;
-      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "H.264 encoding requires GStreamer app, x264enc, and h264parse plugins"));
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Required GStreamer video encoder, parser, or converter is missing"));
     }
     const auto window = VideoEncoderWindow(config);
-    frame_bytes_ = std::size_t(config.input.width) * config.input.height * 3 / 2;
+    row_bytes_ = config.input.width * (ten_bit ? 2 : 1);
+    frame_bytes_ = std::size_t(row_bytes_) * config.input.height * 3 / 2;
     g_object_set(source_, "format", GST_FORMAT_TIME, "block", FALSE, "is-live", FALSE,
         "max-buffers", guint64(window), "max-bytes", guint64(window * frame_bytes_), nullptr);
     g_object_set(sink_, "sync", FALSE, "max-buffers", guint(1), "drop", FALSE,
         "enable-last-sample", FALSE, "wait-on-eos", FALSE, nullptr);
     const auto bframes = VideoEncoderBFrames(config);
-    g_object_set(encoder_, "speed-preset", 3, "bitrate", guint(config.bitrate / 1000), "bframes", guint(bframes),
-        "b-adapt", TRUE, "rc-lookahead", 0, "sync-lookahead", 0, "threads", guint(1),
-        "key-int-max", guint(config.key_frame_interval), "byte-stream", FALSE,
-        "cabac", config.profile != H264Profile::Baseline, "dct8x8", config.profile == H264Profile::High, nullptr);
-    guint actual_bframes = 0, bitrate = 0;
-    g_object_get(encoder_, "bframes", &actual_bframes, "bitrate", &bitrate, nullptr);
-    auto* input = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, "NV12",
+    guint actual_bframes = bframes, bitrate = 0;
+    if (hevc) {
+      gst_util_set_object_arg(G_OBJECT(encoder_), "speed-preset", "ultrafast");
+      gst_util_set_object_arg(G_OBJECT(encoder_), "tune", "zerolatency");
+      const auto options = "open-gop=0:scenecut=0:frame-threads=1:bframes=" + std::to_string(bframes);
+      g_object_set(encoder_, "bitrate", guint(config.bitrate / 1000), "key-int-max", gint(config.key_frame_interval),
+          "option-string", options.c_str(), nullptr);
+    } else {
+      g_object_set(encoder_, "speed-preset", 3, "bitrate", guint(config.bitrate / 1000), "bframes", guint(bframes),
+          "b-adapt", TRUE, "rc-lookahead", 0, "sync-lookahead", 0, "threads", guint(1),
+          "key-int-max", guint(config.key_frame_interval), "byte-stream", FALSE,
+          "cabac", config.profile != H264Profile::Baseline, "dct8x8", config.profile == H264Profile::High, nullptr);
+      g_object_get(encoder_, "bframes", &actual_bframes, nullptr);
+    }
+    g_object_get(encoder_, "bitrate", &bitrate, nullptr);
+    auto* input = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, ten_bit ? "P010_10LE" : "NV12",
         "width", G_TYPE_INT, gint(config.input.width), "height", G_TYPE_INT, gint(config.input.height),
         "framerate", GST_TYPE_FRACTION, gint(config.frame_rate_numerator), gint(config.frame_rate_denominator),
         "pixel-aspect-ratio", GST_TYPE_FRACTION, 1, 1, "interlace-mode", G_TYPE_STRING, "progressive", nullptr);
@@ -244,18 +257,27 @@ public:
       auto* text = gst_video_colorimetry_to_string(&color);
       if (text) { gst_caps_set_simple(input, "colorimetry", G_TYPE_STRING, text, nullptr); g_free(text); }
     }
-    const char* profile = config.profile == H264Profile::Baseline ? "baseline" : config.profile == H264Profile::Main ? "main" : "high";
-    auto* output = gst_caps_new_simple("video/x-h264", "stream-format", G_TYPE_STRING, "avc",
+    const char* profile = hevc ? (ten_bit ? "main-10" : "main") : config.profile == H264Profile::Baseline ? "baseline" : config.profile == H264Profile::Main ? "main" : "high";
+    auto* output = gst_caps_new_simple(hevc ? "video/x-h265" : "video/x-h264", "stream-format", G_TYPE_STRING, hevc ? "hvc1" : "avc",
         "alignment", G_TYPE_STRING, "au", "profile", G_TYPE_STRING, profile, nullptr);
     gst_app_src_set_caps(GST_APP_SRC(source_), input); gst_app_sink_set_caps(GST_APP_SINK(sink_), output);
     gst_caps_unref(input); gst_caps_unref(output);
     gst_bin_add_many(GST_BIN(pipeline_), source_, encoder_, parser, sink_, nullptr);
-    if (actual_bframes != bframes || bitrate != config.bitrate / 1000 ||
-        !gst_element_link_many(source_, encoder_, parser, sink_, nullptr))
-      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "GStreamer rejected H.264 encoder controls"));
+    bool linked;
+    if (convert) {
+      gst_bin_add(GST_BIN(pipeline_), convert);
+      auto* raw = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, ten_bit ? "I420_10LE" : "I420", nullptr);
+      linked = gst_element_link(source_, convert) && gst_element_link_filtered(convert, encoder_, raw) &&
+          gst_element_link_many(encoder_, parser, sink_, nullptr);
+      gst_caps_unref(raw);
+    } else {
+      linked = gst_element_link_many(source_, encoder_, parser, sink_, nullptr);
+    }
+    if (actual_bframes != bframes || bitrate != config.bitrate / 1000 || !linked)
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "GStreamer rejected video encoder controls"));
     bus_ = gst_element_get_bus(pipeline_);
     if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
-      return CodecResult<void>::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot start GStreamer H.264 encoding"));
+      return CodecResult<void>::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot start GStreamer video encoding"));
     return CodecResult<void>::Success();
   }
   CodecResult<SubmitStatus> Submit(const VideoFrame& frame) override {
@@ -274,11 +296,12 @@ public:
       gst_buffer_unref(buffer);
       return R::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot map GStreamer video input"));
     }
-    CopyVideoEncoderPixels(frame, VideoPixelFormat::NV12, {reinterpret_cast<std::byte*>(map.data), map.size});
+    const bool ten_bit = config_.input.pixel_format == VideoPixelFormat::P010;
+    CopyVideoEncoderPixels(frame, ten_bit ? VideoPixelFormat::P010 : VideoPixelFormat::NV12, {reinterpret_cast<std::byte*>(map.data), map.size});
     gst_buffer_unmap(buffer, &map);
-    gsize offsets[GST_VIDEO_MAX_PLANES]{0, std::size_t(config_.input.width) * config_.input.height};
-    gint strides[GST_VIDEO_MAX_PLANES]{gint(config_.input.width), gint(config_.input.width)};
-    if (!gst_buffer_add_video_meta_full(buffer, GST_VIDEO_FRAME_FLAG_NONE, GST_VIDEO_FORMAT_NV12,
+    gsize offsets[GST_VIDEO_MAX_PLANES]{0, std::size_t(row_bytes_) * config_.input.height};
+    gint strides[GST_VIDEO_MAX_PLANES]{gint(row_bytes_), gint(row_bytes_)};
+    if (!gst_buffer_add_video_meta_full(buffer, GST_VIDEO_FRAME_FLAG_NONE, ten_bit ? GST_VIDEO_FORMAT_P010_10LE : GST_VIDEO_FORMAT_NV12,
         config_.input.width, config_.input.height, 2, offsets, strides)) {
       gst_buffer_unref(buffer);
       return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot describe packed GStreamer video strides"));
@@ -294,7 +317,7 @@ public:
     if (auto* message = gst_bus_pop_filtered(bus_, GST_MESSAGE_ERROR)) {
       GError* error = nullptr; gchar* debug = nullptr;
       gst_message_parse_error(message, &error, &debug);
-      auto failure = Error(CodecErrorCode::PlatformFailure, error ? error->message : "H.264 encoding failed", debug ? debug : "");
+      auto failure = Error(CodecErrorCode::PlatformFailure, error ? error->message : "video encoding failed", debug ? debug : "");
       if (error) g_error_free(error);
       g_free(debug); gst_message_unref(message);
       return R::Failure(std::move(failure));
@@ -308,7 +331,7 @@ public:
     auto* buffer = gst_sample_get_buffer(sample);
     const auto* segment = gst_sample_get_segment(sample);
     if (!buffer || !segment || !GST_BUFFER_PTS_IS_VALID(buffer))
-      return R::Failure(Error(CodecErrorCode::InvalidData, "GStreamer H.264 output has no presentation time"));
+      return R::Failure(Error(CodecErrorCode::InvalidData, "GStreamer video output has no presentation time"));
     auto time = [segment](GstClockTime value) -> std::optional<MediaTimestamp> {
       guint64 stream = 0;
       const auto sign = gst_segment_to_stream_time_full(segment, GST_FORMAT_TIME, value, &stream);
@@ -318,33 +341,33 @@ public:
     const auto pts = time(GST_BUFFER_PTS(buffer));
     const auto dts = GST_BUFFER_DTS_IS_VALID(buffer) ? time(GST_BUFFER_DTS(buffer)) : std::optional<MediaTimestamp>{};
     if (!pts || (GST_BUFFER_DTS_IS_VALID(buffer) && !dts))
-      return R::Failure(Error(CodecErrorCode::InvalidData, "GStreamer H.264 timestamps exceed the session range"));
+      return R::Failure(Error(CodecErrorCode::InvalidData, "GStreamer video timestamps exceed the session range"));
     auto* caps = gst_sample_get_caps(sample);
     const auto* structure = caps ? gst_caps_get_structure(caps, 0) : nullptr;
     const auto* value = structure ? gst_structure_get_value(structure, "codec_data") : nullptr;
     if (!value || !GST_VALUE_HOLDS_BUFFER(value))
-      return R::Failure(Error(CodecErrorCode::InvalidData, "GStreamer H.264 configuration is missing"));
+      return R::Failure(Error(CodecErrorCode::InvalidData, "GStreamer video configuration is missing"));
     auto* description = gst_value_get_buffer(value);
     const auto init_size = gst_buffer_get_size(description);
     if (!init_size || init_size > 65536)
-      return R::Failure(Error(CodecErrorCode::ResourceExhausted, "H.264 configuration exceeds 64 KiB"));
+      return R::Failure(Error(CodecErrorCode::ResourceExhausted, "video configuration exceeds 64 KiB"));
     Bytes init(init_size);
     if (gst_buffer_extract(description, 0, init.data(), init.size()) != init.size())
-      return R::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot read H.264 configuration"));
-    auto parsed = ParseAvc(init);
-    if (!parsed.Succeeded()) return R::Failure(parsed.Error());
+      return R::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot read video configuration"));
     auto described = ReadVideoEncodeFormat(init, config_);
     if (!described.Succeeded()) return R::Failure(described.Error());
+    if (init.front() != std::byte{1}) return R::Failure(Error(CodecErrorCode::InvalidData, "GStreamer did not return a configuration record"));
+    const auto length_size = (std::to_integer<unsigned>(init[config_.codec == CodecId::Hevc ? 21 : 4]) & 3) + 1;
     if (format_ && *format_ != described.Value())
-      return R::Failure(Error(CodecErrorCode::Unsupported, "GStreamer H.264 configuration changed"));
+      return R::Failure(Error(CodecErrorCode::Unsupported, "GStreamer video configuration changed"));
     const auto size = gst_buffer_get_size(buffer);
     if (!size || size > config_.max_packet_bytes)
-      return R::Failure(Error(CodecErrorCode::ResourceExhausted, "GStreamer H.264 access unit exceeds the packet bound"));
+      return R::Failure(Error(CodecErrorCode::ResourceExhausted, "GStreamer video access unit exceeds the packet bound"));
     GstMapInfo map{};
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ))
-      return R::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot map GStreamer H.264 output"));
+      return R::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot map GStreamer video output"));
     auto normalized = NormalizeVideoEncoderPacket({reinterpret_cast<const std::byte*>(map.data), map.size},
-        parsed.Value().length_size, config_.max_packet_bytes);
+        length_size, config_.max_packet_bytes, config_.codec);
     gst_buffer_unmap(buffer, &map);
     if (!normalized.Succeeded()) return R::Failure(normalized.Error());
     EncodedPacket packet{Own(std::move(normalized).Value()), *pts, dts, std::nullopt, false};
@@ -361,7 +384,7 @@ public:
   }
   CodecResult<SubmitStatus> Finish() override {
     const auto status = gst_app_src_end_of_stream(GST_APP_SRC(source_));
-    if (status != GST_FLOW_OK) return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::PlatformFailure, "GStreamer rejected H.264 EOS", gst_flow_get_name(status)));
+    if (status != GST_FLOW_OK) return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::PlatformFailure, "GStreamer rejected video EOS", gst_flow_get_name(status)));
     finished_ = true;
     return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
   }
@@ -375,7 +398,7 @@ public:
     }
     if (bus_) { gst_object_unref(bus_); bus_ = nullptr; }
     pending_.reset();
-    return failed ? CodecResult<void>::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot stop GStreamer H.264 encoder")) : CodecResult<void>::Success();
+    return failed ? CodecResult<void>::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot stop GStreamer video encoder")) : CodecResult<void>::Success();
   }
 private:
   VideoEncoderConfig config_;
@@ -386,6 +409,7 @@ private:
   GstBus* bus_ = nullptr;
   std::optional<VideoEncodeFormat> format_;
   std::optional<EncodedPacket> pending_;
+  std::uint32_t row_bytes_ = 0;
   std::size_t frame_bytes_ = 0;
   bool finished_ = false, eos_ = false;
 };

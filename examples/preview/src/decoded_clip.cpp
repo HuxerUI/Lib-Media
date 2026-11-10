@@ -594,8 +594,8 @@ struct MovieCopy {
 
 VideoFrame EncoderInput(VideoFrame frame) {
   const auto visible = frame.format.visible;
-  if (frame.format.pixel_format == VideoPixelFormat::P010 || (visible.x | visible.y | visible.width | visible.height) & 1u)
-    throw std::runtime_error("H.264 export requires an even, eight-bit 4:2:0 crop");
+  if ((visible.x | visible.y | visible.width | visible.height) & 1u)
+    throw std::runtime_error("Video encoding requires an even 4:2:0 crop");
   for (std::size_t i = 0; i < frame.planes.size(); ++i) {
     auto& plane = frame.planes[i];
     const auto scale = i ? 2u : 1u;
@@ -621,12 +621,18 @@ struct ExportQueue {
 
 struct DecodeOrder {
   std::uint32_t scale;
+  bool ordered_pts = false;
   std::optional<ContainerPacket> pending;
   std::int64_t first_dts = 0;
   std::int64_t total_duration = 0;
 
   std::optional<ContainerPacket> Push(ContainerPacket packet) {
-    if (!packet.dts || !packet.duration) throw std::runtime_error("B-picture export requires explicit DTS and duration");
+    if (ordered_pts) {
+      if (!packet.pts || (pending && packet.pts->Compare(*pending->pts) <= 0))
+        throw std::runtime_error("MP4 export cannot use presentation timestamps for reordered video without DTS");
+      packet.dts = packet.pts;
+    }
+    if (!packet.dts || !packet.duration) throw std::runtime_error("MP4 export requires explicit DTS and duration");
     const auto dts = Ticks(*packet.dts, scale);
     const auto duration = Ticks(*packet.duration, scale);
     if (duration <= 0 || total_duration > INT64_MAX - duration)
@@ -659,7 +665,7 @@ struct ExportTrack {
       if (auto output = Require(encoder->TryRead())) {
         if (auto* packet = std::get_if<EncodedPacket>(&*output)) {
           if (!queue.track) throw std::runtime_error("Codec packet preceded its configuration");
-          // With reordering disabled the presentation order is the decode order.
+          // The automatic policy uses DecodeOrder to validate or supply the decode timeline.
           auto dts = decode_order ? packet->dts : std::optional{packet->pts};
           ContainerPacket sample{queue.track->id, packet->data, packet->pts, dts, packet->duration, packet->key_frame};
           queue.packet = decode_order ? decode_order->Push(std::move(sample)) : std::optional{std::move(sample)};
@@ -681,7 +687,7 @@ struct ExportTrack {
           } else {
             const auto& format = std::get<VideoEncodeFormat>(*output);
             const auto range = source->PresentationRange();
-            queue.track = MediaTrack{.id = source->track.id, .kind = TrackKind::Video, .codec = CodecId::H264,
+            queue.track = MediaTrack{.id = source->track.id, .kind = TrackKind::Video, .codec = format.codec,
                 .framing = PacketFraming::LengthPrefixedNals, .initialization_data = format.initialization_data,
                 .timescale = decode_order ? std::optional{decode_order->scale} : source->track.timescale,
                 .coded_width = format.width, .coded_height = format.height,
@@ -703,6 +709,7 @@ struct ExportTrack {
         } else {
           VideoEncoderConfig config;
           config.input = frames.front().format;
+          config.codec = source->track.codec;
           config.profile = decode_order ? H264Profile::High : H264Profile::Baseline;
           config.max_b_frames = decode_order ? std::nullopt : std::optional<std::uint32_t>{0};
           encoder.emplace(Require(VideoEncoder::Create(config)));
@@ -782,13 +789,20 @@ Task<std::shared_ptr<const File>> CopyClip(std::shared_ptr<const File> file, Fil
 
 Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, File temporary, bool reorder) {
   auto clip = co_await OnFileThread([file] { return ClipInput(file); });
-  if (clip.video->track.codec != CodecId::H264)
-    throw std::runtime_error("MP4 encoding in the preview requires an eight-bit H.264 source");
   if (const auto range = clip.video->PresentationRange(); range && range->start == range->end)
     throw std::runtime_error("The video edit contains no pictures to export");
   ExportTrack<VideoDecoder, VideoEncoder, VideoFrame> video(
       clip.video, Require(VideoDecoder::Create(VideoConfig(clip.video->track))));
-  if (reorder) video.decode_order.emplace(DecodeOrder{.scale = CommonClock(clip.video->track.timescale.value_or(90000), 1000000)});
+  bool ordered_pts = false;
+#if defined(__EMSCRIPTEN__)
+  ordered_pts = clip.video->track.codec == CodecId::Hevc;
+#elif defined(__APPLE__) && TARGET_OS_IOS && TARGET_OS_SIMULATOR
+  if (clip.video->track.codec == CodecId::Hevc) reorder = true;
+#endif
+  const auto clock = clip.video->track.timescale.value_or(90000);
+  if (ordered_pts || reorder)
+    video.decode_order.emplace(DecodeOrder{.scale = ordered_pts ? clock : CommonClock(clock, 1000000),
+        .ordered_pts = ordered_pts});
   std::optional<ExportTrack<AudioDecoder, AudioEncoder, AudioFrame>> audio;
   ExportQueue audio_copy;
   if (clip.audio) {

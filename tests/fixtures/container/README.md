@@ -41,6 +41,8 @@ ffmpeg -f lavfi -i sine=sample_rate=48000:duration=5.15 \
 
 - `preview-avc-aac.mp4` carries four seconds of generated color and audio markers, with Main-profile AVC
   B pictures, uneven presentation intervals, and AAC priming. It is the bundled Frames sample.
+- `preview-hevc-main.mp4` has 20 generated SDR Main-profile HEVC pictures with an `hvc1` entry.
+  The Web and iOS preview tests encode it and compare every picture timestamp after MP4 readback.
 - `preview-hevc10.mov` is an AVAssetWriter-generated Main10 `hvc1` movie with an SDR BT.709 ramp and
   a clockwise 90-degree transform. Generate it on macOS with
   `xcrun swift generate_hevc10.swift preview-hevc10.mov` in this directory.
@@ -60,8 +62,19 @@ ffmpeg -f lavfi -i sine=sample_rate=48000:duration=5.15 \
 - `tagged-flac.flac` and `tagged-mp3.mp3` carry the same audio as the untagged samples and contain UTF-8 or
   UTF-16 text and a front cover. FLAC includes a native seek point. The tests compare every compressed frame
   before and after copying and verify that WAV readback contains exactly 50142 samples.
+- `tagged-aac.m4a` has AAC-LC at 48 kHz, 1024 samples of encoder priming, and 52800 audible samples. Its last
+  packet spans 576 samples on the container timeline. The metadata test replaces its `udta` or `ilst` with
+  an empty box and checks that the audio timeline and packets remain readable.
+- `tagged-alac.m4a` has three lossless packets at 96 kHz with 10560 samples, including a shorter final packet.
+  Both M4A fixtures carry the same text tags and PNG cover and exercise fast-start copy and seek.
+- `fragmented-aac.m4a` has 23 AAC-LC packets over four fragments, spanning 22624 samples at 48 kHz. The
+  preview test copies it to regular M4A and compares packet contents and timing with indexed source readback.
 
 ```sh
+ffmpeg -f lavfi -i 'testsrc2=size=320x240:rate=30:duration=0.64' -c:v hevc_videotoolbox \
+  -profile:v main -pix_fmt nv12 -tag:v hvc1 -g 6 -bf 0 -b:v 500k -movflags +faststart preview-hevc-main.mp4
+ffmpeg -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=0.45' -c:a aac -ac 2 \
+  -movflags +empty_moov+default_base_moof+frag_keyframe -frag_duration 120000 -f mp4 fragmented-aac.m4a
 ffmpeg -f lavfi -i sine=sample_rate=48000:duration=2.237 -c:a opus -strict experimental -ac 2 -b:a 48k preview-opus.ogg
 ffmpeg -f lavfi -i sine=sample_rate=44100:duration=1.137 -c:a flac -ac 2 preview-flac.flac
 ffmpeg -f lavfi -i sine=sample_rate=44100:duration=1.137 -c:a pcm_s16le -ac 2 audio.wav
@@ -83,6 +96,17 @@ ffmpeg -i preview-mp3.mp3 -i audio-cover.png -map 0:a -map 1:v -c copy -id3v2_ve
   -metadata 'title=试听 Café' -metadata 'artist=Lib-Media' -metadata 'album=Audio Fixtures' \
   -metadata 'track=2/12' -metadata 'genre=Test' -metadata 'date=2026' \
   -metadata:s:v 'comment=Cover (front)' -disposition:v attached_pic tagged-mp3.mp3
+while read -r codec frequency rate duration; do
+  set -- -c:a "$codec"
+  if [ "$codec" = aac ]; then set -- "$@" -profile:a aac_low -b:a 48k; fi
+  ffmpeg -nostdin -f lavfi -i "sine=frequency=$frequency:sample_rate=$rate:duration=$duration" -i audio-cover.png \
+    -map 0:a -map 1:v "$@" -ac 2 -c:v copy -disposition:v attached_pic \
+    -metadata 'title=试听 Café' -metadata 'artist=Lib-Media' -metadata 'album=Audio Fixtures' \
+    -metadata 'track=2/12' -metadata 'genre=Test' -metadata 'date=2026' -movflags +faststart "tagged-$codec.m4a"
+done <<'EOF'
+aac 660 48000 1.1
+alac 440 96000 0.11
+EOF
 ```
 
 ```sh

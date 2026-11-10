@@ -61,6 +61,29 @@ async function run() {
   assert.equal(frameClosed, true, 'Retired asynchronous copy leaked its platform frame');
   assert.equal(decoders[1].closed, 1);
   assert.equal(api.close(video), '');
+  const hevc = api.open({audio: false, codec: 'hvc1.2.4.L30.B0', tenBit: true, width: 4, height: 2,
+    description: new Uint8Array([1, 2])});
+  probes.shift()(); await turn();
+  decoders[2].callbacks.output({timestamp: 0, duration: 1, codedWidth: 4, codedHeight: 2, displayWidth: 4, displayHeight: 2,
+    format: 'I420P10', visibleRect: {x: 0, y: 0, width: 4, height: 2}, colorSpace: {toJSON() { return {}; }},
+    allocationSize() { return 40; },
+    async copyTo(bytes) {
+      const view = new DataView(bytes.buffer);
+      for (const [offset, sample] of [[0, 65], [10, 1023], [24, 100], [26, 101], [32, 500], [34, 501]])
+        view.setUint16(offset, sample, true);
+      return [{offset: 0, stride: 10}, {offset: 24, stride: 6}, {offset: 32, stride: 6}];
+    },
+    close() { ++closed; }
+  });
+  await turn();
+  const p010 = api.poll(hevc);
+  assert.equal(p010.format, 'P010');
+  assert.deepEqual(Array.from(p010.strides), [8, 8]);
+  const y = new DataView(p010.planes[0].buffer), uv = new DataView(p010.planes[1].buffer);
+  assert.equal(y.getUint16(0, true), 65 << 6);
+  assert.equal(y.getUint16(8, true), 1023 << 6);
+  assert.deepEqual([0, 2, 4, 6].map(offset => uv.getUint16(offset, true) >>> 6), [100, 500, 101, 501]);
+  assert.equal(api.close(hevc), '');
   console.log('Web codec pending-probe, copy, flush, and late-callback retirement contracts passed');
 }
 run().catch(error => { console.error(error); process.exitCode = 1; });

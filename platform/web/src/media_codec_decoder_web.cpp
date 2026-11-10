@@ -1,5 +1,6 @@
 #include "codec/decoder/backend.h"
 #include "codec/decoder/copy.h"
+#include "codec/hevc.h"
 #include <algorithm>
 #include <emscripten/val.h>
 
@@ -46,6 +47,8 @@ public:
     } else {
       const auto& video = std::get<VideoDecoderConfig>(config);
       options.set("audio", false); options.set("width", video.width); options.set("height", video.height);
+      if (video.codec == CodecId::Hevc) options.set("codec", HevcCodecString(video.initialization_data));
+      options.set("tenBit", video.output == VideoPixelFormat::P010);
       options.set("description", Uint8(video.initialization_data));
     }
     id_ = bridge_.call<unsigned>("open", options);
@@ -108,19 +111,24 @@ public:
     format.width = value["width"].as<unsigned>(); format.height = value["height"].as<unsigned>();
     auto rect = value["visible"];
     format.visible = {rect["x"].as<unsigned>(), rect["y"].as<unsigned>(), rect["width"].as<unsigned>(), rect["height"].as<unsigned>()};
-    format.pixel_format = value["format"].as<std::string>() == "I420" ? VideoPixelFormat::I420 : VideoPixelFormat::NV12;
+    const auto layout = value["format"].as<std::string>();
+    format.pixel_format = layout == "P010" ? VideoPixelFormat::P010 : layout == "I420" ? VideoPixelFormat::I420 : VideoPixelFormat::NV12;
     format.aspect_width = value["aspectWidth"].as<unsigned>(); format.aspect_height = value["aspectHeight"].as<unsigned>();
     auto color = value["color"];
     if (color["primaries"].equals(val("bt709"))) format.primaries = ColorPrimaries::BT709;
     else if (color["primaries"].equals(val("bt2020"))) format.primaries = ColorPrimaries::BT2020;
     if (color["transfer"].equals(val("bt709"))) format.transfer = ColorTransfer::BT709;
     else if (color["transfer"].equals(val("iec61966-2-1"))) format.transfer = ColorTransfer::SRGB;
+    else if (color["transfer"].equals(val("pq"))) format.transfer = ColorTransfer::PQ;
+    else if (color["transfer"].equals(val("hlg"))) format.transfer = ColorTransfer::HLG;
     if (color["matrix"].equals(val("bt709"))) format.matrix = ColorMatrix::BT709;
     else if (color["matrix"].equals(val("smpte170m"))) format.matrix = ColorMatrix::BT601;
+    else if (color["matrix"].equals(val("bt2020-ncl"))) format.matrix = ColorMatrix::BT2020;
     if (!color["fullRange"].isNull() && !color["fullRange"].isUndefined()) format.range = color["fullRange"].as<bool>() ? ColorRange::Full : ColorRange::Limited;
     std::vector<VideoPlane> source_planes;
+    const auto component = layout == "P010" ? 2u : 1u;
     for (unsigned i = 0; i < planes["length"].as<unsigned>(); ++i)
-      source_planes.push_back({Buffer(planes[i]), value["strides"][i].as<unsigned>(), i && format.pixel_format == VideoPixelFormat::NV12 ? 2u : 1u});
+      source_planes.push_back({Buffer(planes[i]), value["strides"][i].as<unsigned>(), i && layout != "I420" ? component * 2 : component});
     auto duration = value["duration"].isNull() ? std::nullopt : std::optional(MediaTimestamp{static_cast<std::int64_t>(value["duration"].as<double>()), 1000000});
     auto copied = CopyVideo(format, pts, duration, std::move(source_planes), config.output);
     if (!copied.Succeeded()) return R::Failure(copied.Error());

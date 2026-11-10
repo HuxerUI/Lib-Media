@@ -1,4 +1,8 @@
 #include <huxerui/media_codec.h>
+#ifndef __EMSCRIPTEN__
+#include <huxerui/file.h>
+#include <huxerui/media_container.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -179,6 +183,50 @@ void CheckSignal(const Encoded& encoded, const std::vector<std::int16_t>& decode
   std::cout << encoded.format.sample_rate << " Hz " << channels << " channels: packets=" << encoded.packets.size()
       << " correlation=" << best << " alignment(test only)=" << best_delay << '\n';
 }
+#ifndef __EMSCRIPTEN__
+template<class T, class E> T Take(Result<T, E> result) {
+  if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
+  if constexpr (!std::is_void_v<T>) return std::move(result).Value();
+}
+
+void M4aReadback(Encoded& encoded) {
+  const auto& summary = encoded.summary;
+  if (!summary.priming_samples || !summary.padding_samples) return;
+  const auto rate = encoded.format.sample_rate;
+  const MediaTrack track{.id = 1, .kind = TrackKind::Audio, .codec = CodecId::Aac,
+      .initialization_data = encoded.format.initialization_data, .sample_rate = rate,
+      .channel_count = encoded.format.channel_layout == AudioChannelLayout::Mono ? 1u : 2u};
+  const auto path = std::filesystem::temp_directory_path() /
+      ("lib-media-aac-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".m4a");
+  const File file(path.u8string());
+  auto mux = Take(MediaMuxer::Open(Take(file.OpenRandomAccess(FileAccessMode::ReadWrite, FileOpenMode::CreateNew)),
+      ContainerFormat::Mp4, std::span(&track, 1), ContainerLayout::FastStart));
+  for (const auto& packet : encoded.packets)
+    Check(!Take(mux.TryWrite({1, packet.data, packet.pts, packet.dts, packet.duration, true})), "M4A AAC muxing stalled");
+  Take(mux.EndTrack(1, summary.priming_samples, summary.padding_samples));
+  Take(mux.Finish());
+  auto demux = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+  const auto& description = demux.Tracks().front();
+  Check(description.codec == CodecId::Aac && description.initialization_data == track.initialization_data &&
+      description.priming_samples == summary.priming_samples && description.padding_samples == summary.padding_samples,
+      "M4A changed AAC initialization or trim");
+  const auto start = *summary.input_start->Rescale(rate);
+  Check(demux.PresentationRange(description.id) == MediaPresentationRange{start,
+      {start.ticks + static_cast<std::int64_t>(summary.input_samples), rate}}, "M4A changed the audible sample interval");
+  for (auto& packet : encoded.packets) {
+    auto item = Take(demux.Read());
+    Check(bool(item), "M4A lost an encoded AAC packet");
+    auto& actual = std::get<ContainerPacket>(*item);
+    Check(actual.pts == packet.pts && actual.duration == packet.duration &&
+        std::ranges::equal(actual.data.AsBytes(), packet.data.AsBytes()), "M4A changed the AAC packet");
+    packet.data = std::move(actual.data);
+  }
+  Check(!Take(demux.Read()), "M4A added AAC packets");
+  Take(demux.Close());
+  std::filesystem::remove(path);
+}
+#endif
+
 void Export(const Encoded& encoded, const std::filesystem::path& directory) {
   std::filesystem::create_directories(directory);
   const auto name = std::to_string(encoded.format.sample_rate) + (encoded.format.channel_layout == AudioChannelLayout::Mono ? "-mono" : "-stereo");
@@ -202,6 +250,9 @@ int Run(int argc, char** argv) {
     for (auto count : {0u, 1u, 1023u, 1024u, 1025u, 1537u}) Encode(48000, AudioChannelLayout::Stereo, count);
     for (auto rate : {44100u, 48000u}) for (auto layout : {AudioChannelLayout::Mono, AudioChannelLayout::Stereo}) {
       auto encoded = Encode(rate, layout, rate + 1537);
+#ifndef __EMSCRIPTEN__
+      M4aReadback(encoded);
+#endif
       CheckSignal(encoded, Decode(encoded));
       if (argc == 2) Export(encoded, argv[1]);
     }

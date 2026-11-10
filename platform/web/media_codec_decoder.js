@@ -27,8 +27,9 @@
         const width = Math.min(frame.codedWidth, state.width), height = Math.min(frame.codedHeight, state.height);
         if (frame.visibleRect.x + frame.visibleRect.width > width || frame.visibleRect.y + frame.visibleRect.height > height)
           throw new Error('WebCodecs visible frame exceeds configured dimensions');
-        if (frame.format !== 'I420' && frame.format !== 'NV12')
-          throw new Error('WebCodecs did not expose CPU I420/NV12');
+        const planar10 = frame.format === 'I420P10';
+        if (state.tenBit ? !planar10 : frame.format !== 'I420' && frame.format !== 'NV12')
+          throw new Error('WebCodecs did not expose the requested CPU YUV bit depth (' + frame.format + ')');
         record.width = width; record.height = height;
         record.visible = {x: frame.visibleRect.x, y: frame.visibleRect.y, width: frame.visibleRect.width, height: frame.visibleRect.height};
         record.format = frame.format;
@@ -38,15 +39,33 @@
         const options = {rect: {x: 0, y: 0, width, height}};
         const bytes = new Uint8Array(frame.allocationSize(options));
         const layouts = await frame.copyTo(bytes, options);
-        const count = frame.format === 'I420' ? 3 : 2;
+        const count = frame.format === 'NV12' ? 2 : 3;
         if (layouts.length !== count) throw new Error('Invalid WebCodecs plane layout');
-        record.strides = [];
-        for (let i = 0; i < count; ++i) {
-          const rows = i ? Math.ceil(height / 2) : height;
-          const rowBytes = i ? Math.ceil(width / 2) * (count === 2 ? 2 : 1) : width;
-          const size = layouts[i].stride * (rows - 1) + rowBytes;
-          record.planes.push(bytes.slice(layouts[i].offset, layouts[i].offset + size));
-          record.strides.push(layouts[i].stride);
+        if (planar10) {
+          const y = new Uint8Array(width * height * 2);
+          const cw = Math.ceil(width / 2), ch = Math.ceil(height / 2);
+          const uv = new Uint8Array(cw * ch * 4);
+          const source = new DataView(bytes.buffer);
+          const luma = new DataView(y.buffer), chroma = new DataView(uv.buffer);
+          const read = (plane, row, x) => source.getUint16(layouts[plane].offset + row * layouts[plane].stride + x * 2, true);
+          for (let row = 0; row < height; ++row) for (let x = 0; x < width; ++x) {
+            luma.setUint16((row * width + x) * 2, read(0, row, x) << 6, true);
+          }
+          for (let row = 0; row < ch; ++row) for (let x = 0; x < cw; ++x) for (let plane = 1; plane < 3; ++plane) {
+            chroma.setUint16((row * cw + x) * 4 + (plane - 1) * 2, read(plane, row, x) << 6, true);
+          }
+          record.format = 'P010';
+          record.planes = [y, uv];
+          record.strides = [width * 2, cw * 4];
+        } else {
+          record.strides = [];
+          for (let i = 0; i < count; ++i) {
+            const rows = i ? Math.ceil(height / 2) : height;
+            const rowBytes = i ? Math.ceil(width / 2) * (count === 2 ? 2 : 1) : width;
+            const size = layouts[i].stride * (rows - 1) + rowBytes;
+            record.planes.push(bytes.slice(layouts[i].offset, layouts[i].offset + size));
+            record.strides.push(layouts[i].stride);
+          }
         }
       }
       if (state.active) state.output.push(record);
@@ -64,7 +83,7 @@
       const codecConfig = config.audio
         ? {codec: config.codec || 'mp4a.40.2', sampleRate: config.rate, numberOfChannels: config.channels,
            ...(description.length ? {description} : {})}
-        : {codec: 'avc1.' + Array.from(description.slice(1, 4), x => x.toString(16).padStart(2, '0')).join(''),
+        : {codec: config.codec || 'avc1.' + Array.from(description.slice(1, 4), x => x.toString(16).padStart(2, '0')).join(''),
            codedWidth: config.width, codedHeight: config.height, description};
       Type.isConfigSupported(codecConfig).then(support => {
         if (!state.active) return;

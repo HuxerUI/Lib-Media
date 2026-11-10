@@ -26,7 +26,9 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied presentation metadata");
     if (it->kind != TrackKind::Video && (it->pixel_aspect_ratio || !it->video_extensions.empty()))
       Fail(ContainerErrorCode::InvalidArgument, "Visual metadata requires a video track");
-    if (it->audio_metadata && format != ContainerFormat::Flac && format != ContainerFormat::Mp3)
+    if (it->audio_metadata && format != ContainerFormat::Flac && format != ContainerFormat::Mp3 &&
+        (format != ContainerFormat::Mp4 || tracks.size() != 1 || it->kind != TrackKind::Audio ||
+         layout == ContainerLayout::Fragmented))
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied audio tags");
   }
   if (layout != ContainerLayout::Default && (format != ContainerFormat::Mp4 ||

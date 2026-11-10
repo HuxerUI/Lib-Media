@@ -97,8 +97,12 @@ public:
           return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Unsupported GStreamer audio codec"));
       }
     } else {
-      input = gst_caps_new_simple("video/x-h264", "stream-format", G_TYPE_STRING, "avc", "alignment", G_TYPE_STRING, "au", nullptr);
-      headers_ok = SetDescription(input, std::get<VideoDecoderConfig>(config_).initialization_data, false);
+      const auto& video = std::get<VideoDecoderConfig>(config_);
+      const bool hevc = video.codec == CodecId::Hevc;
+      if (hevc) parser_name = "h265parse";
+      input = gst_caps_new_simple(hevc ? "video/x-h265" : "video/x-h264", "stream-format", G_TYPE_STRING,
+          hevc ? "hvc1" : "avc", "alignment", G_TYPE_STRING, "au", nullptr);
+      headers_ok = SetDescription(input, video.initialization_data, false);
     }
     if (!headers_ok) {
       gst_caps_unref(input);
@@ -137,8 +141,11 @@ public:
           audio->output.sample_format == AudioSampleFormat::F32 ? GST_AUDIO_NE(F32) : GST_AUDIO_NE(S16),
           "layout", G_TYPE_STRING, "interleaved", "rate", G_TYPE_INT, int(audio->output.sample_rate),
           "channels", G_TYPE_INT, int(audio->output.ChannelCount()), nullptr);
-    } else output = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING,
-        std::get<VideoDecoderConfig>(config_).output == VideoPixelFormat::NV12 ? "NV12" : "I420", nullptr);
+    } else {
+      const auto layout = std::get<VideoDecoderConfig>(config_).output;
+      output = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING,
+          layout == VideoPixelFormat::P010 ? "P010_10LE" : layout == VideoPixelFormat::NV12 ? "NV12" : "I420", nullptr);
+    }
     gst_app_sink_set_caps(GST_APP_SINK(sink_), output);
     gst_caps_unref(output);
     gst_bin_add_many(GST_BIN(pipeline_), source_, decoder, convert, sink_, nullptr);
@@ -273,7 +280,8 @@ private:
     GstVideoInfo info;
     if (!gst_video_info_from_caps(&info, caps) || info.width <= 0 || info.height <= 0 || info.width > config.width || info.height > config.height)
       return R::Failure(Error(CodecErrorCode::InvalidData, "GStreamer video exceeds configured geometry"));
-    const auto expected = config.output == VideoPixelFormat::NV12 ? GST_VIDEO_FORMAT_NV12 : GST_VIDEO_FORMAT_I420;
+    const auto expected = config.output == VideoPixelFormat::P010 ? GST_VIDEO_FORMAT_P010_10LE :
+        config.output == VideoPixelFormat::NV12 ? GST_VIDEO_FORMAT_NV12 : GST_VIDEO_FORMAT_I420;
     if (GST_VIDEO_INFO_FORMAT(&info) != expected) return R::Failure(Error(CodecErrorCode::Unsupported, "Unsupported GStreamer pixel layout"));
     VideoMapping mapping;
     if (!gst_video_frame_map(&mapping.frame, &info, buffer, GST_MAP_READ)) return R::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot map GStreamer YUV"));
@@ -285,22 +293,27 @@ private:
     format.aspect_width = info.par_n; format.aspect_height = info.par_d;
     format.range = info.colorimetry.range == GST_VIDEO_COLOR_RANGE_0_255 ? ColorRange::Full : info.colorimetry.range == GST_VIDEO_COLOR_RANGE_16_235 ? ColorRange::Limited : ColorRange::Unknown;
     if (info.colorimetry.primaries == GST_VIDEO_COLOR_PRIMARIES_BT709) format.primaries = ColorPrimaries::BT709;
+    else if (info.colorimetry.primaries == GST_VIDEO_COLOR_PRIMARIES_BT2020) format.primaries = ColorPrimaries::BT2020;
     if (info.colorimetry.transfer == GST_VIDEO_TRANSFER_BT709) format.transfer = ColorTransfer::BT709;
+    else if (info.colorimetry.transfer == GST_VIDEO_TRANSFER_SMPTE2084) format.transfer = ColorTransfer::PQ;
+    else if (info.colorimetry.transfer == GST_VIDEO_TRANSFER_ARIB_STD_B67) format.transfer = ColorTransfer::HLG;
     if (info.colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_BT709) format.matrix = ColorMatrix::BT709;
     else if (info.colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_BT601) format.matrix = ColorMatrix::BT601;
+    else if (info.colorimetry.matrix == GST_VIDEO_COLOR_MATRIX_BT2020) format.matrix = ColorMatrix::BT2020;
     if (auto* crop = gst_buffer_get_video_crop_meta(buffer)) format.visible = {crop->x, crop->y, crop->width, crop->height};
     std::vector<VideoPlane> planes;
-    bool valid = true;
-    for (unsigned i = 0; i < (config.output == VideoPixelFormat::I420 ? 3u : 2u); ++i) {
+    const bool planar = config.output == VideoPixelFormat::I420;
+    const auto component = config.output == VideoPixelFormat::P010 ? 2u : 1u;
+    for (unsigned i = 0; i < (planar ? 3u : 2u); ++i) {
       const auto stride = GST_VIDEO_FRAME_PLANE_STRIDE(&frame, i);
-      if (stride <= 0) { valid = false; break; }
       const auto height = i ? (format.height + 1) / 2 : format.height;
-      const auto width = i ? ((format.width + 1) / 2) * (config.output == VideoPixelFormat::NV12 ? 2 : 1) : format.width;
+      const auto pixel = i && !planar ? component * 2 : component;
+      const auto width = (i ? (format.width + 1) / 2 : format.width) * pixel;
+      if (stride < int(width)) return R::Failure(Error(CodecErrorCode::Unsupported, "Invalid GStreamer video stride"));
       const auto size = std::size_t(stride) * (height - 1) + width;
       auto* base = static_cast<const std::byte*>(GST_VIDEO_FRAME_PLANE_DATA(&frame, i));
-      planes.push_back({Own(Bytes(base, base + size)), std::size_t(stride), i && config.output == VideoPixelFormat::NV12 ? 2u : 1u});
+      planes.push_back({Own(Bytes(base, base + size)), std::size_t(stride), pixel});
     }
-    if (!valid) return R::Failure(Error(CodecErrorCode::Unsupported, "Negative GStreamer video stride is unsupported"));
     const auto duration = GST_BUFFER_DURATION_IS_VALID(buffer) ? std::optional(MediaTimestamp{std::int64_t(GST_BUFFER_DURATION(buffer)), GST_SECOND}) : std::nullopt;
     auto copied = CopyVideo(format, pts, duration, std::move(planes), config.output);
     if (!copied.Succeeded()) return R::Failure(copied.Error());

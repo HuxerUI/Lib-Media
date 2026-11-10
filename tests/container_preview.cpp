@@ -1,11 +1,13 @@
 #include "decoded_preview.h"
 
 #include <huxerui/huxerui.h>
+#include <huxerui/media_codec.h>
 #include <huxerui/media_container.h>
 #include <huxerui/testing/ui_test.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -220,6 +222,25 @@ std::optional<ContainerPacket> ReadPacket(MediaDemuxer& demux) {
   return {};
 }
 
+std::shared_ptr<const File> RunMovieExport(const TaskScope& tasks, testing::UiTest& ui, const File& temporary,
+    std::shared_ptr<const File> input, std::optional<ContainerFormat> copy, bool reorder = false) {
+  std::shared_ptr<const File> output;
+  std::exception_ptr failure;
+  const auto exporting = tasks.Launch([&, input = std::move(input)]() -> Task<void> {
+    try {
+      if (copy) output = co_await media_preview::CopyClip(input, temporary, copy);
+      else output = co_await media_preview::ExportClip(input, temporary, reorder);
+    } catch (...) { failure = std::current_exception(); }
+  });
+  try {
+    Until(ui, failure, [&] { return bool(output); }, "MP4 export did not finish");
+  } catch (...) {
+    exporting.Cancel();
+    throw;
+  }
+  return output;
+}
+
 void CheckCopy(const File& source, const File& output, ContainerFormat format) {
   auto open = [](const File& file) { return Require(MediaDemuxer::Open(Require(file.OpenRandomAccess()))); };
   const auto original = open(source);
@@ -248,7 +269,16 @@ void CheckCopy(const File& source, const File& output, ContainerFormat format) {
   }
 }
 
-void CheckAudioCopy(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+void CheckAudioCopy(const TaskScope& tasks, testing::UiTest& ui, const File& temporary, const char* name) {
+  const auto input = Fixture(name);
+  auto source = media_preview::Open(*input);
+  if (source.Layout() == ContainerLayout::Fragmented) {
+    Check(!source.PresentationRange(source.Tracks().front().id), "Fragment fixture already has an index");
+    Require(source.FindSeekPoint(source.Tracks().front().id, {0, 1}));
+  }
+  const auto& original = source.Tracks().front();
+  const auto expected_range = source.PresentationRange(original.id);
+  Check(expected_range.has_value(), "Audio fixture is missing its presentation range");
   struct CopyResult {
     std::shared_ptr<const File> file;
     bool dispatched_during_copy = false;
@@ -258,7 +288,7 @@ void CheckAudioCopy(const TaskScope& tasks, testing::UiTest& ui, const File& tem
   const auto copying = tasks.Launch([&]() -> Task<void> {
     try {
       tasks.Post([result] { result->dispatched_during_copy = !result->file; });
-      result->file = co_await media_preview::CopyAudioClip(Fixture("tagged-mp3.mp3"), temporary);
+      result->file = co_await media_preview::CopyAudioClip(input, temporary);
     } catch (...) { failure = std::current_exception(); }
   });
   Until(ui, failure, [&] { return bool(result->file); }, "Audio packet copy did not complete");
@@ -268,12 +298,75 @@ void CheckAudioCopy(const TaskScope& tasks, testing::UiTest& ui, const File& tem
   auto copy = media_preview::Open(*result->file);
   const auto tracks = copy.Tracks();
   const auto& tags = tracks.front().audio_metadata;
-  Check(copy.Format() == ContainerFormat::Mp3 && copy.Duration() == MediaTimestamp{50142, 44100} &&
-        tags && tags->cover, "Audio packet copy lost timing or cover metadata");
-  std::size_t packets = 0;
-  while (Require(copy.Read())) ++packets;
-  Check(packets == 45, "Audio packet copy changed the number of frames");
+  Check(copy.Format() == source.Format() && tracks.front().codec == original.codec &&
+        copy.PresentationRange(tracks.front().id) == expected_range, "Audio packet copy changed the format or presentation range");
+  if (original.audio_metadata)
+    Check(tags && tags->title == original.audio_metadata->title && tags->cover, "Audio packet copy lost cover metadata");
+  while (const auto expected = ReadPacket(source)) {
+    const auto actual = ReadPacket(copy);
+    Check(actual && actual->pts == expected->pts && actual->dts == expected->dts && actual->duration == expected->duration &&
+          std::ranges::equal(actual->data.AsBytes(), expected->data.AsBytes()), "Audio packet copy changed packet bytes or timing");
+  }
+  Check(!ReadPacket(copy), "Audio packet copy added packets");
+  if (copy.Format() == ContainerFormat::Mp4) {
+    const auto sequential = MediaDemuxer::Open(Require(result->file->OpenRead()), ContainerFormat::Mp4);
+#ifdef __EMSCRIPTEN__
+    Check(!sequential.Succeeded() && sequential.Error().code == ContainerErrorCode::NeedRandomAccess,
+          "Web M4A output must keep media before the index to avoid relocation");
+#else
+    Check(sequential.Succeeded(), "Native M4A output lost fast-start layout");
+#endif
+  }
 }
+
+#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && TARGET_OS_IOS)
+void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+  const auto input = Fixture("preview-hevc-main.mp4");
+  auto source = media_preview::Open(*input);
+  const auto& track = source.Tracks().front();
+  VideoDecoderConfig decode{.initialization_data = track.initialization_data,
+      .width = *track.coded_width, .height = *track.coded_height, .codec = CodecId::Hevc};
+  VideoEncoderConfig encode;
+  encode.input = {*track.coded_width, *track.coded_height, {0, 0, *track.coded_width, *track.coded_height}};
+  encode.max_b_frames = std::nullopt;
+  encode.codec = CodecId::Hevc;
+  const auto supported = [&](const auto& config, auto probe) {
+    enum class Status { Pending, Supported, Unsupported, Failed };
+    const auto status = std::make_shared<std::atomic<Status>>(Status::Pending);
+    probe(config, [status](auto result) {
+      *status = result.Succeeded() ? Status::Supported :
+          result.Error().code == CodecErrorCode::Unsupported ? Status::Unsupported : Status::Failed;
+    });
+    Until(ui, {}, [&] { return *status != Status::Pending; }, "HEVC probe timed out");
+    Check(*status != Status::Failed, "HEVC probe failed");
+    return *status == Status::Supported;
+  };
+  if (!supported(decode, VideoDecoder::Probe) || !supported(encode, VideoEncoder::Probe)) {
+    std::cout << "HEVC Main preview export skipped for an unavailable codec\n";
+    return;
+  }
+  const auto output = RunMovieExport(tasks, ui, temporary, input, {}, media_preview::preview_reordered_export);
+  auto result = media_preview::Open(*output);
+  const auto& encoded = result.Tracks().front();
+  Check(encoded.codec == CodecId::Hevc && encoded.sample_entry == "hvc1" &&
+        source.PresentationRange(track.id) == result.PresentationRange(encoded.id), "HEVC export lost its format or timeline");
+  std::vector<MediaTimestamp> expected_pts, actual_pts;
+  while (const auto packet = ReadPacket(source)) expected_pts.push_back(*packet->pts);
+  std::optional<MediaTimestamp> last_dts;
+  while (const auto packet = ReadPacket(result)) {
+    Check(packet->pts && packet->dts && packet->duration &&
+          (!last_dts || packet->dts->Compare(*last_dts) > 0), "HEVC export lost increasing decode timestamps");
+#ifdef __EMSCRIPTEN__
+    Check(packet->pts == packet->dts, "Web HEVC export did not preserve presentation order");
+#endif
+    last_dts = packet->dts;
+    actual_pts.push_back(*packet->pts);
+  }
+  std::ranges::sort(actual_pts, [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; });
+  Check(!expected_pts.empty() && actual_pts == expected_pts, "HEVC export changed the picture presentation times");
+  std::cout << "HEVC Main preview export preserved " << actual_pts.size() << " picture times\n";
+}
+#endif
 
 void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
   const auto link = media_preview::TemporaryFile(temporary, ".ogg");
@@ -308,7 +401,8 @@ void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& 
       Sample{Fixture("webm-opus.webm"), {247200, 48000}},
       Sample{streaming, {35880, 48000}},
       Sample{Fixture("tagged-flac.flac"), {50142, 44100}},
-      Sample{Fixture("tagged-mp3.mp3"), {50142, 44100}}};
+      Sample{Fixture("tagged-mp3.mp3"), {50142, 44100}},
+      Sample{Fixture("tagged-aac.m4a"), {52800, 48000}}};
   for (const auto& sample : samples) {
     float position = 0;
     float duration = 0;
@@ -378,9 +472,12 @@ int main(int argc, char** argv) {
     });
     testing::UiTest ui(app);
     const File temporary(std::filesystem::temp_directory_path().u8string());
-    CheckAudioCopy(tasks, ui, temporary);
-#ifdef __EMSCRIPTEN__
-    std::cout << "Web audio packet copy yielded and preserved its output\n";
+    CheckAudioCopy(tasks, ui, temporary, "tagged-mp3.mp3");
+    CheckAudioCopy(tasks, ui, temporary, "tagged-aac.m4a");
+    CheckAudioCopy(tasks, ui, temporary, "fragmented-aac.m4a");
+#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && TARGET_OS_IOS)
+    CheckHevcMainExport(tasks, ui, temporary);
+    std::cout << "PASS: Preview export and audio packet copy contracts\n";
 #else
     const auto mp4 = Fixture("preview-avc-aac.mp4");
     std::exception_ptr failure;
@@ -453,20 +550,7 @@ int main(int argc, char** argv) {
     ui.Pump();
 
     const auto run_export = [&](std::shared_ptr<const File> input, std::optional<ContainerFormat> copy, bool reorder = false) {
-      std::shared_ptr<const File> output;
-      const auto exporting = tasks.Launch([&, input = std::move(input), copy, reorder]() -> Task<void> {
-        try {
-          if (copy) output = co_await media_preview::CopyClip(input, temporary, copy);
-          else output = co_await media_preview::ExportClip(input, temporary, reorder);
-        } catch (...) { failure = std::current_exception(); }
-      });
-      try {
-        Until(ui, failure, [&] { return bool(output); }, "MP4 export did not finish");
-      } catch (...) {
-        exporting.Cancel();
-        throw;
-      }
-      return output;
+      return RunMovieExport(tasks, ui, temporary, std::move(input), copy, reorder);
     };
     const auto output = run_export(mp4, {});
     CheckExport(*mp4, *output, OriginalSamples);
@@ -486,6 +570,14 @@ int main(int argc, char** argv) {
     }
     const auto hdr_copy = run_export(hlg, ContainerFormat::Mp4);
     CheckCopy(*hlg, *hdr_copy, ContainerFormat::Mp4);
+    const auto main10_export = run_export(Fixture("preview-hevc10.mov"), {}, true);
+    const auto hevc = media_preview::Open(*main10_export);
+    const auto& encoded_track = hevc.Tracks().front();
+    Check(encoded_track.codec == CodecId::Hevc && encoded_track.sample_entry == "hvc1" &&
+          encoded_track.rotation == VideoRotation::Clockwise90 &&
+          encoded_track.initialization_data.size() > 17 &&
+          (std::to_integer<unsigned>(encoded_track.initialization_data[17]) & 7) == 2,
+          "Main10 export lost its codec, rotation, or bit depth");
     CheckAudioPreview(tasks, ui, temporary);
     if (argc >= 2) Check(output->CopyTo(File(argv[1]), true), "Cannot retain export for independent validation");
     if (argc >= 3) Check(reordered->CopyTo(File(argv[2]), true), "Cannot retain reordered export");

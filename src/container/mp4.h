@@ -31,6 +31,24 @@ template<class Body> void FullBox(Bytes& bytes, std::string_view tag, std::uint3
 }
 
 std::uint32_t Mp4Scale(const MediaTrack& track);
+
+struct AlacConfig {
+  std::uint32_t frame_length, sample_rate;
+  unsigned channels, bits;
+};
+AlacConfig ParseAlac(ByteView config, ContainerErrorCode error);
+
+struct Mp4AudioTag {
+  std::string_view name;
+  std::string MediaAudioMetadata::*field;
+};
+inline constexpr Mp4AudioTag Mp4AudioTags[]{
+    {"\xa9" "nam", &MediaAudioMetadata::title},
+    {"\xa9" "ART", &MediaAudioMetadata::artist},
+    {"\xa9" "alb", &MediaAudioMetadata::album},
+    {"\xa9" "gen", &MediaAudioMetadata::genre},
+    {"\xa9" "day", &MediaAudioMetadata::date}};
+
 bool Mp4VideoExtensionTag(std::uint32_t tag);
 void ValidateMp4VideoExtension(std::uint32_t tag, ByteView payload, CodecId codec, ContainerErrorCode error);
 bool AvcIdr(ByteView bytes, unsigned length_size, ContainerErrorCode error);

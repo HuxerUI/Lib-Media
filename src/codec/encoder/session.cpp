@@ -494,15 +494,17 @@ CodecResult<SubmitStatus> VideoEncoderState::Submit(const VideoFrame& frame) {
     struct Storage { std::shared_ptr<Credit> credit; Bytes bytes; };
     auto owner = std::make_shared<Storage>(Storage{credit, Bytes(frame_bytes_)});
     CopyVideoEncoderPixels(frame, config_.input.pixel_format, owner->bytes);
-    const auto width = config_.input.width, height = config_.input.height;
-    const auto luma = std::size_t(width) * height;
+    const auto layout = config_.input.pixel_format;
+    const auto sample = layout == VideoPixelFormat::P010 ? 2u : 1u;
+    const auto row = std::size_t(config_.input.width) * sample;
+    const auto luma = row * config_.input.height;
     BufferReference pixels(owner->bytes, owner);
-    VideoFrame copy{config_.input, frame.pts, frame.duration, {{pixels.Slice(0, luma), width, 1}}};
-    if (config_.input.pixel_format == VideoPixelFormat::NV12)
-      copy.planes.push_back({pixels.Slice(luma, luma / 2), width, 2});
+    VideoFrame copy{config_.input, frame.pts, frame.duration, {{pixels.Slice(0, luma), row, sample}}};
+    if (layout != VideoPixelFormat::I420)
+      copy.planes.push_back({pixels.Slice(luma, luma / 2), row, sample * 2});
     else {
-      copy.planes.push_back({pixels.Slice(luma, luma / 4), width / 2, 1});
-      copy.planes.push_back({pixels.Slice(luma + luma / 4, luma / 4), width / 2, 1});
+      copy.planes.push_back({pixels.Slice(luma, luma / 4), row / 2, 1});
+      copy.planes.push_back({pixels.Slice(luma + luma / 4, luma / 4), row / 2, 1});
     }
     ScheduleLocked(); input_.push_back(std::move(copy));
     if (!origin_) origin_ = pts->ticks;
@@ -654,16 +656,16 @@ void VideoEncoderState::Publish(VideoEncoderBackendOutput value, std::uint64_t g
   if (auto* format = std::get_if<VideoEncodeFormat>(&value)) {
     auto parsed = ReadVideoEncodeFormat(format->initialization_data, config_);
     if (!parsed.Succeeded()) throw SessionFailure{parsed.Error()};
-    if (parsed.Value() != *format || (format_ && *format_ != *format)) Reject("H.264 format is invalid or changed during encoding");
+    if (parsed.Value() != *format || (format_ && *format_ != *format)) Reject("Video format is invalid or changed during encoding");
     if (!format_) { format_ = *format; output_.push_back(std::move(*format)); wake_pending_ = true; }
   } else if (auto* packet = std::get_if<EncodedPacket>(&value)) {
     auto size = packet->data.AsBytes().size();
     const auto pts = packet->pts.Rescale(1000000);
     const auto dts = packet->dts ? packet->dts->Rescale(1000000) : std::optional<MediaTimestamp>{};
     if (size > config_.max_packet_bytes)
-      throw SessionFailure{Error(CodecErrorCode::ResourceExhausted, "H.264 output exceeds the reserved packet bound")};
+      throw SessionFailure{Error(CodecErrorCode::ResourceExhausted, "Video output exceeds the reserved packet bound")};
     if (!format_ || !origin_ || !size || !pts || (packet->dts && !dts))
-      Reject("H.264 output has missing configuration or invalid timing");
+      Reject("Video output has missing configuration or invalid timing");
     auto found = pending_.find(pts->ticks);
     if (found == pending_.end()) {
       std::string timing = std::to_string(pts->ticks) + "; pending";
@@ -672,24 +674,24 @@ void VideoEncoderState::Publish(VideoEncoderBackendOutput value, std::uint64_t g
         timing += " " + std::to_string(value);
         if (++count == 4) break;
       }
-      throw SessionFailure{Error(CodecErrorCode::InvalidData, "H.264 output PTS does not match an accepted picture", std::move(timing))};
+      throw SessionFailure{Error(CodecErrorCode::InvalidData, "Video output PTS does not match an accepted picture", std::move(timing))};
     }
     auto picture = InspectVideoEncoderPacket(*packet, *format_);
     if (!picture.Succeeded()) throw SessionFailure{picture.Error()};
     if (picture.Value().headers) {
-      auto normalized = NormalizeVideoEncoderPacket(packet->data.AsBytes(), 4, config_.max_packet_bytes, true);
+      auto normalized = NormalizeVideoEncoderPacket(packet->data.AsBytes(), 4, config_.max_packet_bytes, config_.codec, true);
       if (!normalized.Succeeded()) throw SessionFailure{normalized.Error()};
       packet->data = Own(std::move(normalized).Value()); size = packet->data.AsBytes().size();
     }
-    if (needs_idr_ && !picture.Value().key_frame) Reject("H.264 stream must start with an IDR picture");
+    if (needs_idr_ && !picture.Value().key_frame) Reject("Video stream must start with an IDR picture");
     needs_idr_ = false;
     b_run_ = picture.Value().b_frame ? b_run_ + 1 : 0;
     if (config_.max_b_frames && b_run_ > *config_.max_b_frames)
-      throw SessionFailure{Error(CodecErrorCode::Unsupported, "H.264 encoder exceeded the requested B-picture bound")};
+      throw SessionFailure{Error(CodecErrorCode::Unsupported, "Video encoder exceeded the requested B-picture bound")};
     if (dts) {
       if ((last_dts_ && dts->ticks <= *last_dts_) ||
           (*origin_ > 0 && dts->ticks > INT64_MAX - *origin_) ||
-          (*origin_ < 0 && dts->ticks < INT64_MIN - *origin_)) Reject("H.264 DTS is nonincreasing or overflows the input timeline");
+          (*origin_ < 0 && dts->ticks < INT64_MIN - *origin_)) Reject("Video DTS is nonincreasing or overflows the input timeline");
       last_dts_ = dts->ticks;
       packet->dts = MediaTimestamp{dts->ticks + *origin_, 1000000};
     }
@@ -702,7 +704,7 @@ void VideoEncoderState::Publish(VideoEncoderBackendOutput value, std::uint64_t g
     output_.push_back(std::move(*packet)); wake_pending_ = true;
   } else {
     if (phase_ != Phase::Draining || !input_.empty() || !pending_.empty() || (origin_ && !finish_sent_))
-      Reject("H.264 encoder ended before emitting every accepted picture");
+      Reject("Video encoder ended before emitting every accepted picture");
     output_.push_back(EndOfStream{}); eos_queued_ = true; wake_pending_ = true;
   }
 }

@@ -239,9 +239,6 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
       const auto supported = ValidateSps(parsed.Value(), video.width, video.height);
       if (!supported.Succeeded()) return R::Failure(supported.Error());
     } else if (video.codec == CodecId::Hevc) {
-#if !defined(__APPLE__)
-      return R::Failure(Error(CodecErrorCode::Unsupported, "HEVC decoding is unavailable on this platform"));
-#else
       try {
         const auto description = ParseHevcConfiguration(video.initialization_data, true, false);
         if (description.chroma_format != 1 || description.luma_bits != description.chroma_bits ||
@@ -251,7 +248,6 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
       } catch (const std::invalid_argument& error) {
         return R::Failure(Error(CodecErrorCode::InvalidArgument, error.what()));
       }
-#endif
     } else {
       return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video decoding requires H.264 or HEVC"));
     }

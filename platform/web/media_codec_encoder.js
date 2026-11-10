@@ -101,9 +101,27 @@
   const sessions = new Map();
   let nextId = 1;
   function fail(state, error) {
-    if (state.active) state.error = String(error && error.message || error);
+    if (state.active && !state.error) state.error = String(error && error.message || error);
   }
   function codec(options) {
+    if (options.hevc) {
+      const picture = options.width * options.height;
+      const rate = picture * options.rateNumerator / options.rateDenominator;
+      // HEVC Main-tier bounds from Annex A for luma samples, sample rate, and bit rate.
+      const levels = [
+        [30, 36864, 552960, 128000], [60, 122880, 3686400, 1500000], [63, 245760, 7372800, 3000000],
+        [90, 552960, 16588800, 6000000], [93, 983040, 33177600, 10000000],
+        [120, 2228224, 66846720, 12000000], [123, 2228224, 133693440, 20000000],
+        [150, 8912896, 267386880, 25000000], [153, 8912896, 534773760, 40000000],
+        [156, 8912896, 1069547520, 60000000], [180, 35651584, 1069547520, 60000000],
+        [183, 35651584, 2139095040, 120000000], [186, 35651584, 4278190080, 240000000]
+      ];
+      const edge = Math.max(options.width, options.height);
+      const level = levels.find(value => picture <= value[1] && edge * edge <= 8 * value[1] &&
+        rate <= value[2] && options.bitrate <= value[3]);
+      if (!level) throw new Error('HEVC geometry, frame rate, or bit rate exceeds Main-tier limits');
+      return 'hvc1.' + (options.layout === 'P010' ? '2.4' : '1.6') + '.L' + level[0] + '.B0';
+    }
     const blocks = Math.ceil(options.width / 16) * Math.ceil(options.height / 16);
     const rate = blocks * options.rateNumerator / options.rateDenominator;
     const bitrate = options.bitrate / (options.profile === 100 ? 1.25 : 1);
@@ -121,29 +139,44 @@
     return 'avc1.' + options.profile.toString(16).padStart(2, '0') +
       (options.profile === 66 ? 'e0' : '00') + level[0].toString(16).padStart(2, '0');
   }
+  function planar10(data, width, height) {
+    const luma = width * height;
+    const chroma = luma / 4;
+    const packed = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const planes = new Uint8Array(data.byteLength);
+    const output = new DataView(planes.buffer);
+    for (let i = 0; i < luma; ++i)
+      output.setUint16(i * 2, packed.getUint16(i * 2, true) >>> 6, true);
+    for (let i = 0; i < chroma; ++i) {
+      output.setUint16((luma + i) * 2, packed.getUint16(luma * 2 + i * 4, true) >>> 6, true);
+      output.setUint16((luma + chroma + i) * 2, packed.getUint16(luma * 2 + i * 4 + 2, true) >>> 6, true);
+    }
+    return planes;
+  }
   function output(state, chunk, metadata) {
     if (!state.active || state.error) return;
     try {
       if (!state.pending || !Number.isSafeInteger(chunk.timestamp) || !chunk.byteLength || chunk.byteLength > state.options.maximum)
-        throw new Error('H.264 output exceeds reserved capacity or timestamp range');
+        throw new Error('Video output exceeds reserved capacity or timestamp range');
       --state.pending;
       const config = metadata && metadata.decoderConfig;
       if (config) {
-        if (!config.description || !/^avc[13]\./i.test(config.codec))
-          throw new Error('WebCodecs did not provide AVC initialization data');
+        const codec = state.options.hevc ? /^(hvc1|hev1)\./i : /^avc[13]\./i;
+        if (!config.description || !codec.test(config.codec))
+          throw new Error('WebCodecs did not provide initialization data for the requested video codec');
         const source = config.description;
         const description = ArrayBuffer.isView(source)
           ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength) : new Uint8Array(source);
-        if (!description.length || description.length > 65536) throw new Error('H.264 initialization data exceeds 64 KiB');
+        if (!description.length || description.length > 65536) throw new Error('Video initialization data exceeds 64 KiB');
         if (state.description && (state.description.length !== description.length ||
             state.description.some((value, i) => value !== description[i])))
-          throw new Error('WebCodecs H.264 configuration changed');
+          throw new Error('WebCodecs video configuration changed');
         if (!state.description) {
           state.description = description.slice();
           state.output.push({kind: 'format', description: state.description});
         }
       }
-      if (!state.description) throw new Error('H.264 output preceded initialization data');
+      if (!state.description) throw new Error('Video output preceded initialization data');
       const data = new Uint8Array(chunk.byteLength);
       chunk.copyTo(data);
       state.output.push({kind: 'packet', data, pts: chunk.timestamp});
@@ -170,18 +203,22 @@
       sessions.set(id, state);
       try {
         if (!root.VideoEncoder || !root.VideoFrame) throw new Error('WebCodecs VideoEncoder/VideoFrame is unavailable');
-        if (options.maxB !== null && (options.profile !== 66 || options.maxB !== 0))
-          throw new Error('WebCodecs cannot enforce a numeric B-picture bound for Main/High profiles');
+        if (options.maxB !== null && (options.hevc || options.profile !== 66 || options.maxB !== 0))
+          throw new Error('WebCodecs cannot enforce the requested numeric B-picture bound');
         const config = {codec: codec(options), width: options.width, height: options.height,
           framerate: options.rateNumerator / options.rateDenominator, bitrate: options.bitrate,
-          latencyMode: 'quality', avc: {format: 'avc'}};
+          latencyMode: 'quality', ...(options.hevc ? {hevc: {format: 'hevc'}} : {avc: {format: 'avc'}})};
         root.VideoEncoder.isConfigSupported(config).then(support => {
           if (!state.active) return;
           if (!support.supported || support.config.codec.toLowerCase() !== config.codec.toLowerCase() ||
               support.config.width !== config.width || support.config.height !== config.height ||
               support.config.bitrate !== config.bitrate || support.config.latencyMode !== 'quality' ||
-              support.config.avc?.format !== 'avc')
-            throw new Error('WebCodecs does not support the requested H.264 configuration');
+              (options.hevc ? (support.config.hevc?.format ?? 'hevc') !== 'hevc' : support.config.avc?.format !== 'avc'))
+            throw new Error('WebCodecs does not support the requested video configuration');
+          if (options.layout === 'P010') {
+            const probe = new root.VideoFrame(new Uint8Array(12), {format: 'I420P10', codedWidth: 2, codedHeight: 2, timestamp: 0});
+            probe.close();
+          }
           state.encoder = new root.VideoEncoder({output: (chunk, metadata) => output(state, chunk, metadata),
             error: error => fail(state, error)});
           state.encoder.configure(config); state.ready = true;
@@ -198,10 +235,11 @@
       try {
         if (!Number.isSafeInteger(pts) || (duration !== null && (!Number.isSafeInteger(duration) || duration <= 0)))
           throw new Error('Video timing exceeds the WebCodecs safe integer range');
-        const init = {format: options.layout, codedWidth: options.width, codedHeight: options.height,
+        const tenBit = options.layout === 'P010';
+        const init = {format: tenBit ? 'I420P10' : options.layout, codedWidth: options.width, codedHeight: options.height,
           timestamp: pts, colorSpace: options.color};
         if (duration !== null) init.duration = duration;
-        frame = new root.VideoFrame(data, init);
+        frame = new root.VideoFrame(tenBit ? planar10(data, options.width, options.height) : data, init);
         const key = state.first || state.keyRequested || state.submitted % options.keyInterval === 0;
         ++state.pending; ++state.submitted;
         state.encoder.encode(frame, {keyFrame: key});

@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file
-/// @brief Headless, bounded, asynchronous AAC-LC/H.264 encoding and decoding, with HEVC decoding on Apple.
+/// @brief Headless, bounded, asynchronous audio and video encoding and decoding.
 ///
 /// Include <huxerui/media_codec.h> and link HuxerUI::Media. Use these sessions directly from headless code.
 /// Decoders accept initialization data and complete compressed access units in decode order, then emit format
@@ -121,8 +121,8 @@ struct AudioDecoderConfig {
 /// @brief Configuration for decoding length-prefixed video access units to CPU YUV.
 ///
 /// AVC supports Baseline, Main, and High profiles with at most 16 reference pictures and continuous frame
-/// numbering. HEVC supports 8-bit and 10-bit 4:2:0 on Apple platforms. Probe the concrete configuration for
-/// platform support. A fresh or reset video session requires an IDR access unit.
+/// numbering. HEVC supports single-layer Main and Main10 4:2:0. Probe the concrete configuration for platform
+/// support and the requested CPU layout. A fresh or reset video session requires an IDR access unit.
 /// @see VideoDecoder::Create(), VideoDecoder::Probe()
 struct VideoDecoderConfig {
   /// Decoder configuration of at most 64 KiB, either avcC with SPS/PPS or hvcC with complete VPS/SPS/PPS arrays.
@@ -337,14 +337,15 @@ struct VideoEncoderCapabilities {
   CodecVideoLimits platform_limits;
 };
 
-/// @brief Fixed configuration for encoding CPU I420 or NV12 frames to H.264 access units.
+/// @brief Fixed configuration for encoding CPU frames to H.264 or HEVC access units.
 ///
 /// Supply even dimensions in [2, 8192], a full visible rectangle, square pixels, no rotation, and SDR color facts.
 /// Every submitted frame must match input; plane strides may differ. No scaling or color-space conversion occurs.
-/// Platform limits may be smaller. Probe the concrete profile, dimensions, rate, and B-picture policy.
+/// H.264 and HEVC Main take I420 or NV12. HEVC Main10 takes P010. Probe the concrete codec, pixel
+/// format, dimensions, rate, and B-picture policy because availability varies by device and runtime.
 /// @see VideoEncoder::Create(), VideoEncoder::Probe(), VideoEncodeFormat
 struct VideoEncoderConfig {
-  /// Required CPU geometry, I420/NV12 layout, and color metadata. The default unset VideoFormat is invalid.
+  /// Required CPU geometry, pixel layout, and SDR color metadata. The default unset VideoFormat is invalid.
   VideoFormat input;
   /// Positive numerator of the expected frame rate. This guides rate control; input PTS remains authoritative.
   std::uint32_t frame_rate_numerator = 30;
@@ -352,7 +353,7 @@ struct VideoEncoderConfig {
   std::uint32_t frame_rate_denominator = 1;
   /// Positive target average bits per second, at most INT32_MAX. This is not a per-packet size guarantee.
   std::uint32_t bitrate = 4'000'000;
-  /// Requested stream profile. An unavailable profile is rejected rather than silently downgraded.
+  /// Requested H.264 profile. HEVC derives its profile from input.pixel_format.
   H264Profile profile = H264Profile::High;
   /// Target distance in input pictures between random-access pictures, in [1, INT32_MAX]. Platforms may insert them earlier.
   /// This is a rate-control request, not an exact frame boundary guarantee.
@@ -379,12 +380,15 @@ struct VideoEncoderConfig {
   /// is separate from an encoding failure; unsafe outstanding platform work leaves completion pending.
   /// Return promptly without throwing or waiting. Use owned or weak captures that survive retirement.
   std::function<void(CodecResult<void>)> cleanup_completed;
+  /// CodecId::H264 or CodecId::Hevc. Defaults to H.264.
+  CodecId codec = CodecId::H264;
 };
 
-/// @brief H.264 configuration emitted before its dependent access units.
+/// @brief Video configuration emitted before its dependent access units.
 ///
-/// Coded bounds may include macroblock padding beyond visible; use these bounds when configuring VideoDecoder.
-/// Coded geometry, crop, profile, and requested color signaling are validated against the configuration.
+/// Coded bounds may include padding beyond visible. Use these bounds when configuring VideoDecoder.
+/// The configuration record carries the stream profile, bit depth, and any color signaling.
+/// H.264 encoding validates any explicitly requested color signaling against the emitted configuration.
 /// Initialization data carries the platform-selected level; there is no separate level request in this API.
 /// @see VideoEncodeOutput, VideoDecoderConfig
 struct VideoEncodeFormat {
@@ -394,9 +398,12 @@ struct VideoEncodeFormat {
   std::uint32_t height = 0;
   /// Visible input picture within the coded bounds.
   VideoRectangle visible;
-  /// AVCDecoderConfigurationRecord of at most 64 KiB, containing SPS/PPS and a four-byte NAL length size.
+  /// AVCDecoderConfigurationRecord or HEVCDecoderConfigurationRecord of at most 64 KiB.
+  /// Parameter sets are out of band and access units use four-byte NAL lengths.
   Bytes initialization_data;
-  /// @brief Compares coded bounds, visible rectangle, and initialization data.
+  /// Codec used by the configuration record and following access units.
+  CodecId codec = CodecId::H264;
+  /// @brief Compares codec, coded bounds, visible rectangle, and initialization data.
   /// @return True when all stored fields match.
   bool operator==(const VideoEncodeFormat&) const = default;
 };
@@ -504,7 +511,7 @@ using VideoDecodeOutput = std::variant<VideoFormat, VideoFrame, EndOfStream>;
 /// @see AudioEncoder::TryRead(), AudioEncodeSummary
 using AudioEncodeOutput = std::variant<AudioEncodeFormat, EncodedPacket, AudioEncodeSummary, EndOfStream>;
 
-/// @brief A video configuration, retained H.264 access unit, or successful end of the stream.
+/// @brief A video configuration, retained coded access unit, or successful end of the stream.
 ///
 /// Format precedes dependent packets, including after Reset(). Each packet represents one input picture and uses
 /// four-byte big-endian NAL lengths. Packets are emitted in decode order; PTS may move backwards with B pictures.
@@ -838,9 +845,9 @@ private:
   std::shared_ptr<detail::AudioEncoderState> state_;
 };
 
-/// @brief Move-only asynchronous H.264 encoder with bounded queues and independently retained packet bytes.
+/// @brief Move-only asynchronous H.264 and HEVC encoder with bounded queues and retained packet bytes.
 ///
-/// Submit CPU I420/NV12 pictures and drain H.264 access units through TryRead(). The returned handle owns the
+/// Submit CPU pictures matching the configuration and drain access units through TryRead(). The handle owns the
 /// session. No Runtime, window, texture, or capture device is required.
 ///
 /// On desktop and mobile platforms, queue and control calls may run concurrently on a live handle. On Web, use the

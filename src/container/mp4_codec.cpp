@@ -2,6 +2,18 @@
 #include "../codec/hevc.h"
 
 namespace huxerui::media::detail {
+
+AlacConfig ParseAlac(ByteView config, ContainerErrorCode error) {
+  if (config.size() != 24 || Number<std::uint8_t>(config, 4) != 0)
+    Fail(error, "Invalid ALACSpecificConfig");
+  const auto frames = Number<std::uint32_t>(config), rate = Number<std::uint32_t>(config, 20);
+  const auto channels = Number<std::uint8_t>(config, 9), bits = Number<std::uint8_t>(config, 5);
+  if (!frames || !rate || (bits != 16 && bits != 20 && bits != 24 && bits != 32))
+    Fail(error, "Invalid ALAC sample geometry");
+  if (channels != 1 && channels != 2)
+    Fail(ContainerErrorCode::Unsupported, "ALAC packet copy requires mono or stereo audio");
+  return {frames, rate, channels, bits};
+}
 bool Mp4VideoExtensionTag(std::uint32_t tag) {
   switch (tag) {
     case Tag("colr"):

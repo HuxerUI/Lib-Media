@@ -1,10 +1,13 @@
 #include <huxerui/media_codec.h>
+#include <huxerui/media_container.h>
+#include <huxerui/file.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <thread>
 #ifdef __APPLE__
@@ -46,26 +49,34 @@ MediaTimestamp PictureTime(unsigned index, bool variable) {
 }
 VideoFrame Frame(const VideoEncoderConfig& config, unsigned index, bool variable) {
   const auto width = config.input.width, height = config.input.height;
-  const auto stride = width + 16;
+  const bool ten_bit = config.input.pixel_format == VideoPixelFormat::P010;
+  const auto component = ten_bit ? 2u : 1u;
+  const auto stride = (width + 16) * component;
   auto storage = std::make_shared<Bytes>(std::size_t(stride) * height * 3 / 2, std::byte{255});
   BufferReference owner(*storage, storage);
   const auto luma = std::size_t(stride) * height;
   const auto pts = PictureTime(index, variable);
   const MediaTimestamp duration{PictureTime(index + 1, variable).ticks - pts.ticks, 90000};
   VideoFrame frame{config.input, pts, duration,
-      {{owner.Slice(0, luma), stride, 1}}};
-  if (config.input.pixel_format == VideoPixelFormat::NV12)
-    frame.planes.push_back({owner.Slice(luma, luma / 2), stride, 2});
+      {{owner.Slice(0, luma), stride, component}}};
+  if (config.input.pixel_format != VideoPixelFormat::I420)
+    frame.planes.push_back({owner.Slice(luma, luma / 2), stride, component * 2});
   else {
     frame.planes.push_back({owner.Slice(luma, luma / 4), stride / 2, 1});
     frame.planes.push_back({owner.Slice(luma + luma / 4, luma / 4), stride / 2, 1});
   }
+  auto write = [&](std::size_t offset, unsigned value) {
+    if (ten_bit) {
+      (*storage)[offset] = std::byte{0x80};
+      (*storage)[offset + 1] = std::byte(value);
+    } else (*storage)[offset] = std::byte(value);
+  };
   for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x)
-    (*storage)[std::size_t(y) * stride + x] = std::byte(32 + ((x / 8 + y / 8 + index * 3) % 160));
+    write(std::size_t(y) * stride + x * component, 32 + ((x / 8 + y / 8 + index * 3) % 160));
   for (unsigned y = 0; y < height / 2; ++y) for (unsigned x = 0; x < width / 2; ++x) {
-    if (config.input.pixel_format == VideoPixelFormat::NV12) {
-      (*storage)[luma + std::size_t(y) * stride + x * 2] = std::byte{100};
-      (*storage)[luma + std::size_t(y) * stride + x * 2 + 1] = std::byte{150};
+    if (config.input.pixel_format != VideoPixelFormat::I420) {
+      write(luma + std::size_t(y) * stride + x * 2 * component, 100);
+      write(luma + std::size_t(y) * stride + (x * 2 + 1) * component, 150);
     } else {
       (*storage)[luma + std::size_t(y) * (stride / 2) + x] = std::byte{100};
       (*storage)[luma + luma / 4 + std::size_t(y) * (stride / 2) + x] = std::byte{150};
@@ -129,11 +140,19 @@ Encoded Encode(VideoEncoderConfig config, unsigned count, bool request_key = fal
       auto& value = *read.Value();
       if (auto* format = std::get_if<VideoEncodeFormat>(&value)) {
         Check(!described, "Duplicate video configuration");
+        const bool hevc = config.codec == CodecId::Hevc;
+        const auto length = hevc ? 21u : 4u;
         Check(format->width >= config.input.width && format->height >= config.input.height &&
-            format->visible == config.input.visible && format->initialization_data.size() >= 7 &&
-            (std::to_integer<unsigned>(format->initialization_data[4]) & 3) == 3, "Wrong coded/cropped picture or AVC length size");
-        const auto profile = config.profile == H264Profile::Baseline ? 66 : config.profile == H264Profile::Main ? 77 : 100;
-        Check(std::to_integer<unsigned>(format->initialization_data[1]) == unsigned(profile), "Profile was silently changed");
+            format->visible == config.input.visible && format->codec == config.codec &&
+            format->initialization_data.size() > length &&
+            (std::to_integer<unsigned>(format->initialization_data[length]) & 3) == 3, "Wrong coded/cropped picture or NAL length size");
+        if (hevc) {
+          const auto depth = std::to_integer<unsigned>(format->initialization_data[17]) & 7;
+          Check(depth == (config.input.pixel_format == VideoPixelFormat::P010 ? 2 : 0), "HEVC bit depth was silently changed");
+        } else {
+          const auto profile = config.profile == H264Profile::Baseline ? 66 : config.profile == H264Profile::Main ? 77 : 100;
+          Check(std::to_integer<unsigned>(format->initialization_data[1]) == unsigned(profile), "Profile was silently changed");
+        }
         encoded.format = *format; described = true;
       } else if (auto* packet = std::get_if<EncodedPacket>(&value)) {
         Check(described && packet->data.AsBytes().size() <= config.max_packet_bytes, "Video packet preceded format or exceeded bounds");
@@ -146,7 +165,8 @@ Encoded Encode(VideoEncoderConfig config, unsigned count, bool request_key = fal
           encoded.reordered |= packet->pts.Compare(encoded.packets.back().pts) < 0;
           if (packet->dts && encoded.packets.back().dts) Check(packet->dts->Compare(*encoded.packets.back().dts) > 0, "DTS did not follow decode order");
         }
-        encoded.keys += packet->key_frame; encoded.bframes += IsB(*packet);
+        encoded.keys += packet->key_frame;
+        if (config.codec == CodecId::H264) encoded.bframes += IsB(*packet);
         if (!encoded.packets.empty()) {
           auto copy = std::make_shared<Bytes>(packet->data.AsBytes().begin(), packet->data.AsBytes().end());
           packet->data = BufferReference(*copy, copy);
@@ -192,7 +212,11 @@ void Decode(const Encoded& encoded, const VideoEncoderConfig& input) {
   if (encoded.packets.empty()) return;
   VideoDecoderConfig config;
   config.initialization_data = encoded.format.initialization_data;
-  config.width = encoded.format.width; config.height = encoded.format.height; config.output = VideoPixelFormat::NV12;
+  config.width = encoded.format.width; config.height = encoded.format.height; config.codec = encoded.format.codec;
+  const bool ten_bit = input.input.pixel_format == VideoPixelFormat::P010;
+  config.output = ten_bit ? VideoPixelFormat::P010 : VideoPixelFormat::NV12;
+  auto cleaned = std::make_shared<std::atomic<bool>>(false), cleanup_ok = std::make_shared<std::atomic<bool>>(false);
+  config.cleanup_completed = [cleaned, cleanup_ok](auto result) { *cleanup_ok = result.Succeeded(); *cleaned = true; };
   auto created = VideoDecoder::Create(config); Require(created);
   auto decoder = std::move(created).Value();
   unsigned frames = 0; bool ended = false;
@@ -202,16 +226,24 @@ void Decode(const Encoded& encoded, const VideoEncoderConfig& input) {
       auto read = decoder.TryRead(); Require(read);
       if (!read.Value()) return;
       if (auto* frame = std::get_if<VideoFrame>(&*read.Value())) {
-        Check(frame->Validate() && frame->format.visible.width == input.input.width && frame->format.visible.height == input.input.height,
+        Check(frame->Validate() && frame->format.pixel_format == config.output &&
+            frame->format.visible.width == input.input.width && frame->format.visible.height == input.input.height,
             "Roundtrip video geometry is wrong");
         Check(frame->pts == PictureTime(frames, encoded.variable), "Roundtrip video presentation order or PTS changed");
         const auto& plane = frame->planes[0]; const auto bytes = plane.data.AsBytes();
         for (unsigned y = 0; y < input.input.height; y += 4) for (unsigned x = 0; x < input.input.width; x += 4) {
           const auto expected = 32 + ((x / 8 + y / 8 + frames * 3) % 160);
           const auto actual = std::to_integer<unsigned>(bytes[(y + frame->format.visible.y) * plane.row_stride +
-              (x + frame->format.visible.x) * plane.pixel_stride]);
+              (x + frame->format.visible.x) * plane.pixel_stride + (ten_bit ? 1 : 0)]);
           const auto delta = double(actual) - expected; error += delta * delta; ++samples;
         }
+        const auto& uv = frame->planes[1];
+        const auto offset = (frame->format.visible.y / 2) * uv.row_stride +
+            (frame->format.visible.x / 2) * uv.pixel_stride;
+        const auto component = ten_bit ? 2u : 1u;
+        const auto u = std::to_integer<int>(uv.data.AsBytes()[offset + component - 1]);
+        const auto v = std::to_integer<int>(uv.data.AsBytes()[offset + component * 2 - 1]);
+        Check(std::abs(u - 100) < 12 && std::abs(v - 150) < 12, "Roundtrip video chroma layout changed");
         ++frames;
       } else if (std::holds_alternative<EndOfStream>(*read.Value())) ended = true;
     }
@@ -222,11 +254,14 @@ void Decode(const Encoded& encoded, const VideoEncoderConfig& input) {
   Require(decoder.Finish());
   Eventually([&] { drain(); return ended; }, "Roundtrip video drain stalled");
   decoder.Close();
+  Eventually([&] { return cleaned->load(); }, "Roundtrip decoder cleanup stalled");
+  Check(cleanup_ok->load(), "Roundtrip decoder cleanup failed");
   Check(frames == encoded.packets.size() && samples && std::sqrt(error / samples) < 12, "Roundtrip video count or luma quality failed");
-  std::cout << "profile=" << int(input.profile) << " pictures=" << frames << " B=" << encoded.bframes
-      << " reordered=" << encoded.reordered << " luma-RMSE=" << std::sqrt(error / samples) << '\n';
+  std::cout << (config.codec == CodecId::Hevc ? ten_bit ? "HEVC Main10" : "HEVC Main" : "H.264")
+      << " pictures=" << frames;
+  if (config.codec == CodecId::H264) std::cout << " B=" << encoded.bframes;
+  std::cout << " reordered=" << encoded.reordered << " luma-RMSE=" << std::sqrt(error / samples) << '\n';
 }
-#if defined(__EMSCRIPTEN__) || defined(__APPLE__) || defined(__ANDROID__)
 bool Supported(const VideoEncoderConfig& config) {
   auto done = std::make_shared<std::atomic<bool>>(false);
   auto failure = std::make_shared<std::optional<CodecError>>();
@@ -237,14 +272,99 @@ bool Supported(const VideoEncoderConfig& config) {
   Eventually([&] { return done->load(); }, "Video capability probe stalled");
   if (!*failure) return true;
   if ((*failure)->code != CodecErrorCode::Unsupported) throw std::runtime_error((*failure)->message);
-  std::cout << "Unsupported profile=" << int(config.profile) << " B="
-      << (config.max_b_frames ? std::to_string(*config.max_b_frames) : "auto") << ": " << (*failure)->message << '\n';
+  std::cout << "Unsupported " << (config.codec == CodecId::Hevc ? "HEVC" : "H.264")
+      << " layout=" << int(config.input.pixel_format) << " B="
+      << (config.max_b_frames ? std::to_string(*config.max_b_frames) : "auto")
+      << ": " << (*failure)->message << " (" << (*failure)->platform_code << ")\n";
   return false;
 }
-#endif
+
+#ifndef __EMSCRIPTEN__
+template<class T, class E> T Take(Result<T, E> result) {
+  if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
+  if constexpr (!std::is_void_v<T>) return std::move(result).Value();
 }
+
+Encoded ReadbackHevc(Encoded encoded, const File& file) {
+  const auto& format = encoded.format;
+  constexpr std::uint32_t scale = 9000000;
+  const auto first = PictureTime(0, encoded.variable);
+  const auto end = PictureTime(static_cast<unsigned>(encoded.packets.size()), encoded.variable);
+  const MediaTrack track{.id = 1, .kind = TrackKind::Video, .codec = format.codec,
+      .framing = PacketFraming::LengthPrefixedNals, .initialization_data = format.initialization_data,
+      .timescale = scale, .coded_width = format.width, .coded_height = format.height, .visible = format.visible,
+      .presentation_edit = MediaPresentationRange{first, end}};
+  auto mux = Take(MediaMuxer::Open(Take(file.OpenRandomAccess(FileAccessMode::ReadWrite, FileOpenMode::CreateNew)),
+      ContainerFormat::Mp4, std::span(&track, 1), ContainerLayout::FastStart));
+  auto dts = [&](const EncodedPacket& packet) {
+    if (!encoded.reordered) return *packet.pts.Rescale(scale);
+    Check(packet.dts.has_value(), "Native HEVC reordering did not provide DTS");
+    return *packet.dts->Rescale(scale);
+  };
+  const auto decode_end = dts(encoded.packets.front()).ticks + MediaTimestamp{end.ticks - first.ticks, end.timescale}.Rescale(scale)->ticks;
+  for (std::size_t i = 0; i < encoded.packets.size(); ++i) {
+    auto& packet = encoded.packets[i];
+    packet.dts = dts(packet);
+    const auto next = i + 1 < encoded.packets.size() ? dts(encoded.packets[i + 1]).ticks : decode_end;
+    packet.duration = MediaTimestamp{next - packet.dts->ticks, scale};
+    Check(!Take(mux.TryWrite({1, packet.data, packet.pts, packet.dts, packet.duration, packet.key_frame})),
+        "HEVC MP4 writer did not accept the packet");
+  }
+  Take(mux.Finish());
+  auto demux = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+  const auto& read_track = demux.Tracks().front();
+  Check(read_track.codec == CodecId::Hevc && read_track.sample_entry == "hvc1" &&
+      read_track.coded_width == format.width && read_track.coded_height == format.height &&
+      read_track.initialization_data == format.initialization_data &&
+      read_track.visible.value_or(VideoRectangle{0, 0, format.width, format.height}) == format.visible,
+      "HEVC MP4 did not retain its configuration and geometry");
+  for (auto& expected : encoded.packets) {
+    auto item = Take(demux.Read());
+    Check(bool(item), "HEVC MP4 lost a packet");
+    auto& actual = std::get<ContainerPacket>(*item);
+    Check(actual.pts == expected.pts && actual.dts == expected.dts && actual.duration == expected.duration &&
+        actual.sync_sample == expected.key_frame && std::ranges::equal(actual.data.AsBytes(), expected.data.AsBytes()),
+        "HEVC MP4 changed a packet");
+    expected.data = std::move(actual.data);
+    expected.dts = actual.dts;
+  }
+  Check(!Take(demux.Read()), "HEVC MP4 has extra packets");
+  return encoded;
+}
+#endif
+
+void Hevc(const char* retain = nullptr) {
+  for (const auto layout : {VideoPixelFormat::NV12, VideoPixelFormat::P010}) {
+    auto config = Config(H264Profile::High, 0, layout);
+    config.codec = CodecId::Hevc;
+#if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && TARGET_OS_SIMULATOR)
+    config.max_b_frames = std::nullopt;
+#endif
+    if (!Supported(config)) continue;
+    auto encoded = Encode(config, 19, false, true);
+#ifndef __EMSCRIPTEN__
+    const bool keep = retain && layout == VideoPixelFormat::NV12;
+    const auto path = keep ? std::filesystem::path(retain) : std::filesystem::temp_directory_path() /
+        ("lib-media-hevc-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".mp4");
+    encoded = ReadbackHevc(std::move(encoded), File(path.u8string()));
+    if (!keep) std::filesystem::remove(path);
+#endif
+    Decode(encoded, config);
+  }
+}
+}
+#ifdef __EMSCRIPTEN__
 int main() {
+#else
+int main(int argc, char** argv) {
+#endif
   try {
+#ifndef __EMSCRIPTEN__
+    if (argc >= 2 && std::string_view(argv[1]) == "--hevc-only") {
+      Hevc(argc >= 3 ? argv[2] : nullptr);
+      return 0;
+    }
+#endif
 #ifdef __EMSCRIPTEN__
     unsigned exercised = 0;
     for (auto profile : {H264Profile::Baseline, H264Profile::Main, H264Profile::High}) {
@@ -259,7 +379,8 @@ int main() {
       extended.limits.output_items = 48; extended.limits.output_bytes = 48 * extended.max_packet_bytes;
       Decode(Encode(extended, 70, true, true), extended);
     }
-    EM_ASM({ document.body.textContent = 'PASS: C++ WASM H.264 profiles, roundtrip, timing and cleanup'; });
+    Hevc();
+    EM_ASM({ document.body.textContent = 'PASS: C++ WASM video encoding, roundtrip, timing and cleanup'; });
 #else
     for (auto count : {0u, 1u, 2u}) Encode(Config(H264Profile::High, 0), count);
     for (auto profile : {H264Profile::Baseline, H264Profile::Main, H264Profile::High}) {
@@ -297,6 +418,7 @@ int main() {
     });
     Eventually([&] { return probed->load(); }, "Video probe stalled"); Check(supported->load(), "Video probe failed: " + *probe_error);
     std::cout << "H.264 profiles, B-picture ordering, retained packets, timing, crop, and roundtrip passed\n";
+    Hevc();
 #endif
     return 0;
   } catch (const std::exception& error) {

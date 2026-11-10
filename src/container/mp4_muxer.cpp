@@ -1,8 +1,10 @@
 #include "mp4.h"
+#include "framed_audio.h"
 
 #include "codec/common.h"
 
 #include <array>
+#include <charconv>
 #include <numeric>
 
 namespace huxerui::media::detail {
@@ -11,6 +13,56 @@ namespace {
 constexpr auto WriteError = ContainerErrorCode::InvalidArgument;
 
 void Zero(Bytes& bytes, std::size_t size) { bytes.resize(bytes.size() + size); }
+
+std::pair<std::uint16_t, std::uint16_t> TrackNumber(std::string_view text) {
+  if (text.empty()) return {};
+  const auto slash = text.find('/');
+  auto read = [](std::string_view field) {
+    std::uint16_t number = 0;
+    const auto end = field.data() + field.size();
+    const auto parsed = std::from_chars(field.data(), end, number);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || !number)
+      Fail(WriteError, "MP4 track number must be a positive 16-bit index with an optional total");
+    return number;
+  };
+  return {read(text.substr(0, slash)), slash == std::string_view::npos ? 0 : read(text.substr(slash + 1))};
+}
+
+void AudioMetadata(Bytes& bytes, const MediaAudioMetadata& metadata) {
+  if (!HasAudioMetadata(metadata)) return;
+  Box(bytes, "udta", [&] {
+    FullBox(bytes, "meta", 0, [&] {
+      FullBox(bytes, "hdlr", 0, [&] {
+        Put(bytes, 0u);
+        Put(bytes, Tag("mdir"));
+        Put(bytes, Tag("appl"));
+        Zero(bytes, 9);
+      });
+      Box(bytes, "ilst", [&] {
+        auto item = [&](std::string_view tag, unsigned type, auto payload) {
+          Box(bytes, tag, [&] {
+            FullBox(bytes, "data", type, [&] { Put(bytes, 0u); payload(); });
+          });
+        };
+        for (const auto& tag : Mp4AudioTags) {
+          const auto& text = metadata.*tag.field;
+          if (!text.empty()) item(tag.name, 1, [&] {
+            Append(bytes, std::as_bytes(std::span{text.data(), text.size()}));
+          });
+        }
+        const auto [number, total] = TrackNumber(metadata.track_number);
+        if (number) item("trkn", 0, [&] {
+          Put<std::uint16_t>(bytes, 0);
+          Put(bytes, number);
+          Put(bytes, total);
+          Put<std::uint16_t>(bytes, 0);
+        });
+        if (const auto& cover = metadata.cover)
+          item("covr", cover->mime_type == "image/jpeg" ? 13 : 14, [&] { Append(bytes, cover->data.AsBytes()); });
+      });
+    });
+  });
+}
 
 void Matrix(Bytes& bytes, VideoRotation rotation = VideoRotation::None,
             std::uint32_t width = 0, std::uint32_t height = 0) {
@@ -145,6 +197,18 @@ void SampleDescription(Bytes& bytes, const MediaTrack& track, bool mov) {
         } else {
           descriptor();
         }
+      });
+    } else if (track.codec == CodecId::Alac) {
+      const auto alac = ParseAlac(track.initialization_data, WriteError);
+      Box(bytes, "alac", [&] {
+        Zero(bytes, 6);
+        Put<std::uint16_t>(bytes, 1);
+        Zero(bytes, 8);
+        Put<std::uint16_t>(bytes, static_cast<std::uint16_t>(alac.channels));
+        Put<std::uint16_t>(bytes, static_cast<std::uint16_t>(alac.bits));
+        Zero(bytes, 4);
+        Put(bytes, alac.sample_rate <= 65535 ? alac.sample_rate << 16 : 0);
+        FullBox(bytes, "alac", 0, [&] { Append(bytes, track.initialization_data); });
       });
     } else if (track.kind == TrackKind::Audio) {
       PcmDescription(bytes, track);
@@ -383,13 +447,15 @@ public:
         states_[i].nal_length = HevcNalLength(tracks[i].initialization_data, VideoEntry(tracks[i]) == "hvc1", WriteError);
     }
     Bytes header;
+    const bool audio_only = tracks.size() == 1 && tracks.front().kind == TrackKind::Audio;
     Box(header, "ftyp", [&] {
-      Put(header, Tag(mov_ ? "qt  " : (fragmented_ ? "iso6" : "isom")));
+      Put(header, Tag(mov_ ? "qt  " : fragmented_ ? "iso6" : audio_only ? "M4A " : "isom"));
       Put(header, 512u);
       if (mov_) {
         Put(header, Tag("qt  "));
       } else {
         for (auto brand : {"isom", "iso6", "mp41"}) Put(header, Tag(brand));
+        if (audio_only && !fragmented_) Put(header, Tag("M4A "));
         if (std::ranges::any_of(tracks, [](const auto& track) { return track.codec == CodecId::H264; }))
           Put(header, Tag("avc1"));
       }
@@ -442,6 +508,16 @@ public:
     } else if (track.codec == CodecId::Aac) {
       if (!dts) dts = pts;
       derived_duration = MediaTimestamp{1024, *track.sample_rate};
+    } else if (track.codec == CodecId::Alac) {
+      if (!dts) dts = pts;
+      const auto alac = ParseAlac(track.initialization_data, WriteError);
+      if (packet.duration) {
+        const auto samples = ExactTicks(*packet.duration, alac.sample_rate);
+        if (samples <= 0 || samples > alac.frame_length)
+          Fail(WriteError, "ALAC packet duration exceeds its configured frame length");
+      }
+      if (pts != dts || packet.sync_sample == false)
+        Fail(WriteError, "ALAC requires independent samples and matching PTS/DTS");
     } else if (track.codec == CodecId::ProRes && !dts) {
       dts = pts;
     }
@@ -531,6 +607,8 @@ private:
         Put(bytes, max_id + 1);
       });
       for (std::size_t i = 0; i < tracks.size(); ++i) TrackBox(bytes, tracks[i], states_[i].index, edits[i], mov_);
+      if (tracks.size() == 1 && tracks.front().audio_metadata)
+        AudioMetadata(bytes, *tracks.front().audio_metadata);
       if (fragmented_) {
         Box(bytes, "mvex", [&] {
           for (const auto& track : tracks) FullBox(bytes, "trex", 0, [&] {
@@ -635,6 +713,10 @@ bool AvcIdr(ByteView bytes, unsigned length_size, ContainerErrorCode error) {
 void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout) {
   for (const auto& track : tracks) {
     if (track.id == 0xffffffffu) Fail(WriteError, "MP4 track ID leaves no next track ID");
+    if (track.audio_metadata) {
+      ValidateAudioMetadata(*track.audio_metadata);
+      TrackNumber(track.audio_metadata->track_number);
+    }
     if (const auto& range = track.presentation_edit) {
       if (layout == ContainerLayout::Fragmented)
         Fail(ContainerErrorCode::Unsupported, "Fragmented MP4 output cannot retain an explicit presentation interval");
@@ -650,6 +732,14 @@ void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, Con
       if (layout == ContainerLayout::Fragmented &&
           (track.priming_samples.value_or(0) || track.padding_samples.value_or(0)))
         Fail(ContainerErrorCode::Unsupported, "Fragmented MP4 cannot retain audio trim in this layout");
+    } else if (track.kind == TrackKind::Audio && format == ContainerFormat::Mp4 && track.codec == CodecId::Alac) {
+      const auto alac = ParseAlac(track.initialization_data, WriteError);
+      if (track.sample_rate != alac.sample_rate || track.channel_count != alac.channels ||
+          Mp4Scale(track) % alac.sample_rate || track.framing != PacketFraming::CodecPacket ||
+          (!track.sample_entry.empty() && track.sample_entry != "alac"))
+        Fail(WriteError, "MP4 ALAC track metadata does not match ALACSpecificConfig");
+      if (layout == ContainerLayout::Fragmented)
+        Fail(ContainerErrorCode::Unsupported, "ALAC output requires regular or fast-start MP4");
     } else if (track.kind == TrackKind::Audio && format == ContainerFormat::Mov && MovPcmBits(track.codec)) {
       const auto rate = track.sample_rate.value_or(0), channels = track.channel_count.value_or(0);
       if (!rate || !channels || channels > 64 || Mp4Scale(track) % rate ||

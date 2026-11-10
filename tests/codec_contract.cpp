@@ -1,6 +1,10 @@
 #include "codec/decoder/session.h"
 #include "codec/decoder/copy.h"
 
+#ifdef _WIN32
+#include "media_codec_transform_windows.h"
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -28,6 +32,34 @@ using namespace huxerui::media::detail;
 using State = DecoderState<AudioDecodeOutput>;
 namespace {
 void Check(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
+#ifdef _WIN32
+void WindowsVideoColor() {
+  Check(SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED)), "Could not initialize COM");
+  struct Uninitialize { ~Uninitialize() { CoUninitialize(); } } uninitialize;
+  Check(SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE)), "Could not initialize Media Foundation");
+  struct Shutdown { ~Shutdown() { MFShutdown(); } } shutdown;
+  Microsoft::WRL::ComPtr<IMFMediaType> type;
+  Check(SUCCEEDED(MFCreateMediaType(&type)), "Could not create a Media Foundation output type");
+  VideoFormat format;
+  format.pixel_format = VideoPixelFormat::P010;
+  ReadMediaFoundationVideoColor(type.Get(), format);
+  Check(format.primaries == ColorPrimaries::Unknown && format.transfer == ColorTransfer::Unknown &&
+        format.matrix == ColorMatrix::Unknown && format.range == ColorRange::Unknown, "Missing MF color attributes were inferred");
+  Check(SUCCEEDED(type->SetUINT32(MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT2020)) &&
+        SUCCEEDED(type->SetUINT32(MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235)), "Could not set MF HDR color attributes");
+  for (const auto transfer : {MFVideoTransFunc_2084, MFVideoTransFunc_HLG}) {
+    const auto pq = transfer == MFVideoTransFunc_2084;
+    Check(SUCCEEDED(type->SetUINT32(MF_MT_TRANSFER_FUNCTION, transfer)) &&
+          SUCCEEDED(type->SetUINT32(MF_MT_YUV_MATRIX, pq ? MFVideoTransferMatrix_BT2020_10 : MFVideoTransferMatrix_BT2020_12)),
+          "Could not set MF HDR transfer and matrix");
+    ReadMediaFoundationVideoColor(type.Get(), format);
+    Check(format.primaries == ColorPrimaries::BT2020 && format.matrix == ColorMatrix::BT2020 &&
+          format.transfer == (pq ? ColorTransfer::PQ : ColorTransfer::HLG) &&
+          format.range == ColorRange::Limited && format.pixel_format == VideoPixelFormat::P010,
+          "Media Foundation HDR output lost color signaling");
+  }
+}
+#endif
 template<class Predicate> void Eventually(Predicate predicate, const char* message) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
   while (std::chrono::steady_clock::now() < deadline) {
@@ -397,6 +429,9 @@ void Values() {
 } // namespace
 int main() {
   try {
+#ifdef _WIN32
+    WindowsVideoColor();
+#endif
     Values(); AllocationFailureReturnsCredit(); PlatformTimestampRounding();
 #ifndef __EMSCRIPTEN__
     IndependentWorkerCleanup();

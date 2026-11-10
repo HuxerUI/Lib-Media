@@ -1,11 +1,11 @@
 # Media codecs
 
-`<huxerui/media_format.h>` and `<huxerui/media_codec.h>` provide the first implementation stage of
+`<huxerui/media_format.h>` and `<huxerui/media_codec.h>` provide the headless codec primitives for
 [codec issue #20](https://github.com/HuxerUI/HuxerUI/issues/20). Link `HuxerUI::Media` with the installed public SDK.
 No `Install()`, View, Runtime, window, or application Task is needed. Existing MediaPlayer and photo-library APIs are unchanged.
 
 This guide covers AAC-LC, Opus, FLAC, and MP3 decoded to CPU PCM, and length-prefixed AVC and HEVC decoded to CPU YUV.
-The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264. Codec sessions do not
+The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264 and HEVC. Codec sessions do not
 demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
 
@@ -16,12 +16,11 @@ supported demuxed track, assign `MediaTrack::codec` directly to the decoder conf
 `AudioDecoderConfig::codec` uses the same `CodecId` and defaults to `CodecId::Aac`. Use the audio track's
 codec, `initialization_data`, sample rate, and channel layout to configure a demuxed stream.
 
-Apple VideoToolbox also decodes single-layer HEVC with complete out-of-band VPS, SPS and PPS. Set
-`VideoDecoderConfig::codec` to `CodecId::Hevc` and supply an hvcC record. Use NV12 or I420 for
-8-bit input and P010 for 10-bit input. The first packet after opening or resetting must be an IDR.
-P010 stores ten-bit samples in the upper bits of little-endian 16-bit words. VideoToolbox color
-attachments are retained on decoded frames. The SDR example converts BT.601/BT.709 frames and
-applies container rotation. HDR presentation requires a different display path.
+For HEVC decoding, set `VideoDecoderConfig::codec` to `CodecId::Hevc` and supply an `hvcC` record with complete
+out-of-band VPS, SPS, and PPS for a single-layer stream. Request NV12 or I420 for Main and P010 for Main10.
+The first packet after opening or resetting must be a key-marked IDR. P010 stores ten-bit samples in the upper
+bits of little-endian 16-bit words. The SDR example converts BT.601/BT.709 frames and applies container rotation.
+See the [HEVC matrix](#hevc) for backend and CPU layout availability.
 
 ## Implementation layout
 
@@ -276,7 +275,8 @@ reconfiguring a consumer, and each frame also carries its complete format. No PC
 the decoders. It accepts CPU I420/NV12, progressive eight-bit 4:2:0 SDR pictures. Dimensions must be positive, even,
 and at most 8192×8192, with a full visible rectangle, square pixels, and no rotation. Each input frame must match the
 configured format; row/pixel strides may vary. The library copies active samples before returning `Accepted`.
-No resizing, RGB conversion, HDR, GPU surface input, HEVC, muxing, or dynamic stream reconfiguration is included.
+The encoder takes the supplied CPU pixel values and format as-is. For container output, pass its configuration
+and access units to [`MediaMuxer`](media-container.md).
 
 Choose `H264Profile::Baseline`, `Main`, or `High`; the default is High. Profile and `max_b_frames` are independent:
 
@@ -334,6 +334,33 @@ application. Apple `MaxFrameDelayCount` bounds retained work; it is not treated 
 WebCodecs has no portable exact B control, so Main/High with the default zero policy returns `Unsupported`.
 Web uses quality mode because realtime mode permits dropped pictures. A nonterminal flush makes progress within
 the reserved window without discarding accepted input. Probe success does not guarantee later output negotiation.
+
+### HEVC
+
+Set `VideoEncoderConfig::codec = CodecId::Hevc` and choose the input layout. I420 and NV12 request Main.
+P010 requests Main10. Both take even SDR 4:2:0 pictures with the same geometry and queue contracts as H.264.
+The session emits `VideoEncodeFormat::codec = CodecId::Hevc`, an `hvcC` record with complete VPS/SPS/PPS,
+and four-byte-length access units. Repeated parameter sets and delimiters are checked and removed so the
+packets can be muxed with the `hvc1` sample entry. The first encoded picture must be IDR, and packet key flags
+identify actual IDR pictures. When configuring a decoder or muxer, use the codec, initialization record, and
+coded/visible geometry from the format event.
+
+Use `Probe()` with the full configuration for HEVC. The video `QueryCapabilities()` snapshots describe H.264.
+The available component, CPU pixel layout, bit depth, and B-picture policy can vary independently.
+When a backend omits DTS, export can use PTS as decode time only when decode order is known to match presentation order.
+The example uses automatic B-picture selection for HEVC on Web and the iOS Simulator. On Web, it checks that
+packet PTS strictly increase before using them as DTS. On the iOS Simulator, it uses the encoder's DTS.
+The simulator HEVC adapter waits for its reserved encoding window to fill before forcing nonterminal output
+when VideoToolbox rejects `MaxFrameDelayCount`. End of stream drains any remaining pictures.
+
+| Platform | HEVC backend | Validation |
+| --- | --- | --- |
+| Android | NDK MediaCodec, CPU byte buffers. P010 requires API 33+ and a codec exposing that layout. Encoding requires API 28+. | Main encode, `hvc1` MP4 readback, and decode on Android 12 hardware. The system software encoder was used. |
+| iOS | Independent VideoToolbox adapter. Physical device availability is configuration dependent. The simulator requires automatic B-picture selection. | Main and Main10 `hvc1` MP4 round trips with reordered PTS and platform DTS, plus Main preview export, on the iOS Simulator. |
+| macOS | Independent VideoToolbox adapter. Zero or automatic B pictures. | Main and Main10 encode, `hvc1` MP4 readback, and decode on Apple Silicon. |
+| Windows | Synchronous Media Foundation HEVC transforms. Main10 depends on the installed transform accepting P010. Decoder output retains signaled BT.2020 primaries and matrix, PQ or HLG transfer, and nominal range. | Windows runtime validation pending. |
+| Linux | GStreamer `h265parse` with an installed decoder and `x265enc` for encoding. CPU P010 uses GStreamer conversion. | Main and Main10 round trips with the Linux adapter, `x265enc`, and `avdec_h265` in a macOS GStreamer test harness. Native Linux validation pending. |
+| Web | WebCodecs with automatic B-picture selection. Main10 decode requires CPU `I420P10` frames. Main10 encode requires the browser to accept the profile and ten-bit input. | Main C++/WASM encode/decode and preview export passed in Chrome. The test browser rejected Main10 encoding and decoded Main10 without exposing CPU YUV planes. |
 
 ### Bounded encoding pump
 
@@ -419,8 +446,9 @@ in platform APIs remain validation work; shared fake-backend failure tests do no
 
 On macOS, `media_container_preview` verifies PCM across a zero-pre-skip Ogg link and WAV export from WebM without
 Cues. For Web, build `media_container_preview_tests` and serve the generated `tests/container_preview_wasm.html`
-with its JS/WASM/data files. The test checks that an application callback runs during packet copy and that the copied
-MP3 reopens with the same duration, packet count, and cover metadata.
+with its JS/WASM/data files. The test checks that an application callback runs during audio packet copy, that regular
+and fragmented AAC retain their packets and timing, and that the Web M4A has its index after the media data. The Web
+and iOS Simulator runs also encode the Main HEVC fixture and compare the exported picture timestamps.
 
 A local Apple Silicon Release archive comparison against the pre-codec commit grew from approximately 0.54 MiB to
 1.04 MiB (about 0.50 MiB). These figures exclude system frameworks and vary by toolchain. The existing macOS preview,

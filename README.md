@@ -30,13 +30,13 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`media_player.h`](include/huxerui/media_player.h) |
 | Platform image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
-| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, and Apple HEVC. See [decoder validation](#media-decoding). | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
-| HEVC decoding | Apple VideoToolbox with 8-bit or 10-bit 4:2:0 output for single-layer `hvc1` | `CodecId::Hevc`, `VideoPixelFormat::P010` |
+| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, and HEVC. See [decoder validation](#media-decoding). | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
+| HEVC encoding and decoding | Main and Main10 adapters for all six platforms. Device and runtime support varies. See the [HEVC matrix](docs/media-codec.md#hevc). | `CodecId::Hevc`, `VideoEncoder`, `VideoDecoder`, and `VideoPixelFormat::P010` |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; macOS native tests passed; iOS validation pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; macOS native tests passed; iOS validation pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | Codec capability discovery | Typed AAC-LC/H.264 snapshots for the current adapter; unreported platform facts remain unknown | `QueryCapabilities()` on the four codec classes in [`media_codec.h`](include/huxerui/media_codec.h) |
-| Container demuxing and muxing | MP4/fMP4, QuickTime MOV, Matroska, WebM, WAVE/RF64, ADTS, Ogg Opus with chained input, and native FLAC/MP3 with tag and cover copy | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
+| Container demuxing and muxing | MP4/M4A/fMP4, QuickTime MOV, Matroska, WebM, WAVE/RF64, ADTS, Ogg Opus with chained input, and native FLAC/MP3 with tag and cover copy | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
 
 Platform selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
 SDK `FileReference` values, which can be retained for reading, imported to local files, or passed to `MediaSource` for
@@ -324,10 +324,11 @@ See the [six-platform Opus, FLAC, and MP3 matrix](docs/media-codec.md#opus-flac-
 ## Media encoding
 
 `AudioEncoder` accepts contiguous interleaved S16 mono/stereo PCM at 44.1 or 48 kHz and emits raw AAC-LC packets,
-AudioSpecificConfig, and a final sample summary. `VideoEncoder` accepts CPU I420/NV12 pictures and emits H.264
-access units with four-byte NAL lengths and a separate `avcC` description. Neither encoder writes a container.
+AudioSpecificConfig, and a final sample summary. `VideoEncoder` emits H.264 or HEVC access units with four-byte NAL
+lengths and a separate `avcC` or `hvcC` description. It takes I420/NV12 for H.264 and HEVC Main, and P010 for
+HEVC Main10. Encoded packets can be written through `MediaMuxer`.
 
-Video supports Baseline, Main, and High profiles, independently of its B-picture policy: `max_b_frames = 0` forbids B
+H.264 supports Baseline, Main, and High profiles independently of its B-picture policy: `max_b_frames = 0` forbids B
 pictures, a positive value requests an upper bound, and `std::nullopt` allows platform selection. Defaults are High
 with zero B pictures. Unsupported controls return an error; Web Main/High requires `std::nullopt` because WebCodecs
 cannot enforce a numeric bound. Use `RequestKeyFrame()` to request a later IDR without promising an exact frame.
@@ -352,7 +353,8 @@ window, or `Install()`, and does not reserve resources or select a different bac
 
 `MediaDemuxer` reads tracks and packets from SDK streams. `MediaMuxer` writes packets to a fresh stream and
 finalizes it through `Finish()`. Both sessions are synchronous. Use the [container guide](docs/media-container.md)
-for format mappings, seek behavior, output requirements, and packet ownership.
+for format mappings, seek behavior, output requirements, and packet ownership. Audio-only MP4 is saved as
+`.m4a` and supports AAC-LC or ALAC packets, supported text tags, front-cover artwork, and exact presentation trim.
 
 ## PCM playback
 
@@ -443,20 +445,23 @@ FilePicker explicitly to obtain a source. Switching tabs unmounts the previous s
 The Frames tab decodes files through `MediaDemuxer` and `DecodedPlayback`. Local MP4, MOV, and fragmented MP4
 can use a seek index to restart the decoders and replace the texture for each playback epoch. Effective track ranges
 limit visible pictures and PCM to the intersection of sample coverage and edits. The bundled file has reordered H.264
-pictures, uneven frame intervals, and AAC priming. Apple platforms also preview rotated SDR HEVC in 8-bit or P010.
+pictures, uneven frame intervals, and AAC priming. The Frames preview can also present rotated SDR HEVC when the selected decoder exposes CPU I420, NV12, or P010.
 
-“Open audio” reuses the Frames controls for Ogg Opus, audio in WebM/MKA, native FLAC, and MP3. It plays decoded PCM
+“Open audio” reuses the Frames controls for Ogg Opus, audio in WebM/MKA, native FLAC, MP3, and M4A. It plays decoded PCM
 and supports repeated seeks, including across chained Ogg links. Sequential preview and WAV export also work with
 WebM audio that has no seek index. “Export WAV” writes and reopens S16 PCM at the source rate and layout. “Copy Audio”
-keeps native FLAC or MP3 compressed frames, supported tags, and cover art. The copy and readback yield between packet
-batches on Web. Use “Save Audio” to save the prepared file.
+keeps FLAC, MP3, or AAC/ALAC M4A packets, their presentation interval, supported tags, and cover art. It can also
+copy fragmented AAC into a regular M4A. AAC-LC M4A supports PCM preview and WAV export. Native M4A copies use
+fast-start. Web copies yield between packet batches and leave the M4A index after the media data. Use “Save Audio”
+to save the prepared file.
 
 “Copy Movie” rewrites up to two compatible tracks into MP4 or MOV with the original access units, timing,
 authored edits, and supported visual metadata. This includes HLG and Dolby Vision configuration on the
-HEVC packet-copy path. “Encode MP4” encodes eight-bit H.264 to fast-start MP4. macOS allows B pictures and uses
-explicit encoder DTS. Other platforms use Baseline without reordering. The output container preserves the display
-pixel aspect ratio. Android, Windows, and Web pass AAC packets through. The other platforms encode PCM and require
-a known AAC trim summary.
+HEVC packet-copy path. “Encode MP4” encodes SDR H.264 or HEVC using the source codec and writes fast-start MP4. macOS allows B pictures
+and uses explicit encoder DTS, as does HEVC on the iOS Simulator. Web HEVC uses automatic B-picture selection and
+can export when encoder output has strictly increasing presentation timestamps. The zero-B-picture H.264 path
+uses Baseline. The output container preserves the display pixel aspect ratio. Android, Windows, and Web pass AAC
+packets through. The other platforms encode PCM and require a known AAC trim summary.
 
 Both actions reopen the finished file before “Save Movie” can publish it. Changing the source or preparing another
 result clears the previous export. The separate save action lets the browser picker start from a fresh click.

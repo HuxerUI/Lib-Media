@@ -2,6 +2,7 @@
 #include <huxerui/media_container.h>
 
 #include "container/ebml.h"
+#include "container/mp4.h"
 
 #include <algorithm>
 #include <array>
@@ -497,6 +498,87 @@ void AudioFormats(const fs::path& directory) {
   }
 }
 
+void EmptyM4aMetadata(const fs::path& directory) {
+  using huxerui::media::detail::Number, huxerui::media::detail::SetU32, huxerui::media::detail::Tag;
+  const auto input = Path(fs::path(MEDIA_FIXTURES) / "container" / "tagged-aac.m4a");
+  const auto original = Take(input.ReadBytes());
+  for (const std::string_view tag : {"udta", "ilst"}) {
+    auto bytes = original;
+    const auto name = std::as_bytes(std::span(tag.data(), tag.size()));
+    const auto found = std::ranges::search(bytes, name);
+    Check(!found.empty() && found.begin() - bytes.begin() >= 4, "Fixture is missing a metadata box");
+    const auto box = static_cast<std::size_t>(found.begin() - bytes.begin()) - 4;
+    const auto size = Number<std::uint32_t>(bytes, box);
+    Check(size >= 16 && size <= bytes.size() - box, "Fixture metadata box is too small");
+    // Preserve the file offsets by replacing the payload with a sibling free box.
+    SetU32(bytes, box, 8);
+    SetU32(bytes, box + 8, size - 8);
+    SetU32(bytes, box + 12, Tag("free"));
+    const auto output = Path(directory / ("empty-" + std::string(tag) + ".m4a"));
+    Check(output.WriteBytes(bytes), "Could not stage empty M4A metadata");
+    auto reader = Take(MediaDemuxer::Open(Take(output.OpenRandomAccess())));
+    const auto& track = reader.Tracks().front();
+    Check(track.codec == CodecId::Aac && !track.audio_metadata &&
+          reader.PresentationRange(track.id) == MediaPresentationRange{{0, 1}, {52800, 48000}},
+          "Empty optional M4A metadata affected the audio track");
+    unsigned count = 0;
+    while (Take(reader.Read())) ++count;
+    Check(count == 53, "Empty optional M4A metadata affected the audio packets");
+  }
+}
+
+void M4a(const fs::path& directory) {
+  const auto fixtures = fs::path(MEDIA_FIXTURES) / "container";
+  for (const auto codec : {CodecId::Aac, CodecId::Alac}) {
+    const bool aac = codec == CodecId::Aac;
+    const auto input = Path(fixtures / (aac ? "tagged-aac.m4a" : "tagged-alac.m4a"));
+    const auto output = Path(directory / (aac ? "copy-aac.m4a" : "copy-alac.m4a"));
+    auto reader = Take(MediaDemuxer::Open(Take(input.OpenRandomAccess())));
+    const auto track = reader.Tracks().front();
+    const std::uint32_t rate = aac ? 48000 : 96000;
+    const std::int64_t samples = aac ? 52800 : 10560;
+    const MediaPresentationRange range{{0, 1}, {samples, rate}};
+    Check(reader.Format() == ContainerFormat::Mp4 && reader.Tracks().size() == 1 &&
+        track.codec == codec && track.sample_rate == rate && track.channel_count == 2 &&
+        reader.PresentationRange(track.id) == range, "Wrong M4A coding or effective presentation range");
+    Check(track.priming_samples.value_or(0) == (aac ? 1024 : 0), "Wrong M4A encoder priming");
+    const auto& tags = track.audio_metadata;
+    Check(tags && tags->title == "试听 Café" && tags->artist == "Lib-Media" && tags->album == "Audio Fixtures" &&
+        tags->track_number == "2/12" && tags->genre == "Test" && tags->date == "2026" &&
+        tags->cover && tags->cover->mime_type == "image/png", "Wrong M4A tags or cover");
+    auto mux = Take(MediaMuxer::Open(Take(output.OpenRandomAccess(FileAccessMode::ReadWrite, FileOpenMode::CreateNew)),
+        ContainerFormat::Mp4, reader.Tracks(), ContainerLayout::FastStart));
+    std::vector<ContainerPacket> packets;
+    while (auto item = Take(reader.Read())) {
+      packets.push_back(std::get<ContainerPacket>(std::move(*item)));
+      Check(!Take(mux.TryWrite(packets.back())), "M4A writer did not accept the packet");
+    }
+    Check(packets.size() == (aac ? 53 : 3) && packets.back().duration == MediaTimestamp{aac ? 576 : 2368, rate},
+        "M4A final packet lost its actual duration");
+    Take(mux.Finish());
+    auto sequential = Take(MediaDemuxer::Open(Take(output.OpenRead()), ContainerFormat::Mp4));
+    const auto copy = sequential.Tracks().front();
+    const auto& metadata = copy.audio_metadata;
+    Check(copy.codec == codec && copy.initialization_data == track.initialization_data &&
+        copy.priming_samples == track.priming_samples && copy.padding_samples == track.padding_samples &&
+        sequential.PresentationRange(copy.id) == range, "M4A copy lost format or gapless trim");
+    Check(metadata && metadata->title == tags->title && metadata->artist == tags->artist &&
+        metadata->album == tags->album && metadata->track_number == tags->track_number &&
+        metadata->genre == tags->genre && metadata->date == tags->date && metadata->cover &&
+        metadata->cover->mime_type == tags->cover->mime_type &&
+        std::ranges::equal(metadata->cover->data.AsBytes(), tags->cover->data.AsBytes()), "M4A copy lost tags or cover bytes");
+    for (const auto& packet : packets) Compare(std::get<ContainerPacket>(*Take(sequential.Read())), packet);
+    Check(!Take(sequential.Read()), "M4A copy added packets");
+    auto random = Take(MediaDemuxer::Open(Take(output.OpenRandomAccess())));
+    for (const auto ticks : {samples / 2, std::int64_t(0), samples - 1}) {
+      const auto point = Take(random.Seek(copy.id, {ticks, rate}));
+      Check(point && std::holds_alternative<MediaTrack>(*Take(random.Read())), "M4A copy lost its seek index");
+      const auto packet = std::get<ContainerPacket>(*Take(random.Read()));
+      Check(packet.pts == point->decode_start.value_or(point->time), "M4A seek landed at the wrong packet");
+    }
+  }
+}
+
 void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in_band = false,
          ContainerLayout layout = ContainerLayout::Default) {
   const auto fixture = fs::path(MEDIA_FIXTURES) / "container" /
@@ -885,6 +967,8 @@ int main(int argc, char** argv) {
     EbmlRoundTrip(path / names[16], "webm-vp8-opus.webm", ContainerFormat::WebM, CodecId::Vp8);
     Mp4(path / names[17], ContainerLayout::FastStart);
     AudioFormats(path);
+    M4a(path);
+    EmptyM4aMetadata(path);
     if (argc != 2) {
       for (auto name : names) fs::remove(path / name);
       fs::remove(path / "open-ended.mp4");
@@ -894,6 +978,10 @@ int main(int argc, char** argv) {
       fs::remove(path / "chained.ogg");
       fs::remove(path / "copy.flac");
       fs::remove(path / "copy.mp3");
+      fs::remove(path / "copy-aac.m4a");
+      fs::remove(path / "copy-alac.m4a");
+      fs::remove(path / "empty-udta.m4a");
+      fs::remove(path / "empty-ilst.m4a");
       fs::remove(path / "truncated-audio");
       fs::remove(path);
     }

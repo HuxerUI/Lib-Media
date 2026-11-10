@@ -1,10 +1,13 @@
 #include "codec/decoder/backend.h"
 #include "codec/decoder/copy.h"
+#include "codec/hevc.h"
+#include "media_codec_transform_windows.h"
 
 #include <algorithm>
 #include <cstring>
 #include <deque>
 
+#include <codecapi.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -16,8 +19,8 @@ namespace huxerui::media::detail {
 namespace {
 using Microsoft::WRL::ComPtr;
 struct MfFailure { CodecError error; };
-void Require(HRESULT status, const char* operation) {
-  if (FAILED(status)) throw MfFailure{Error(CodecErrorCode::PlatformFailure, operation, std::to_string(status))};
+void Require(HRESULT status, const char* operation, CodecErrorCode code = CodecErrorCode::PlatformFailure) {
+  if (FAILED(status)) throw MfFailure{Error(code, operation, std::to_string(status))};
 }
 template<class T, class Function> CodecResult<T> Guard(Function function) {
   try {
@@ -37,12 +40,21 @@ public:
       Require(CoInitializeEx(nullptr, COINIT_MULTITHREADED), "COM initialization failed"); com_ = true;
       Require(MFStartup(MF_VERSION, MFSTARTUP_FULL), "Media Foundation initialization failed"); mf_ = true;
       const auto* audio = std::get_if<AudioDecoderConfig>(&config_);
-      Require(CoCreateInstance(audio ? CLSID_CMSAACDecMFT : CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER,
-          IID_PPV_ARGS(&decoder_)), "System AAC/AVC decoder is unavailable");
+      const auto* video = std::get_if<VideoDecoderConfig>(&config_);
+      const bool hevc = video && video->codec == CodecId::Hevc;
+      if (hevc) {
+        const MFT_REGISTER_TYPE_INFO type{MFMediaType_Video, MFVideoFormat_HEVC};
+        Require(OpenSynchronousTransform(MFT_CATEGORY_VIDEO_DECODER, &type, nullptr, decoder_),
+            "No synchronous Media Foundation HEVC decoder", CodecErrorCode::Unsupported);
+      } else {
+        Require(CoCreateInstance(audio ? CLSID_CMSAACDecMFT : CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&decoder_)), "System AAC/AVC decoder is unavailable");
+      }
       ComPtr<IMFMediaType> input;
       Require(MFCreateMediaType(&input), "Cannot allocate decoder input type");
       Require(input->SetGUID(MF_MT_MAJOR_TYPE, audio ? MFMediaType_Audio : MFMediaType_Video), "Cannot set input major type");
-      Require(input->SetGUID(MF_MT_SUBTYPE, audio ? MFAudioFormat_AAC : MFVideoFormat_H264), "Cannot set input subtype");
+      Require(input->SetGUID(MF_MT_SUBTYPE, audio ? MFAudioFormat_AAC : hevc ? MFVideoFormat_HEVC : MFVideoFormat_H264),
+          "Cannot set input subtype");
       if (audio) {
         Require(input->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, audio->output.ChannelCount()), "Cannot set AAC channels");
         Require(input->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, audio->output.sample_rate), "Cannot set AAC rate");
@@ -53,16 +65,24 @@ public:
         for (auto byte : audio->initialization_data) cookie.push_back(std::to_integer<UINT8>(byte));
         Require(input->SetBlob(MF_MT_USER_DATA, cookie.data(), static_cast<UINT32>(cookie.size())), "Cannot set AAC initialization data");
       } else {
-        const auto& video = std::get<VideoDecoderConfig>(config_);
         ComPtr<IMFAttributes> attributes;
-        Require(decoder_->GetAttributes(&attributes), "Cannot configure AVC buffering");
-        Require(attributes->SetUINT32(MF_LOW_LATENCY, TRUE), "Cannot bound AVC startup buffering");
-        Require(MFSetAttributeSize(input.Get(), MF_MT_FRAME_SIZE, video.width, video.height), "Cannot set AVC dimensions");
-        const auto avc = ParseAvc(video.initialization_data).Value();
-        length_size_ = avc.length_size;
-        for (const auto& parameter : avc.parameters) {
-          parameters_.insert(parameters_.end(), {std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}});
-          parameters_.insert(parameters_.end(), parameter.begin(), parameter.end());
+        Require(decoder_->GetAttributes(&attributes), "Cannot configure video buffering");
+        Require(attributes->SetUINT32(MF_LOW_LATENCY, TRUE), "Cannot bound video startup buffering");
+        Require(MFSetAttributeSize(input.Get(), MF_MT_FRAME_SIZE, video->width, video->height), "Cannot set video dimensions");
+        if (hevc) {
+          length_size_ = ParseHevcConfiguration(video->initialization_data, true, false).length;
+          parameters_ = HevcAnnexBConfiguration(video->initialization_data);
+          Require(input->SetUINT32(MF_MT_MPEG2_PROFILE, video->output == VideoPixelFormat::P010 ?
+              eAVEncH265VProfile_Main_420_10 : eAVEncH265VProfile_Main_420_8), "Cannot set HEVC profile");
+          Require(input->SetBlob(MF_MT_MPEG_SEQUENCE_HEADER, reinterpret_cast<const UINT8*>(parameters_.data()),
+              static_cast<UINT32>(parameters_.size())), "Cannot set HEVC initialization data");
+        } else {
+          const auto avc = ParseAvc(video->initialization_data).Value();
+          length_size_ = avc.length_size;
+          for (const auto& parameter : avc.parameters) {
+            parameters_.insert(parameters_.end(), {std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}});
+            parameters_.insert(parameters_.end(), parameter.begin(), parameter.end());
+          }
         }
       }
       Require(decoder_->SetInputType(0, input.Get(), 0), "Decoder rejected input format");
@@ -164,7 +184,8 @@ public:
 private:
   void Negotiate() {
     const auto* audio = std::get_if<AudioDecoderConfig>(&config_);
-    const GUID wanted = audio ? (audio->output.sample_format == AudioSampleFormat::F32 ? MFAudioFormat_Float : MFAudioFormat_PCM) : MFVideoFormat_NV12;
+    const GUID wanted = audio ? (audio->output.sample_format == AudioSampleFormat::F32 ? MFAudioFormat_Float : MFAudioFormat_PCM) :
+        std::get<VideoDecoderConfig>(config_).output == VideoPixelFormat::P010 ? MFVideoFormat_P010 : MFVideoFormat_NV12;
     for (DWORD i = 0;; ++i) {
       ComPtr<IMFMediaType> type;
       const auto status = decoder_->GetOutputAvailableType(0, i, &type);
@@ -188,7 +209,7 @@ private:
       output_type_ = std::move(type);
       return;
     }
-    throw MfFailure{Error(CodecErrorCode::Unsupported, "No compatible CPU PCM/NV12 output format")};
+    throw MfFailure{Error(CodecErrorCode::Unsupported, "No compatible Media Foundation CPU output format")};
   }
   DecodedFrame Copy(IMFSample* sample) {
     LONGLONG time;
@@ -223,12 +244,16 @@ private:
     VideoFormat format;
     Require(MFGetAttributeSize(output_type_.Get(), MF_MT_FRAME_SIZE, &format.width, &format.height), "Decoded geometry is missing");
     format.visible = {0, 0, format.width, format.height};
-    const auto raw_stride = MFGetAttributeUINT32(output_type_.Get(), MF_MT_DEFAULT_STRIDE, format.width);
+    const auto output = std::get<VideoDecoderConfig>(config_).output;
+    const auto component = output == VideoPixelFormat::P010 ? 2u : 1u;
+    format.pixel_format = output == VideoPixelFormat::P010 ? VideoPixelFormat::P010 : VideoPixelFormat::NV12;
+    const auto row = (format.width + 1) / 2 * 2 * component;
+    const auto raw_stride = MFGetAttributeUINT32(output_type_.Get(), MF_MT_DEFAULT_STRIDE, row);
     const auto stride = static_cast<LONG>(raw_stride);
-    if (stride < static_cast<LONG>(format.width)) throw MfFailure{Error(CodecErrorCode::Unsupported, "Unsupported NV12 stride")};
+    if (stride < static_cast<LONG>(row)) throw MfFailure{Error(CodecErrorCode::Unsupported, "Unsupported CPU YUV stride")};
     const auto ysize = std::size_t(stride) * format.height;
     const auto csize = std::size_t(stride) * ((format.height + 1) / 2);
-    if (ysize > size || csize > size - ysize) throw MfFailure{Error(CodecErrorCode::InvalidData, "NV12 planes exceed output bytes")};
+    if (ysize > size || csize > size - ysize) throw MfFailure{Error(CodecErrorCode::InvalidData, "YUV planes exceed output bytes")};
     UINT32 aspect_width, aspect_height;
     if (SUCCEEDED(MFGetAttributeRatio(output_type_.Get(), MF_MT_PIXEL_ASPECT_RATIO, &aspect_width, &aspect_height))) {
       format.aspect_width = aspect_width; format.aspect_height = aspect_height;
@@ -240,18 +265,11 @@ private:
         throw MfFailure{Error(CodecErrorCode::Unsupported, "Unsupported fractional video aperture")};
       format.visible = {UINT32(area.OffsetX.value), UINT32(area.OffsetY.value), UINT32(area.Area.cx), UINT32(area.Area.cy)};
     }
-    const auto primaries = MFGetAttributeUINT32(output_type_.Get(), MF_MT_VIDEO_PRIMARIES, 0);
-    const auto matrix = MFGetAttributeUINT32(output_type_.Get(), MF_MT_YUV_MATRIX, 0);
-    const auto range = MFGetAttributeUINT32(output_type_.Get(), MF_MT_VIDEO_NOMINAL_RANGE, 0);
-    if (primaries == MFVideoPrimaries_BT709) format.primaries = ColorPrimaries::BT709;
-    if (matrix == MFVideoTransferMatrix_BT709) format.matrix = ColorMatrix::BT709;
-    else if (matrix == MFVideoTransferMatrix_BT601) format.matrix = ColorMatrix::BT601;
-    if (range == MFNominalRange_0_255) format.range = ColorRange::Full;
-    else if (range == MFNominalRange_16_235) format.range = ColorRange::Limited;
+    ReadMediaFoundationVideoColor(output_type_.Get(), format);
     LONGLONG duration;
     const auto timed = SUCCEEDED(sample->GetSampleDuration(&duration)) ? std::optional(MediaTimestamp{duration, PresentationTimescale()}) : std::nullopt;
-    auto result = CopyVideo(format, pts, timed, {{data.Slice(0, ysize), std::size_t(stride), 1},
-        {data.Slice(ysize, csize), std::size_t(stride), 2}}, std::get<VideoDecoderConfig>(config_).output);
+    auto result = CopyVideo(format, pts, timed, {{data.Slice(0, ysize), std::size_t(stride), component},
+        {data.Slice(ysize, csize), std::size_t(stride), component * 2}}, output);
     if (!result.Succeeded()) throw MfFailure{result.Error()};
     return DecodedFrame{std::move(result).Value()};
   }

@@ -91,7 +91,9 @@ public:
     options.set("window", static_cast<unsigned>(VideoEncoderWindow(config)));
     options.set("profile", config.profile == H264Profile::Baseline ? 66 : config.profile == H264Profile::Main ? 77 : 100);
     options.set("maxB", config.max_b_frames ? val(*config.max_b_frames) : val::null());
-    options.set("layout", config.input.pixel_format == VideoPixelFormat::NV12 ? "NV12" : "I420");
+    options.set("hevc", config.codec == CodecId::Hevc);
+    options.set("layout", config.input.pixel_format == VideoPixelFormat::P010 ? "P010" :
+        config.input.pixel_format == VideoPixelFormat::NV12 ? "NV12" : "I420");
     auto color = val::object();
     if (config.input.primaries != ColorPrimaries::Unknown)
       color.set("primaries", config.input.primaries == ColorPrimaries::BT709 ? "bt709" :
@@ -117,7 +119,8 @@ public:
     if (frame.pts.ticks > 9007199254740991LL ||
         (frame.duration && (!duration || duration->ticks > 9007199254740991LL)))
       return R::Failure(Error(CodecErrorCode::InvalidData, "Video timing exceeds the WebCodecs safe integer range"));
-    Bytes pixels(std::size_t(config_.input.width) * config_.input.height * 3 / 2);
+    const auto sample = config_.input.pixel_format == VideoPixelFormat::P010 ? 2 : 1;
+    Bytes pixels(std::size_t(config_.input.width) * config_.input.height * sample * 3 / 2);
     CopyVideoEncoderPixels(frame, config_.input.pixel_format, pixels);
     const auto accepted = bridge_.call<bool>("submit", id_, Uint8(pixels), double(frame.pts.ticks),
         duration ? val(double(duration->ticks)) : val::null());
@@ -135,19 +138,20 @@ public:
     }
     if (value["kind"].as<std::string>() == "format") {
       const auto size = value["description"]["length"].as<unsigned>();
-      if (!size || size > 65536) return R::Failure(Error(CodecErrorCode::ResourceExhausted, "H.264 configuration exceeds 64 KiB"));
+      if (!size || size > 65536) return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Video configuration exceeds 64 KiB"));
       auto bytes = Copy(value["description"]);
-      auto parsed = ParseAvc(bytes);
-      if (!parsed.Succeeded()) return R::Failure(parsed.Error());
-      length_size_ = parsed.Value().length_size;
+      if (bytes.front() != std::byte{1})
+        return R::Failure(Error(CodecErrorCode::InvalidData, "WebCodecs did not return a configuration record"));
       auto format = ReadVideoEncodeFormat(bytes, config_);
-      return format.Succeeded() ? R::Success(std::move(format).Value()) : R::Failure(format.Error());
+      if (!format.Succeeded()) return R::Failure(format.Error());
+      length_size_ = (std::to_integer<unsigned>(bytes[config_.codec == CodecId::Hevc ? 21 : 4]) & 3) + 1;
+      return R::Success(std::move(format).Value());
     }
     const auto size = value["data"]["length"].as<unsigned>();
     if (!size || size > config_.max_packet_bytes)
-      return R::Failure(Error(CodecErrorCode::ResourceExhausted, "WebCodecs H.264 access unit exceeds the packet bound"));
+      return R::Failure(Error(CodecErrorCode::ResourceExhausted, "WebCodecs access unit exceeds the packet bound"));
     auto bytes = Copy(value["data"]);
-    auto normalized = NormalizeVideoEncoderPacket(bytes, length_size_, config_.max_packet_bytes);
+    auto normalized = NormalizeVideoEncoderPacket(bytes, length_size_, config_.max_packet_bytes, config_.codec);
     if (!normalized.Succeeded()) return R::Failure(normalized.Error());
     return R::Success(EncodedPacket{Own(std::move(normalized).Value()),
         {static_cast<std::int64_t>(value["pts"].as<double>()), 1000000}, std::nullopt, std::nullopt, false});

@@ -83,7 +83,7 @@ struct MediaPresentationRange {
   bool operator==(const MediaPresentationRange&) const = default;
 };
 
-/// @brief Common text tags and front-cover artwork in a native FLAC or MP3 file.
+/// @brief Common text tags and front-cover artwork in FLAC, MP3, or single-track audio MP4 (M4A).
 ///
 /// Text is UTF-8. Empty strings represent absent tags. When copying a track to the same container format,
 /// its writer emits the supported fields using that format's native metadata blocks.
@@ -102,7 +102,7 @@ struct MediaAudioMetadata {
   std::string artist;
   /// Album or collection title.
   std::string album;
-  /// Track number as written, which may include the total, such as 2/12.
+  /// Track number, which may include the total, such as 2/12. M4A stores the index and total as integers.
   std::string track_number;
   /// Genre text.
   std::string genre;
@@ -148,6 +148,7 @@ struct MediaTrack {
   /// Representation of packet bytes.
   PacketFraming framing = PacketFraming::CodecPacket;
   /// Codec configuration in the representation specified by the mapping, such as the payload of an hvcC box.
+  /// ALAC uses the 24-byte ALACSpecificConfig without the MP4 box header or version and flags.
   Bytes initialization_data;
   /// Known track clock or requested output tick rate.
   std::optional<std::uint32_t> timescale;
@@ -186,7 +187,7 @@ struct MediaTrack {
   /// Supported color and HDR extension payloads from MP4 or MOV. Preserve them when copying compatible
   /// compressed samples. Supply metadata for the new bitstream when encoding different pictures.
   std::vector<VideoExtension> video_extensions = {};
-  /// Supported file tags for the single audio track of native FLAC or MP3. Retained when copying to the same mapping.
+  /// Supported file tags for the single audio track of FLAC, MP3, or M4A. Retained when copying to the same mapping.
   std::optional<MediaAudioMetadata> audio_metadata = {};
 };
 

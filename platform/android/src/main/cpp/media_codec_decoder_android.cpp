@@ -1,6 +1,8 @@
 #include "codec/decoder/backend.h"
 #include "codec/decoder/copy.h"
+#include "codec/hevc.h"
 
+#include <android/api-level.h>
 #include <bit>
 #include <cstring>
 #include <media/NdkMediaCodec.h>
@@ -16,7 +18,11 @@ public:
   CodecResult<void> Open(const DecoderConfig& config) override {
     config_ = config;
     const auto* audio = std::get_if<AudioDecoderConfig>(&config_);
-    const char* mime = "video/avc";
+    const auto* video = std::get_if<VideoDecoderConfig>(&config_);
+    const bool hevc = video && video->codec == CodecId::Hevc;
+    if (hevc && video->output == VideoPixelFormat::P010 && android_get_device_api_level() < 33)
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "P010 decoding requires Android API 33 or later"));
+    const char* mime = hevc ? "video/hevc" : "video/avc";
     if (audio) {
       switch (audio->codec) {
         case CodecId::Aac: mime = "audio/mp4a-latm"; break;
@@ -29,6 +35,8 @@ public:
     codec_ = AMediaCodec_createDecoderByType(mime);
     if (!codec_) return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "No Android decoder for this MIME type"));
     auto* format = AMediaFormat_new();
+    if (!format) return CodecResult<void>::Failure(Error(CodecErrorCode::ResourceExhausted, "Cannot allocate decoder MediaFormat"));
+    std::unique_ptr<AMediaFormat, decltype(&AMediaFormat_delete)> format_owner(format, AMediaFormat_delete);
     AMediaFormat_setString(format, "mime", mime);
     if (audio) {
       audio_sample_limit_ = AudioSampleLimit(*audio).Value();
@@ -44,23 +52,28 @@ public:
         AMediaFormat_setBuffer(format, "csd-2", &delay, sizeof(delay));
       }
     } else {
-      const auto& video = std::get<VideoDecoderConfig>(config_);
-      AMediaFormat_setInt32(format, "width", video.width);
-      AMediaFormat_setInt32(format, "height", video.height);
-      AMediaFormat_setInt32(format, "color-format", 19);
-      auto avc = ParseAvc(video.initialization_data).Value();
-      length_size_ = avc.length_size;
-      Bytes sps, pps;
-      for (const auto& parameter : avc.parameters) {
-        auto& bytes = (std::to_integer<unsigned>(parameter[0]) & 31) == 7 ? sps : pps;
-        bytes.insert(bytes.end(), {std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}});
-        bytes.insert(bytes.end(), parameter.begin(), parameter.end());
+      AMediaFormat_setInt32(format, "width", video->width);
+      AMediaFormat_setInt32(format, "height", video->height);
+      AMediaFormat_setInt32(format, "color-format", video->output == VideoPixelFormat::P010 ? 54 : 19);
+      if (hevc) {
+        length_size_ = ParseHevcConfiguration(video->initialization_data, true, false).length;
+        const auto header = HevcAnnexBConfiguration(video->initialization_data);
+        AMediaFormat_setBuffer(format, "csd-0", header.data(), header.size());
+      } else {
+        auto avc = ParseAvc(video->initialization_data).Value();
+        length_size_ = avc.length_size;
+        Bytes sps, pps;
+        for (const auto& parameter : avc.parameters) {
+          auto& bytes = (std::to_integer<unsigned>(parameter[0]) & 31) == 7 ? sps : pps;
+          bytes.insert(bytes.end(), {std::byte{0}, std::byte{0}, std::byte{0}, std::byte{1}});
+          bytes.insert(bytes.end(), parameter.begin(), parameter.end());
+        }
+        AMediaFormat_setBuffer(format, "csd-0", sps.data(), sps.size());
+        AMediaFormat_setBuffer(format, "csd-1", pps.data(), pps.size());
       }
-      AMediaFormat_setBuffer(format, "csd-0", sps.data(), sps.size());
-      AMediaFormat_setBuffer(format, "csd-1", pps.data(), pps.size());
     }
     auto status = AMediaCodec_configure(codec_, format, nullptr, nullptr, 0);
-    const auto deleted = AMediaFormat_delete(format);
+    const auto deleted = AMediaFormat_delete(format_owner.release());
     if (status != AMEDIA_OK) return CodecResult<void>::Failure(AndroidError(status, "MediaCodec configure failed"));
     if (deleted != AMEDIA_OK) return CodecResult<void>::Failure(AndroidError(deleted, "MediaFormat release failed"));
     status = AMediaCodec_start(codec_);
@@ -190,16 +203,23 @@ private:
     }
     const auto& config = std::get<VideoDecoderConfig>(config_);
     const auto color = Get("color-format", 0);
-    if (color != 19 && color != 21) return R::Failure(Error(CodecErrorCode::Unsupported, "MediaCodec output is not CPU I420/NV12", std::to_string(color)));
+    const bool ten_bit = color == 54;
+    const auto component = ten_bit ? 2u : 1u;
+    if (ten_bit != (config.output == VideoPixelFormat::P010) || (!ten_bit && color != 19 && color != 21))
+      return R::Failure(Error(CodecErrorCode::Unsupported, "Unexpected MediaCodec CPU YUV layout", std::to_string(color)));
     const auto width = Get("width", 0), height = Get("height", 0);
-    const auto stride = Get("stride", width), slice = Get("slice-height", height);
-    if (width <= 0 || height <= 0 || width > config.width || height > config.height || stride < width || slice < height)
+    const auto stride = Get("stride", ten_bit ? 0 : width), slice = Get("slice-height", height);
+    if (width <= 0 || height <= 0 || width > config.width || height > config.height || slice < height ||
+        stride < width * int(component) || (ten_bit && (stride % 4 || stride < (width + 1) / 2 * 4)))
       return R::Failure(Error(CodecErrorCode::InvalidData, "Invalid MediaCodec geometry"));
+    if (std::size_t(slice) > bytes.size() / std::size_t(stride))
+      return R::Failure(Error(CodecErrorCode::InvalidData, "MediaCodec luma exceeds output buffer"));
     const auto ysize = std::size_t(stride) * slice;
-    const auto cstride = color == 19 ? (std::size_t(stride) + 1) / 2 : ((std::size_t(stride) + 1) / 2) * 2;
-    const auto csize = cstride * ((std::size_t(slice) + 1) / 2);
-    if (ysize > bytes.size() || csize > (bytes.size() - ysize) / (color == 19 ? 2 : 1))
+    const auto cstride = ten_bit ? std::size_t(stride) : (std::size_t(stride) + 1) / 2 * (color == 19 ? 1 : 2);
+    const auto crows = (std::size_t(slice) + 1) / 2;
+    if (crows > (bytes.size() - ysize) / cstride / (color == 19 ? 2 : 1))
       return R::Failure(Error(CodecErrorCode::InvalidData, "MediaCodec YUV planes exceed output buffer"));
+    const auto csize = cstride * crows;
     VideoFormat format;
     format.width = width; format.height = height;
     const auto left = Get("crop-left", 0), top = Get("crop-top", 0);
@@ -207,14 +227,15 @@ private:
     if (left < 0 || top < 0 || right < left || bottom < top || right >= width || bottom >= height)
       return R::Failure(Error(CodecErrorCode::InvalidData, "Invalid MediaCodec crop"));
     format.visible = {std::uint32_t(left), std::uint32_t(top), std::uint32_t(right - left + 1), std::uint32_t(bottom - top + 1)};
-    format.pixel_format = color == 19 ? VideoPixelFormat::I420 : VideoPixelFormat::NV12;
+    format.pixel_format = ten_bit ? VideoPixelFormat::P010 : color == 19 ? VideoPixelFormat::I420 : VideoPixelFormat::NV12;
     const auto range = Get("color-range", 0), standard = Get("color-standard", 0), transfer = Get("color-transfer", 0);
     format.range = range == 1 ? ColorRange::Full : range == 2 ? ColorRange::Limited : ColorRange::Unknown;
     if (standard == 1) { format.primaries = ColorPrimaries::BT709; format.matrix = ColorMatrix::BT709; }
     else if (standard == 2 || standard == 4) { format.primaries = standard == 2 ? ColorPrimaries::BT601_625 : ColorPrimaries::BT601_525; format.matrix = ColorMatrix::BT601; }
     else if (standard == 6) { format.primaries = ColorPrimaries::BT2020; format.matrix = ColorMatrix::BT2020; }
     format.transfer = transfer == 1 ? ColorTransfer::Linear : transfer == 3 ? ColorTransfer::BT709 : transfer == 6 ? ColorTransfer::PQ : transfer == 7 ? ColorTransfer::HLG : ColorTransfer::Unknown;
-    std::vector<VideoPlane> planes{{data.Slice(0, ysize), std::size_t(stride), 1}, {data.Slice(ysize, csize), cstride, color == 19 ? 1u : 2u}};
+    std::vector<VideoPlane> planes{{data.Slice(0, ysize), std::size_t(stride), component},
+        {data.Slice(ysize, csize), cstride, color == 19 ? 1u : 2 * component}};
     if (color == 19) planes.push_back({data.Slice(ysize + csize, csize), cstride, 1});
     auto copied = CopyVideo(format, pts, std::nullopt, std::move(planes), config.output);
     if (!copied.Succeeded()) return R::Failure(copied.Error());

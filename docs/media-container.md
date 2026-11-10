@@ -12,7 +12,7 @@ track's initialization data to the corresponding decoder configuration for a sup
 
 | Container | Packets | Input | Output |
 | --- | --- | --- | --- |
-| Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC and length-prefixed AVC or HEVC | Random access, or sequential when movie metadata precedes samples | Random write; fast-start requires random read/write |
+| Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC or ALAC, and length-prefixed AVC or HEVC | Random access, or sequential when movie metadata precedes samples | Random write; fast-start requires random read/write |
 | Fragmented MP4 | Same AAC, AVC, and HEVC mappings | Sequential or random access from initialization. Finite random-access files support seek. | Sequential or random write |
 | QuickTime MOV | Same AAC, AVC, and HEVC mappings, ProRes, and packed interleaved PCM | Random access, or sequential when movie metadata precedes samples | Random write |
 | Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, raw AAC-LC, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
@@ -29,6 +29,29 @@ preserve track offsets and audio trim. Trim is measured relative to packet timin
 so a shortened sample duration is already reflected in that timeline. The fragmented writer emits an initialization movie and bounded
 fragments. It requires nonnegative DTS and rejects explicit presentation edits and nonzero audio trim. ADTS and
 sequential fragmented MP4 report `IndexUnavailable` for time-based index queries.
+
+### M4A
+
+Use `ContainerFormat::Mp4` for single-track AAC-LC or ALAC audio. Regular and fast-start single-audio output
+use the `M4A ` major brand and can be saved with a `.m4a` suffix. A fast-start file supports sequential reading
+and, from a random-access stream, indexed seek. For AAC-LC encoded from PCM, write the raw access units with
+their PTS and duration, then pass the encoder summary's priming and padding to `EndTrack()`. Use
+`PresentationRange()` on readback to select the audible interval.
+
+The audio-copy example also copies fragmented AAC to regular M4A. It collects the packet presentation interval
+as it copies and applies any supported track edit before checking the finished file. Native M4A copies place
+the index before the samples. On Web, the example keeps the index after the samples so finalization does not
+relocate the media data. The Web output can be reopened with random access.
+
+ALAC uses `CodecId::Alac`, mono or stereo, and the 24-byte `ALACSpecificConfig` in `initialization_data`.
+Write each original packet with its actual duration, including a shorter final packet. The packet-copy path
+retains the lossless bitstream and sample clock. PCM playback and encoding in the current audio codec API
+use other supported mappings, such as AAC-LC.
+
+For a single audio track, `audio_metadata` carries title, artist, album, track index and total, genre, date,
+and the first JPEG or PNG cover. Regular and fast-start MP4 write these fields in `udta/meta/ilst`. An
+empty optional metadata box leaves the audio track and its packets readable without tags.
+[QuickTime metadata item list](https://developer.apple.com/documentation/quicktime-file-format/metadata_item_list_atom)
 
 ### Track presentation intervals
 

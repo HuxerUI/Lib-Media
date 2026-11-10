@@ -476,7 +476,7 @@ View FramesPage() {
       try {
         std::optional<FileReference> chosen;
         if (!sample) {
-          const auto filter = audio ? FilePickerFilter{.name = "Audio", .extensions = {"ogg", "opus", "flac", "mp3", "webm", "mka"},
+          const auto filter = audio ? FilePickerFilter{.name = "Audio", .extensions = {"m4a", "ogg", "opus", "flac", "mp3", "webm", "mka"},
                                                        .content_types = {"audio/*", "application/ogg", "video/webm", "video/x-matroska"}}
                                     : FilePickerFilter{.name = "Movies", .extensions = {"mp4", "m4v", "mov"}, .content_types = {"video/*"}};
           chosen = co_await picker->OpenFileAsync(filter);

@@ -1,4 +1,5 @@
 #include "mp4.h"
+#include "framed_audio.h"
 
 #include "codec/common.h"
 
@@ -32,18 +33,63 @@ BoxView NextBox(ByteView& input) {
   return {type, data};
 }
 
-ByteView Child(ByteView input, std::string_view tag, bool required = true, bool mov_visual = false) {
+std::optional<ByteView> FindChild(ByteView input, std::string_view tag, bool mov_visual = false) {
   std::optional<ByteView> found;
   while (!input.empty()) {
     // QuickTime visual sample descriptions can end with a four-byte zero terminator.
     if (mov_visual && input.size() == 4 && Number<std::uint32_t>(input) == 0) break;
     const auto child = NextBox(input);
     if (child.tag != Tag(tag)) continue;
-    if (found || child.bytes.empty()) Fail(Invalid, "Duplicate or empty MP4 box: " + std::string(tag));
+    if (found) Fail(Invalid, "Duplicate MP4 box: " + std::string(tag));
     found = child.bytes;
   }
+  return found;
+}
+
+ByteView Child(ByteView input, std::string_view tag, bool required = true, bool mov_visual = false) {
+  const auto found = FindChild(input, tag, mov_visual);
   if (!found && required) Fail(Invalid, "Missing MP4 box: " + std::string(tag));
+  if (found && found->empty()) Fail(Invalid, "Empty MP4 box: " + std::string(tag));
   return found.value_or(ByteView{});
+}
+
+std::optional<MediaAudioMetadata> ReadAudioMetadata(ByteView movie) {
+  const auto udta = FindChild(movie, "udta").value_or(ByteView{});
+  const auto meta = FindChild(udta, "meta").value_or(ByteView{});
+  if (meta.size() < 4 || Number<std::uint32_t>(meta) != 0) return {};
+  const auto header = FindChild(meta.subspan(4), "hdlr").value_or(ByteView{});
+  if (header.size() < 12 || Number<std::uint32_t>(header, 8) != Tag("mdir")) return {};
+  auto items = FindChild(meta.subspan(4), "ilst").value_or(ByteView{});
+  MediaAudioMetadata metadata;
+  while (!items.empty()) {
+    const auto item = NextBox(items);
+    const auto text = std::ranges::find_if(Mp4AudioTags, [&](auto tag) { return Tag(tag.name) == item.tag; });
+    if (text == std::end(Mp4AudioTags) && item.tag != Tag("trkn") && item.tag != Tag("covr")) continue;
+    auto values = item.bytes;
+    while (!values.empty()) {
+      const auto value = NextBox(values);
+      if (value.tag != Tag("data") || value.bytes.size() < 8) continue;
+      const auto type = Number<std::uint32_t>(value.bytes);
+      const auto data = value.bytes.subspan(8);
+      if (text != std::end(Mp4AudioTags)) {
+        auto& field = metadata.*text->field;
+        if (field.empty() && type == 1 && !data.empty() && data.size() <= MaxAudioText &&
+            std::ranges::find(data, std::byte{0}) == data.end())
+          field.assign(reinterpret_cast<const char*>(data.data()), data.size());
+      } else if (item.tag == Tag("trkn") && metadata.track_number.empty() && type == 0 && data.size() >= 6) {
+        const auto number = Number<std::uint16_t>(data, 2), total = Number<std::uint16_t>(data, 4);
+        if (number) {
+          metadata.track_number = std::to_string(number);
+          if (total) metadata.track_number += "/" + std::to_string(total);
+        }
+      } else if (item.tag == Tag("covr") && !metadata.cover && (type == 13 || type == 14) &&
+                 !data.empty() && data.size() <= MaxContainerPacket - 64) {
+        metadata.cover = MediaAudioMetadata::Cover{type == 13 ? "image/jpeg" : "image/png", Own(Bytes(data.begin(), data.end()))};
+      }
+    }
+  }
+  if (!HasAudioMetadata(metadata)) return {};
+  return metadata;
 }
 
 struct TopBox {
@@ -628,11 +674,14 @@ private:
       layout = ContainerLayout::Fragmented;
     }
     std::size_t count = 0;
-    while (!movie.empty()) {
-      const auto box = NextBox(movie);
+    auto boxes = movie;
+    while (!boxes.empty()) {
+      const auto box = NextBox(boxes);
       if (box.tag == Tag("trak")) ReadTrack(box.bytes, count);
     }
     if (tracks.empty()) Fail(Invalid, "Movie has no audio or video tracks");
+    if (format == ContainerFormat::Mp4 && tracks.size() == 1 && tracks.front().kind == TrackKind::Audio)
+      tracks.front().audio_metadata = ReadAudioMetadata(movie);
     if (layout == ContainerLayout::Fragmented) {
       if (count) Fail(Unsupported, "MP4 hybrid sample tables and fragments are unsupported");
       ReadDefaults(extensions);
@@ -692,6 +741,18 @@ private:
       track.codec = CodecId::Aac;
       track.sample_rate = config.Value().sample_rate;
       track.channel_count = config.Value().channels;
+    } else if (handler == Tag("soun") && entry.tag == Tag("alac") && format == ContainerFormat::Mp4) {
+      if (Number<std::uint16_t>(entry.bytes, 8) != 0) Fail(Unsupported, "Unsupported ALAC audio sample entry version");
+      Slice(entry.bytes, 0, 28);
+      const auto full = Child(entry.bytes.subspan(28), "alac");
+      if (Number<std::uint32_t>(full) != 0) Fail(Unsupported, "Unsupported ALAC configuration box version");
+      const auto config = full.subspan(4);
+      const auto alac = ParseAlac(config, Invalid);
+      track.kind = TrackKind::Audio;
+      track.codec = CodecId::Alac;
+      track.sample_rate = alac.sample_rate;
+      track.channel_count = alac.channels;
+      track.initialization_data.assign(config.begin(), config.end());
     } else if (handler == Tag("vide")) {
       track.kind = TrackKind::Video;
       const auto width = Number<std::uint16_t>(entry.bytes, 24), height = Number<std::uint16_t>(entry.bytes, 26);

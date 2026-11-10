@@ -37,8 +37,9 @@ struct AudioInput {
 
   void ReadTimeline() {
     range = source.PresentationRange(description.id);
-    origin = source.StartTime().value_or(MediaTimestamp{0, 1});
-    if (const auto time = source.Duration()) duration = Seconds(*time);
+    origin = range ? range->start : source.StartTime().value_or(MediaTimestamp{0, 1});
+    if (range) duration = Seconds(range->end) - Seconds(range->start);
+    else if (const auto time = source.Duration()) duration = Seconds(*time);
   }
 
   std::optional<MediaTrack> Seek(MediaTimestamp target) {
@@ -174,23 +175,47 @@ private:
   bool sealed_ = false;
 };
 
-std::string_view AudioCopySuffix(ContainerFormat format) {
-  switch (format) {
+std::string_view AudioCopySuffix(const MediaDemuxer& reader) {
+  const auto tracks = reader.Tracks();
+  if (tracks.size() != 1 || tracks.front().kind != TrackKind::Audio) return {};
+  switch (reader.Format()) {
     case ContainerFormat::Flac: return ".flac";
     case ContainerFormat::Mp3: return ".mp3";
+    case ContainerFormat::Mp4:
+      if (tracks.front().codec == CodecId::Aac || tracks.front().codec == CodecId::Alac) return ".m4a";
+      return {};
     default: return {};
   }
 }
 
 struct AudioCopy {
   AudioCopy(std::shared_ptr<const File> input, const File& temporary)
-      : file(std::move(input)), reader(Open(*file)) {
+      : file(std::move(input)), reader(Open(*file)), fragmented(reader.Layout() == ContainerLayout::Fragmented) {
     const auto format = reader.Format();
-    const auto suffix = AudioCopySuffix(format);
-    if (suffix.empty()) throw std::runtime_error("Audio packet copy requires a native FLAC or MP3 file");
+    const auto suffix = AudioCopySuffix(reader);
+    if (suffix.empty()) throw std::runtime_error("Audio packet copy requires FLAC, MP3, or a single AAC/ALAC MP4 track");
     output = TemporaryFile(temporary, suffix);
+#ifdef __EMSCRIPTEN__
+    const auto layout = ContainerLayout::Default;
+#else
+    const auto layout = format == ContainerFormat::Mp4 ? ContainerLayout::FastStart : ContainerLayout::Default;
+#endif
     mux.emplace(Require(MediaMuxer::Open(
-        Require(output->OpenRandomAccess(FileAccessMode::ReadWrite)), format, reader.Tracks())));
+        Require(output->OpenRandomAccess(FileAccessMode::ReadWrite)), format, reader.Tracks(), layout)));
+  }
+
+  void ExtendRange(const ContainerPacket& packet) {
+    if (!packet.pts || !packet.duration) throw std::runtime_error("Fragmented audio packet is missing presentation timing");
+    const auto start = *packet.pts;
+    const auto duration = Ticks(*packet.duration, start.timescale);
+    if (duration <= 0 || start.ticks > INT64_MAX - duration)
+      throw std::runtime_error("Fragmented audio packet has an invalid presentation interval");
+    const MediaTimestamp end{start.ticks + duration, start.timescale};
+    if (!range) range = MediaPresentationRange{start, end};
+    else {
+      if (start.Compare(range->start) < 0) range->start = start;
+      if (end.Compare(range->end) > 0) range->end = end;
+    }
   }
 
   bool Pump() {
@@ -198,19 +223,27 @@ struct AudioCopy {
     for (unsigned i = 0; i < 32; ++i) {
       auto item = Require(reader.Read());
       if (item && mux) {
-        if (Require(mux->TryWrite(std::get<ContainerPacket>(*item))))
+        const auto& packet = std::get<ContainerPacket>(*item);
+        if (Require(mux->TryWrite(packet)))
           throw std::runtime_error("Audio copy requested another track");
+        if (fragmented) ExtendRange(packet);
         ++remaining;
       } else if (item) {
         if (!remaining) throw std::runtime_error("Audio copy added packets");
         --remaining;
       } else if (mux) {
-        duration = reader.Duration();
+        const auto& track = reader.Tracks().front();
+        if (const auto indexed = reader.PresentationRange(track.id)) range = indexed;
+        else if (range && track.presentation_edit) {
+          const auto earlier = [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; };
+          range->start = std::max(range->start, track.presentation_edit->start, earlier);
+          range->end = std::max(range->start, std::min(range->end, track.presentation_edit->end, earlier), earlier);
+        }
         Require(mux->Finish());
         mux.reset();
         reader = Open(*output);
       } else {
-        if (remaining || reader.Duration() != duration)
+        if (remaining || reader.PresentationRange(reader.Tracks().front().id) != range)
           throw std::runtime_error("Audio copy readback differs from its source");
         return true;
       }
@@ -222,8 +255,9 @@ struct AudioCopy {
   std::shared_ptr<const File> file;
   std::shared_ptr<const File> output;
   MediaDemuxer reader;
+  const bool fragmented;
   std::optional<MediaMuxer> mux;
-  std::optional<MediaTimestamp> duration;
+  std::optional<MediaPresentationRange> range;
   std::size_t remaining = 0;
 };
 
@@ -244,7 +278,7 @@ Task<void> PlayAudio(std::shared_ptr<const File> file, ClipControls controls) {
     return audio;
   });
   if (controls.audio_info)
-    controls.audio_info(!AudioCopySuffix(input->source.Format()).empty(), input->description.audio_metadata);
+    controls.audio_info(!AudioCopySuffix(input->source).empty(), input->description.audio_metadata);
   AudioDecode decode(input);
   std::optional<DecodedPlayback> playback;
   std::optional<AudioFormat> format;

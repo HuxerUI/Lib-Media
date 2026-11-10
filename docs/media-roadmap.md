@@ -8,7 +8,8 @@ record current support. Each planned capability has its own format, direction, p
 
 | Order | Work | Acceptance |
 | --- | --- | --- |
-| Current | Chained Ogg, Opus/FLAC/MP3 decoding, native audio packet copy, and WAV export | macOS and Android 12 hardware pass preview, repeated seek, packet copy, and WAV readback. Independent checks verify compressed frames, tag and cover retention, and sample counts. See the [six-platform audio matrix](media-codec.md#opus-flac-and-mp3). |
+| Current | HEVC encode/decode and M4A | Main and Main10 MP4 round trips on macOS, Main on Android 12 and Chrome, and reordered Main/Main10 on the iOS Simulator. Main preview export passes on Chrome and the iOS Simulator. AAC-LC and ALAC M4A preserve the packet timeline, tags, and cover. Fragmented AAC can be copied into regular M4A. See the [HEVC matrix](media-codec.md#hevc) for remaining platform checks. |
+| Delivered | Chained Ogg, Opus/FLAC/MP3 decoding, native audio packet copy, and WAV export | macOS and Android 12 hardware pass preview, repeated seek, packet copy, and WAV readback. Independent checks verify compressed frames, tag and cover retention, and sample counts. See the [six-platform audio matrix](media-codec.md#opus-flac-and-mp3). |
 | Delivered | Track presentation intervals, local fMP4 seek, MP4/MOV packet copy and reordered export | macOS passes fixture integration and independent B-picture readback. Android 12 hardware and iOS Simulator pass headless FFmpeg-generated fMP4 seek and HLG HEVC MOV-to-MP4 copy with identical access units and supported metadata. iOS Simulator decodes SDR Main10 MOV to P010. |
 | Remaining acceptance | iPhone camera originals and additional desktop and browser runs | On an iPhone, import a camera-original MOV, verify SDR preview and repeated seeks, then save a packet copy and check its display transform, timing and color metadata independently. Validate HDR presentation separately from metadata retention. Expand Windows, Linux and browser checks. |
 | Remaining audio acceptance | Expand native audio backend coverage | Check physical iOS, Linux plugins, and additional browsers. Add Windows decoder mappings when the selected transforms meet the packet and PCM timing contract. |
@@ -46,8 +47,9 @@ See the [decoded playback design](codec-design.md#decoded-playback-boundary) and
 - Exercise H.264 profile and B-picture controls, keyframe requests, variable frame intervals, and codec configuration
   changes. Preserve PTS, DTS, duration, and the evidence for independently decodable output. Android and Web H.264
   encoding currently omit DTS. Windows may omit DTS when variable timing makes its codec clock unsuitable.
-- Extend Apple HEVC decoding and 10-bit frame output to additional platforms, then cover HEVC encoding. Evaluate ProRes,
-  AV1, VP8/VP9, and Vorbis by platform and direction. Add capability and configuration coverage with each codec.
+- Complete HEVC platform acceptance on physical iOS, Windows, Linux, and additional Android and browser configurations.
+  Verify Main10 CPU paths and ordered/reordered output where supported. Evaluate ProRes, AV1, VP8/VP9, and Vorbis by
+  platform and direction. Add capability and configuration coverage with each codec.
 - Extend the frame contract as needed for higher bit depths, visible region, and color and HDR information.
   Evaluate platform-frame import and zero-copy paths against measured workloads, with explicit synchronization,
   ownership, and release requirements.
