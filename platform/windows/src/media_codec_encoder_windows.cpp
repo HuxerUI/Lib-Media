@@ -226,10 +226,7 @@ public:
       }
       Require(output->SetGUID(MF_MT_SUBTYPE, hevc ? MFVideoFormat_HEVC : MFVideoFormat_H264), "Cannot select encoded output");
       Require(output->SetUINT32(MF_MT_AVG_BITRATE, config.bitrate), "Cannot set video bitrate");
-      const UINT32 profile = hevc ? UINT32(ten_bit ? eAVEncH265VProfile_Main_420_10 : eAVEncH265VProfile_Main_420_8) :
-          config.profile == H264Profile::Baseline ? eAVEncH264VProfile_Base :
-          config.profile == H264Profile::Main ? eAVEncH264VProfile_Main : eAVEncH264VProfile_High;
-      Require(output->SetUINT32(MF_MT_MPEG2_PROFILE, profile), "Cannot select video profile");
+      Require(output->SetUINT32(MF_MT_MPEG2_PROFILE, OutputProfile()), "Cannot select video profile");
       auto status = encoder_->SetOutputType(output_stream_, output.Get(), 0);
       if (hevc && FAILED(status)) {
         Require(output->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H265), "Cannot select alternate HEVC output");
@@ -240,13 +237,7 @@ public:
       Require(input->SetGUID(MF_MT_SUBTYPE, ten_bit ? MFVideoFormat_P010 : MFVideoFormat_NV12), "Cannot select video input layout");
       if (!device_) Require(input->SetUINT32(MF_MT_DEFAULT_STRIDE, row), "Cannot set YUV stride");
       Require(encoder_->SetInputType(input_stream_, input.Get(), 0), "Video encoder rejected its input format", CodecErrorCode::Unsupported);
-      ComPtr<IMFMediaType> actual;
-      Require(encoder_->GetOutputCurrentType(output_stream_, &actual), "Cannot query video output configuration");
-      UINT32 bitrate = 0, actual_profile = 0;
-      Require(actual->GetUINT32(MF_MT_AVG_BITRATE, &bitrate), "Video bitrate is missing");
-      Require(actual->GetUINT32(MF_MT_MPEG2_PROFILE, &actual_profile), "Video profile is missing");
-      if (bitrate != config.bitrate || actual_profile != UINT32(profile))
-        throw EncoderFailure{Error(CodecErrorCode::Unsupported, "Video encoder changed requested controls")};
+      VerifyOutputControls();
       Require(encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0), "Cannot begin video encoding");
       streaming_ = true;
       Require(encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0), "Cannot start video encoding");
@@ -322,6 +313,10 @@ public:
       const auto status = encoder_->ProcessOutput(0, 1, &output, &flags);
       if (output.pEvents) output.pEvents->Release();
       if (!sample && output.pSample) sample.Attach(output.pSample);
+      if (status == MF_E_TRANSFORM_STREAM_CHANGE && HardwareAvc()) {
+        RenegotiateAvcOutput();
+        return std::nullopt;
+      }
       if (status == MF_E_TRANSFORM_NEED_MORE_INPUT) {
         if (finished_ && !events_) { eos_ = true; return VideoEncoderEnd{}; }
         return std::nullopt;
@@ -364,7 +359,8 @@ public:
         throw EncoderFailure{Error(CodecErrorCode::ResourceExhausted, "Video access unit exceeds configured byte bound")};
       BYTE* data = nullptr;
       Require(buffer->Lock(&data, nullptr, nullptr), "Cannot map video packet");
-      auto normalized = NormalizeVideoEncoderPacket({reinterpret_cast<std::byte*>(data), size}, 0, config_.max_packet_bytes, config_.codec);
+      auto normalized = NormalizeVideoEncoderPacket({reinterpret_cast<std::byte*>(data), size}, 0, config_.max_packet_bytes,
+          config_.codec, false, HardwareAvc() ? &config_ : nullptr);
       Require(buffer->Unlock(), "Cannot unmap video packet");
       if (!normalized.Succeeded()) throw EncoderFailure{normalized.Error()};
       EncodedPacket packet{Own(std::move(normalized).Value()), {original_pts, 1000000}, std::nullopt, std::nullopt, false};
@@ -411,6 +407,45 @@ public:
     return failure ? CodecResult<void>::Failure(*failure) : CodecResult<void>::Success();
   }
 private:
+  bool HardwareAvc() const { return device_ && config_.codec == CodecId::H264; }
+
+  UINT32 OutputProfile() const {
+    if (config_.codec == CodecId::Hevc)
+      return config_.input.pixel_format == VideoPixelFormat::P010 ? eAVEncH265VProfile_Main_420_10 : eAVEncH265VProfile_Main_420_8;
+    return config_.profile == H264Profile::Baseline ? eAVEncH264VProfile_Base :
+        config_.profile == H264Profile::Main ? eAVEncH264VProfile_Main : eAVEncH264VProfile_High;
+  }
+
+  void VerifyOutputControls() {
+    ComPtr<IMFMediaType> actual;
+    Require(encoder_->GetOutputCurrentType(output_stream_, &actual), "Cannot query video output configuration");
+    UINT32 bitrate = 0, profile = 0;
+    Require(actual->GetUINT32(MF_MT_AVG_BITRATE, &bitrate), "Video bitrate is missing");
+    Require(actual->GetUINT32(MF_MT_MPEG2_PROFILE, &profile), "Video profile is missing");
+    if (bitrate != config_.bitrate || profile != OutputProfile())
+      throw EncoderFailure{Error(CodecErrorCode::Unsupported, "Video encoder changed requested controls")};
+  }
+
+  void RenegotiateAvcOutput() {
+    for (DWORD i = 0; ; ++i) {
+      ComPtr<IMFMediaType> type;
+      const auto status = encoder_->GetOutputAvailableType(output_stream_, i, &type);
+      if (status == MF_E_NO_MORE_TYPES)
+        throw EncoderFailure{Error(CodecErrorCode::Unsupported, "Hardware encoder no longer offers the configured H.264 output")};
+      Require(status, "Cannot enumerate hardware encoder output types");
+      GUID subtype{};
+      UINT32 width = 0, height = 0;
+      if (FAILED(type->GetGUID(MF_MT_SUBTYPE, &subtype)) || subtype != MFVideoFormat_H264 ||
+          FAILED(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width, &height)) ||
+          width != config_.input.width || height != config_.input.height)
+        continue;
+      SetColor(type.Get(), config_.input);
+      Require(encoder_->SetOutputType(output_stream_, type.Get(), 0), "Cannot set updated hardware encoder output type");
+      VerifyOutputControls();
+      return;
+    }
+  }
+
   HRESULT OpenHardwareEncoder(const GUID& subtype) {
     const MFT_REGISTER_TYPE_INFO output{MFMediaType_Video, subtype};
     const MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_NV12};
@@ -521,7 +556,7 @@ private:
     if (!size || size > 65536) throw EncoderFailure{Error(CodecErrorCode::ResourceExhausted, "Video parameter sets exceed 64 KiB")};
     Bytes bytes(size);
     Require(type->GetBlob(MF_MT_MPEG_SEQUENCE_HEADER, reinterpret_cast<UINT8*>(bytes.data()), size, &size), "Cannot read video parameter sets");
-    auto format = ReadVideoEncodeFormat(bytes, config_);
+    auto format = ReadVideoEncodeFormat(bytes, config_, HardwareAvc());
     if (!format.Succeeded()) throw EncoderFailure{format.Error()};
     return std::move(format).Value();
   }

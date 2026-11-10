@@ -40,8 +40,9 @@ releasing the next one to the surface. The decoder validates presentation order.
 can pause further output until a consumer releases a lease. Reset starts a new surface and the retired
 reader survives only as long as its retained images. A returned image remains usable after codec cleanup.
 Encoder submission takes a frame reference on Accepted. WouldBlock leaves it with the caller.
-On Windows, a decoded frame retains its `IMFSample` and texture slice. The encoder's DXGI input buffer retains
-the frame for as long as the transform uses it. A hardware transform can need additional input slots for delay.
+On Windows, the decoder copies the DXGI sample into an owned texture on the GPU and releases the tracked sample
+while the decoder is active. The encoder's DXGI input buffer retains the frame for as long as the transform uses it.
+A hardware transform can need additional input slots for delay.
 An Opaque decoder output slot is budgeted at four bytes per coded pixel. For larger input sizes, set
 `limits.output_bytes` to at least 34 times that charge; the limit is a reservation and does not allocate
 34 hardware images. Size the encoder input byte limit for at least one coded picture.
@@ -138,8 +139,9 @@ ctest --test-dir build/gpu -R 'media_video_(gpu|texture)' --output-on-failure
 Use the same CTest selection on Windows with the installed Windows SDK and a hardware graphics adapter.
 The texture cases publish colored BGRA8 watermarks from a separate D3D11 device on the same adapter. MP4
 readback checks the acquired frame's position, chroma, and timing. An unsupported codec or video processor
-skips the corresponding fixture. The Windows video backend and texture test sources cross-compile for x64 and
-ARM64. Hardware validation and performance measurements are pending.
+skips the corresponding fixture. The H.264 GPU transcode and texture cases passed on Windows x64 hardware
+with 87 pictures each. HEVC runtime acceptance, additional hardware coverage, and performance measurements
+remain pending.
 
 For the iOS Simulator, build the target using the iOS CMake configuration and run the executable with
 `xcrun simctl spawn booted`. Supply an absolute fixture path, `-` for temporary output, and `gpu` or `texture`.

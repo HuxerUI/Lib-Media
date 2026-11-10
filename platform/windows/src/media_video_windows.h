@@ -25,7 +25,7 @@ struct WindowsVideoDevice {
 HRESULT OpenVideoDevice(std::shared_ptr<WindowsVideoDevice>& device);
 HRESULT BindVideoDevice(IMFTransform& transform, const WindowsVideoDevice& device,
     Microsoft::WRL::ComPtr<IMFDXGIDeviceManager>& manager);
-CodecResult<VideoFrame> RetainVideoSample(IMFSample& sample, const std::shared_ptr<WindowsVideoDevice>& device,
+CodecResult<VideoFrame> CopyVideoSample(IMFSample& sample, const std::shared_ptr<WindowsVideoDevice>& device,
     VideoFormat format, MediaTimestamp pts, std::optional<MediaTimestamp> duration);
 HRESULT MakeVideoInputBuffer(const VideoFrame& frame, const WindowsVideoDevice& device,
     Microsoft::WRL::ComPtr<IMFMediaBuffer>& buffer);

@@ -19,12 +19,14 @@ CodecResult<std::size_t> ValidateVideoEncoderConfig(const VideoEncoderConfig& co
 // Copies active samples into tightly packed I420, NV12, or P010 storage without changing color values.
 void CopyVideoEncoderPixels(const VideoFrame& frame, VideoPixelFormat layout, std::span<std::byte> target);
 // Reads a configuration record or Annex B parameter sets and returns geometry and a four-byte-length record.
-CodecResult<VideoEncodeFormat> ReadVideoEncodeFormat(std::span<const std::byte> description, const VideoEncoderConfig& config);
+// An encoder that preserves the input YUV values can supply absent AVC color signaling from its configuration.
+CodecResult<VideoEncodeFormat> ReadVideoEncodeFormat(std::span<const std::byte> description, const VideoEncoderConfig& config,
+    bool complete_avc_color = false);
 CodecResult<VideoEncodeFormat> ReadVideoEncodeFormatFromPacket(std::span<const std::byte> packet, const VideoEncoderConfig& config);
 // A zero length_size denotes Annex B; 1, 2, or 4 denotes length-prefixed NAL units. Enforces the access-unit bound
 // and removes validated AVC base-layer extension prefixes. strip_headers also removes parameter sets and delimiters.
 CodecResult<Bytes> NormalizeVideoEncoderPacket(std::span<const std::byte> bytes, unsigned length_size, std::size_t maximum,
-    CodecId codec = CodecId::H264, bool strip_headers = false);
+    CodecId codec = CodecId::H264, bool strip_headers = false, const VideoEncoderConfig* avc_color_config = nullptr);
 // Facts read from one complete picture access unit, independently of platform key-picture flags.
 struct VideoEncoderPicture {
   bool key_frame = false;

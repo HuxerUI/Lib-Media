@@ -231,7 +231,7 @@ private:
       LONGLONG duration = 0;
       const auto timed = SUCCEEDED(sample->GetSampleDuration(&duration)) ?
           std::optional(MediaTimestamp{duration, PresentationTimescale()}) : std::nullopt;
-      auto image = RetainVideoSample(*sample, device_, VideoOutputFormat(), pts, timed);
+      auto image = CopyVideoSample(*sample, device_, VideoOutputFormat(), pts, timed);
       if (!image.Succeeded()) throw MfFailure{image.Error()};
       return DecodedFrame{std::move(image).Value()};
     }

@@ -28,14 +28,12 @@ CodecError VideoError(HRESULT status, const char* message) {
 
 struct TextureStorage final : PlatformVideoStorage {
   TextureStorage(const VideoFormat& format, std::shared_ptr<WindowsVideoDevice> device,
-      ComPtr<ID3D11Texture2D> image, UINT slice, IMFSample* sample = nullptr)
+      ComPtr<ID3D11Texture2D> image)
       : PlatformVideoStorage(format.width, format.height, format.pixel_format), device(std::move(device)),
-        image(std::move(image)), slice(slice), sample(sample) {}
+        image(std::move(image)) {}
 
   std::shared_ptr<WindowsVideoDevice> device;
   ComPtr<ID3D11Texture2D> image;
-  UINT slice;
-  ComPtr<IMFSample> sample;
 };
 
 class InputImageLease final : public IUnknown {
@@ -100,7 +98,6 @@ public:
 
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_desc{};
     input_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
-    input_desc.Texture2D.ArraySlice = source.slice;
     ComPtr<ID3D11VideoProcessorInputView> input_view;
     status = device.video->CreateVideoProcessorInputView(source.image.Get(), enumerator_.Get(), &input_desc, &input_view);
     if (FAILED(status)) return status;
@@ -235,7 +232,7 @@ public:
     const auto status = processor_.Run(*input, frame.format, target.width, target.height, DXGI_FORMAT_NV12, output);
     if (FAILED(status)) return R::Failure(VideoError(status, "Cannot transform the D3D11 video image"));
     return R::Success(VideoFrameAccess::FromPlatform(target, frame.pts, frame.duration,
-        std::make_shared<TextureStorage>(target, input->device, std::move(output), 0)));
+        std::make_shared<TextureStorage>(target, input->device, std::move(output))));
   }
 
 private:
@@ -281,7 +278,7 @@ HRESULT BindVideoDevice(IMFTransform& transform, const WindowsVideoDevice& devic
   return transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(manager.Get()));
 }
 
-CodecResult<VideoFrame> RetainVideoSample(IMFSample& sample, const std::shared_ptr<WindowsVideoDevice>& device,
+CodecResult<VideoFrame> CopyVideoSample(IMFSample& sample, const std::shared_ptr<WindowsVideoDevice>& device,
     VideoFormat format, MediaTimestamp pts, std::optional<MediaTimestamp> duration) {
   using R = CodecResult<VideoFrame>;
   ComPtr<IMFMediaBuffer> buffer;
@@ -298,8 +295,26 @@ CodecResult<VideoFrame> RetainVideoSample(IMFSample& sample, const std::shared_p
   if (desc.Format != DXGI_FORMAT_NV12 || desc.MipLevels != 1 || desc.SampleDesc.Count != 1 || slice >= desc.ArraySize ||
       desc.Width < format.width || desc.Height < format.height || owner.Get() != device->device.Get())
     return R::Failure(Error(CodecErrorCode::Unsupported, "Media Foundation returned an incompatible D3D11 video image"));
+  // The decoder's tracked sample can call back into its allocator on release.
+  // Complete the GPU copy while the decoder and its allocator are still active.
+  desc.ArraySize = 1;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  desc.BindFlags = desc.CPUAccessFlags = desc.MiscFlags = 0;
+  ComPtr<ID3D11Texture2D> copy;
+  auto status = device->device->CreateTexture2D(&desc, nullptr, &copy);
+  if (FAILED(status)) return R::Failure(VideoError(status, "Cannot allocate decoded D3D11 video storage"));
+  const D3D11_QUERY_DESC query_desc{D3D11_QUERY_EVENT, 0};
+  ComPtr<ID3D11Query> completed;
+  status = device->device->CreateQuery(&query_desc, &completed);
+  if (FAILED(status)) return R::Failure(VideoError(status, "Cannot create decoded video copy fence"));
+  {
+    std::lock_guard lock(device->commands);
+    device->context->CopySubresourceRegion(copy.Get(), 0, 0, 0, 0, image.Get(), slice, nullptr);
+    status = WaitForVideo(*device->context.Get(), *completed.Get(), true);
+  }
+  if (FAILED(status)) return R::Failure(VideoError(status, "Cannot complete decoded D3D11 video copy"));
   return R::Success(VideoFrameAccess::FromPlatform(format, pts, duration,
-      std::make_shared<TextureStorage>(format, device, std::move(image), slice, &sample)));
+      std::make_shared<TextureStorage>(format, device, std::move(copy))));
 }
 
 HRESULT MakeVideoInputBuffer(const VideoFrame& frame, const WindowsVideoDevice& device, ComPtr<IMFMediaBuffer>& buffer) {
@@ -309,12 +324,12 @@ HRESULT MakeVideoInputBuffer(const VideoFrame& frame, const WindowsVideoDevice& 
   const auto create = MediaFoundationFunction<HRESULT (WINAPI*)(REFIID, IUnknown*, UINT, BOOL, IMFMediaBuffer**)>(
       "MFCreateDXGISurfaceBuffer");
   if (!create) return E_NOTIMPL;
-  auto status = create(__uuidof(ID3D11Texture2D), image->image.Get(), image->slice, FALSE, &buffer);
+  auto status = create(__uuidof(ID3D11Texture2D), image->image.Get(), 0, FALSE, &buffer);
   if (FAILED(status)) return status;
   ComPtr<IMFDXGIBuffer> dxgi;
   status = buffer.As(&dxgi);
   if (FAILED(status)) return status;
-  // The wrapper can outlive the input sample. Keep the frame and any decoder pool reservation with it.
+  // The wrapper can outlive the input sample, so it retains the frame storage.
   constexpr GUID image_lease{0xc7b11760, 0xdc13, 0x4d94, {0x9c, 0x6b, 0xa2, 0x83, 0x60, 0x25, 0x63, 0x1c}};
   ComPtr<IUnknown> lease;
   lease.Attach(new InputImageLease(storage));
@@ -353,7 +368,7 @@ CodecResult<VideoFrame> AcquirePlatformVideoFrame(const ExternalTexture& texture
   auto coded = format;
   coded.visible = {0, 0, format.width, format.height};
   coded.rotation = VideoRotation::None;
-  TextureStorage input(format, device, std::move(bgra), 0);
+  TextureStorage input(format, device, std::move(bgra));
   VideoProcessor processor;
   ComPtr<ID3D11Texture2D> output;
   status = processor.Run(input, coded, format.width, format.height, DXGI_FORMAT_NV12, output, snapshot.get());
@@ -361,7 +376,7 @@ CodecResult<VideoFrame> AcquirePlatformVideoFrame(const ExternalTexture& texture
     return R::Failure(Error(CodecErrorCode::ResourceExhausted, "The SDK D3D11 frame is busy"));
   if (FAILED(status)) return R::Failure(VideoError(status, "Cannot convert the SDK D3D11 frame to NV12"));
   return R::Success(VideoFrameAccess::FromPlatform(format, pts, duration,
-      std::make_shared<TextureStorage>(format, std::move(device), std::move(output), 0)));
+      std::make_shared<TextureStorage>(format, std::move(device), std::move(output))));
 }
 
 CodecResult<void> PublishWindowsVideo(ExternalTexture& texture, const VideoFrame& frame) {

@@ -3,7 +3,9 @@
 #include "format/platform_video_storage.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
 
@@ -70,6 +72,36 @@ public:
     return ((1u << zeros) - 1) + Read(zeros);
   }
   int Signed() { const auto value = Unsigned(); return value & 1 ? int((value + 1) / 2) : -int(value / 2); }
+  std::size_t Position() const { return position_; }
+  Bytes ReplaceBits(std::byte header, std::size_t first, std::initializer_list<std::pair<unsigned, unsigned>> fields) {
+    if (bytes_.empty() || bytes_.back() == 0) VideoInvalid("Invalid H.264 SPS trailing bits");
+    const auto end = bytes_.size() * 8 - std::countr_zero(unsigned(bytes_.back()));
+    if (position_ >= end) VideoInvalid("Missing H.264 SPS trailing bits");
+    std::vector<unsigned char> rbsp;
+    unsigned used = 0;
+    auto append = [&](unsigned value, unsigned count) {
+      while (count) {
+        if (!used) rbsp.push_back(0);
+        rbsp.back() |= static_cast<unsigned char>(((value >> --count) & 1u) << (7 - used));
+        used = (used + 1) % 8;
+      }
+    };
+    const auto suffix = position_;
+    position_ = 0;
+    while (position_ < first) append(Read(1), 1);
+    for (const auto& [value, count] : fields) append(value, count);
+    position_ = suffix;
+    while (position_ < end) append(Read(1), 1);
+
+    Bytes nal{header};
+    unsigned zeros = 0;
+    for (const auto value : rbsp) {
+      if (zeros == 2 && value <= 3) { nal.push_back(std::byte{3}); zeros = 0; }
+      nal.push_back(std::byte{value});
+      zeros = value ? 0 : zeros + 1;
+    }
+    return nal;
+  }
 private:
   std::vector<unsigned char> bytes_;
   std::size_t position_ = 0;
@@ -129,7 +161,8 @@ unsigned VideoProfileId(H264Profile profile) {
   }
   return 0;
 }
-VideoEncodeFormat VideoGeometry(std::span<const std::byte> sps, const VideoEncoderConfig& config) {
+VideoEncodeFormat VideoGeometry(std::span<const std::byte> sps, const VideoEncoderConfig& config, Bytes* completed = nullptr) {
+  if (sps.size() > 65535) VideoInvalid("H.264 SPS exceeds its configuration bound");
   VideoBits bits(sps);
   if (bits.Read(8) != VideoProfileId(config.profile)) VideoUnsupported("H.264 encoder changed the requested profile");
   if (bits.Read(8) & 3) VideoInvalid("Invalid reserved H.264 constraint bits");
@@ -168,8 +201,12 @@ VideoEncodeFormat VideoGeometry(std::span<const std::byte> sps, const VideoEncod
   format.visible = {left * 2, top * 2, format.width - (left + right) * 2, format.height - (top + bottom) * 2};
   if (format.visible.x || format.visible.y || format.visible.width != config.input.width ||
       format.visible.height != config.input.height) VideoUnsupported("H.264 encoder changed the visible picture");
-  unsigned primaries = 2, transfer = 2, matrix = 2, full = 0;
-  if (bits.Read(1)) {
+  unsigned primaries = 2, transfer = 2, matrix = 2, full = 0, video_format = 5;
+  const auto vui = bits.Position();
+  auto signal = vui;
+  bool has_signal = false;
+  const bool has_vui = bits.Read(1);
+  if (has_vui) {
     if (bits.Read(1)) {
       const auto aspect = bits.Read(8);
       if (aspect == 255) {
@@ -178,8 +215,10 @@ VideoEncodeFormat VideoGeometry(std::span<const std::byte> sps, const VideoEncod
       } else if (aspect != 0 && aspect != 1) VideoUnsupported("H.264 encoder changed the pixel aspect ratio");
     }
     if (bits.Read(1)) bits.Read(1);
-    if (bits.Read(1)) {
-      bits.Read(3); full = bits.Read(1);
+    signal = bits.Position();
+    has_signal = bits.Read(1);
+    if (has_signal) {
+      video_format = bits.Read(3); full = bits.Read(1);
       if (bits.Read(1)) { primaries = bits.Read(8); transfer = bits.Read(8); matrix = bits.Read(8); }
     }
   }
@@ -188,6 +227,24 @@ VideoEncodeFormat VideoGeometry(std::span<const std::byte> sps, const VideoEncod
       input.primaries == ColorPrimaries::BT601_525 ? 6u : 5u;
   const auto expected_transfer = input.transfer == ColorTransfer::BT709 ? 1u :
       input.transfer == ColorTransfer::SRGB ? 13u : 8u;
+  if (completed) {
+    const bool add_primaries = primaries == 2 && input.primaries != ColorPrimaries::Unknown;
+    const bool add_transfer = transfer == 2 && input.transfer != ColorTransfer::Unknown;
+    const bool add_matrix = matrix == 2 && input.matrix != ColorMatrix::Unknown;
+    const bool add_range = !has_signal && input.range != ColorRange::Unknown;
+    if (add_primaries || add_transfer || add_matrix || add_range) {
+      if (add_primaries) primaries = expected_primaries;
+      if (add_transfer) transfer = expected_transfer;
+      if (add_matrix) matrix = input.matrix == ColorMatrix::BT709 ? 1 : 6;
+      if (add_range) full = input.range == ColorRange::Full;
+      const bool has_color = primaries != 2 || transfer != 2 || matrix != 2;
+      const unsigned color_bits = has_color ? 8 : 0;
+      // A new VUI has no aspect, overscan, timing, HRD, or bitstream restriction fields.
+      *completed = bits.ReplaceBits(sps.front(), signal, {{4, has_vui ? 0u : 3u}, {1, 1}, {video_format, 3},
+          {full, 1}, {has_color, 1}, {primaries, color_bits}, {transfer, color_bits}, {matrix, color_bits},
+          {0, has_vui ? 0u : 6u}});
+    }
+  }
   if ((input.primaries != ColorPrimaries::Unknown && primaries != expected_primaries) ||
       (input.transfer != ColorTransfer::Unknown && transfer != expected_transfer) ||
       (input.matrix == ColorMatrix::BT709 && matrix != 1) ||
@@ -336,7 +393,8 @@ void CopyVideoEncoderPixels(const VideoFrame& frame, VideoPixelFormat layout, st
     else { target[base + index] = u; target[base + chroma + index] = v; }
   }
 }
-CodecResult<VideoEncodeFormat> ReadVideoEncodeFormat(std::span<const std::byte> description, const VideoEncoderConfig& config) {
+CodecResult<VideoEncodeFormat> ReadVideoEncodeFormat(std::span<const std::byte> description, const VideoEncoderConfig& config,
+    bool complete_avc_color) {
   using R = CodecResult<VideoEncodeFormat>;
   try {
     if (description.empty() || description.size() > 65536) VideoInvalid("Invalid video configuration size");
@@ -351,9 +409,15 @@ CodecResult<VideoEncodeFormat> ReadVideoEncodeFormat(std::span<const std::byte> 
       if (type == 7 || type == 8) parsed.parameters.emplace_back(nal.begin(), nal.end());
     }
     std::vector<std::span<const std::byte>> sps, pps;
-    for (const auto& nal : parsed.parameters) {
-      if ((std::to_integer<unsigned>(nal[0]) & 31) == 7) sps.emplace_back(nal);
-      else pps.emplace_back(nal);
+    for (auto& nal : parsed.parameters) {
+      if ((std::to_integer<unsigned>(nal[0]) & 31) == 7) {
+        if (complete_avc_color) {
+          Bytes completed;
+          VideoGeometry(nal, config, &completed);
+          if (!completed.empty()) nal = std::move(completed);
+        }
+        sps.emplace_back(nal);
+      } else pps.emplace_back(nal);
     }
     if (sps.empty() || sps.size() > 31 || pps.empty() || pps.size() > 255 || sps[0].size() < 4)
       VideoInvalid("H.264 encoder configuration needs bounded SPS and PPS data");
@@ -394,7 +458,7 @@ CodecResult<VideoEncodeFormat> ReadVideoEncodeFormatFromPacket(std::span<const s
 }
 
 CodecResult<Bytes> NormalizeVideoEncoderPacket(std::span<const std::byte> bytes, unsigned length_size,
-                                               std::size_t maximum, CodecId codec, bool strip_headers) {
+    std::size_t maximum, CodecId codec, bool strip_headers, const VideoEncoderConfig* avc_color_config) {
   using R = CodecResult<Bytes>;
   try {
     if (bytes.size() > maximum) return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Video packet exceeds configured byte bound"));
@@ -405,6 +469,11 @@ CodecResult<Bytes> NormalizeVideoEncoderPacket(std::span<const std::byte> bytes,
       // AVC base pictures decode independently of their optional, validated extension prefix.
       if (!hevc && type == 14) continue;
       if (strip_headers && (hevc ? type >= 32 && type <= 35 : type >= 7 && type <= 9)) continue;
+      Bytes completed;
+      if (!hevc && type == 7 && avc_color_config) {
+        VideoGeometry(nal, *avc_color_config, &completed);
+        if (!completed.empty()) nal = completed;
+      }
       if (result.size() > maximum || maximum - result.size() < 4 || nal.size() > maximum - result.size() - 4)
         return R::Failure(Error(CodecErrorCode::ResourceExhausted, "Normalized video packet exceeds configured byte bound"));
       const auto size = static_cast<std::uint32_t>(nal.size());
