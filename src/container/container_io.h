@@ -115,6 +115,7 @@ template<class T> void Put(Bytes& bytes, T value, bool little = false) {
 
 inline void Append(Bytes& bytes, ByteView tail) { bytes.insert(bytes.end(), tail.begin(), tail.end()); }
 
+ByteView AacLcInitialization(ByteView config);
 std::uint64_t AddOffset(std::uint64_t offset, std::uint64_t size);
 std::int64_t AddTime(std::int64_t time, std::int64_t delta);
 std::int64_t SubTime(std::int64_t time, std::int64_t start);
@@ -149,6 +150,7 @@ public:
   virtual std::optional<std::uint32_t> Write(std::uint32_t track, const ContainerPacket& packet) = 0;
   virtual void TrackEnded(std::uint32_t) {}
   virtual bool SupportsTrim() const { return false; }
+  virtual bool SupportsPacketTrim() const { return false; }
   virtual void Finish() = 0;
 
   ContainerOutput output;
@@ -167,5 +169,9 @@ std::unique_ptr<ContainerReader> OpenMp4Reader(ContainerInput input, std::option
 std::unique_ptr<ContainerWriter> OpenMp4Writer(ContainerOutput output, ContainerFormat format,
                                                std::span<const MediaTrack> tracks, ContainerLayout layout);
 void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout);
+std::unique_ptr<ContainerReader> OpenMatroskaReader(ContainerInput input, std::optional<ContainerFormat> hint);
+std::unique_ptr<ContainerWriter> OpenMatroskaWriter(ContainerOutput output, ContainerFormat format,
+                                                    std::span<const MediaTrack> tracks);
+void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks);
 
 } // namespace huxerui::media::detail

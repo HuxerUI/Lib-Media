@@ -30,6 +30,8 @@ enum class ContainerFormat {
   Rf64,  ///< RF64 WAVE with a 64-bit size table.
   Adts,  ///< AAC with an ADTS header on each access unit.
   Mov,   ///< Self-contained QuickTime movie with the `qt  ` major brand.
+  Matroska, ///< EBML media with the matroska document type, including audio-only files.
+  WebM,     ///< EBML media with the webm document type and its restricted codec mappings.
 };
 
 /// @brief File organization within a container format.
@@ -63,6 +65,8 @@ enum class CodecId {
   PcmS24Be, ///< Signed packed 24-bit big-endian PCM.
   PcmS32Be, ///< Signed 32-bit big-endian PCM.
   PcmF32Be, ///< IEEE float 32-bit big-endian PCM.
+  Vp9,      ///< VP9 coded pictures.
+  Opus,     ///< Opus coded audio. Trim uses the 48 kHz decoded sample grid.
 };
 
 /// @brief Byte representation of packets belonging to a track.
@@ -118,6 +122,9 @@ struct MediaTrack {
   /// HEVC retains hvc1 or hev1. ProRes retains its profile entry, such as apch.
   /// Empty selects hvc1 for HEVC. ProRes output requires an explicit profile entry.
   std::string sample_entry;
+  /// Known nonnegative duration of data to decode before using the output after seeking.
+  /// Absence leaves the preroll unspecified. Matroska and WebM can retain this value in the track header.
+  std::optional<MediaTimestamp> seek_preroll = {};
 };
 
 /// @brief A packet on a container session's common timeline.
@@ -137,6 +144,9 @@ struct ContainerPacket {
   std::optional<MediaTimestamp> duration;
   /// Known container sync flag. Absence means unavailable.
   std::optional<bool> sync_sample;
+  /// Optional audio trim within this packet. A negative value trims the beginning, a positive value trims the end.
+  /// This duration does not shift PTS and is separate from trim declared on the track.
+  std::optional<MediaTimestamp> discard_padding = {};
 };
 
 /// @brief A covered index candidate or actual seek anchor on a reference track.

@@ -12,6 +12,8 @@ Serialize calls on each session.
 | Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC and length-prefixed AVC or HEVC | Random access, or sequential when movie metadata precedes samples | Random write |
 | Fragmented MP4 | Same AAC, AVC, and HEVC mappings | Sequential or random-access input, beginning with initialization | Sequential or random write |
 | QuickTime MOV | Same AAC, AVC, and HEVC mappings, ProRes, and packed interleaved PCM | Random access, or sequential when movie metadata precedes samples | Random write |
+| Matroska, including audio-only MKA | Length-prefixed HEVC, raw AAC-LC, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
+| WebM | VP9 and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
 | RIFF WAVE and RF64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
 | MPEG-4 ADTS | One raw mono/stereo AAC-LC access unit per frame | Sequential or random access | Sequential or random write |
 
@@ -56,10 +58,25 @@ Use the most recent description for that track before interpreting its packet. A
 EOF. Truncated packets and malformed sample tables are errors. A returned `BufferReference` keeps its bytes alive
 across reads, seeks, and session closure.
 
-`FindSeekPoint()` preserves the read position. `Seek()` places subsequent reads at the selected anchor in regular
-MP4 or at a sample frame in WAVE. Check the returned point and its evidence before starting a decoder. A
+`FindSeekPoint()` preserves the read position. `Seek()` uses indexed anchors in regular MP4, MOV, Matroska,
+and WebM, or sample frames in WAVE and RF64. Check the returned point and its evidence before starting a decoder. A
 reference-track anchor can also affect the starting positions of other selected tracks. The first packet read
 from each track after a seek is preceded by its description.
+
+Matroska and WebM share the EBML reader. The document type selects the mapping. The reader accepts
+known- and unknown-sized Segments and Clusters, `SimpleBlock`, `BlockGroup`, and Xiph, fixed, and EBML
+lacing. Laced frames are delivered separately in their stored order. Select mapped tracks before reading
+when `Tracks()` contains an unknown codec. A sequential input requires Info and Tracks before media.
+
+Matroska Block time is a presentation clock adjusted by the track's CodecDelay. The reader leaves DTS absent.
+BlockDuration, DefaultDuration, and known codec frame durations supply timing where available. Opus preserves
+OpusHead and pre-skip on its 48 kHz decoded sample grid. `seek_preroll` and `discard_padding` retain
+the track preroll and signed per-packet trim.
+
+Random input uses Cues from SeekHead or finds existing tail Cues by following EBML element boundaries.
+Each returned anchor is matched to a Block on its reference track. An Opus seek can start before the
+anchor at the returned `decode_start`. A file with no usable Cues for that track reports
+`IndexUnavailable`; normal packet reads remain available.
 
 ## Write and finish
 
@@ -74,6 +91,19 @@ must follow a contiguous grid. Presentation times may move backwards across succ
 B pictures. WAVE, ADTS, and MOV PCM can derive timing from sample counts and validate any supplied
 values against that grid.
 
+Matroska and WebM use a 1 ms output timestamp grid. The writer keeps the supplied decode order per track
+and rounds absolute packet times and duration boundaries. WebM additionally requires nondecreasing
+stored Block times. Output uses a single Segment, bounded Clusters, and one packet per Block. Finish
+writes available video sync Cues or audio Cues for audio-only output. Output duration is absent from
+the initial header.
+
+`priming_samples` and OpusHead must describe the initial delay before opening the writer.
+Supply packet trim through `discard_padding` before submitting the affected packet. Positive values
+trim the end, and negative values trim the beginning. The trim must fit both the packet's coded duration
+and any explicit BlockDuration on the output time grid. Matroska and WebM report `Unsupported` for
+nonzero trim supplied only at `EndTrack()`. Other current output formats reject nonzero packet
+discard padding or track seek preroll when the mapping cannot represent them.
+
 `TryWrite()` consumes the whole packet when it returns success with no ID. If it returns an ID, supply
 that track's next packet or call `EndTrack()` when the track is exhausted, then retry the unconsumed packet.
 The MP4 interleaver keeps one bounded packet slot per track. `EndTrack()` can also supply known leading and
@@ -86,6 +116,7 @@ partial files. When a destination only exposes `AsyncOutputStream`, an applicati
 container in a writable temporary file and copy it through the SDK's asynchronous streams.
 
 The current bounds include eight tracks, 16 MiB per packet, 64 MiB per metadata box, and one million
-indexed packets for a regular movie or an individual fragment. A QuickTime PCM index entry can cover many
+indexed packets for a regular movie or an individual fragment. The Matroska and WebM Cue table also
+uses a one-million-entry limit. A QuickTime PCM index entry can cover many
 sample frames. See [the container contract test](../tests/container_contract.cpp) for codec packet round trips and
-[the QuickTime fixtures](../tests/fixtures/container/README.md) for independent input samples.
+[the container fixtures](../tests/fixtures/container/README.md) for independent input samples.

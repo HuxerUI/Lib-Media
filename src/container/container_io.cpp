@@ -9,6 +9,13 @@ namespace huxerui::media::detail {
   throw ContainerError{code, std::move(message), {}};
 }
 
+ByteView AacLcInitialization(ByteView config) {
+  // An explicit absent-SBR sync extension is equivalent to the two-byte AAC-LC description.
+  if (config.size() == 5 && Number<std::uint16_t>(config, 2) == 0x56e5 && Number<std::uint8_t>(config, 4) == 0)
+    return config.first(2);
+  return config;
+}
+
 std::uint64_t AddOffset(std::uint64_t offset, std::uint64_t size) {
   if (size > std::numeric_limits<std::uint64_t>::max() - offset)
     Fail(ContainerErrorCode::InvalidData, "Container offset overflows");

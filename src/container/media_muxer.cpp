@@ -12,6 +12,11 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
     if (!it->id || std::ranges::find(tracks.begin(), it, it->id, &MediaTrack::id) != it)
       Fail(ContainerErrorCode::InvalidArgument, "Output track IDs must be nonzero and unique");
     if (it->timescale == 0) Fail(ContainerErrorCode::InvalidArgument, "Zero output track timescale");
+    if (it->seek_preroll && (!it->seek_preroll->timescale || it->seek_preroll->ticks < 0))
+      Fail(ContainerErrorCode::InvalidArgument, "Invalid track seek preroll");
+    if (it->seek_preroll && it->seek_preroll->ticks &&
+        format != ContainerFormat::Matroska && format != ContainerFormat::WebM)
+      Fail(ContainerErrorCode::Unsupported, "Output format cannot retain track seek preroll");
     if (it->initialization_data.size() > 65536)
       Fail(ContainerErrorCode::LimitExceeded, "Output track configuration exceeds 64 KiB");
   }
@@ -30,6 +35,10 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
     case ContainerFormat::Mov:
       ValidateMp4(format, tracks, layout);
       return layout == ContainerLayout::Fragmented ? Requirement::SequentialWrite : Requirement::RandomWrite;
+    case ContainerFormat::Matroska:
+    case ContainerFormat::WebM:
+      ValidateMatroska(format, tracks);
+      return Requirement::SequentialWrite;
   }
   Fail(ContainerErrorCode::Unsupported, "Unsupported output container");
 }
@@ -44,6 +53,8 @@ std::unique_ptr<ContainerWriter> OpenWriter(ContainerOutput output, ContainerFor
     case ContainerFormat::Adts: return OpenAdtsWriter(std::move(output), tracks);
     case ContainerFormat::Mp4:
     case ContainerFormat::Mov: return OpenMp4Writer(std::move(output), format, tracks, layout);
+    case ContainerFormat::Matroska:
+    case ContainerFormat::WebM: return OpenMatroskaWriter(std::move(output), format, tracks);
   }
   Fail(ContainerErrorCode::Unsupported, "Unsupported output container");
 }
@@ -82,8 +93,11 @@ ContainerResult<std::optional<std::uint32_t>> MediaMuxer::TryWrite(const Contain
     if (!size) Fail(ContainerErrorCode::InvalidArgument, "Empty container packet");
     if (size > MaxContainerPacket) Fail(ContainerErrorCode::LimitExceeded, "Container packet exceeds 16 MiB");
     if ((packet.pts && !packet.pts->timescale) || (packet.dts && !packet.dts->timescale) ||
-        (packet.duration && (!packet.duration->timescale || packet.duration->ticks < 0)))
+        (packet.duration && (!packet.duration->timescale || packet.duration->ticks < 0)) ||
+        (packet.discard_padding && !packet.discard_padding->timescale))
       Fail(ContainerErrorCode::InvalidArgument, "Invalid container packet timing");
+    if (packet.discard_padding && packet.discard_padding->ticks && !writer_->SupportsPacketTrim())
+      Fail(ContainerErrorCode::Unsupported, "Output format cannot retain packet discard padding");
     return writer_->Write(index, packet);
   });
   if (!result.Succeeded() && result.Error().code == ContainerErrorCode::Io) Close();

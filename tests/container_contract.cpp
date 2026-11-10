@@ -1,9 +1,12 @@
 #include <huxerui/file.h>
 #include <huxerui/media_container.h>
 
+#include "container/ebml.h"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -382,13 +385,208 @@ void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in
         "Seek did not deliver the remuxed rotation");
   Compare(std::get<ContainerPacket>(*Take(result.Read())), packets[0].front());
 }
+
+void EbmlRoundTrip(const fs::path& destination, std::string_view fixture, ContainerFormat format) {
+  namespace ebml = huxerui::media::detail::ebml;
+  const auto source = Path(fs::path(MEDIA_FIXTURES) / "container" / fixture);
+  auto input = Take(MediaDemuxer::Open(Take(source.OpenRandomAccess()), format));
+  std::vector<MediaTrack> tracks(input.Tracks().begin(), input.Tracks().end());
+  const bool audio_only = tracks.size() == 1;
+  const bool webm = format == ContainerFormat::WebM;
+  Check(input.Format() == format && (audio_only || tracks.size() == 2), "Wrong Matroska or WebM track count");
+  Check(tracks.front().codec == (audio_only ? CodecId::Opus : (webm ? CodecId::Vp9 : CodecId::Hevc)) &&
+        tracks.back().codec == (webm ? CodecId::Opus : CodecId::Aac), "Wrong Matroska or WebM codec mapping");
+  if (webm) {
+    Check(tracks.back().seek_preroll == MediaTimestamp{80, 1000} &&
+          tracks.back().priming_samples == 312, "Opus seek preroll or pre-skip differs");
+  }
+  const auto time = MediaTimestamp{audio_only ? 4500 : 450, 1000};
+  const auto external_point = Take(input.FindSeekPoint(tracks.front().id, time));
+  Check(external_point && external_point->byte_offset, "Independent fixture Cues did not resolve a Block");
+  if (audio_only) {
+    Check(external_point->kind == SeekPoint::Kind::NeedsPreroll && external_point->decode_start &&
+          external_point->decode_start->Compare(external_point->time) < 0, "Opus Cues did not resolve earlier preroll");
+  }
+
+  std::vector<std::vector<ContainerPacket>> packets(tracks.size());
+  bool positive_padding = false;
+  while (auto item = Take(input.Read())) {
+    auto packet = std::get<ContainerPacket>(std::move(*item));
+    Check(packet.pts && !packet.dts, "Matroska Block did not preserve PTS or fabricated DTS");
+    positive_padding |= packet.discard_padding && packet.discard_padding->ticks > 0;
+    Check(packet.track_id > 0 && packet.track_id <= tracks.size(), "Unexpected Matroska track identity");
+    packets[packet.track_id - 1].push_back(std::move(packet));
+  }
+  if (webm) Check(positive_padding, "Opus end trim was lost");
+  if (!webm) {
+    const auto& video = packets.front();
+    Check(std::adjacent_find(video.begin(), video.end(), [](const auto& a, const auto& b) {
+      return a.pts->Compare(*b.pts) > 0;
+    }) != video.end(), "HEVC fixture did not preserve decode order with B pictures");
+  }
+  Take(input.Close());
+
+  Check(Take(MediaMuxer::ValidateOutput(format, tracks)) == MediaMuxer::OutputRequirement::SequentialWrite,
+        "Matroska or WebM unexpectedly requires backpatching");
+  auto output = Take(MediaMuxer::Open(Take(Path(destination).OpenWrite()), format, tracks));
+  if (audio_only) {
+    auto short_packet = packets.front().front();
+    short_packet.duration = MediaTimestamp{10, 1000};
+    short_packet.discard_padding = MediaTimestamp{15, 1000};
+    auto rejected = output.TryWrite(short_packet);
+    Check(!rejected.Succeeded() && rejected.Error().code == ContainerErrorCode::InvalidArgument,
+          "WebM accepted trim exceeding an explicit packet duration");
+    short_packet.duration = MediaTimestamp{104, 10000};
+    short_packet.discard_padding = MediaTimestamp{102, 10000};
+    rejected = output.TryWrite(short_packet);
+    Check(!rejected.Succeeded() && rejected.Error().code == ContainerErrorCode::Unsupported,
+          "WebM accepted trim exceeding the serialized BlockDuration");
+    packets.front().front().discard_padding = MediaTimestamp{0, 1};
+  }
+  std::vector<std::size_t> cursor(tracks.size());
+  std::size_t track = 0;
+  for (std::size_t attempts = 0; track < tracks.size();) {
+    Check(++attempts < 1000, "Matroska or WebM mux did not make progress");
+    const auto need = Take(output.TryWrite(packets[track][cursor[track]]));
+    if (need) {
+      Check(*need > 0 && *need <= tracks.size() && cursor[*need - 1] < packets[*need - 1].size(),
+            "Matroska mux requested a completed track");
+      track = *need - 1;
+    } else if (++cursor[track] == packets[track].size()) {
+      Take(output.EndTrack(tracks[track].id));
+      track = 0;
+      while (track < tracks.size() && cursor[track] == packets[track].size()) ++track;
+    }
+  }
+  Take(output.Finish());
+
+  auto readback = Take(MediaDemuxer::Open(Take(Path(destination).OpenRead()), format));
+  Check(readback.Tracks().size() == tracks.size(), "Matroska or WebM output lost tracks");
+  std::fill(cursor.begin(), cursor.end(), 0);
+  while (auto item = Take(readback.Read())) {
+    const auto& packet = std::get<ContainerPacket>(*item);
+    const auto index = packet.track_id - 1;
+    Check(index < tracks.size() && cursor[index] < packets[index].size(), "Unexpected remuxed Matroska packet");
+    const auto& expected = packets[index][cursor[index]++];
+    Check(packet.pts && std::abs(ebml::ToNs(*packet.pts) - ebml::ToNs(*expected.pts)) <= 500000 &&
+          !packet.dts && packet.sync_sample == expected.sync_sample && packet.discard_padding == expected.discard_padding &&
+          std::ranges::equal(packet.data.AsBytes(), expected.data.AsBytes()), "Matroska packet differs after remux");
+    if (expected.duration) {
+      Check(packet.duration && std::abs(ebml::ToNs(*packet.duration) - ebml::ToNs(*expected.duration)) <= 1000000,
+            "Matroska Block duration exceeded the output grid error");
+    }
+  }
+  for (std::size_t i = 0; i < cursor.size(); ++i) Check(cursor[i] == packets[i].size(), "Matroska remux lost packets");
+  auto seekable = Take(MediaDemuxer::Open(Take(Path(destination).OpenRandomAccess()), format));
+  const auto point = Take(seekable.Seek(tracks.front().id, time));
+  Check(point && point->byte_offset, "Tail Cues did not resolve a Block");
+  const auto expected = audio_only ? point->decode_start : std::optional{point->time};
+  Check(expected && (!audio_only || (point->kind == SeekPoint::Kind::NeedsPreroll && expected->Compare(point->time) < 0)),
+        "Matroska Seek did not preserve the decode start");
+  Check(std::get<MediaTrack>(*Take(seekable.Read())).id == tracks.front().id, "Matroska Seek did not replay track description");
+  Check(std::get<ContainerPacket>(*Take(seekable.Read())).pts == expected, "Matroska Seek landed at the wrong Block");
+}
+
+void MatroskaLacing(const fs::path& path, bool corrupt) {
+  using namespace huxerui::media::detail;
+  using namespace huxerui::media::detail::ebml;
+  const auto audio = Fixture(true, false);
+  Bytes bytes;
+  Master(bytes, Header, [](Bytes& header) { PutText(header, 0x4282, "matroska"); });
+  PutId(bytes, Segment);
+  Put<std::uint8_t>(bytes, 0xff);
+  Master(bytes, Info, [](Bytes&) {});
+  Master(bytes, Tracks, [&](Bytes& tracks) {
+    Master(tracks, 0xae, [&](Bytes& track) {
+      PutUInt(track, 0xd7, 1);
+      PutUInt(track, 0x83, 2);
+      PutText(track, 0x86, "A_AAC");
+      PutElement(track, 0x63a2, audio.track.initialization_data);
+      Master(track, 0xe1, [](Bytes& parameters) {
+        PutFloat(parameters, 0xb5, 48000);
+        PutUInt(parameters, 0x9f, 2);
+      });
+    });
+  });
+  // Unknown-sized sibling Clusters exercise both boundary detection and all three lace encodings.
+  const std::array<std::vector<std::size_t>, 3> sizes{{{3, 4}, {3, 3}, {3, 2, 4}}};
+  for (unsigned i = 0; i < sizes.size(); ++i) {
+    PutId(bytes, Cluster);
+    Put<std::uint8_t>(bytes, 0xff);
+    PutUInt(bytes, Timestamp, i * 100);
+    Bytes block;
+    PutVint(block, 1);
+    Put<std::int16_t>(block, 0);
+    Put<std::uint8_t>(block, static_cast<std::uint8_t>(128 | ((i + 1) << 1)));
+    Put<std::uint8_t>(block, static_cast<std::uint8_t>(sizes[i].size() - 1));
+    if (i == 0) Put<std::uint8_t>(block, 3);
+    if (i == 2) {
+      PutVint(block, corrupt ? 100 : 3);
+      PutVint(block, 62);
+    }
+    for (std::size_t j = 0; j < sizes[i].size(); ++j)
+      block.insert(block.end(), sizes[i][j], static_cast<std::byte>(j + 1));
+    PutElement(bytes, SimpleBlock, block);
+  }
+  Master(bytes, BlockGroup, [](Bytes& group) {
+    Bytes block;
+    PutVint(block, 1);
+    Put<std::int16_t>(block, 80);
+    Put<std::uint8_t>(block, 0);
+    Put<std::uint8_t>(block, 1);
+    PutElement(group, Block, block);
+    PutInt(group, DiscardPadding, -1000000);
+  });
+  if (corrupt) {
+    Master(bytes, Cues, [](Bytes& entries) {
+      Master(entries, 0xbb, [](Bytes& point) {
+        PutUInt(point, 0xb3, 0);
+        Master(point, 0xb7, [](Bytes& position) {
+          PutUInt(position, 0xf7, 1);
+          PutUInt(position, 0xf1, 1u << 30);
+        });
+      });
+    });
+  }
+  Check(Path(path).WriteBytes(bytes), "Could not write synthetic Matroska lace");
+  auto input = Take(MediaDemuxer::Open(Take(Path(path).OpenRead())));
+  for (unsigned i = 0; i < sizes.size(); ++i) {
+    for (std::size_t j = 0; j < sizes[i].size(); ++j) {
+      auto item = input.Read();
+      if (corrupt && i == 2) {
+        Check(!item.Succeeded() && item.Error().code == ContainerErrorCode::InvalidData,
+              "Matroska demux accepted a corrupt lace length");
+        auto random = Take(MediaDemuxer::Open(Take(Path(path).OpenRandomAccess())));
+        const auto point = random.FindSeekPoint(1, {0, 1});
+        Check(!point.Succeeded() && point.Error().code == ContainerErrorCode::InvalidData,
+              "Matroska demux accepted an out-of-range Cue");
+        return;
+      }
+      const auto packet = std::get<ContainerPacket>(*Take(std::move(item)));
+      Check(packet.data.AsBytes().size() == sizes[i][j] &&
+            packet.data.AsBytes().front() == static_cast<std::byte>(j + 1) &&
+            packet.pts == MediaTimestamp{static_cast<std::int64_t>(i * 100000000) +
+                         ToNs({static_cast<std::int64_t>(j * 1024), 48000}), Nanoseconds},
+            "Matroska lace lost a packet boundary or timestamp");
+    }
+  }
+  const auto trimmed = std::get<ContainerPacket>(*Take(input.Read()));
+  Check(trimmed.pts == MediaTimestamp{280, 1000} && trimmed.discard_padding == MediaTimestamp{-1, 1000},
+        "Matroska did not preserve leading packet trim");
+  Check(!Take(input.Read()), "Matroska did not end after its last unknown-sized Cluster");
+  auto random = Take(MediaDemuxer::Open(Take(Path(path).OpenRandomAccess())));
+  const auto point = random.FindSeekPoint(1, {0, 1});
+  Check(!point.Succeeded() && point.Error().code == ContainerErrorCode::IndexUnavailable,
+        "Matroska reported an index for a file with no Cues");
+}
 } // namespace
 
 int main(int argc, char** argv) {
   const auto path = argc == 2 ? fs::path(argv[1]) : fs::temp_directory_path() /
       ("huxerui-container-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   const std::array names{"regular.mp4", "fragmented.mp4", "audio.wav", "audio.rf64.wav", "audio.aac",
-                         "hevc.mov", "hevc.mp4", "hev1.mp4", "prores-pcm.mov", "hevc-fragmented.mp4"};
+                         "hevc.mov", "hevc.mp4", "hev1.mp4", "prores-pcm.mov", "hevc-fragmented.mp4",
+                         "hevc-aac.mkv", "vp9-opus.webm", "opus.webm", "lace.mka", "lace-invalid.mka"};
   try {
     Check(fs::create_directory(path), "Could not create a fresh container test directory");
     Mp4(path / names[0], false);
@@ -401,6 +599,11 @@ int main(int argc, char** argv) {
     Mov(path / names[7], true, ContainerFormat::Mp4, true);
     Mov(path / names[8], false, ContainerFormat::Mov);
     Mov(path / names[9], true, ContainerFormat::Mp4, false, ContainerLayout::Fragmented);
+    EbmlRoundTrip(path / names[10], "mkv-hevc-aac.mkv", ContainerFormat::Matroska);
+    EbmlRoundTrip(path / names[11], "webm-vp9-opus.webm", ContainerFormat::WebM);
+    EbmlRoundTrip(path / names[12], "webm-opus.webm", ContainerFormat::WebM);
+    MatroskaLacing(path / names[13], false);
+    MatroskaLacing(path / names[14], true);
     if (argc != 2) {
       for (auto name : names) fs::remove(path / name);
       fs::remove(path / "open-ended.mp4");

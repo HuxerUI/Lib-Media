@@ -6,6 +6,11 @@ using namespace detail;
 
 std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<ContainerFormat> hint) {
   const auto prefix = input.Peek(12);
+  if (prefix.size() >= 4 && Number<std::uint32_t>(prefix) == 0x1a45dfa3u) {
+    if (hint && *hint != ContainerFormat::Matroska && *hint != ContainerFormat::WebM)
+      Fail(ContainerErrorCode::UnrecognizedFormat, "EBML input does not match the format hint");
+    return OpenMatroskaReader(std::move(input), hint);
+  }
   std::optional<ContainerFormat> recognized;
   if (prefix.size() >= 12 && Number<std::uint32_t>(prefix, 8) == Tag("WAVE")) {
     const auto type = Number<std::uint32_t>(prefix);
@@ -29,6 +34,8 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
     case ContainerFormat::Adts: return OpenAdtsReader(std::move(input));
     case ContainerFormat::Mp4:
     case ContainerFormat::Mov: return OpenMp4Reader(std::move(input), hint);
+    case ContainerFormat::Matroska:
+    case ContainerFormat::WebM: break;
   }
   Fail(ContainerErrorCode::Unsupported, "Unsupported input container");
 }

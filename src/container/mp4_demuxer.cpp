@@ -124,11 +124,8 @@ Bytes AacInitialization(ByteView esds) {
   const auto config = FindDescriptor(es.subspan(offset), 4);
   if (Number<std::uint8_t>(config) != 0x40) Fail(Unsupported, "MP4 audio object is not MPEG-4 AAC");
   Slice(config, 0, 13);
-  auto asc = FindDescriptor(config.subspan(13), 5);
+  const auto asc = AacLcInitialization(FindDescriptor(config.subspan(13), 5));
   if (asc.size() > 65536) Fail(ContainerErrorCode::LimitExceeded, "AAC configuration exceeds 64 KiB");
-  // An explicit absent-SBR sync extension has the same AAC-LC contract as the two-byte description.
-  if (asc.size() == 5 && Number<std::uint16_t>(asc, 2) == 0x56e5 && Number<std::uint8_t>(asc, 4) == 0)
-    asc = asc.first(2);
   return Bytes(asc.begin(), asc.end());
 }
 
