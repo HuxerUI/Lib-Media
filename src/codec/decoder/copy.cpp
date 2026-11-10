@@ -39,28 +39,34 @@ CodecResult<VideoFrame> CopyVideo(VideoFormat format, MediaTimestamp pts,
     std::optional<MediaTimestamp> duration, std::vector<VideoPlane> planes, VideoPixelFormat requested) {
   VideoFrame source{format, pts, duration, std::move(planes)};
   if (!source.Validate()) return CodecResult<VideoFrame>::Failure(Error(CodecErrorCode::InvalidData, "Invalid platform video planes"));
+  if ((format.pixel_format == VideoPixelFormat::P010) != (requested == VideoPixelFormat::P010))
+    return CodecResult<VideoFrame>::Failure(Error(CodecErrorCode::Unsupported, "Video bit-depth conversion is unavailable"));
   format.pixel_format = requested;
   const auto aspect_divisor = std::gcd(format.aspect_width, format.aspect_height);
   format.aspect_width /= aspect_divisor;
   format.aspect_height /= aspect_divisor;
   VideoFrame output{format, pts, duration, {}};
   const auto cw = (std::size_t(format.width) + 1) / 2, ch = (std::size_t(format.height) + 1) / 2;
+  const std::size_t component_bytes = requested == VideoPixelFormat::P010 ? 2 : 1;
   for (unsigned p = 0; p < (requested == VideoPixelFormat::I420 ? 3u : 2u); ++p) {
     const auto width = p ? cw : format.width, height = p ? ch : format.height;
-    const std::size_t components = p && requested == VideoPixelFormat::NV12 ? 2 : 1;
-    Bytes bytes(width * height * components);
+    const std::size_t components = p && requested != VideoPixelFormat::I420 ? 2 : 1;
+    const auto pixel_bytes = components * component_bytes;
+    Bytes bytes(width * height * pixel_bytes);
     for (std::size_t y = 0; y < height; ++y) {
       for (std::size_t x = 0; x < width; ++x) {
         for (std::size_t c = 0; c < components; ++c) {
           const auto channel = p ? requested == VideoPixelFormat::I420 ? p - 1 : c : 0;
           const auto source_plane = !p ? 0 : source.format.pixel_format == VideoPixelFormat::I420 ? channel + 1 : 1;
           const auto& plane = source.planes[source_plane];
-          const auto component = p && source.format.pixel_format == VideoPixelFormat::NV12 ? channel : 0;
-          bytes[(y * width + x) * components + c] = plane.data.AsBytes()[y * plane.row_stride + x * plane.pixel_stride + component];
+          const auto component = p && source.format.pixel_format != VideoPixelFormat::I420 ? channel : 0;
+          const auto at = y * plane.row_stride + x * plane.pixel_stride + component * component_bytes;
+          const auto to = (y * width + x) * pixel_bytes + c * component_bytes;
+          std::copy_n(plane.data.AsBytes().data() + at, component_bytes, bytes.data() + to);
         }
       }
     }
-    output.planes.push_back({Own(std::move(bytes)), width * components, components});
+    output.planes.push_back({Own(std::move(bytes)), width * pixel_bytes, pixel_bytes});
   }
   return CodecResult<VideoFrame>::Success(std::move(output));
 }

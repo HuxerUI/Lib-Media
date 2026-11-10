@@ -252,8 +252,16 @@ int main(int argc, char** argv) {
     auto sync_aac = PackedPackets(root, "sync-aac");
     Decode<AudioDecoder, AudioDecoderConfig, AudioFrame>(audio, sync_aac, sync_aac.size());
     VideoDecoderConfig video;
+    Check(video.codec == CodecId::H264, "Video decoder no longer defaults to H.264");
     video.initialization_data = Read(root / "avc.config");
     video.width = 64; video.height = 48;
+    auto unsupported = video;
+    for (const auto codec : {CodecId::Aac, CodecId::Vp9, CodecId::Unknown}) {
+      unsupported.codec = codec;
+      const auto rejected = VideoDecoder::Create(unsupported);
+      Check(!rejected.Succeeded() && rejected.Error().code == CodecErrorCode::InvalidArgument,
+            "Video decoder must reject codec IDs outside H.264 and HEVC");
+    }
     auto avc = Packets(root, "avc");
     Decode<VideoDecoder, VideoDecoderConfig, VideoFrame>(video, avc, avc.size());
     video.output = VideoPixelFormat::I420;

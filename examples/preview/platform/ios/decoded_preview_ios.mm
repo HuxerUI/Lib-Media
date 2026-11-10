@@ -58,8 +58,7 @@ std::shared_ptr<huxerui::ExternalTexture> MakeFrameTexture(huxerui::Size size) {
 void PublishFrame(huxerui::ExternalTexture& texture, const huxerui::media::VideoFrame& frame) {
   @autoreleasepool {
     const auto pixels = ConvertFramePixels(frame);
-    const auto width = frame.format.visible.width;
-    const auto height = frame.format.visible.height;
+    const auto [width, height] = DisplayDimensions(frame.format.visible, frame.format.rotation);
     NSDictionary* attributes = @{
       (__bridge NSString*)kCVPixelBufferIOSurfacePropertiesKey: @{},
       (__bridge NSString*)kCVPixelBufferMetalCompatibilityKey: @YES

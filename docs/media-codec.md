@@ -9,6 +9,17 @@ The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.
 demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
 
+`VideoDecoderConfig::codec` uses `CodecId` from `<huxerui/media_format.h>` and defaults to `CodecId::H264`.
+Use `CodecId::H264` or `CodecId::Hevc`. Other identifiers return `InvalidArgument`. When decoding a
+supported demuxed track, assign `MediaTrack::codec` directly to the decoder configuration.
+
+Apple VideoToolbox also decodes single-layer HEVC with complete out-of-band VPS, SPS and PPS. Set
+`VideoDecoderConfig::codec` to `CodecId::Hevc` and supply an hvcC record. Use NV12 or I420 for
+8-bit input and P010 for 10-bit input. The first packet after opening or resetting must be an IDR.
+P010 stores ten-bit samples in the upper bits of little-endian 16-bit words. VideoToolbox color
+attachments are retained on decoded frames. The SDR example converts BT.601/BT.709 frames and
+applies container rotation. HDR presentation requires a different display path.
+
 ## Implementation layout
 
 The public declarations remain in [`media_codec.h`](../include/huxerui/media_codec.h). Decoder and encoder
@@ -74,7 +85,7 @@ checked during processing. Snapshots own their candidate vectors and can outlive
 | --- | --- |
 | Windows | The same synchronous system MFT CLSIDs used by sessions; advertised media types, ICodecAPI values/defaults and parameter ranges. Missing metadata remains unknown; no third-party or asynchronous MFT enumeration. |
 | Linux | Required installed pipeline elements, the decoder selected by the existing factory-rank/filter rule, or the exact avenc_aac/x264enc encoder; static pad caps and property ranges. No GTK initialization or plugin installation. |
-| Android | The component chosen by NDK MediaCodec; API 36 metadata is loaded dynamically when available. Older systems retain unknown detailed limits; the library minimum remains API 23 and video encoding still requires API 28. No Activity or JNI requirement. |
+| Android | The component chosen by NDK MediaCodec; API 36 metadata is loaded dynamically when available. Older systems retain unknown detailed limits; the library minimum remains API 23 and video encoding still requires API 28. A Baseline session can retry the system software encoder if the first component rejects configuration. No Activity or JNI requirement. |
 | iOS | AudioToolbox format lists/encode ranges, VideoToolbox encoder discovery, hardware decoder discovery, and positive encoder profile/control checks using small reference sessions. Software-only decoder availability and unreported limits remain unknown. |
 | macOS | An independent platform implementation using AudioToolbox/VideoToolbox discovery with the same conservative evidence rules. |
 | Web | Four AAC or three H.264 reference configuration checks on the owning event loop. Failed/rejected reference checks remain unknown; missing required APIs are unsupported. Global numeric limits and hardware use are unknown. |
@@ -279,9 +290,9 @@ fails with `ResourceExhausted`. Platform codec allocations and bounded conversio
 | --- | --- | --- |
 | Windows | System synchronous H.264 MFT; Baseline/Main/High, numeric B bounds 0..2 and Auto | Native round trips, real B reordering, requested IDR, variable PTS, crop, padded input and cleanup on Windows 11 |
 | Linux | GStreamer `x264enc` + `h264parse`; Baseline/Main/High, numeric B bounds 0..16 and Auto; bitrate must be integral kbit/s | Headless native round trips and shared contracts on Ubuntu 24.04/WSL; no GTK initialization |
-| Android | NDK MediaCodec API 28+; Main/High numeric B bounds require API 29+, with codec confirmation for positive bounds; interpretable packed I420/NV12 input only | arm64 build; encoder hardware validation pending |
+| Android | NDK MediaCodec API 28+; Main/High numeric B bounds require API 29+, with codec confirmation for positive bounds; interpretable packed I420/NV12 input only | Baseline software fallback and MP4 export verified on Android 12; broader hardware validation pending |
 | iOS | Independent VideoToolbox implementation; zero or Auto B pictures; positive numeric bounds return `Unsupported` | Build/device validation pending |
-| macOS | Independent VideoToolbox implementation with the same B-policy limitation | Build/device validation pending |
+| macOS | Independent VideoToolbox implementation with the same B-policy limitation | Native H.264 round trips and two-slot output regression on Apple Silicon |
 | Web | WebCodecs quality mode; Baseline with zero/Auto, Main/High with Auto only | Chrome C++/WASM Baseline/Main/High round trips and Node bridge contracts |
 
 The library minimum on Android remains API 23; video encoding resolves newer NDK entry points at runtime and
@@ -401,5 +412,5 @@ Runtime or Install. Shared tests cover unknown versus unavailable evidence, inde
 post-TLS completion, and discovery failures. Node checks bounded reference queries, unchanged configuration evidence,
 and promise retirement. Run the subset with `ctest --test-dir <build> -R media_codec_capabilities --output-on-failure`.
 For a browser, build `media_codec_capabilities_tests` and serve the generated `tests/codec_capabilities_wasm.html`.
-Windows/Linux native queries and Android/Web compilation are validated. Apple capability compilation and device
-validation remain pending; prior codec-session validation does not validate the new discovery adapter.
+Windows/Linux and macOS native queries and Android/Web compilation are validated. iOS device
+validation remains pending; prior codec-session validation does not validate the new discovery adapter.

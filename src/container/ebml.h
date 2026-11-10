@@ -60,15 +60,6 @@ std::int64_t ScaleTime(std::int64_t ticks, std::uint64_t scale);
 std::int64_t ToNs(MediaTimestamp time);
 std::optional<MediaTimestamp> CodecDuration(const MediaTrack& track, ByteView packet, ContainerErrorCode error);
 
-struct OpusHead {
-  std::uint32_t channels;
-  std::uint32_t input_rate;
-  std::uint16_t pre_skip;
-  std::int64_t Delay() const { return static_cast<std::int64_t>(pre_skip) * Nanoseconds / 48000; }
-};
-
-OpusHead ParseOpus(ByteView bytes, ContainerErrorCode error);
-
 void PutVint(Bytes& out, std::uint64_t value);
 void PutId(Bytes& out, std::uint32_t id);
 void PutElement(Bytes& out, std::uint32_t id, ByteView bytes);

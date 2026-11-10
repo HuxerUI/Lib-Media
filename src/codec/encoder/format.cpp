@@ -207,6 +207,7 @@ CodecResult<std::size_t> ValidateVideoEncoderConfig(const VideoEncoderConfig& co
       (config.profile == H264Profile::Baseline && config.max_b_frames.value_or(0)))
     return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid video encoder geometry, controls, or queue bounds"));
   if (input.visible != VideoRectangle{0, 0, input.width, input.height} ||
+      input.pixel_format == VideoPixelFormat::P010 ||
       input.aspect_width != input.aspect_height || input.rotation != VideoRotation::None ||
       input.primaries == ColorPrimaries::BT2020 || input.matrix == ColorMatrix::BT2020 ||
       input.transfer == ColorTransfer::PQ || input.transfer == ColorTransfer::HLG ||

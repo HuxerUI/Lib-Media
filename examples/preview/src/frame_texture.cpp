@@ -27,35 +27,54 @@ namespace media_preview {
 #if defined(__ANDROID__) || defined(__APPLE__) || defined(__EMSCRIPTEN__) || defined(_WIN32) || defined(__linux__)
 namespace {
 
-unsigned Sample(const VideoPlane& plane, unsigned x, unsigned y, unsigned component = 0) {
-  return std::to_integer<unsigned>(plane.data.AsBytes()[y * plane.row_stride + x * plane.pixel_stride + component]);
+unsigned Sample(const VideoPlane& plane, unsigned x, unsigned y, bool ten_bit, unsigned component = 0) {
+  const auto bytes = plane.data.AsBytes();
+  const auto at = y * plane.row_stride + x * plane.pixel_stride + component * (ten_bit ? 2 : 1);
+  const auto low = std::to_integer<unsigned>(bytes[at]);
+  if (!ten_bit) return low;
+  return (low | (std::to_integer<unsigned>(bytes[at + 1]) << 8)) >> 6;
 }
 
 } // namespace
 
 Bytes ConvertFramePixels(const VideoFrame& frame) {
   if (!frame.Validate()) throw std::runtime_error("Invalid VideoFrame");
+  if (frame.format.transfer == ColorTransfer::PQ || frame.format.transfer == ColorTransfer::HLG)
+    throw std::runtime_error("HDR frames require an HDR display path");
   const auto matrix = frame.format.matrix == ColorMatrix::Unknown ? ColorMatrix::BT601 : frame.format.matrix;
   if (matrix != ColorMatrix::BT601 && matrix != ColorMatrix::BT709)
     throw std::runtime_error("The preview supports BT.601 and BT.709");
   const auto visible = frame.format.visible;
+  const auto [width, height] = DisplayDimensions(visible, frame.format.rotation);
   const bool planar = frame.format.pixel_format == VideoPixelFormat::I420;
+  const bool ten_bit = frame.format.pixel_format == VideoPixelFormat::P010;
+  const double scale = ten_bit ? 4 : 1;
+  const double maximum = ten_bit ? 1023 : 255;
   const bool limited = frame.format.range != ColorRange::Full;
   const double kr = matrix == ColorMatrix::BT601 ? 0.299 : 0.2126;
   const double kb = matrix == ColorMatrix::BT601 ? 0.114 : 0.0722;
   const auto byte = [](double value) { return std::byte(std::lround(std::clamp(value, 0., 1.) * 255)); };
-  Bytes pixels(std::size_t(visible.width) * visible.height * 4);
+  Bytes pixels(std::size_t(width) * height * 4);
   for (unsigned y = 0; y < visible.height; ++y) {
     for (unsigned x = 0; x < visible.width; ++x) {
       const auto px = x + visible.x, py = y + visible.y;
-      const auto luma = (double(Sample(frame.planes[0], px, py)) - (limited ? 16 : 0)) / (limited ? 219 : 255);
-      const auto u = (double(Sample(frame.planes[1], px / 2, py / 2)) - 128) / (limited ? 224 : 255);
-      const auto v = (double(Sample(frame.planes[planar ? 2 : 1], px / 2, py / 2, planar ? 0 : 1)) - 128) /
-                     (limited ? 224 : 255);
+      const auto luma = (double(Sample(frame.planes[0], px, py, ten_bit)) - (limited ? 16 * scale : 0)) /
+                        (limited ? 219 * scale : maximum);
+      const auto u = (double(Sample(frame.planes[1], px / 2, py / 2, ten_bit)) - 128 * scale) /
+                     (limited ? 224 * scale : maximum);
+      const auto v = (double(Sample(frame.planes[planar ? 2 : 1], px / 2, py / 2, ten_bit, planar ? 0 : 1)) -
+                      128 * scale) / (limited ? 224 * scale : maximum);
       const auto red = luma + 2 * (1 - kr) * v;
       const auto blue = luma + 2 * (1 - kb) * u;
       const auto green = (luma - kr * red - kb * blue) / (1 - kr - kb);
-      auto* out = pixels.data() + (y * visible.width + x) * 4;
+      unsigned dx = x, dy = y;
+      switch (frame.format.rotation) {
+        case VideoRotation::None: break;
+        case VideoRotation::Clockwise90: dx = width - 1 - y; dy = x; break;
+        case VideoRotation::Clockwise180: dx = width - 1 - x; dy = height - 1 - y; break;
+        case VideoRotation::Clockwise270: dx = y; dy = height - 1 - x; break;
+      }
+      auto* out = pixels.data() + (std::size_t(dy) * width + dx) * 4;
       out[0] = byte(red);
       out[1] = byte(green);
       out[2] = byte(blue);
@@ -173,7 +192,8 @@ std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size) {
 }
 
 void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
-  Upload(texture, ConvertFramePixels(frame), frame.format.visible.width, frame.format.visible.height);
+  const auto [width, height] = DisplayDimensions(frame.format.visible, frame.format.rotation);
+  Upload(texture, ConvertFramePixels(frame), width, height);
 }
 #elif defined(__EMSCRIPTEN__)
 namespace {
@@ -205,9 +225,9 @@ void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
     throw std::runtime_error("VideoFrame timestamp exceeds the browser range");
   const auto bytes = emscripten::val(emscripten::typed_memory_view(
       pixels.size(), reinterpret_cast<const unsigned char*>(pixels.data())));
-  const auto visible = frame.format.visible;
+  const auto [width, height] = DisplayDimensions(frame.format.visible, frame.format.rotation);
   auto video_frame = emscripten::val::take_ownership(
-      CreatePreviewVideoFrame(bytes.as_handle(), visible.width, visible.height, double(timestamp->ticks)));
+      CreatePreviewVideoFrame(bytes.as_handle(), width, height, double(timestamp->ticks)));
   if (video_frame.isNull()) throw std::runtime_error("Cannot create the Web preview VideoFrame");
   try {
     static_cast<web::VideoFrameTexture&>(texture).Publish(video_frame);
@@ -230,10 +250,10 @@ std::shared_ptr<ExternalTexture> MakeFrameTexture(huxerui::Size size) {
 
 void PublishFrame(ExternalTexture& texture, const VideoFrame& frame) {
   const auto pixels = ConvertFramePixels(frame);
-  const auto visible = frame.format.visible;
+  const auto [width, height] = DisplayDimensions(frame.format.visible, frame.format.rotation);
   static_cast<pixel_platform::PixelTexture&>(texture).Publish({
-      .pixel_width = int(visible.width), .pixel_height = int(visible.height),
-      .bytes_per_row = std::size_t(visible.width) * 4,
+      .pixel_width = int(width), .pixel_height = int(height),
+      .bytes_per_row = std::size_t(width) * 4,
       .format = pixel_platform::PixelFormat::Rgba8888, .pixels = pixels});
 }
 #elif !defined(__APPLE__) || !TARGET_OS_IOS

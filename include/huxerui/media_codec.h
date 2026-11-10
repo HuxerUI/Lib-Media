@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file
-/// @brief Headless, bounded, asynchronous AAC-LC/H.264 encoding and decoding.
+/// @brief Headless, bounded, asynchronous AAC-LC/H.264 encoding and decoding, with HEVC decoding on Apple.
 ///
 /// Include <huxerui/media_codec.h> and link HuxerUI::Media. Use these sessions directly from headless code.
 /// Decoders accept initialization data and complete compressed access units in decode order, then emit format
@@ -114,21 +114,22 @@ struct AudioDecoderConfig {
   std::function<void(CodecResult<void>)> cleanup_completed;
 };
 
-/// @brief Configuration for decoding length-prefixed H.264 access units to CPU YUV.
+/// @brief Configuration for decoding length-prefixed video access units to CPU YUV.
 ///
-/// The initial subset is progressive 8-bit 4:2:0 Baseline, Main, and High profiles, with at most 16 reference
-/// pictures and continuous frame numbering. Probe the concrete configuration for platform support.
+/// AVC supports Baseline, Main, and High profiles with at most 16 reference pictures and continuous frame
+/// numbering. HEVC supports 8-bit and 10-bit 4:2:0 on Apple platforms. Probe the concrete configuration for
+/// platform support. A fresh or reset video session requires an IDR access unit.
 /// @see VideoDecoder::Create(), VideoDecoder::Probe()
 struct VideoDecoderConfig {
-  /// AVCDecoderConfigurationRecord (avcC) of at most 64 KiB. Include SPS and PPS data and a NAL length field
-  /// size of 1, 2, or 4 bytes. Every submitted picture must use that length prefix size.
+  /// Decoder configuration of at most 64 KiB, either avcC with SPS/PPS or hvcC with complete VPS/SPS/PPS arrays.
+  /// Every submitted picture uses the configuration's NAL length field size of 1, 2, or 4 bytes.
   Bytes initialization_data;
   /// Maximum coded luma width in pixels, in [1, 8192]. The backend can impose smaller limits.
   /// Together with height, configures the codec and sizes output reservations. Use a new session for larger bounds.
   std::uint32_t width = 0;
   /// Maximum coded luma height in pixels, in [1, 8192], subject to the platform limit described for width.
   std::uint32_t height = 0;
-  /// Requested I420 or NV12 CPU layout. An unavailable layout produces an error.
+  /// Requested CPU layout. Use I420 or NV12 for 8-bit output and P010 for 10-bit HEVC output.
   VideoPixelFormat output = VideoPixelFormat::NV12;
   /// Retained input and output bounds. See QueueLimits for the video minimum and byte accounting.
   QueueLimits limits;
@@ -136,6 +137,10 @@ struct VideoDecoderConfig {
   std::function<void()> wakeup;
   /// Optional teardown callback with the resource and lifetime contract of AudioDecoderConfig::cleanup_completed.
   std::function<void(CodecResult<void>)> cleanup_completed;
+  /// Coding of the supplied configuration and access units. Use CodecId::H264 or CodecId::Hevc.
+  /// Other values return CodecErrorCode::InvalidArgument. QueryCapabilities() describes the H.264 adapter.
+  /// Use Probe() to check a particular HEVC configuration.
+  CodecId codec = CodecId::H264;
 };
 
 /// @brief H.264 profiles described by the CPU video codec APIs.
@@ -621,7 +626,7 @@ private:
   std::shared_ptr<detail::DecoderState<AudioDecodeOutput>> state_;
 };
 
-/// @brief Move-only H.264 decoder with bounded queues and retained CPU YUV frames.
+/// @brief Move-only video decoder with bounded queues and retained CPU YUV frames.
 ///
 /// Submit complete picture access units in decode order and begin each stream with a key-marked IDR. Output
 /// arrives in presentation order. The current 16-frame reordering window can hold frames until more input arrives
@@ -629,14 +634,14 @@ private:
 /// @see VideoDecoderConfig, VideoFrame, AudioDecoder
 class VideoDecoder final {
 public:
-  /// @brief Validates the AVC configuration and schedules platform initialization.
-  /// @param config avcC data, coded bounds, output layout, queue limits, and optional callbacks, copied for the session.
+  /// @brief Validates the video configuration and schedules platform initialization.
+  /// @param config Codec identifier, initialization data, coded bounds, layout, limits, and callbacks, copied for the session.
   /// @return An owning decoder handle on success. TrySubmit() can return WouldBlock while initialization is pending.
   /// A synchronous Failure returns a CodecError and schedules no callbacks.
   /// @see Probe(), TryRead(), VideoDecoderConfig::wakeup
   static CodecResult<VideoDecoder> Create(const VideoDecoderConfig& config);
 
-  /// @brief Tests platform initialization and release for the supplied AVC configuration asynchronously.
+  /// @brief Tests platform initialization and release for the supplied video configuration asynchronously.
   /// @param config Configuration to probe. The wakeup and cleanup_completed fields are ignored.
   /// @param completion Optional callback invoked once when the probe finishes, with success or a CodecError.
   /// On desktop and mobile platforms it is dispatched after the probe worker exits; on Web it runs on the owning event loop.
@@ -661,7 +666,7 @@ public:
   /// @brief Retires the session as in Close(). Internal state remains alive through asynchronous teardown.
   ~VideoDecoder();
 
-  /// @brief Queues one complete length-prefixed AVC picture access unit without waiting for platform decoding.
+  /// @brief Queues one complete length-prefixed picture access unit without waiting for platform decoding.
   /// @param packet Access unit in decode order, with valid timing and NAL lengths matching initialization_data.
   /// The first packet after creation or reset must contain an IDR and set key_frame. Keep bytes unchanged until return.
   /// @return Accepted after copying the packet. WouldBlock leaves it unconsumed while startup or reset is pending
@@ -685,7 +690,7 @@ public:
   /// @see AudioDecoder::Finish()
   CodecResult<void> Finish();
 
-  /// @brief Discards pending input and output and schedules a fresh AVC stream with the same configuration.
+  /// @brief Discards pending input and output and schedules a fresh stream with the same video configuration.
   ///
   /// Previously returned frames retain storage and reservations. TrySubmit() returns WouldBlock until the new
   /// stream is ready. Start it with a key-marked IDR. Use Create() to change coded bounds or initialization data.

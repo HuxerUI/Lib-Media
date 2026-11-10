@@ -1,5 +1,6 @@
 #include "codec/decoder/backend.h"
 #include "codec/decoder/copy.h"
+#include "codec/hevc.h"
 
 #include <deque>
 #include <mutex>
@@ -65,17 +66,33 @@ public:
       return CodecResult<void>::Success();
     }
     const auto& video = std::get<VideoDecoderConfig>(config_);
-    auto avc = ParseAvc(video.initialization_data).Value();
+    OSStatus status;
     std::vector<const std::uint8_t*> parameters;
     std::vector<std::size_t> sizes;
-    for (const auto& p : avc.parameters) { parameters.push_back(reinterpret_cast<const std::uint8_t*>(p.data())); sizes.push_back(p.size()); }
-    auto status = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, parameters.size(), parameters.data(),
-        sizes.data(), avc.length_size, &description_);
-    if (status) return CodecResult<void>::Failure(AppleError(status, "AVC parameter sets were rejected"));
+    const auto add_parameters = [&](const auto& entries) {
+      for (const auto& entry : entries) {
+        parameters.push_back(reinterpret_cast<const std::uint8_t*>(entry.data()));
+        sizes.push_back(entry.size());
+      }
+    };
+    if (video.codec == CodecId::Hevc) {
+      const auto hevc = ParseHevcConfiguration(video.initialization_data, true, true);
+      add_parameters(hevc.parameters);
+      status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault, parameters.size(),
+          parameters.data(), sizes.data(), hevc.length, nullptr, &description_);
+    } else {
+      const auto avc = ParseAvc(video.initialization_data).Value();
+      add_parameters(avc.parameters);
+      status = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, parameters.size(),
+          parameters.data(), sizes.data(), avc.length_size, &description_);
+    }
+    if (status) return CodecResult<void>::Failure(AppleError(status, "Video parameter sets were rejected"));
     const auto dimensions = CMVideoFormatDescriptionGetDimensions(description_);
     if (dimensions.width <= 0 || dimensions.height <= 0 || dimensions.width > video.width || dimensions.height > video.height)
-      return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidArgument, "AVC dimensions exceed configured bounds"));
-    NSDictionary* attributes = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)};
+      return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidArgument, "Video dimensions exceed configured bounds"));
+    const auto pixel_type = video.output == VideoPixelFormat::P010
+        ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    NSDictionary* attributes = @{(id)kCVPixelBufferPixelFormatTypeKey: @(pixel_type)};
     VTDecompressionOutputCallbackRecord callback{Output, this};
     status = VTDecompressionSessionCreate(kCFAllocatorDefault, description_, nullptr, (__bridge CFDictionaryRef)attributes, &callback, &video_);
     if (status) return CodecResult<void>::Failure(AppleError(status, "VTDecompressionSessionCreate failed"));
@@ -92,7 +109,7 @@ public:
     auto bytes = packet.data.AsBytes();
     auto status = CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, nullptr, bytes.size(), kCFAllocatorDefault,
         nullptr, 0, bytes.size(), 0, &block);
-    if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "Cannot allocate AVC input"));
+    if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "Cannot allocate compressed video input"));
     status = CMBlockBufferReplaceDataBytes(bytes.data(), block, 0, bytes.size());
     CMSampleBufferRef sample = nullptr;
     if (!status) {
@@ -102,11 +119,11 @@ public:
       status = CMSampleBufferCreateReady(kCFAllocatorDefault, block, description_, 1, 1, &time, 1, &size, &sample);
     }
     CFRelease(block);
-    if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "Cannot create AVC sample"));
+    if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "Cannot create compressed video sample"));
     VTDecodeInfoFlags flags = 0;
     status = VTDecompressionSessionDecodeFrame(video_, sample, 0, nullptr, &flags);
     CFRelease(sample);
-    if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "AVC decoding failed"));
+    if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "VideoToolbox decoding failed"));
     if (flags & kVTDecodeInfo_FrameDropped)
       return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::InvalidData, "VideoToolbox dropped a frame"));
     return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
@@ -214,19 +231,25 @@ private:
     try {
       const auto& config = std::get<VideoDecoderConfig>(self.config_);
       const auto type = CVPixelBufferGetPixelFormatType(image);
-      if (type != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange && type != kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
-        self.failure_ = Error(CodecErrorCode::Unsupported, "VideoToolbox did not return 8-bit NV12"); return;
+      const bool ten_bit = type == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+                           type == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+      const bool eight_bit = type == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+                             type == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+      if ((!ten_bit && !eight_bit) || ten_bit != (config.output == VideoPixelFormat::P010)) {
+        self.failure_ = Error(CodecErrorCode::Unsupported, "VideoToolbox returned an unexpected CPU pixel format"); return;
       }
       VideoFormat format;
+      format.pixel_format = ten_bit ? VideoPixelFormat::P010 : VideoPixelFormat::NV12;
       format.width = static_cast<std::uint32_t>(CVPixelBufferGetWidth(image));
       format.height = static_cast<std::uint32_t>(CVPixelBufferGetHeight(image));
       if (format.width > config.width || format.height > config.height) {
-        self.failure_ = Error(CodecErrorCode::InvalidData, "AVC output exceeds configured dimensions"); return;
+        self.failure_ = Error(CodecErrorCode::InvalidData, "Video output exceeds configured dimensions"); return;
       }
       const auto rect = CVImageBufferGetCleanRect(image);
       format.visible = {static_cast<std::uint32_t>(rect.origin.x), static_cast<std::uint32_t>(rect.origin.y),
           static_cast<std::uint32_t>(rect.size.width), static_cast<std::uint32_t>(rect.size.height)};
-      format.range = type == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ? ColorRange::Full : ColorRange::Limited;
+      format.range = type == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+          type == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ? ColorRange::Full : ColorRange::Limited;
       if (auto aspect = CVBufferCopyAttachment(image, kCVImageBufferPixelAspectRatioKey, nullptr)) {
         std::int64_t horizontal = 0, vertical = 0;
         bool valid = false;
@@ -253,8 +276,11 @@ private:
       if (attachment(kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2)) format.primaries = ColorPrimaries::BT709;
       else if (attachment(kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020)) format.primaries = ColorPrimaries::BT2020;
       if (attachment(kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2)) format.transfer = ColorTransfer::BT709;
+      else if (attachment(kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ)) format.transfer = ColorTransfer::PQ;
+      else if (attachment(kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_2100_HLG)) format.transfer = ColorTransfer::HLG;
       if (attachment(kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2)) format.matrix = ColorMatrix::BT709;
       else if (attachment(kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4)) format.matrix = ColorMatrix::BT601;
+      else if (attachment(kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020)) format.matrix = ColorMatrix::BT2020;
       auto owner = std::make_shared<PixelMapping>(image, &self.failure_);
       const auto locked = CVPixelBufferLockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
       if (locked) { self.failure_ = AppleError(locked, "Cannot map decoded pixels"); return; }
@@ -264,7 +290,7 @@ private:
         const auto stride = CVPixelBufferGetBytesPerRowOfPlane(image, i);
         const auto size = stride * CVPixelBufferGetHeightOfPlane(image, i);
         auto* base = static_cast<const std::byte*>(CVPixelBufferGetBaseAddressOfPlane(image, i));
-        planes.push_back({BufferReference({base, size}, owner), stride, i ? 2u : 1u});
+        planes.push_back({BufferReference({base, size}, owner), stride, (i ? 2u : 1u) * (ten_bit ? 2u : 1u)});
       }
       auto copied = CopyVideo(format, Timestamp(pts), CMTIME_IS_NUMERIC(duration) ? std::optional(Timestamp(duration)) : std::nullopt,
           std::move(planes), config.output);

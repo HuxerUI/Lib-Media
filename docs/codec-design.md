@@ -1,7 +1,7 @@
 # Codec and decoded-playback design
 
 The shared CPU media values, AAC/AVC decoders, AAC-LC/H.264 encoders, and six-platform PCM playback are
-implemented. The [codec guide](mediacodec.md) records platform validation and the encoder limitations. The
+implemented. The [codec guide](media-codec.md) records platform validation and the encoder limitations. The
 [PCM acceptance section](#first-implementation-and-acceptance) records playback validation and the remaining work.
 
 The current implementation provides typed asynchronous capability snapshots and concrete asynchronous Probe calls.
@@ -378,7 +378,7 @@ adapters. Library constraints and platform-reported bounds are separate; absent 
 unknown. Profile support, no-B control, automatic B policy, and positive numeric B bounds are independent facts.
 No Cartesian combination guarantee, application-wide registry, alternate-backend policy, or bundled fallback is added.
 Queries own their native worker or Web promise observation lifetime independently of existing sessions. See the
-[query contract and platform evidence](mediacodec.md#capability-queries) for the implemented scope.
+[query contract and platform evidence](media-codec.md#capability-queries) for the implemented scope.
 
 Hardware availability is reported only from reliable platform evidence and is not the identity of a later session.
 Hardware-only selection remains a future extension; if introduced, it must fail when unavailable. A successful
@@ -479,7 +479,7 @@ progressive eight-bit 4:2:0 SDR, full visible source, square pixels, and no rota
 Baseline/Main/High selection is independent of B-picture policy. Zero forbids B pictures, positive values request
 an upper bound, and Auto permits platform selection. Unsupported exact controls fail. VideoToolbox's frame-delay
 limit bounds in-flight work and is not substituted for a B count; WebCodecs Main/High requires Auto. The
-[platform matrix](mediacodec.md#video-encoder-platform-limits) records concrete limits.
+[platform matrix](media-codec.md#video-encoder-platform-limits) records concrete limits.
 
 Reserve one maximum access-unit slot before each platform submission. Match output by its presentation identity,
 preserve original PTS/duration, and emit complete four-byte-length AVC access units in decode order. Configuration

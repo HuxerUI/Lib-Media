@@ -16,6 +16,34 @@ ByteView AacLcInitialization(ByteView config) {
   return config;
 }
 
+OpusHead ParseOpus(ByteView bytes, ContainerErrorCode error) {
+  if (bytes.size() != 19 || Number<std::uint64_t>(bytes) != 0x4f70757348656164ull ||
+      Number<std::uint8_t>(bytes, 8) != 1 || Number<std::uint8_t>(bytes, 18) != 0)
+    Fail(error, "Opus requires a version-one mapping-family-zero OpusHead");
+  const auto channels = Number<std::uint8_t>(bytes, 9);
+  if (channels != 1 && channels != 2) Fail(error, "Opus requires one or two channels");
+  return {channels, Number<std::uint32_t>(bytes, 12, true), Number<std::uint16_t>(bytes, 10, true)};
+}
+
+unsigned OpusPacketSamples(ByteView packet, ContainerErrorCode error) {
+  if (packet.empty()) Fail(error, "Empty Opus packet");
+  const auto toc = Number<std::uint8_t>(packet);
+  const auto configuration = toc >> 3;
+  constexpr std::array silk{480, 960, 1920, 2880};
+  constexpr std::array celt{120, 240, 480, 960};
+  const auto length = configuration < 12 ? silk[configuration & 3] :
+      (configuration < 16 ? silk[configuration & 1] : celt[configuration & 3]);
+  unsigned frames = 1;
+  if ((toc & 3) == 3) {
+    if (packet.size() < 2) Fail(error, "Missing Opus frame count");
+    frames = Number<std::uint8_t>(packet, 1) & 63;
+  } else if (toc & 3) {
+    frames = 2;
+  }
+  if (!frames || frames * length > 5760) Fail(error, "Opus packet duration exceeds 120 ms");
+  return frames * length;
+}
+
 std::uint64_t AddOffset(std::uint64_t offset, std::uint64_t size) {
   if (size > std::numeric_limits<std::uint64_t>::max() - offset)
     Fail(ContainerErrorCode::InvalidData, "Container offset overflows");
@@ -147,6 +175,36 @@ void ContainerOutput::Write(ByteView bytes) {
 void ContainerOutput::Patch(std::uint64_t offset, ByteView bytes) {
   if (!Random()) Fail(ContainerErrorCode::NeedRandomAccess, "Container output cannot backpatch");
   UnwrapIo(std::get<RandomAccessStream>(stream_).WriteAt(offset, bytes));
+}
+
+void ContainerOutput::RequireReadable() {
+  std::array<std::byte, 1> probe;
+  try {
+    UnwrapIo(std::get<RandomAccessStream>(stream_).ReadAt(0, probe));
+  } catch (const std::logic_error&) {
+    Fail(ContainerErrorCode::InvalidArgument, "Fast-start output requires a read/write stream");
+  }
+}
+
+void ContainerOutput::Insert(std::uint64_t offset, ByteView bytes) {
+  auto& stream = std::get<RandomAccessStream>(stream_);
+  const auto end = AddOffset(position_, bytes.size());
+  std::array<std::byte, 64 * 1024> buffer;
+  auto remaining = position_ - offset;
+  // Move the tail backwards so an overlapping write cannot overwrite unread bytes.
+  while (remaining) {
+    auto chunk = std::span(buffer).first(std::min<std::uint64_t>(buffer.size(), remaining));
+    remaining -= chunk.size();
+    const auto source = offset + remaining;
+    for (std::size_t read = 0; read < chunk.size();) {
+      const auto count = UnwrapIo(stream.ReadAt(source + read, chunk.subspan(read)));
+      if (!count) Fail(ContainerErrorCode::InvalidData, "Container output ended during relocation");
+      read += count;
+    }
+    Patch(source + bytes.size(), chunk);
+  }
+  Patch(offset, bytes);
+  position_ = end;
 }
 
 void ContainerOutput::Close() {

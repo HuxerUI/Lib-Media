@@ -8,9 +8,9 @@ record current support. Each planned capability has its own format, direction, p
 
 | Order | Work | Acceptance |
 | --- | --- | --- |
-| Next | Validate a real H.264/AAC MP4 through preview and export | Open a fixture with B pictures, variable frame intervals, and AAC priming. Seek repeatedly and check the first frame and audio at the new position. Decode, encode, write, and reopen an export. Check frame order, duration, audio trim, and A/V alignment with an independent reader. |
-| Then | Resolve timing gaps from the MP4 test and extend it to phone MOV/HEVC | Verify explicit DTS where available, a supported non-reordered path where needed, and a clear error for unrepresentable output. Check rotation, 10-bit output, and color information on real phone footage. |
-| In parallel | Add Ogg/Opus, then native FLAC and MP3 | Remux Opus between WebM and Ogg and verify decoded samples, pre-skip, end trim, and seek preroll. Verify FLAC and MP3 duration and random access with independent files. |
+| Next | Expand real-file MP4 preview and export acceptance | Extend macOS, Android 12 and Chrome coverage to iOS, Windows, Linux, other devices and browsers. Verify frame order, duration, audio trim, and A/V alignment with independent readers and device playback. |
+| Then | Expand phone MOV/HEVC acceptance and export timing | Check real phone footage on devices, HDR presentation, and hardware combinations. Validate explicit DTS paths for reordered encoding in addition to the preview's no-reorder path. |
+| In parallel | Extend the audio mappings | Ogg/Opus and native FLAC/MP3 input cover basic timing and random seek. Expand Ogg chaining and mappings, FLAC metadata and writing, and MP3 writing and tag variants with independent samples. |
 
 ## File and URL playback
 
@@ -38,20 +38,20 @@ See the [decoded playback design](codec-design.md#decoded-playback-boundary) and
 ## Codecs and shared frame formats
 
 - Finish platform acceptance for AAC-LC and H.264. Cover Android encoding hardware, iOS device decoding, independent
-  iOS and macOS encoder builds and device runs, Apple capability queries, Linux hardware and plugin combinations,
+  iOS encoder builds and device runs, iOS capability queries, Linux hardware and plugin combinations,
   and browser runtime behavior. Compare each capability claim with actual configuration and session behavior.
 - Expand AAC configurations, sample rates, input sample formats, and channel layouts as supported by each backend.
   Verify priming and tail padding through encoding, muxing, decoding, and PCM playback.
 - Exercise H.264 profile and B-picture controls, keyframe requests, variable frame intervals, and codec configuration
   changes. Preserve PTS, DTS, duration, and the evidence for independently decodable output. Android and Web H.264
   encoding currently omit DTS. Windows may omit DTS when variable timing makes its codec clock unsuitable.
-- Prioritize HEVC decoding and 10-bit frame output, followed by HEVC encoding and Opus. Evaluate ProRes, AV1,
+- Extend Apple HEVC decoding and 10-bit frame output to additional platforms, then cover HEVC encoding and Opus. Evaluate ProRes, AV1,
   VP8/VP9, FLAC, MP3, and Vorbis by platform and direction. Add capability and configuration coverage with each codec.
 - Extend the frame contract as needed for higher bit depths, visible region, and color and HDR information.
   Evaluate platform-frame import and zero-copy paths against measured workloads, with explicit synchronization,
   ownership, and release requirements.
 
-See the [codec guide](mediacodec.md), [codec validation](mediacodec.md#validation), and [HuxerUI #20](https://github.com/HuxerUI/HuxerUI/issues/20).
+See the [codec guide](media-codec.md), [codec validation](media-codec.md#validation), and [HuxerUI #20](https://github.com/HuxerUI/HuxerUI/issues/20).
 
 ## Container coverage
 
@@ -59,7 +59,7 @@ See the [codec guide](mediacodec.md), [codec validation](mediacodec.md#validatio
 
 | Container | Remaining work |
 | --- | --- |
-| MP4, M4A, MOV, fMP4 | Fast-start output for regular files, fragment boundaries and seek indexes, multiple sample descriptions and configuration changes, additional edit lists and fragmented audio trim, AV1 and other needed mappings, and MOV timecode, timed metadata, and display transforms. |
+| MP4, M4A, MOV, fMP4 | Fragment boundaries and seek indexes, multiple sample descriptions and configuration changes, additional edit lists and fragmented audio trim, AV1 and other needed mappings, and MOV timecode, timed metadata, and display transforms. |
 | Matroska, MKA, WebM | Additional mappings such as VP8, VP9, AV1, FLAC, and Vorbis for Matroska, and AV1 and Vorbis for WebM. Extend Opus beyond mapping family zero. Cover files without Cues, timestamp precision beyond the current 1 ms output grid, and subtitle, chapter, attachment, and tag preservation. |
 | WAVE and RF64 | RF64 additional-size entries, large-file interoperation, and further PCM or channel layouts where needed. |
 | ADTS | Additional AAC configurations and transport variants driven by input samples. |
@@ -76,9 +76,9 @@ capabilities before opening.
 
 | Format | Planned coverage |
 | --- | --- |
-| Ogg | Opus first, then Vorbis, FLAC, Theora, and chained logical streams. Cover pages, packet continuations, granule positions, trim, and seek. |
-| Native FLAC | STREAMINFO, frames, metadata and cover art, and seek tables. |
-| MP3 and MP2 | Frame boundaries, ID3, Xing/VBRI, variable-bitrate duration and seek, and MP3 gapless timing. |
+| Ogg extensions | Vorbis, FLAC, Theora, and chained logical streams. |
+| Native FLAC extensions | Writing, metadata and cover art, and using native seek tables. |
+| MPEG audio extensions | MP3 writing and VBRI, ID3 metadata, and MP2 frame mapping. |
 | Wave64, AIFF, AIFC, CAF | PCM and floating-point descriptions, byte order, channel layout, and file lengths. |
 | 3GP | ISO BMFF brands and supported track and codec mappings. |
 | MPEG-TS, M2TS, MTS | Programs and tracks, PES assembly, clock wrap and discontinuities, sequential I/O, and seek. |
@@ -87,7 +87,7 @@ capabilities before opening.
 | Annex B AVC and HEVC | Parameter sets, access unit boundaries, length-prefix conversion, and input with absent timestamps. |
 
 Evaluate standalone SRT, WebVTT, and ASS/SSA, ASF/WMA/WMV, MPEG-PS/VOB, MXF, and HEIF/AVIF item support
-against actual ingest and export needs. The [container guide](mediacontainer.md) tracks supported combinations
+against actual ingest and export needs. The [container guide](media-container.md) tracks supported combinations
 and endpoint requirements.
 
 ## System media library
@@ -98,7 +98,7 @@ and endpoint requirements.
   pagination, albums, limited library access, and change notifications. Evaluate additional platform integrations
   against their system library capabilities and application requirements.
 
-See the [media library guide](medialibrary.md#preview-and-validation) and [HuxerUI #125](https://github.com/HuxerUI/HuxerUI/issues/125).
+See the [media library guide](media-library.md#preview-and-validation) and [HuxerUI #125](https://github.com/HuxerUI/HuxerUI/issues/125).
 
 ## Integration and acceptance
 

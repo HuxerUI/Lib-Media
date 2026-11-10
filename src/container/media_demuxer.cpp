@@ -12,6 +12,8 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
     return OpenMatroskaReader(std::move(input), hint);
   }
   std::optional<ContainerFormat> recognized;
+  if (prefix.size() >= 4 && Number<std::uint32_t>(prefix) == Tag("OggS")) recognized = ContainerFormat::Ogg;
+  if (prefix.size() >= 4 && Number<std::uint32_t>(prefix) == Tag("fLaC")) recognized = ContainerFormat::Flac;
   if (prefix.size() >= 12 && Number<std::uint32_t>(prefix, 8) == Tag("WAVE")) {
     const auto type = Number<std::uint32_t>(prefix);
     if (type == Tag("RIFF")) recognized = ContainerFormat::Wave;
@@ -24,6 +26,7 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
   }
   if (!recognized && prefix.size() >= 2 && (Number<std::uint16_t>(prefix) & 0xfff6) == 0xfff0)
     recognized = ContainerFormat::Adts;
+  if (!recognized && LooksLikeMp3(prefix)) recognized = ContainerFormat::Mp3;
 
   if (!recognized || (hint && *recognized != *hint &&
       !(*recognized == ContainerFormat::Mp4 && *hint == ContainerFormat::Mov)))
@@ -32,6 +35,9 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
     case ContainerFormat::Wave:
     case ContainerFormat::Rf64: return OpenWaveReader(std::move(input), *recognized);
     case ContainerFormat::Adts: return OpenAdtsReader(std::move(input));
+    case ContainerFormat::Ogg: return OpenOggReader(std::move(input));
+    case ContainerFormat::Flac: return OpenFlacReader(std::move(input));
+    case ContainerFormat::Mp3: return OpenMp3Reader(std::move(input));
     case ContainerFormat::Mp4:
     case ContainerFormat::Mov: return OpenMp4Reader(std::move(input), hint);
     case ContainerFormat::Matroska:

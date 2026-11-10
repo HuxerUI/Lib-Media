@@ -83,17 +83,28 @@ void Compare(const ContainerPacket& actual, const ContainerPacket& expected) {
         std::ranges::equal(actual.data.AsBytes(), expected.data.AsBytes()), "Container packet differs after round trip");
 }
 
-void Mp4(const fs::path& path, bool fragmented) {
+void Mp4(const fs::path& path, ContainerLayout layout) {
+  const bool fragmented = layout == ContainerLayout::Fragmented;
+  const bool fast_start = layout == ContainerLayout::FastStart;
   const auto video = Fixture(false, fragmented);
   const auto audio = Fixture(true, fragmented);
   const std::array tracks{video.track, audio.track};
-  const auto layout = fragmented ? ContainerLayout::Fragmented : ContainerLayout::Default;
+  using Requirement = MediaMuxer::OutputRequirement;
   const auto requirement = Take(MediaMuxer::ValidateOutput(ContainerFormat::Mp4, tracks, layout));
-  Check(requirement == (fragmented ? MediaMuxer::OutputRequirement::SequentialWrite :
-                                    MediaMuxer::OutputRequirement::RandomWrite), "Wrong MP4 output requirement");
+  Check(requirement == (fragmented ? Requirement::SequentialWrite :
+                       fast_start ? Requirement::RandomReadWrite : Requirement::RandomWrite),
+        "Wrong MP4 output requirement");
+  const auto file = Path(path);
+  if (fast_start) {
+    auto write_only = Output(path);
+    auto rejected = MediaMuxer::Open(std::move(write_only), ContainerFormat::Mp4, tracks, layout);
+    Check(!rejected.Succeeded() && rejected.Error().code == ContainerErrorCode::InvalidArgument &&
+          fs::file_size(path) == 0, "Fast-start accepted a write-only destination");
+  }
   auto mux = fragmented
-      ? Take(MediaMuxer::Open(Take(Path(path).OpenWrite()), ContainerFormat::Mp4, tracks, layout))
-      : Take(MediaMuxer::Open(Output(path), ContainerFormat::Mp4, tracks, layout));
+      ? Take(MediaMuxer::Open(Take(file.OpenWrite()), ContainerFormat::Mp4, tracks, layout))
+      : Take(MediaMuxer::Open(fast_start ? Take(file.OpenRandomAccess(FileAccessMode::ReadWrite)) : Output(path),
+                             ContainerFormat::Mp4, tracks, layout));
 
   auto untimed = video.packets[0];
   untimed.dts.reset();
@@ -121,8 +132,7 @@ void Mp4(const fs::path& path, bool fragmented) {
   Take(mux.Finish());
   Check(!mux.TryWrite(video.packets[0]).Succeeded(), "Finished writer still accepts input");
 
-  auto file = Path(path);
-  if (!fragmented) {
+  if (!fragmented && !fast_start) {
     auto rejected = MediaDemuxer::Open(Take(file.OpenRead()));
     Check(!rejected.Succeeded() && rejected.Error().code == ContainerErrorCode::NeedRandomAccess,
           "Tail metadata did not request random access");
@@ -130,7 +140,14 @@ void Mp4(const fs::path& path, bool fragmented) {
   auto demux = fragmented
       ? Take(MediaDemuxer::Open(Take(file.OpenRead())))
       : Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
-  Check(demux.Layout() == layout && demux.Tracks().size() == 2, "Wrong MP4 layout or track count");
+  Check(demux.Layout() == (fragmented ? layout : ContainerLayout::Default) && demux.Tracks().size() == 2,
+        "Wrong MP4 layout or track count");
+  if (fast_start) {
+    auto sequential = Take(MediaDemuxer::Open(Take(file.OpenRead())));
+    std::size_t count = 0;
+    while (Take(sequential.Read())) ++count;
+    Check(count == video.packets.size() + audio.packets.size(), "Fast-start MP4 cannot be read sequentially");
+  }
   Check(demux.Tracks()[0].visible == video.track.visible, "MP4 clean aperture was not retained");
   if (!fragmented) {
     Check(demux.Tracks()[1].priming_samples == 1024 && demux.Tracks()[1].padding_samples == 288,
@@ -251,6 +268,118 @@ void Adts(const fs::path& path) {
         "Wrong ADTS configuration");
   for (const auto& packet : audio.packets) Compare(std::get<ContainerPacket>(*Take(demux.Read())), packet);
   Check(!Take(demux.Read()) && demux.Duration() == MediaTimestamp{next, 48000}, "Wrong ADTS end or duration");
+}
+
+void AudioFormats(const fs::path& directory) {
+  const auto fixtures = fs::path(MEDIA_FIXTURES) / "container";
+  struct Sample {
+    const char* name;
+    ContainerFormat format;
+    CodecId codec;
+    MediaTimestamp duration;
+  };
+  const std::array samples{
+      Sample{"preview-opus.ogg", ContainerFormat::Ogg, CodecId::Opus, {107376, 48000}},
+      Sample{"preview-flac.flac", ContainerFormat::Flac, CodecId::Flac, {50142, 44100}},
+      Sample{"preview-mp3.mp3", ContainerFormat::Mp3, CodecId::Mp3, {50142, 44100}}};
+  for (const auto& sample : samples) {
+    const auto file = Path(fixtures / sample.name);
+    auto reader = Take(MediaDemuxer::Open(Take(file.OpenRead())));
+    Check(reader.Format() == sample.format && reader.Tracks().size() == 1 &&
+          reader.Tracks().front().codec == sample.codec, "Wrong native audio format or codec");
+    unsigned count = 0;
+    std::optional<ContainerPacket> last;
+    while (auto item = Take(reader.Read())) {
+      last = std::get<ContainerPacket>(std::move(*item));
+      Check(last->duration.has_value(), "Native audio frame lost its sample count");
+      ++count;
+    }
+    if (count <= 2 || reader.Duration() != sample.duration) {
+      const auto actual = reader.Duration();
+      throw std::runtime_error(std::string(sample.name) + " duration differs from the reference (ticks " +
+                               (actual ? std::to_string(actual->ticks) : "unknown") + ")");
+    }
+    auto random = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+    const auto anchor = Take(random.FindSeekPoint(1, {1, 1}));
+    Check(anchor && anchor->time.Compare({1, 1}) <= 0, "Native audio seek has no covered anchor");
+    Check(std::holds_alternative<ContainerPacket>(*Take(random.Read())), "Native audio query consumed the first packet");
+    for (auto target : {MediaTimestamp{1, 2}, MediaTimestamp{1, 5}, MediaTimestamp{1, 1}}) {
+      const auto found = Take(random.Seek(1, target));
+      Check(found && found->time.Compare(target) <= 0, "Repeated native audio seek has no anchor");
+      Check(std::holds_alternative<MediaTrack>(*Take(random.Read())), "Native audio seek lost its track description");
+      const auto packet = std::get<ContainerPacket>(*Take(random.Read()));
+      Check(packet.pts == found->decode_start.value_or(found->time), "Native audio seek used the wrong decode start");
+    }
+    auto truncated = Take(file.ReadBytes());
+    truncated.pop_back();
+    const auto damaged = Path(directory / "truncated-audio");
+    Check(damaged.WriteBytes(truncated), "Could not create a truncated audio sample");
+    auto broken = Take(MediaDemuxer::Open(Take(damaged.OpenRead())));
+    auto result = broken.Read();
+    while (result.Succeeded() && result.Value()) result = broken.Read();
+    Check(!result.Succeeded() && result.Error().code == ContainerErrorCode::InvalidData,
+          "Truncated audio frame was treated as clean EOF");
+  }
+
+  const auto opus = Path(fixtures / "webm-opus.webm");
+  auto webm = Take(MediaDemuxer::Open(Take(opus.OpenRead())));
+  const auto target = Path(directory / "remux.ogg");
+  auto ogg = Take(MediaMuxer::Open(Take(target.OpenWrite()), ContainerFormat::Ogg, webm.Tracks()));
+  std::vector<ContainerPacket> expected;
+  while (auto item = Take(webm.Read())) {
+    auto packet = std::get<ContainerPacket>(std::move(*item));
+    Check(!Take(ogg.TryWrite(packet)), "Single-track Ogg requested more input tracks");
+    expected.push_back(std::move(packet));
+  }
+  Take(ogg.Finish());
+  auto reopened = Take(MediaDemuxer::Open(Take(target.OpenRead())));
+  Check(reopened.Tracks().front().initialization_data == webm.Tracks().front().initialization_data,
+        "OpusHead changed during remux");
+  const auto reverse = Path(directory / "remux.webm");
+  auto back = Take(MediaMuxer::Open(Take(reverse.OpenWrite()), ContainerFormat::WebM, reopened.Tracks()));
+  std::size_t index = 0;
+  while (auto item = Take(reopened.Read())) {
+    const auto packet = std::get<ContainerPacket>(std::move(*item));
+    Check(index < expected.size() && packet.duration == expected[index].duration &&
+          packet.discard_padding == expected[index].discard_padding &&
+          std::ranges::equal(packet.data.AsBytes(), expected[index].data.AsBytes()),
+          "WebM to Ogg remux changed Opus packets or tail trim");
+    Check(!Take(back.TryWrite(packet)), "Single-track WebM requested more input tracks");
+    ++index;
+  }
+  Take(back.Finish());
+  Check(index == expected.size(), "WebM to Ogg remux lost packets");
+  auto roundtrip = Take(MediaDemuxer::Open(Take(reverse.OpenRead())));
+  index = 0;
+  while (auto item = Take(roundtrip.Read())) {
+    const auto packet = std::get<ContainerPacket>(std::move(*item));
+    Check(index < expected.size() && packet.duration == expected[index].duration &&
+          packet.discard_padding == expected[index].discard_padding &&
+          std::ranges::equal(packet.data.AsBytes(), expected[index].data.AsBytes()),
+          "Ogg to WebM remux changed Opus packets or tail trim");
+    ++index;
+  }
+  Check(index == expected.size(), "Ogg to WebM remux lost packets");
+
+  auto links = Take(Path(fixtures / "preview-opus.ogg").ReadBytes());
+  const auto next_link = Take(target.ReadBytes());
+  Check(!std::ranges::equal(std::span(links).subspan(14, 4), std::span(next_link).subspan(14, 4)),
+        "Chained Ogg fixture must use distinct stream serial numbers");
+  links.insert(links.end(), next_link.begin(), next_link.end());
+  const auto chained = Path(directory / "chained.ogg");
+  Check(chained.WriteBytes(links), "Could not write chained Ogg input");
+  for (const bool random : {false, true}) {
+    auto reader = random ? Take(MediaDemuxer::Open(Take(chained.OpenRandomAccess())))
+                         : Take(MediaDemuxer::Open(Take(chained.OpenRead())));
+    auto item = reader.Read();
+    while (item.Succeeded() && item.Value()) item = reader.Read();
+    Check(!item.Succeeded() && item.Error().code == ContainerErrorCode::Unsupported,
+          "Chained Ogg input was treated as clean EOF");
+  }
+  auto indexed = Take(MediaDemuxer::Open(Take(chained.OpenRandomAccess())));
+  const auto point = indexed.FindSeekPoint(1, {1, 1});
+  Check(!point.Succeeded() && point.Error().code == ContainerErrorCode::Unsupported,
+        "Chained Ogg input produced an index for only the first stream");
 }
 
 void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in_band = false,
@@ -599,11 +728,11 @@ int main(int argc, char** argv) {
   const std::array names{"regular.mp4", "fragmented.mp4", "audio.wav", "audio.rf64.wav", "audio.aac",
                          "hevc.mov", "hevc.mp4", "hev1.mp4", "prores-pcm.mov", "hevc-fragmented.mp4",
                          "hevc-aac.mkv", "vp9-opus.webm", "opus.webm", "lace.mka", "lace-invalid.mka",
-                         "avc-aac.mkv", "vp8-opus.webm"};
+                         "avc-aac.mkv", "vp8-opus.webm", "fast-start.mp4"};
   try {
     Check(fs::create_directory(path), "Could not create a fresh container test directory");
-    Mp4(path / names[0], false);
-    Mp4(path / names[1], true);
+    Mp4(path / names[0], ContainerLayout::Default);
+    Mp4(path / names[1], ContainerLayout::Fragmented);
     Wave(path / names[2], ContainerFormat::Wave);
     Wave(path / names[3], ContainerFormat::Rf64);
     Adts(path / names[4]);
@@ -619,10 +748,16 @@ int main(int argc, char** argv) {
     MatroskaLacing(path / names[14], true);
     EbmlRoundTrip(path / names[15], "mkv-avc-aac.mkv", ContainerFormat::Matroska, CodecId::H264);
     EbmlRoundTrip(path / names[16], "webm-vp8-opus.webm", ContainerFormat::WebM, CodecId::Vp8);
+    Mp4(path / names[17], ContainerLayout::FastStart);
+    AudioFormats(path);
     if (argc != 2) {
       for (auto name : names) fs::remove(path / name);
       fs::remove(path / "open-ended.mp4");
       fs::remove(path / "truncated.mp4");
+      fs::remove(path / "remux.ogg");
+      fs::remove(path / "remux.webm");
+      fs::remove(path / "chained.ogg");
+      fs::remove(path / "truncated-audio");
       fs::remove(path);
     }
   } catch (const std::exception& error) {

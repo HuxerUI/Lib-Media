@@ -31,11 +31,12 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Platform image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
 | AAC-LC / H.264 decoding | Implemented for the first stage of [#20](https://github.com/HuxerUI/HuxerUI/issues/20); see [decoder validation](#media-decoding) | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
+| HEVC decoding | Apple VideoToolbox with 8-bit or 10-bit 4:2:0 output for single-layer `hvc1` | `CodecId::Hevc`, `VideoPixelFormat::P010` |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
-| AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; Apple encoder validation remains pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
-| H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; Apple build/device validation remains pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
+| AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; macOS native tests passed; iOS validation pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
+| H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; macOS native tests passed; iOS validation pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | Codec capability discovery | Typed AAC-LC/H.264 snapshots for the current adapter; unreported platform facts remain unknown | `QueryCapabilities()` on the four codec classes in [`media_codec.h`](include/huxerui/media_codec.h) |
-| Container demuxing and muxing | MP4/fMP4, QuickTime MOV, Matroska, WebM, WAVE/RF64, and ADTS with the documented codec mappings | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
+| Container demuxing and muxing | MP4/fMP4, QuickTime MOV, Matroska, WebM, WAVE/RF64, ADTS, and Ogg Opus; native FLAC and MP3 input | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
 
 Platform selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
 SDK `FileReference` values, which can be retained for reading, imported to local files, or passed to `MediaSource` for
@@ -68,7 +69,7 @@ its own adapter. See [selection limits and compatibility](#selection-limits-and-
 Lib-Media uses C++20 and the public HuxerUI SDK. Playback and photo-library access use `ApplicationContext`,
 `AppOptions::application_hooks`, and window platform factories. System photo-library access also uses the SDK's
 shared `Result` type, callback-to-Task bridge, platform file-reference factories, and window presentation coordination
-listed in the [SDK integration guide](docs/medialibrary.md#sdk-integration).
+listed in the [SDK integration guide](docs/media-library.md#sdk-integration).
 
 Clone the library beside your application:
 
@@ -291,7 +292,7 @@ closes it. Platform selection shares the SDK's window presentation coordination 
 Canceling a save cannot undo committed publication. Android attempts to delete an unfinished pending entry, subject to
 provider cleanup failures. Once an iOS Photos transaction is submitted, it may finish after cancellation; its staged
 source remains retained until completion. Partial selection results are released if materializing any item fails.
-See the [media library guide](docs/medialibrary.md) and [`media_library.h`](include/huxerui/media_library.h) for details.
+See the [media library guide](docs/media-library.md) and [`media_library.h`](include/huxerui/media_library.h) for details.
 
 ## Media decoding
 
@@ -299,7 +300,7 @@ See the [media library guide](docs/medialibrary.md) and [`media_library.h`](incl
 or demuxer: raw AAC-LC with AudioSpecificConfig produces mono/stereo S16 or F32 PCM, and length-prefixed H.264 with
 `avcC` produces I420 or NV12 video. Returned frames own immutable CPU storage and remain readable after reset and close.
 
-- `QueryCapabilities(completion)` discovers candidates and known limits; see [capability queries](docs/mediacodec.md#capability-queries).
+- `QueryCapabilities(completion)` discovers candidates and known limits; see [capability queries](docs/media-codec.md#capability-queries).
   `Probe(config, completion)` checks a complete configuration by opening and releasing a temporary decoder.
   `Create()` starts a session asynchronously.
 - `TrySubmit()` copies an accepted packet. On `WouldBlock`, keep the packet and retry when the session can accept input.
@@ -313,7 +314,7 @@ GStreamer 1.24+ with installed AAC/H.264 parser and decoder plugins.
 
 AAC/H.264 fixture decoding passed on an Android 12 device, an iOS simulator, Apple Silicon macOS, Windows 11,
 Ubuntu 24.04 under WSL, and Chrome through the C++/WASM API. Windows and Linux also check the longer synchronization
-fixtures with tight output pools. Physical iOS decoding remains unvalidated. See the [decoding guide](docs/mediacodec.md) for examples, queue limits,
+fixtures with tight output pools. Physical iOS decoding remains unvalidated. See the [decoding guide](docs/media-codec.md) for examples, queue limits,
 platform requirements, and validation instructions.
 
 ## Media encoding
@@ -334,7 +335,7 @@ Continue draining while submitting to avoid filling either bounded queue.
 
 Linux H.264 encoding requires the installed `x264enc` and `h264parse` plugins. Android video encoding requires API 28+;
 Main/High numeric B-picture bounds require API 29+. Apple supports zero or automatic B pictures and has independent
-iOS/macOS implementations. See the [encoding guide](docs/mediacodec.md#h264-video-encoding) for the platform matrix,
+iOS/macOS implementations. See the [encoding guide](docs/media-codec.md#h264-video-encoding) for the platform matrix,
 queue limits, timing contract, and a bounded producer/consumer example.
 
 All four codec classes expose asynchronous `QueryCapabilities(completion)`. The typed value snapshots separate
@@ -346,7 +347,7 @@ window, or `Install()`, and does not reserve resources or select a different bac
 ## Media containers
 
 `MediaDemuxer` reads tracks and packets from SDK streams. `MediaMuxer` writes packets to a fresh stream and
-finalizes it through `Finish()`. Both sessions are synchronous. Use the [container guide](docs/mediacontainer.md)
+finalizes it through `Finish()`. Both sessions are synchronous. Use the [container guide](docs/media-container.md)
 for format mappings, seek behavior, output requirements, and packet ownership.
 
 ## PCM playback
@@ -429,25 +430,27 @@ The [preview](examples/preview) exercises the library through four tabs.
 | Video | Local/reference/URL sources, playback controls, progress, seeking, volume, looping, and video fitting |
 | Music | Audio playback using the same player API without a video surface |
 | Library | Platform image/video/mixed selection, capability-aware multi-select, retained references, and publication |
-| Frames | Video-only and synchronized decoded playback, plus a generated H.264 encoding/decoding round trip |
+| Frames | Open a local MP4/MOV or the bundled H.264/AAC sample, seek through decoded playback, and prepare and save a fast-start MP4 |
 
 The Library tab disables multi-select when the maximum is below two; otherwise it requests up to three items within
 the platform limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
 FilePicker explicitly to obtain a source. Switching tabs unmounts the previous session and cancels its pending work.
 
-“Play video” and “Play A/V sync” share a four-second clip. Video-only playback uses its H.264 track. Synchronized
-playback pairs its flashes with AAC tone bursts and uses the PCM device position as the video clock. Both modes
-support pause and resume and publish to one `ExternalTexture` per run. The result reports published and dropped
-frames, maximum video lag at texture publication, and any fallback for unknown color metadata. Switching tabs
-retires the session and its decoders.
+The Frames tab decodes files through `MediaDemuxer` and `DecodedPlayback`. Seeking uses the container index,
+restarts the decoders, and replaces the texture for the new playback epoch. The bundled file has reordered
+H.264 pictures, uneven frame intervals, and AAC priming. On Apple, the tab can also open SDR HEVC MOV
+files and display rotated 8-bit or 10-bit frames.
 
-“Encode H.264” streams 90 generated 320×180 NV12 pictures through `VideoEncoder`, `VideoDecoder`, and video-only
-`DecodedPlayback` into one texture. It uses High with automatic B pictures, bounded pending input/output, and no
-packet archive. Pause/resume controls presentation; the result separates encoded pictures from playback drops.
+“Prepare MP4” encodes eight-bit H.264 input as Baseline without B pictures. Android, Windows, and Web copy the
+original AAC packets to preserve their trim. On the other platforms, the example encodes the audio and requires
+a known AAC trim summary. It preserves presentation times and the source's visible area, then reopens the
+finished fast-start file before enabling “Save MP4”. Preparing and saving are separate actions so the browser picker can
+start from a fresh click. Browser input is staged in memory and limited to 128 MiB.
 
-The [texture contract test](tests/frame_texture_contract.cpp) checks cropped, padded NV12 and I420 color bars and
-successive publications to one texture. The [native decoder test](tests/codec_native.cpp) checks the 24-frame
-H.264 fixture's exact presentation timestamps and durations.
+The [macOS integration test](tests/container_preview.cpp) runs the same preview and export code with the
+bundled MP4 and a rotated Main10 MOV. The [texture contract test](tests/frame_texture_contract.cpp) checks
+cropped, padded CPU frames and successive publications.
+The bundled MP4 also ran through preview, seek and export readback on a Huawei Android 12 device and in Chrome.
 
 ### Build and run
 
@@ -486,7 +489,7 @@ Tests cover playback state transitions, coalesced seeking/progress, looping, sta
 ownership, and media-library result validation, cancellation, late replies, and session retirement. When Node and the
 SDK Web registry are available, CTest also exercises the Web adapter with simulated media elements. Codec tests use
 generated AAC/H.264 fixtures and cover queue backpressure, session worker isolation, cleanup ordering, and late WebCodecs
-callbacks. See the [codec validation instructions](docs/mediacodec.md#validation) for standalone and browser runs.
+callbacks. See the [codec validation instructions](docs/media-codec.md#validation) for standalone and browser runs.
 
 Windows adds WASAPI underrun/clock tests at 48 kHz stereo and 44.1 kHz mono, decoded PCM/video/A/V tests, texture
 publication tests, platform muted audio smoke tests, and video geometry tests. To check frame transfer and presentation against
@@ -522,19 +525,19 @@ private state, validation, and backend contracts. Shared worker execution lives 
 | [`platform/`](platform) | Platform adapters and platform package integration |
 | [`examples/preview/`](examples/preview) | Consumer application for playback and photo-library access |
 | [`tests/`](tests) | Shared contracts, codec fixtures, and platform checks |
-| [`docs/medialibrary.md`](docs/medialibrary.md) | Photo-library integration and lifecycle details |
-| [`docs/mediacodec.md`](docs/mediacodec.md) | Codec usage, ownership, platform limits, and validation |
-| [`docs/mediacontainer.md`](docs/mediacontainer.md) | Container mappings, I/O requirements, and packet contracts |
+| [`docs/media-library.md`](docs/media-library.md) | Photo-library integration and lifecycle details |
+| [`docs/media-codec.md`](docs/media-codec.md) | Codec usage, ownership, platform limits, and validation |
+| [`docs/media-container.md`](docs/media-container.md) | Container mappings, I/O requirements, and packet contracts |
 | [`docs/codec-design.md`](docs/codec-design.md) | Shared lifecycle design and remaining playback/encoding milestones |
 
 ## Roadmap
 
-The [Lib-Media roadmap](docs/media_roadmap.md) tracks remaining work across playback, codecs, containers, and the
+The [Lib-Media roadmap](docs/media-roadmap.md) tracks remaining work across playback, codecs, containers, and the
 system media library, with the next integration milestones and acceptance checks.
 
 The [codec and decoded-playback design](docs/codec-design.md) records the shared formats, ownership rules, six-platform
 lifecycle contract, and delivery order. The AAC/AVC decoding milestone is now implemented, with remaining platform
-validation called out in the [decoding guide](docs/mediacodec.md).
+validation called out in the [decoding guide](docs/media-codec.md).
 
 The next stages of decoded playback ([#102](https://github.com/HuxerUI/HuxerUI/issues/102)) expand device and
 synchronization measurements. AAC-LC audio encoding and H.264 video encoding have initial implementations; remaining

@@ -142,34 +142,10 @@ std::int64_t ToNs(MediaTimestamp time) {
   return result->ticks;
 }
 
-OpusHead ParseOpus(ByteView bytes, ContainerErrorCode error) {
-  if (bytes.size() != 19 || Text(bytes.first(8)) != "OpusHead" ||
-      Number<std::uint8_t>(bytes, 8) != 1 || Number<std::uint8_t>(bytes, 18) != 0)
-    Fail(error, "Opus requires a version-one mapping-family-zero OpusHead");
-  const auto channels = Number<std::uint8_t>(bytes, 9);
-  if (channels != 1 && channels != 2) Fail(error, "Opus requires one or two channels");
-  return {channels, Number<std::uint32_t>(bytes, 12, true), Number<std::uint16_t>(bytes, 10, true)};
-}
-
 std::optional<MediaTimestamp> CodecDuration(const MediaTrack& track, ByteView packet, ContainerErrorCode error) {
   if (track.codec == CodecId::Aac) return MediaTimestamp{1024, *track.sample_rate};
-  if (track.codec != CodecId::Opus) return {};
-  if (packet.empty()) Fail(error, "Empty Opus packet");
-  const auto toc = Number<std::uint8_t>(packet);
-  const auto configuration = toc >> 3;
-  constexpr std::array silk{480, 960, 1920, 2880};
-  constexpr std::array celt{120, 240, 480, 960};
-  const auto length = configuration < 12 ? silk[configuration & 3] :
-      (configuration < 16 ? silk[configuration & 1] : celt[configuration & 3]);
-  unsigned frames = 1;
-  if ((toc & 3) == 3) {
-    if (packet.size() < 2) Fail(error, "Missing Opus frame count");
-    frames = Number<std::uint8_t>(packet, 1) & 63;
-  } else if (toc & 3) {
-    frames = 2;
-  }
-  if (!frames || frames * length > 5760) Fail(error, "Opus packet duration exceeds 120 ms");
-  return MediaTimestamp{frames * length, 48000};
+  if (track.codec == CodecId::Opus) return MediaTimestamp{OpusPacketSamples(packet, error), 48000};
+  return {};
 }
 
 void PutVint(Bytes& out, std::uint64_t value) {

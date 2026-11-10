@@ -75,6 +75,8 @@ public:
   std::uint64_t Position() const { return position_; }
   void Write(std::span<const std::byte> bytes);
   void Patch(std::uint64_t offset, std::span<const std::byte> bytes);
+  void RequireReadable();
+  void Insert(std::uint64_t offset, std::span<const std::byte> bytes);
   void Close();
 
 private:
@@ -115,6 +117,16 @@ template<class T> void Put(Bytes& bytes, T value, bool little = false) {
 
 inline void Append(Bytes& bytes, ByteView tail) { bytes.insert(bytes.end(), tail.begin(), tail.end()); }
 
+struct OpusHead {
+  std::uint32_t channels;
+  std::uint32_t input_rate;
+  std::uint16_t pre_skip;
+  std::int64_t Delay() const { return static_cast<std::int64_t>(pre_skip) * 1'000'000'000 / 48000; }
+};
+
+OpusHead ParseOpus(ByteView bytes, ContainerErrorCode error);
+
+unsigned OpusPacketSamples(ByteView packet, ContainerErrorCode error);
 ByteView AacLcInitialization(ByteView config);
 std::uint64_t AddOffset(std::uint64_t offset, std::uint64_t size);
 std::int64_t AddTime(std::int64_t time, std::int64_t delta);
@@ -165,6 +177,12 @@ void ValidateWave(std::span<const MediaTrack> tracks);
 std::unique_ptr<ContainerReader> OpenAdtsReader(ContainerInput input);
 std::unique_ptr<ContainerWriter> OpenAdtsWriter(ContainerOutput output, std::span<const MediaTrack> tracks);
 void ValidateAdts(std::span<const MediaTrack> tracks);
+std::unique_ptr<ContainerReader> OpenOggReader(ContainerInput input);
+std::unique_ptr<ContainerWriter> OpenOggWriter(ContainerOutput output, std::span<const MediaTrack> tracks);
+void ValidateOgg(std::span<const MediaTrack> tracks);
+std::unique_ptr<ContainerReader> OpenFlacReader(ContainerInput input);
+std::unique_ptr<ContainerReader> OpenMp3Reader(ContainerInput input);
+bool LooksLikeMp3(ByteView bytes);
 std::unique_ptr<ContainerReader> OpenMp4Reader(ContainerInput input, std::optional<ContainerFormat> hint);
 std::unique_ptr<ContainerWriter> OpenMp4Writer(ContainerOutput output, ContainerFormat format,
                                                std::span<const MediaTrack> tracks, ContainerLayout layout);

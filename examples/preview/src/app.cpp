@@ -408,41 +408,116 @@ View LibraryPage() {
 
 [[huxerui::composable]]
 View FramesPage() {
-  auto texture = UseState(std::shared_ptr<ExternalTexture>{});
-  auto notice = UseState(std::string(media_preview::frame_texture_supported
-      ? "Choose decoded playback or an H.264 encoding roundtrip." : "Frame preview is unavailable on this platform."));
-  auto playing = UseState(false);
-  auto paused = UseState(false);
   auto tasks = UseTaskScope();
+  auto picker = UseService<FilePicker>();
   auto resources = UseService<Resources>();
-  auto play = [texture, playing, paused, tasks, resources, notice](bool with_audio, bool encode = false) {
-    if (!media_preview::frame_texture_supported || playing) return;
-    playing = true;
+  const auto temporary = UseApplication().Directories().temporary_directory;
+  auto current = UseState(TaskHandle{});
+  auto source = UseState(std::shared_ptr<const File>{});
+  auto output = UseState(std::shared_ptr<const File>{});
+  auto texture = UseState(std::shared_ptr<ExternalTexture>{});
+  auto notice = UseState(std::string("Open a file or play the bundled MP4."));
+  auto loading = UseState(false);
+  auto exporting = UseState(false);
+  auto paused = UseState(false);
+  auto position = UseState(0.0F);
+  auto duration = UseState(0.0F);
+  auto requested_seek = UseState(std::optional<float>{});
+  auto seek_draft = UseState(std::optional<float>{});
+
+  auto play = [=](std::shared_ptr<const File> staged) {
+    current->Cancel();
+    source = staged;
     paused = false;
-    notice = encode ? "Encoding and playing H.264..." : with_audio ? "Playing A/V sync clip..." : "Playing video clip...";
-    tasks.Launch([texture, playing, paused, resources, notice, with_audio, encode]() -> Task<void> {
+    position = 0.0F;
+    duration = 0.0F;
+    requested_seek = std::optional<float>{};
+    seek_draft = std::optional<float>{};
+    current = tasks.Launch([=]() -> Task<void> {
       try {
-        texture = media_preview::MakeFrameTexture(encode ? Size{320, 180} : Size{240, 180});
-        if (encode) notice = co_await media_preview::PlayEncodedClip(texture, [paused]() -> bool { return paused; });
-        else notice = co_await media_preview::PlayDecodedClip(resources, texture, with_audio,
-                                                              [paused]() -> bool { return paused; });
+        co_await media_preview::PlayContainer(staged, {
+            .reset_video = [texture](Size size) {
+              texture = media_preview::MakeFrameTexture(size);
+            },
+            .publish = [texture](const VideoFrame& frame) {
+              const std::shared_ptr<ExternalTexture> image = texture;
+              media_preview::PublishFrame(*image, frame);
+            },
+            .paused = [paused]() -> bool { return paused; },
+            .take_seek = [requested_seek]() -> std::optional<float> {
+              const std::optional<float> request = requested_seek;
+              if (request) requested_seek = std::optional<float>{};
+              return request;
+            },
+            .position = [position, duration](float at, float end) { position = at; duration = end; },
+        });
       } catch (const std::exception& error) {
         notice = error.what();
       }
-      playing = false;
     });
   };
+
+  auto open = [=](bool sample) {
+    loading = true;
+    tasks.Launch([=]() -> Task<void> {
+      try {
+        std::optional<FileReference> chosen;
+        if (!sample) {
+          chosen = co_await picker->OpenFileAsync({
+              .name = "Movies", .extensions = {"mp4", "m4v", "mov"}, .content_types = {"video/*"}});
+        }
+        if (sample || chosen) {
+          auto staged = co_await media_preview::StageClip(temporary, std::move(chosen), resources);
+          notice = sample ? "Bundled H.264/AAC MP4" : "Selected movie";
+          play(std::move(staged));
+        }
+      } catch (const std::exception& error) {
+        notice = error.what();
+      }
+      loading = false;
+    });
+  };
+
   const std::shared_ptr<ExternalTexture> image = texture;
-  const bool can_play = media_preview::frame_texture_supported && !playing;
+  const std::shared_ptr<const File> input_file = source;
+  const std::shared_ptr<const File> output_file = output;
   return Column {
-    Text("Decoded playback", TextRole::Title),
+    Text("File preview", TextRole::Title),
     (image ? Image(image).Fit(ImageFit::Contain).With(Frame{.width = 300.0F, .height = 180.0F}) : View{}),
+    Slider(seek_draft->value_or(position)).Range(0.0F, std::max(0.01F, float(duration)))
+        .OnChanged([seek_draft](float value) { seek_draft = value; })
+        .OnCommitted([requested_seek, seek_draft](float value) {
+          requested_seek = value;
+          seek_draft = std::optional<float>{};
+        })
+        .OnCanceled([seek_draft] { seek_draft = std::optional<float>{}; })
+        .With(Enabled{duration > 0}, Semantics{.label = "Preview position"}),
     Flow {
-      Button("Play video").OnClick([play] { play(false); }).With(Enabled{can_play}),
-      Button("Play A/V sync").OnClick([play] { play(true); }).With(Enabled{can_play}),
-      Button("Encode H.264").OnClick([play] { play(false, true); }).With(Enabled{can_play}),
-      Button(playing && paused ? "Resume" : "Pause")
-          .OnClick([paused] { paused = !paused; }).With(Enabled{playing}),
+      Button("Open movie").OnClick([open] { open(false); })
+          .With(Enabled{media_preview::frame_texture_supported && picker->CanOpenFiles() && !loading}),
+      Button("Play sample").OnClick([open] { open(true); })
+          .With(Enabled{media_preview::frame_texture_supported && !loading}),
+      Button(paused ? "Resume" : "Pause").OnClick([paused] { paused = !paused; }).With(Enabled{duration > 0}),
+      Button("Prepare MP4").OnClick([=] {
+        exporting = true;
+        tasks.Launch([=]() -> Task<void> {
+          try {
+            output = co_await media_preview::ExportClip(input_file, temporary);
+            notice = "MP4 prepared and reopened successfully.";
+          } catch (const std::exception& error) {
+            notice = error.what();
+          }
+          exporting = false;
+        });
+      }).With(Enabled{bool(input_file) && !exporting}),
+      Button("Save MP4").OnClick([=] {
+        tasks.Launch([=]() -> Task<void> {
+          const auto saved = co_await picker->SaveFileAsync(*output_file, {
+              .suggested_name = "preview-export.mp4",
+              .filter = {.name = "MP4", .extensions = {"mp4"}, .content_types = {"video/mp4"}}});
+          notice = saved ? "MP4 saved." : "MP4 was not saved.";
+        });
+      }).With(Enabled{bool(output_file) && picker->CanSaveFiles()}),
     }.With(Spacing(10.0F)),
     Text(notice),
   }.With(Spacing(12.0F), CrossAlign(CrossAxisAlignment::Stretch));

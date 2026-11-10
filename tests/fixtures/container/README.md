@@ -35,3 +35,30 @@ ffmpeg -f lavfi -i testsrc2=size=64x48:rate=12:duration=1.25 \
 ffmpeg -f lavfi -i sine=sample_rate=48000:duration=5.15 \
   -c:a libopus -b:a 16k -cluster_time_limit 250 webm-opus.webm
 ```
+
+## Real-container preview and audio formats
+
+- `preview-avc-aac.mp4` carries four seconds of generated color and audio markers, with Main-profile AVC
+  B pictures, uneven presentation intervals, and AAC priming. It is the bundled Frames sample.
+- `preview-hevc10.mov` is an AVAssetWriter-generated Main10 `hvc1` movie with an SDR BT.709 ramp and
+  a clockwise 90-degree transform. Generate it on macOS with
+  `xcrun swift generate_hevc10.swift preview-hevc10.mov` in this directory.
+- `preview-opus.ogg`, `preview-flac.flac`, and `preview-mp3.mp3` use generated sine waves.
+  The Ogg end granule is 107496 at 48 kHz with a pre-skip of 120 samples. FLAC and MP3 both represent
+  50142 audible samples at 44.1 kHz. The MP3 uses the LAME VBR header.
+
+```sh
+ffmpeg -f lavfi -i sine=sample_rate=48000:duration=2.237 -c:a opus -strict experimental -ac 2 -b:a 48k preview-opus.ogg
+ffmpeg -f lavfi -i sine=sample_rate=44100:duration=1.137 -c:a flac -ac 2 preview-flac.flac
+ffmpeg -f lavfi -i sine=sample_rate=44100:duration=1.137 -c:a pcm_s16le -ac 2 audio.wav
+lame -V 4 audio.wav preview-mp3.mp3
+```
+
+```sh
+ffmpeg -f lavfi -i 'testsrc2=size=320x240:rate=24:duration=4' \
+  -f lavfi -i 'aevalsrc=0.12*sin(2*PI*1000*t)*gte(mod(n\,48000)\,24000)*lt(mod(n\,48000)\,28000):s=48000:d=4' \
+  -vf "drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:enable='between(mod(n,24),12,13)',select='not(eq(mod(n,11),5))'" \
+  -vsync vfr -pix_fmt yuv420p -colorspace bt709 -color_range tv \
+  -c:v libx264 -profile:v main -bf 2 -g 22 -video_track_timescale 24000 \
+  -c:a aac -profile:a aac_low -ac 2 -b:a 64k preview-avc-aac.mp4
+```

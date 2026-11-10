@@ -5,17 +5,23 @@ with the SDK's synchronous streams and can run on a caller-owned worker without 
 Use an SDK build that provides `RandomAccessStream` and `File::OpenRandomAccess()`.
 Serialize calls on each session.
 
+`MediaTrack::codec` uses `CodecId` from `<huxerui/media_format.h>`. For H.264 or HEVC tracks, pass
+that identifier directly to `VideoDecoderConfig::codec` along with the track's initialization data.
+
 ## Supported combinations
 
 | Container | Packets | Input | Output |
 | --- | --- | --- | --- |
-| Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC and length-prefixed AVC or HEVC | Random access, or sequential when movie metadata precedes samples | Random write |
+| Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC and length-prefixed AVC or HEVC | Random access, or sequential when movie metadata precedes samples | Random write; fast-start requires random read/write |
 | Fragmented MP4 | Same AAC, AVC, and HEVC mappings | Sequential or random-access input, beginning with initialization | Sequential or random write |
 | QuickTime MOV | Same AAC, AVC, and HEVC mappings, ProRes, and packed interleaved PCM | Random access, or sequential when movie metadata precedes samples | Random write |
 | Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, raw AAC-LC, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
 | WebM | VP8, VP9, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
 | RIFF WAVE and RF64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
 | MPEG-4 ADTS | One raw mono/stereo AAC-LC access unit per frame | Sequential or random access | Sequential or random write |
+| Ogg | One logical Opus stream, mapping family zero | Sequential or random access | Sequential or random write |
+| Native FLAC | Complete FLAC frames with STREAMINFO | Sequential or random access | |
+| MP3 | MPEG Layer III frames, including variable bitrate | Sequential or random access | |
 
 MP4 supports one description per track and self-contained samples in decode order within each track.
 Regular MP4 accepts one rate-one edit and an optional leading empty edit. Its writer uses those edits to
@@ -47,6 +53,20 @@ such as tags, chapters, attachments, color metadata, and complex edit lists is o
 Mirrored, scaled, or perspective movie and track matrices report `Unsupported`.
 A format or codec combination outside the table returns a format or support error.
 
+Ogg Opus preserves OpusHead, pre-skip, and final-packet trim. The reader validates page CRCs and
+assembles continued packets. Random input builds a bounded page index on the first seek query and
+returns an earlier decode start for the 80 ms Opus preroll. The writer emits one packet per page and
+accepts up to 1 ms of timestamp rounding for WebM interoperability. Chained Ogg reports `Unsupported`
+when reading past the first logical stream or building the seek index. Multiplexed Ogg and nonzero Opus
+mapping families are also outside this mapping.
+
+Native FLAC validates frame structure and checksums. MP3 handles MPEG-1, MPEG-2 and MPEG-2.5
+Layer III with fixed sample rate and channel count, optional ID3, and Xing/Info frame counts and
+recognized LAME gapless metadata. The reported trim is the encoder delay and padding from the
+header. A consumer's MPEG audio decoder can have additional synthesis delay. For these formats the
+first random seek query builds a bounded frame index. MP3 selects a reservoir restart point and
+reports preroll. FLAC metadata other than STREAMINFO and MP3 tags are skipped.
+
 ## Read and seek
 
 Open a `File` or `FileReference` through the SDK. Choose `OpenRandomAccess()` for positioning or for
@@ -59,7 +79,7 @@ EOF. Truncated packets and malformed sample tables are errors. A returned `Buffe
 across reads, seeks, and session closure.
 
 `FindSeekPoint()` preserves the read position. `Seek()` uses indexed anchors in regular MP4, MOV, Matroska,
-and WebM, or sample frames in WAVE and RF64. Check the returned point and its evidence before starting a decoder. A
+and WebM, sample frames in WAVE and RF64, or packet anchors in Ogg, native FLAC, and MP3. Check the returned point and its evidence before starting a decoder. A
 reference-track anchor can also affect the starting positions of other selected tracks. The first packet read
 from each track after a seek is preceded by its description.
 
@@ -83,7 +103,10 @@ anchor at the returned `decode_start`. A file with no usable Cues for that track
 ## Write and finish
 
 Call `ValidateOutput()` before creating or truncating the destination. A `SequentialWrite` requirement accepts a
-fresh `OutputStream` or an empty writable `RandomAccessStream`. `RandomWrite` requires the latter. The actual
+fresh `OutputStream` or an empty writable `RandomAccessStream`. `RandomWrite` requires the latter.
+`ContainerLayout::FastStart` is a regular MP4 output layout. It returns `RandomReadWrite` and
+places the movie box before media data at `Finish()`, using bounded copying on the supplied stream.
+Readers report this as a regular MP4 layout. The actual
 open and subsequent I/O can still report SDK errors, including permissions or insufficient space.
 
 Choose an exact output clock using the track's `timescale`. MP4 defaults to the audio sample rate or

@@ -1,4 +1,5 @@
 #include "format.h"
+#include "../hevc.h"
 
 namespace huxerui::media::detail {
 namespace {
@@ -103,6 +104,17 @@ CodecResult<void> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
       || (packet.duration && (!packet.duration->Rescale(1000000) || packet.duration->ticks < 0)))
     return invalid("Empty packet or invalid/unrepresentable timing");
   if (const auto* video = std::get_if<VideoDecoderConfig>(&config)) {
+    if (video->codec == CodecId::Hevc) {
+      const auto length = (std::to_integer<unsigned>(video->initialization_data[21]) & 3u) + 1;
+      try {
+        const bool idr = IsHevcIdr(packet.data.AsBytes(), length, true, true);
+        if (needs_key && (!packet.key_frame || !idr))
+          return invalid("HEVC requires an IDR access unit after creation/reset");
+      } catch (const std::invalid_argument& error) {
+        return invalid(error.what());
+      }
+      return CodecResult<void>::Success();
+    }
     const auto parsed = ParseAvc(video->initialization_data);
     const auto length = parsed.Value().length_size;
     auto bytes = packet.data.AsBytes();
@@ -141,14 +153,34 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
     frame_bytes = 1024 * audio->output.BytesPerSample() * audio->output.ChannelCount();
   } else {
     const auto& video = std::get<VideoDecoderConfig>(config);
-    const auto parsed = ParseAvc(video.initialization_data);
-    if (!parsed.Succeeded()) return R::Failure(parsed.Error());
-    if (!video.width || !video.height || video.width > 8192 || video.height > 8192
-        || (video.output != VideoPixelFormat::NV12 && video.output != VideoPixelFormat::I420))
-      return R::Failure(Error(CodecErrorCode::InvalidArgument, "AVC dimensions must be in 1..8192 with NV12/I420 output"));
-    const auto supported = ValidateSps(parsed.Value(), video.width, video.height);
-    if (!supported.Succeeded()) return R::Failure(supported.Error());
+    if (!video.width || !video.height || video.width > 8192 || video.height > 8192)
+      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video dimensions must be in 1..8192"));
+    const bool eight_bit = video.output == VideoPixelFormat::NV12 || video.output == VideoPixelFormat::I420;
+    if (video.codec == CodecId::H264) {
+      const auto parsed = ParseAvc(video.initialization_data);
+      if (!parsed.Succeeded()) return R::Failure(parsed.Error());
+      if (!eight_bit) return R::Failure(Error(CodecErrorCode::Unsupported, "AVC requires NV12 or I420 output"));
+      const auto supported = ValidateSps(parsed.Value(), video.width, video.height);
+      if (!supported.Succeeded()) return R::Failure(supported.Error());
+    } else if (video.codec == CodecId::Hevc) {
+#if !defined(__APPLE__)
+      return R::Failure(Error(CodecErrorCode::Unsupported, "HEVC decoding is unavailable on this platform"));
+#else
+      try {
+        const auto description = ParseHevcConfiguration(video.initialization_data, true, false);
+        if (description.chroma_format != 1 || description.luma_bits != description.chroma_bits ||
+            !(eight_bit ? description.luma_bits == 8 :
+                video.output == VideoPixelFormat::P010 && description.luma_bits == 10))
+          return R::Failure(Error(CodecErrorCode::Unsupported, "HEVC output must match an 8-bit or 10-bit 4:2:0 stream"));
+      } catch (const std::invalid_argument& error) {
+        return R::Failure(Error(CodecErrorCode::InvalidArgument, error.what()));
+      }
+#endif
+    } else {
+      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video decoding requires H.264 or HEVC"));
+    }
     frame_bytes = std::size_t(video.width) * video.height + 2 * ((std::size_t(video.width) + 1) / 2) * ((std::size_t(video.height) + 1) / 2);
+    if (!eight_bit) frame_bytes *= 2;
     minimum = 34;
   }
   const auto limits = std::visit([](const auto& c) { return c.limits; }, config);

@@ -319,7 +319,10 @@ template<class Output> void DecoderState<Output>::Publish(DecodedFrame frame, st
     return platform_pts && item.packet.pts.Rescale(timescale) == platform_pts;
   });
   if (position == inflight_.end()) {
-    failure_ = Error(CodecErrorCode::InvalidData, "Platform output timing does not match an accepted access unit");
+    const auto media = std::holds_alternative<AudioFrame>(frame) ? "audio" : "video";
+    const auto time = platform_pts ? std::to_string(platform_pts->ticks) + "/" + std::to_string(timescale) : "unknown";
+    failure_ = Error(CodecErrorCode::InvalidData, std::string("Platform ") + media + " output timestamp " + time +
+        " does not match an accepted access unit");
     phase_ = Phase::Failed;
     wake_pending_ = true;
     return;

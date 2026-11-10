@@ -15,6 +15,12 @@ BufferReference Buffer(const val& array) {
 }
 class WebDecoder final : public DecoderBackend {
 public:
+  std::uint32_t PresentationTimescale() const noexcept override {
+    // AudioData timestamps can be rounded from the decoder's sample clock back to microseconds.
+    if (const auto* audio = std::get_if<AudioDecoderConfig>(&config_)) return audio->output.sample_rate;
+    return 1000000;
+  }
+
   CodecResult<void> Open(const DecoderConfig& config) override {
     config_ = config;
     auto options = val::object();

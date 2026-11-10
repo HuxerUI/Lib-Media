@@ -1,8 +1,10 @@
 #pragma once
 
 #include <functional>
+#include <utility>
 
 #include <huxerui/external_texture.h>
+#include <huxerui/file.h>
 #include <huxerui/media_format.h>
 #include <huxerui/resource.h>
 #include <huxerui/task.h>
@@ -22,6 +24,13 @@ inline constexpr bool frame_texture_supported = false;
 std::shared_ptr<huxerui::ExternalTexture> MakeFrameTexture(huxerui::Size size);
 // Copies the visible CPU YUV region into owned RGBA bytes using the preview's SDR color policy.
 huxerui::Bytes ConvertFramePixels(const huxerui::media::VideoFrame& frame);
+inline std::pair<unsigned, unsigned> DisplayDimensions(
+    huxerui::media::VideoRectangle area, huxerui::media::VideoRotation rotation) {
+  using huxerui::media::VideoRotation;
+  if (rotation == VideoRotation::Clockwise90 || rotation == VideoRotation::Clockwise270)
+    return {area.height, area.width};
+  return {area.width, area.height};
+}
 void PublishFrame(huxerui::ExternalTexture& texture, const huxerui::media::VideoFrame& frame);
 class PreviewAudioUse;
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -32,10 +41,19 @@ inline constexpr bool preview_audio_session_supported = false;
 inline std::shared_ptr<PreviewAudioUse> RetainPreviewAudioSession(bool) { return {}; }
 #endif
 
-// Tasks keep their resources and texture alive and observe pause intent through the supplied callback.
-huxerui::Task<std::string> PlayDecodedClip(std::shared_ptr<huxerui::Resources> resources,
-                                          std::shared_ptr<huxerui::ExternalTexture> texture, bool with_audio,
-                                          std::function<bool()> paused);
-huxerui::Task<std::string> PlayEncodedClip(std::shared_ptr<huxerui::ExternalTexture> texture,
-                                          std::function<bool()> paused);
+struct ClipControls {
+  std::function<void(huxerui::Size)> reset_video;
+  std::function<void(const huxerui::media::VideoFrame&)> publish;
+  std::function<bool()> paused;
+  std::function<std::optional<float>()> take_seek;
+  std::function<void(float position, float duration)> position;
+};
+
+// Staged inputs and completed exports are removed when their last owner releases them.
+huxerui::Task<std::shared_ptr<const huxerui::File>> StageClip(
+    huxerui::File temporary, std::optional<huxerui::FileReference> selected,
+    std::shared_ptr<huxerui::Resources> resources);
+huxerui::Task<void> PlayContainer(std::shared_ptr<const huxerui::File> file, ClipControls controls);
+huxerui::Task<std::shared_ptr<const huxerui::File>> ExportClip(
+    std::shared_ptr<const huxerui::File> file, huxerui::File temporary);
 }

@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file
-/// @brief Exact media timestamps, compressed access units, and CPU audio and video frames.
+/// @brief Shared codec identifiers, exact media timestamps, compressed access units, and CPU audio and video frames.
 ///
 /// Include <huxerui/media_format.h> and link HuxerUI::Media. These values can be used in headless code.
 /// Use <huxerui/media_codec.h> to decode compressed packets or encode PCM/CPU video through bounded, headless sessions.
@@ -106,9 +106,36 @@ enum class SubmitStatus {
   WouldBlock
 };
 
+/// @brief Coding of a media stream, independent of packet framing and platform support.
+enum class CodecId {
+  Unknown,  ///< No recognized coding.
+
+  H264,     ///< AVC coded pictures.
+  Hevc,     ///< High Efficiency Video Coding.
+  Vp8,      ///< VP8 coded pictures.
+  Vp9,      ///< VP9 coded pictures.
+  ProRes,   ///< Apple ProRes coded pictures. The sample entry identifies the profile.
+
+  Aac,      ///< Advanced Audio Coding.
+  Opus,     ///< Opus coded audio. Trim uses the 48 kHz decoded sample grid.
+  Flac,     ///< Complete native FLAC frames.
+  Mp3,      ///< Complete MPEG Layer III frames.
+
+  PcmU8,    ///< Unsigned eight-bit PCM.
+  PcmS16Le, ///< Signed 16-bit little-endian PCM.
+  PcmS24Le, ///< Signed packed 24-bit little-endian PCM.
+  PcmS32Le, ///< Signed 32-bit little-endian PCM.
+  PcmF32Le, ///< IEEE float 32-bit little-endian PCM.
+
+  PcmS16Be, ///< Signed 16-bit big-endian PCM.
+  PcmS24Be, ///< Signed packed 24-bit big-endian PCM.
+  PcmS32Be, ///< Signed 32-bit big-endian PCM.
+  PcmF32Be, ///< IEEE float 32-bit big-endian PCM.
+};
+
 /// @brief A complete compressed access unit with timing on the source's media timeline.
 ///
-/// Supply one raw AAC access unit or one complete length-prefixed AVC picture access unit per packet. Keep data
+/// Supply one raw AAC access unit or one complete length-prefixed AVC or HEVC picture access unit per packet. Keep data
 /// address-stable and unchanged throughout TrySubmit(). BufferReference retains the backing owner, which may still
 /// be mutable. Accepted packets are copied before TrySubmit() returns, so the caller can then reuse the source bytes.
 /// Keep a packet available for retry when submission returns SubmitStatus::WouldBlock.
@@ -123,13 +150,13 @@ struct EncodedPacket {
   /// Nonempty access-unit bytes in the representation selected by the codec configuration.
   BufferReference data;
   /// Required presentation timestamp with a positive timescale. Negative preroll is allowed.
-  /// AVC packets can arrive with reordered presentation timestamps.
+  /// Video packets can arrive with reordered presentation timestamps.
   MediaTimestamp pts;
   /// Optional decode timestamp on the same timeline. Submit packets in decode order whether or not DTS is present.
   std::optional<MediaTimestamp> dts;
   /// Optional nonnegative duration with a positive timescale. An absent duration and a zero duration are distinct.
   std::optional<MediaTimestamp> duration;
-  /// Marks a random-access unit. The first AVC packet after Create() or Reset() must contain an IDR and set this flag.
+  /// Marks a random-access unit. The first video packet after Create() or Reset() must contain an IDR and set this flag.
   /// AudioEncoder output always sets this flag; VideoEncoder derives it from actual IDR syntax.
   bool key_frame = false;
 };
@@ -169,14 +196,17 @@ struct AudioFrame {
   [[nodiscard]] bool Validate() const noexcept;
 };
 
-/// @brief Supported 8-bit CPU YUV layouts with 4:2:0 chroma subsampling.
+/// @brief Supported CPU YUV layouts with 4:2:0 chroma subsampling.
 ///
 /// Luma uses the coded width and height. Chroma uses half each coded dimension, rounded up.
 enum class VideoPixelFormat {
   /// Three planes in Y, U, V order, with one byte per sample in each plane.
   I420,
   /// A Y plane followed by a chroma plane containing consecutive U, V byte pairs.
-  NV12
+  NV12,
+  /// Two planes with the same component order as NV12. Each component occupies a little-endian 16-bit word
+  /// with its ten-bit value in the most significant bits.
+  P010
 };
 
 /// @brief Color primaries describing the coded samples.
@@ -307,8 +337,8 @@ struct VideoPlane {
   BufferReference data;
   /// Positive byte distance between starts of adjacent rows, including any row padding.
   std::size_t row_stride = 0;
-  /// Positive byte distance between adjacent samples in a row. At least one byte for a single-component
-  /// sample, or at least two bytes for the U, V pair in the NV12 chroma plane.
+  /// Positive byte distance between adjacent samples in a row. It must cover all bytes of the sample,
+  /// including both components in a semiplanar chroma plane.
   std::size_t pixel_stride = 0;
 };
 

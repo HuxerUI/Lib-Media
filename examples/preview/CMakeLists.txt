@@ -62,15 +62,9 @@ huxerui_use_library(example_media
 
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     if (ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        set(PREVIEW_FIXTURE_ROOT "${CMAKE_CURRENT_BINARY_DIR}/sync-fixture")
-        set(CODEC_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fixtures/codec")
-        file(GLOB PREVIEW_FIXTURE_FILES CONFIGURE_DEPENDS
-                "${CODEC_FIXTURE_DIR}/sync-*"
-        )
-        foreach (fixture IN LISTS PREVIEW_FIXTURE_FILES)
-            get_filename_component(filename "${fixture}" NAME)
-            configure_file("${fixture}" "${PREVIEW_FIXTURE_ROOT}/raw/${filename}" COPYONLY)
-        endforeach ()
+        set(PREVIEW_FIXTURE_ROOT "${CMAKE_CURRENT_BINARY_DIR}/container-fixture")
+        configure_file("${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fixtures/container/preview-avc-aac.mp4"
+                "${PREVIEW_FIXTURE_ROOT}/raw/preview-avc-aac.mp4" COPYONLY)
         huxerui_add_resources(example_media ROOT "${PREVIEW_FIXTURE_ROOT}" NAMESPACE fixture)
     endif ()
     if (ANDROID)

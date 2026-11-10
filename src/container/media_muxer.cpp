@@ -15,13 +15,13 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
     if (it->seek_preroll && (!it->seek_preroll->timescale || it->seek_preroll->ticks < 0))
       Fail(ContainerErrorCode::InvalidArgument, "Invalid track seek preroll");
     if (it->seek_preroll && it->seek_preroll->ticks &&
-        format != ContainerFormat::Matroska && format != ContainerFormat::WebM)
+        format != ContainerFormat::Matroska && format != ContainerFormat::WebM && format != ContainerFormat::Ogg)
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain track seek preroll");
     if (it->initialization_data.size() > 65536)
       Fail(ContainerErrorCode::LimitExceeded, "Output track configuration exceeds 64 KiB");
   }
-  if (layout != ContainerLayout::Default &&
-      (format != ContainerFormat::Mp4 || layout != ContainerLayout::Fragmented))
+  if (layout != ContainerLayout::Default && (format != ContainerFormat::Mp4 ||
+      (layout != ContainerLayout::Fragmented && layout != ContainerLayout::FastStart)))
     Fail(ContainerErrorCode::Unsupported, "Unsupported output layout");
   switch (format) {
     case ContainerFormat::Wave:
@@ -31,30 +31,41 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
     case ContainerFormat::Adts:
       ValidateAdts(tracks);
       return Requirement::SequentialWrite;
+    case ContainerFormat::Ogg:
+      ValidateOgg(tracks);
+      return Requirement::SequentialWrite;
     case ContainerFormat::Mp4:
     case ContainerFormat::Mov:
       ValidateMp4(format, tracks, layout);
+      if (layout == ContainerLayout::FastStart) return Requirement::RandomReadWrite;
       return layout == ContainerLayout::Fragmented ? Requirement::SequentialWrite : Requirement::RandomWrite;
     case ContainerFormat::Matroska:
     case ContainerFormat::WebM:
       ValidateMatroska(format, tracks);
       return Requirement::SequentialWrite;
+    case ContainerFormat::Flac:
+    case ContainerFormat::Mp3: break;
   }
   Fail(ContainerErrorCode::Unsupported, "Unsupported output container");
 }
 
 std::unique_ptr<ContainerWriter> OpenWriter(ContainerOutput output, ContainerFormat format,
                                             std::span<const MediaTrack> tracks, ContainerLayout layout) {
-  if (Validate(format, tracks, layout) == Requirement::RandomWrite && !output.Random())
+  const auto requirement = Validate(format, tracks, layout);
+  if (requirement != Requirement::SequentialWrite && !output.Random())
     Fail(ContainerErrorCode::NeedRandomAccess, "This container layout requires random writes");
+  if (requirement == Requirement::RandomReadWrite) output.RequireReadable();
   switch (format) {
     case ContainerFormat::Wave:
     case ContainerFormat::Rf64: return OpenWaveWriter(std::move(output), format, tracks);
     case ContainerFormat::Adts: return OpenAdtsWriter(std::move(output), tracks);
+    case ContainerFormat::Ogg: return OpenOggWriter(std::move(output), tracks);
     case ContainerFormat::Mp4:
     case ContainerFormat::Mov: return OpenMp4Writer(std::move(output), format, tracks, layout);
     case ContainerFormat::Matroska:
     case ContainerFormat::WebM: return OpenMatroskaWriter(std::move(output), format, tracks);
+    case ContainerFormat::Flac:
+    case ContainerFormat::Mp3: break;
   }
   Fail(ContainerErrorCode::Unsupported, "Unsupported output container");
 }

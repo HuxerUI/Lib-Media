@@ -4,7 +4,7 @@
 /// @brief Synchronous container inspection, packet reading, seeking, and packet writing.
 ///
 /// Include <huxerui/media_container.h> and link HuxerUI::Media. Open streams through the SDK.
-/// Each session owns its stream. Serialize calls on a caller-managed thread. See docs/mediacontainer.md
+/// Each session owns its stream. Serialize calls on a caller-managed thread. See docs/media-container.md
 /// for the supported format, codec, layout, and stream combinations.
 
 #include <cstdint>
@@ -25,19 +25,26 @@ class ContainerWriter;
 
 /// @brief Container syntax used to probe input or select output.
 enum class ContainerFormat {
-  Mp4,   ///< ISO BMFF MP4, including audio-only files and fragmented layouts.
-  Wave,  ///< RIFF WAVE with 32-bit chunk sizes.
-  Rf64,  ///< RF64 WAVE with a 64-bit size table.
-  Adts,  ///< AAC with an ADTS header on each access unit.
-  Mov,   ///< Self-contained QuickTime movie with the `qt  ` major brand.
+  Mp4,      ///< ISO BMFF MP4, including audio-only files and fragmented layouts.
+  Mov,      ///< Self-contained QuickTime movie with the `qt  ` major brand.
+
   Matroska, ///< EBML media with the matroska document type, including audio-only files.
   WebM,     ///< EBML media with the webm document type and its restricted codec mappings.
+
+  Wave,     ///< RIFF WAVE with 32-bit chunk sizes.
+  Rf64,     ///< RF64 WAVE with a 64-bit size table.
+
+  Adts,     ///< AAC with an ADTS header on each access unit.
+  Ogg,      ///< A single Ogg logical stream with mapping-family-zero Opus.
+  Flac,     ///< Native FLAC frames following a STREAMINFO metadata block.
+  Mp3,      ///< MPEG Layer III audio frames with optional ID3 and Xing information.
 };
 
 /// @brief File organization within a container format.
 enum class ContainerLayout {
   Default,    ///< Regular layout for the chosen format.
   Fragmented, ///< MP4 initialization followed by movie fragments.
+  FastStart,  ///< Regular MP4 output with its movie metadata before the media data.
 };
 
 /// @brief Media carried by a track.
@@ -47,27 +54,6 @@ enum class TrackKind {
   Subtitle, ///< Timed subtitles.
   Data,     ///< Timed ancillary data.
   Unknown,  ///< The track kind is unavailable.
-};
-
-/// @brief Coding of a track, independent of container framing and decoder availability.
-enum class CodecId {
-  Unknown,  ///< No recognized coding.
-  Aac,      ///< Advanced Audio Coding.
-  H264,     ///< AVC coded pictures.
-  PcmU8,    ///< Unsigned eight-bit PCM.
-  PcmS16Le, ///< Signed 16-bit little-endian PCM.
-  PcmS24Le, ///< Signed packed 24-bit little-endian PCM.
-  PcmS32Le, ///< Signed 32-bit little-endian PCM.
-  PcmF32Le, ///< IEEE float 32-bit little-endian PCM.
-  Hevc,     ///< High Efficiency Video Coding.
-  ProRes,   ///< Apple ProRes coded pictures. The sample entry identifies the profile.
-  PcmS16Be, ///< Signed 16-bit big-endian PCM.
-  PcmS24Be, ///< Signed packed 24-bit big-endian PCM.
-  PcmS32Be, ///< Signed 32-bit big-endian PCM.
-  PcmF32Be, ///< IEEE float 32-bit big-endian PCM.
-  Vp9,      ///< VP9 coded pictures.
-  Opus,     ///< Opus coded audio. Trim uses the 48 kHz decoded sample grid.
-  Vp8,      ///< VP8 coded pictures.
 };
 
 /// @brief Byte representation of packets belonging to a track.
@@ -284,6 +270,7 @@ public:
   enum class OutputRequirement {
     SequentialWrite, ///< Supports sequential writing.
     RandomWrite,     ///< Supports writing at absolute offsets, including backpatching.
+    RandomReadWrite, ///< Supports reading and writing at absolute offsets for final layout changes.
   };
 
   /// Transfers the session and its stream.
@@ -316,7 +303,7 @@ public:
   /// @param format Target container format.
   /// @param tracks Track descriptions copied by the session.
   /// @param layout Target layout.
-  /// @return A session or an error. Open the destination with the SDK's desired creation or truncation mode.
+  /// @return A session or an error. FastStart requires an SDK stream opened in ReadWrite mode.
   static ContainerResult<MediaMuxer> Open(
       RandomAccessStream output, ContainerFormat format, std::span<const MediaTrack> tracks,
       ContainerLayout layout = ContainerLayout::Default);

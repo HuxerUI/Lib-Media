@@ -78,7 +78,8 @@ bool AudioFrame::Validate() const noexcept {
 bool VideoFormat::Validate() const noexcept {
   return width && height && visible.width && visible.height && visible.x < width && visible.y < height
       && visible.width <= width - visible.x && visible.height <= height - visible.y
-      && aspect_width && aspect_height && (pixel_format == VideoPixelFormat::I420 || pixel_format == VideoPixelFormat::NV12)
+      && aspect_width && aspect_height && (pixel_format == VideoPixelFormat::I420 ||
+          pixel_format == VideoPixelFormat::NV12 || pixel_format == VideoPixelFormat::P010)
       && primaries >= ColorPrimaries::Unknown && primaries <= ColorPrimaries::BT2020
       && transfer >= ColorTransfer::Unknown && transfer <= ColorTransfer::HLG
       && matrix >= ColorMatrix::Unknown && matrix <= ColorMatrix::BT2020
@@ -88,10 +89,11 @@ bool VideoFormat::Validate() const noexcept {
 bool VideoFrame::Validate() const noexcept {
   if (!format.Validate() || !ValidTime(pts) || !ValidDuration(duration)) return false;
   const auto planar = format.pixel_format == VideoPixelFormat::I420;
+  const auto bytes = format.pixel_format == VideoPixelFormat::P010 ? 2u : 1u;
   if (planes.size() != (planar ? 3 : 2)) return false;
-  if (!PlaneFits(planes[0], format.width, format.height, 1)) return false;
+  if (!PlaneFits(planes[0], format.width, format.height, bytes)) return false;
   const auto cw = std::size_t(format.width) / 2 + format.width % 2;
   const auto ch = std::size_t(format.height) / 2 + format.height % 2;
-  return PlaneFits(planes[1], cw, ch, planar ? 1 : 2) && (!planar || PlaneFits(planes[2], cw, ch, 1));
+  return PlaneFits(planes[1], cw, ch, planar ? 1 : 2 * bytes) && (!planar || PlaneFits(planes[2], cw, ch, 1));
 }
 } // namespace huxerui::media

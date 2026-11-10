@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <utility>
 #include <dlfcn.h>
 #include <sys/system_properties.h>
 #include <media/NdkMediaCodec.h>
@@ -208,6 +209,20 @@ public:
       AMediaFormat_setInt32(format, "color-transfer", config.input.transfer == ColorTransfer::Linear ? 1 : 3);
     }
     auto status = AMediaCodec_configure(codec_, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
+    if (status != AMEDIA_OK && config.profile == H264Profile::Baseline) {
+      // A vendor encoder can advertise byte-buffer input and still reject the configuration.
+      for (const char* name : {"c2.android.avc.encoder", "OMX.google.h264.encoder"}) {
+        if (codec_) {
+          const auto retired = AMediaCodec_delete(std::exchange(codec_, nullptr));
+          if (retired != AMEDIA_OK)
+            return CodecResult<void>::Failure(MediaCodecError(retired, "Cannot retire rejected H.264 encoder"));
+        }
+        codec_ = AMediaCodec_createCodecByName(name);
+        if (!codec_) continue;
+        status = AMediaCodec_configure(codec_, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
+        if (status == AMEDIA_OK) break;
+      }
+    }
     if (status != AMEDIA_OK)
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Android rejected H.264 configuration", std::to_string(status)));
     auto* actual = input_format_(codec_);

@@ -339,7 +339,7 @@ class Mp4Writer final : public ContainerWriter {
 public:
   Mp4Writer(ContainerOutput output, ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout)
       : ContainerWriter(std::move(output), tracks), mov_(format == ContainerFormat::Mov),
-        fragmented_(layout == ContainerLayout::Fragmented),
+        fragmented_(layout == ContainerLayout::Fragmented), fast_start_(layout == ContainerLayout::FastStart),
         movie_scale_(MovieScale(tracks)), states_(tracks.size()) {
     for (std::size_t i = 0; i < tracks.size(); ++i) {
       if (tracks[i].codec == CodecId::H264)
@@ -447,11 +447,18 @@ public:
     std::fill(ended.begin(), ended.end(), true);
     Drain();
     if (!fragmented_) {
-      const auto movie = Movie();
       Bytes size;
       Put(size, output.Position() - mdat_);
       output.Patch(mdat_ + 8, size);
-      output.Write(movie);
+      if (fast_start_) {
+        // co64 entries are fixed width, so relocating their offsets does not change the movie box size.
+        const auto movie_size = Movie().size();
+        for (auto& state : states_)
+          for (auto& sample : state.index) sample.offset = AddOffset(sample.offset, movie_size);
+        output.Insert(mdat_, Movie());
+      } else {
+        output.Write(Movie());
+      }
     }
   }
 
@@ -558,6 +565,7 @@ private:
 
   bool mov_;
   bool fragmented_;
+  bool fast_start_;
   std::uint32_t movie_scale_;
   std::vector<TrackState> states_;
   std::size_t samples_ = 0;

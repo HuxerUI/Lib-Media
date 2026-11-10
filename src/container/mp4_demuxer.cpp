@@ -32,9 +32,11 @@ BoxView NextBox(ByteView& input) {
   return {type, data};
 }
 
-ByteView Child(ByteView input, std::string_view tag, bool required = true) {
+ByteView Child(ByteView input, std::string_view tag, bool required = true, bool mov_visual = false) {
   std::optional<ByteView> found;
   while (!input.empty()) {
+    // QuickTime visual sample descriptions can end with a four-byte zero terminator.
+    if (mov_visual && input.size() == 4 && Number<std::uint32_t>(input) == 0) break;
     const auto child = NextBox(input);
     if (child.tag != Tag(tag)) continue;
     if (found || child.bytes.empty()) Fail(Invalid, "Duplicate or empty MP4 box: " + std::string(tag));
@@ -504,6 +506,11 @@ public:
   }
 
   std::optional<DemuxItem> Read() override {
+    if (input.Random() && layout == ContainerLayout::Default && !selected.empty()) {
+      while (cursor_ < order_.size() &&
+             std::ranges::find(selected, tracks[order_[cursor_].track].id) == selected.end())
+        ++cursor_;
+    }
     if (cursor_ == order_.size()) {
       if (layout == ContainerLayout::Default || !NextFragment()) return {};
     }
@@ -675,17 +682,18 @@ private:
       track.coded_height = height;
       Slice(entry.bytes, 0, 78);
       const auto extensions = entry.bytes.subspan(78);
+      const bool mov_visual = format == ContainerFormat::Mov;
       ByteView config;
       if (entry.tag == Tag("avc1")) {
         track.codec = CodecId::H264;
-        config = Child(extensions, "avcC");
+        config = Child(extensions, "avcC", true, mov_visual);
         const auto avc = ParseAvc(config);
         if (!avc.Succeeded()) Fail(Unsupported, avc.Error().message);
         index.nal_length = avc.Value().length_size;
       } else if (entry.tag == Tag("hvc1") || entry.tag == Tag("hev1")) {
         track.codec = CodecId::Hevc;
         track.sample_entry = EntryName(entry.tag);
-        config = Child(extensions, "hvcC");
+        config = Child(extensions, "hvcC", true, mov_visual);
         index.nal_length = HevcNalLength(config, entry.tag == Tag("hvc1"), Invalid);
       } else if (format == ContainerFormat::Mov && ProResEntry(entry.tag)) {
         track.codec = CodecId::ProRes;
@@ -700,7 +708,7 @@ private:
       const auto rotation = Rotation(tkhd, Version(tkhd) ? 52 : 40);
       track.rotation = static_cast<VideoRotation>(
           (static_cast<unsigned>(movie_rotation_) + static_cast<unsigned>(rotation)) % 4);
-      const auto clap = Child(extensions, "clap", false);
+      const auto clap = Child(extensions, "clap", false, mov_visual);
       if (!clap.empty()) track.visible = Aperture(clap, width, height);
     } else if (handler == Tag("soun") && format == ContainerFormat::Mov) {
       ReadPcmDescription(entry, track);
