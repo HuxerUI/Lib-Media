@@ -142,7 +142,7 @@ std::int64_t ToNs(MediaTimestamp time) {
   return result->ticks;
 }
 
-std::optional<MediaTimestamp> CodecDuration(const MediaTrack& track, ByteView packet, ContainerErrorCode error) {
+std::optional<MediaTimestamp> CodecDuration(const MediaSampleDescription& track, ByteView packet, ContainerErrorCode error) {
   if (track.codec == CodecId::Aac) return MediaTimestamp{1024, *track.sample_rate};
   if (track.codec == CodecId::Opus) return MediaTimestamp{OpusPacketSamples(packet, error), 48000};
   return {};

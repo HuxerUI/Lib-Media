@@ -102,16 +102,19 @@ attached by `MakeExternalTexture()`. Treat captured pixels as immutable and rele
 ## Preview and verification
 
 Select **GPU video** in the existing Frames tab. Preview uses the same playback clock and seek epochs.
-On Android, an unrotated SDR movie without a container-level crop uses a `SurfaceStreamTexture` directly
-as the MediaCodec output. The scheduler releases only the selected picture to the Surface and returns dropped
+On Android, an unrotated SDR movie with one configuration, no container-level crop, and a continuous
+presentation interval uses a `SurfaceStreamTexture` directly as the MediaCodec output. The scheduler releases
+only the selected picture to the Surface and returns dropped
 codec buffers without rendering. The last visible image remains during seek until the new epoch presents its
 first picture. Rotated or cropped movies use the GPU transform to apply the container geometry.
-**Encode half-size MP4** applies the visible crop and encodes at half the visible width and height, rounded to
-even dimensions on macOS, Android, iOS, and supported Windows setups. Web **GPU video** previews and exports
-compatible SDR browser frames at their visible size. Use **CPU video** to apply additional container geometry on Web.
-Export reads platform images independently of the preview output and reopens the MP4 before enabling Save Movie.
+Use **CPU video** to apply additional container geometry on Web. The preview integration test also encodes
+platform images and reopens the MP4. It tests half-size output on platforms with GPU crop and scale and
+uses the browser frame's visible size on Web.
 The macOS test publishes into the SDK's PixelBufferTexture. The AppKit renderer's own conversion is outside the
 application pixel audit.
+
+See [timeline thumbnail extraction](timeline-thumbnail-extraction.md) for the proposed Android Surface path
+with small GPU snapshots and GOP skips.
 
 `media_video_gpu_tests` runs both codecs headlessly. It checks output storage, all picture times,
 MP4 decode timing, visible dimensions, crop and rotation pixels, reset at keyframes, and a retained image

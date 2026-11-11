@@ -278,10 +278,10 @@ public:
       }
       metadata += size + 4;
     }
-    MediaTrack track{.id = 1, .kind = TrackKind::Audio, .codec = CodecId::Flac,
-                     .initialization_data = std::move(stream_info), .timescale = info_.rate,
-                     .sample_rate = info_.rate, .channel_count = info_.channels};
-    if (HasAudioMetadata(tags)) track.audio_metadata = std::move(tags);
+    MediaTrack track{.id = 1, .kind = TrackKind::Audio, .timescale = info_.rate,
+        .descriptions = {{.codec = CodecId::Flac, .initialization_data = std::move(stream_info),
+                          .sample_rate = info_.rate, .channel_count = info_.channels}}};
+    if (HasAudioMetadata(tags)) audio_metadata = std::move(tags);
     Begin(std::move(track), info_.total ? std::optional{info_.total} : std::nullopt);
   }
 
@@ -307,7 +307,7 @@ public:
         const auto order = *time.Compare(target);
         if (direction == SeekDirection::AtOrBefore && order > 0) break;
         if (direction == SeekDirection::AtOrBefore || order >= 0)
-          point = SeekPoint{id, time, SeekPoint::Kind::Independent, offset, {}};
+          point = SeekPoint{id, time, SeekPoint::Kind::Independent, offset, time};
         if (order >= 0) break;
         sample = AddTime(sample, frame->samples);
       }
@@ -317,7 +317,7 @@ public:
       seek_table_.clear();
       return FramedAudioReader::Find(id, target, direction, seek);
     }
-    if (seek && point) SeekFrame(*point->byte_offset, point->time.ticks);
+    if (seek && point) SeekFrame(*point->byte_offset, point->decode_start_pts.ticks);
     else input.Seek(previous);
     return point;
   }
@@ -373,15 +373,16 @@ void WriteTags(ContainerOutput& output, const MediaAudioMetadata& metadata) {
 
 class FlacWriter final : public ContainerWriter {
 public:
-  FlacWriter(ContainerOutput output, std::span<const MediaTrack> descriptions)
-      : ContainerWriter(std::move(output), descriptions),
-        info_(ParseFlacStreamInfo(tracks.front().initialization_data, ContainerErrorCode::InvalidArgument)),
+  FlacWriter(ContainerOutput output, std::span<const MediaTrack> tracks,
+             const std::optional<MediaAudioMetadata>& tags)
+      : ContainerWriter(std::move(output), tracks),
+        info_(ParseFlacStreamInfo(tracks.front().descriptions.front().initialization_data, ContainerErrorCode::InvalidArgument)),
         seek_interval_(std::max<std::uint64_t>(info_.rate, (info_.total + SeekSlots - 1) / SeekSlots)) {
     Bytes signature;
     Put(signature, Tag("fLaC"));
     this->output.Write(signature);
-    WriteMetadata(this->output, 0, tracks.front().initialization_data);
-    if (const auto& tags = tracks.front().audio_metadata) WriteTags(this->output, *tags);
+    WriteMetadata(this->output, 0, tracks.front().descriptions.front().initialization_data);
+    if (tags) WriteTags(this->output, *tags);
     seek_offset_ = this->output.Position() + 4;
     WriteMetadata(this->output, 0x83, Bytes(SeekSlots * 18));
     frames_offset_ = this->output.Position();
@@ -411,7 +412,7 @@ public:
 
   void Finish() override {
     if (!sample_) Fail(ContainerErrorCode::InvalidArgument, "FLAC output needs at least one frame");
-    auto info = tracks.front().initialization_data;
+    auto info = tracks.front().descriptions.front().initialization_data;
     const auto set_size = [&](unsigned offset, unsigned value) {
       for (unsigned i = 0; i < 3; ++i) info[offset + i] = std::byte((value >> (16 - 8 * i)) & 255);
     };
@@ -457,18 +458,19 @@ std::unique_ptr<ContainerReader> OpenFlacReader(ContainerInput input) {
 
 void ValidateFlac(std::span<const MediaTrack> tracks) {
   constexpr auto argument = ContainerErrorCode::InvalidArgument;
-  if (tracks.size() != 1 || tracks.front().kind != TrackKind::Audio || tracks.front().codec != CodecId::Flac ||
-      tracks.front().framing != PacketFraming::CodecPacket)
+  if (tracks.size() != 1 || tracks.front().kind != TrackKind::Audio || tracks.front().descriptions.front().codec != CodecId::Flac ||
+      tracks.front().descriptions.front().framing != PacketFraming::CodecPacket)
     Fail(ContainerErrorCode::Unsupported, "Native FLAC output requires one FLAC track");
   const auto& track = tracks.front();
-  const auto info = ParseFlacStreamInfo(track.initialization_data, argument);
-  if (track.sample_rate != info.rate || track.channel_count != info.channels ||
+  const auto& description = track.descriptions.front();
+  const auto info = ParseFlacStreamInfo(description.initialization_data, argument);
+  if (description.sample_rate != info.rate || description.channel_count != info.channels ||
       track.priming_samples.value_or(0) || track.padding_samples.value_or(0))
     Fail(argument, "FLAC track geometry or trim differs from STREAMINFO");
-  if (track.audio_metadata) ValidateAudioMetadata(*track.audio_metadata);
 }
 
-std::unique_ptr<ContainerWriter> OpenFlacWriter(ContainerOutput output, std::span<const MediaTrack> tracks) {
-  return std::make_unique<FlacWriter>(std::move(output), tracks);
+std::unique_ptr<ContainerWriter> OpenFlacWriter(ContainerOutput output, std::span<const MediaTrack> tracks,
+                                               const std::optional<MediaAudioMetadata>& tags) {
+  return std::make_unique<FlacWriter>(std::move(output), tracks, tags);
 }
 } // namespace huxerui::media::detail

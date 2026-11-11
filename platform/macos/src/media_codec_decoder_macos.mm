@@ -113,6 +113,7 @@ public:
     }
     const auto& video = std::get<VideoDecoderConfig>(config_);
     OSStatus status;
+    NSDictionary* specification = nil;
     std::vector<const std::uint8_t*> parameters;
     std::vector<std::size_t> sizes;
     const auto add_parameters = [&](const auto& entries) {
@@ -121,7 +122,19 @@ public:
         sizes.push_back(entry.size());
       }
     };
-    if (video.codec == CodecId::Hevc) {
+    if (video.codec == CodecId::Vp9) {
+      VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
+      if (!VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9))
+        return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "VP9 hardware decoding is unavailable"));
+      // VideoToolbox requires vpcC even when WebM carries the profile in each frame header.
+      // This record specifies profile 0 and leaves level and color signaling unspecified.
+      constexpr std::uint8_t vpcc[]{1, 0, 0, 0, 0, 0, 0x82, 2, 2, 2, 0, 0};
+      NSDictionary* extensions = @{(__bridge NSString*)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms:
+          @{@"vpcC": [NSData dataWithBytes:vpcc length:sizeof(vpcc)]}};
+      status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_VP9, video.width, video.height,
+          (__bridge CFDictionaryRef)extensions, &description_);
+      specification = @{(__bridge NSString*)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @YES};
+    } else if (video.codec == CodecId::Hevc) {
       const auto hevc = ParseHevcConfiguration(video.initialization_data, true, true);
       add_parameters(hevc.parameters);
       status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault, parameters.size(),
@@ -132,7 +145,7 @@ public:
       status = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, parameters.size(),
           parameters.data(), sizes.data(), avc.length_size, &description_);
     }
-    if (status) return CodecResult<void>::Failure(AppleError(status, "Video parameter sets were rejected"));
+    if (status) return CodecResult<void>::Failure(AppleError(status, "Video format description was rejected"));
     const auto dimensions = CMVideoFormatDescriptionGetDimensions(description_);
     if (dimensions.width <= 0 || dimensions.height <= 0 || dimensions.width > video.width || dimensions.height > video.height)
       return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidArgument, "Video dimensions exceed configured bounds"));
@@ -144,7 +157,8 @@ public:
       (__bridge NSString*)kCVPixelBufferIOSurfacePropertiesKey: @{}
     } : @{(id)kCVPixelBufferPixelFormatTypeKey: @(pixel_type)};
     VTDecompressionOutputCallbackRecord callback{Output, this};
-    status = VTDecompressionSessionCreate(kCFAllocatorDefault, description_, nullptr, (__bridge CFDictionaryRef)attributes, &callback, &video_);
+    status = VTDecompressionSessionCreate(kCFAllocatorDefault, description_, (__bridge CFDictionaryRef)specification,
+        (__bridge CFDictionaryRef)attributes, &callback, &video_);
     if (status) return CodecResult<void>::Failure(AppleError(status, "VTDecompressionSessionCreate failed"));
     return CodecResult<void>::Success();
   }

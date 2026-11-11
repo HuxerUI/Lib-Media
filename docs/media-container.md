@@ -5,8 +5,9 @@ with the SDK's synchronous streams and can run on a caller-owned worker without 
 Use an SDK build that provides `RandomAccessStream` and `File::OpenRandomAccess()`.
 Serialize calls on each session.
 
-`MediaTrack::codec` uses `CodecId` from `<huxerui/media_format.h>`. Pass that identifier and the
-track's initialization data to the corresponding decoder configuration for a supported mapping.
+`MediaTrack` holds the track identity, clock, presentation edits, and sample descriptions. Each
+`MediaSampleDescription` holds the codec, framing, initialization bytes, and audio or video geometry.
+Pass the description selected by a packet to the corresponding decoder for a supported mapping.
 
 ## Supported combinations
 
@@ -35,52 +36,48 @@ and, from a random-access stream, indexed seek. For AAC-LC encoded from PCM, wri
 their PTS and duration, then pass the encoder summary's priming and padding to `EndTrack()`. Use
 `PresentationRange()` on readback to select the audible interval.
 
-The audio-copy example also copies fragmented AAC to regular M4A. It collects the packet presentation interval
-as it copies and applies any supported track edit before checking the finished file. Native M4A copies place
-the index before the samples. On Web, the example keeps the index after the samples so finalization does not
-relocate the media data. The Web output can be reopened with random access.
+The audio-copy example also copies fragmented AAC to regular M4A. Native M4A copies place the index before
+the samples. On Web, the example writes the index after the samples to avoid relocating media data.
 
 ALAC uses `CodecId::Alac`, mono or stereo, and the 24-byte `ALACSpecificConfig` in `initialization_data`.
 Write each original packet with its actual duration, including a shorter final packet. The packet-copy path
-retains the lossless bitstream and sample clock. PCM playback and encoding in the current audio codec API
-use other supported mappings, such as AAC-LC.
+retains the lossless bitstream and sample clock.
 
-For a single audio track, `audio_metadata` carries title, artist, album, track index and total, genre, date,
-and the first JPEG or PNG cover. Regular and fast-start MP4 write these fields once in `udta/meta/ilst`.
-Supply the tags on the first sample description when opening a writer with multiple AAC configurations.
-`SampleDescriptions()` returns the tags on the first entry, and the current track description retains them
-across configuration changes. An empty optional metadata box leaves the audio track and its packets readable without tags.
-[QuickTime metadata item list](https://developer.apple.com/documentation/quicktime-file-format/metadata_item_list_atom)
+`MediaDemuxer::AudioMetadata()` returns file-level tags and retained cover bytes. Supply them in
+`MediaMuxerOptions::audio_metadata` when copying. Regular and fast-start MP4 with a single AAC-LC or ALAC
+track write supported tags once in `udta/meta/ilst`. Empty optional metadata boxes leave the track and packets
+readable. [QuickTime metadata item list](https://developer.apple.com/documentation/quicktime-file-format/metadata_item_list_atom)
 
 ### Track presentation intervals
 
-`MediaDemuxer::PresentationRange(track_id)` returns the half-open bounds of the presented samples on the common
-timeline. The bounds can include gaps between edit segments. Equal endpoints describe an empty interval. An absent result means coverage
-is unavailable or the track ID is unknown. The query does not move the cursor or build an index. `Read()` continues
-to return coded preroll and tail packets. Apply the range to decoded pictures and PCM for presentation.
-Native FLAC and MP3 provide a range once their total sample count is known, with any recognized gapless trim applied.
+`MediaTrack::edits` describes supported MP4 and MOV rate-one edits in order from movie time zero. Each entry
+has a duration and an optional media start. An empty entry advances presentation without selecting media.
+Media intervals are forward and nonoverlapping. An empty edit list gives an identity mapping.
 
-`MediaTrack::presentation_edit` carries a finite authored interval for one rate-one edit with an optional leading
-empty edit. The reader normalizes its packet timestamps onto the common clock. Audio trim is relative to packet
-timing, so shortened sample durations already account for those samples. A fragmented writer needs the interval at
-open to declare AAC priming and tail trim. Any separately supplied trim must agree with the interval and packet
-timeline. A sequential writer can confirm the declared trim at `EndTrack()`.
-
-`MediaTrack::edits` carries additional rate-one edit segments. An empty entry advances presentation without
-selecting media. Media intervals are forward and nonoverlapping. Packet PTS and DTS remain on the track's media
-clock. Intersect decoded frame intervals with each selected media interval and map them to the accumulated
-presentation position. Seek queries take presentation time and resolve the corresponding media time and decode
-anchor. Pass the edit list with the original packets to an MP4 or MOV writer to retain the cuts and gaps.
+Packet PTS and DTS stay on the media clock. Use `MapToPresentation(track.edits, begin, end, slices)`
+on a decoded media interval. Each slice contains the retained media start and its half-open presentation
+interval. Equivalent rational clocks are reduced before finding the exact mapping grid. Reuse the output vector
+between calls. The result can contain several slices if a frame or sample block crosses an edit boundary.
+A copy passes the edits and the original packet times together.
 Regular output rebases the media clock and edit offsets together when the first DTS is nonzero.
-`Duration()` includes declared trailing empty edits. `PresentationRange()` ends at the last presented sample.
+
+`PresentationRange(track_id)` reports the half-open bounds of the available presented samples. The bounds
+can span gaps. Equal endpoints describe an empty interval. An absent result means coverage is unavailable
+or the track ID is unknown. The query preserves the cursor and does not build an index. Fragmented input
+can report partial coverage. `Duration()` includes declared trailing empty edits. Native FLAC and MP3
+provide a range when their total sample count and available gapless trim are known.
+
+MP4 and MOV expose authored AAC trim through edits. A fragmented writer needs those edits at open.
+For regular MP4, the encoder's priming and padding can instead be supplied at `EndTrack()`. The writer
+converts them to an edit. If both are supplied, they must agree with the packet timeline.
 
 ### Sample descriptions
 
-`SampleDescriptions(track_id)` exposes the available descriptions. MP4 and MOV accept multiple descriptions of
-one codec for AVC, HEVC, and AAC. AAC descriptions share a sample rate and channel count. Read the
-`MediaTrack` event before submitting its packets to a decoder. Reconfigure at a video sync picture when the
-configuration changes. Pass the descriptions with their consecutive one-based indices to the muxer at open.
-`ContainerPacket::sample_description_index` selects the matching description in the sample table or fragment.
+`MediaTrack::descriptions` holds one entry per known configuration in stable one-based index order.
+Both `ContainerPacket::sample_description_index` and `TrackDecodeStart::sample_description_index`
+refer to this table. MP4 and MOV accept multiple descriptions of one codec for AVC, HEVC, and AAC.
+AAC descriptions share a sample rate and channel count. Pass one track per ID with its full table
+when opening the muxer.
 
 HEVC tracks retain `hvcC` and their `hvc1` or `hev1` sample entry. With `hvc1`, parameter sets are
 in the configuration and the writer rejects in-band parameter sets. `hev1` can carry parameter sets in
@@ -106,7 +103,7 @@ to MOV. `ValidateOutput()` rejects these mappings for MP4. [QuickTime timecode](
 For WAVE, an extensible track carries the 22-byte format suffix in `initialization_data`. It preserves
 the subtype, valid bits, and speaker mask when passed to a WAVE or RF64 writer. WAVE packets are
 frame-aligned blocks. ADTS strips transport headers on read and supplies them on write. It provides a
-sample-count timeline starting at zero and emits an updated track description if the AAC configuration changes.
+sample-count timeline starting at zero and emits a decode start if the AAC configuration changes.
 
 The container API covers the track and packet fields declared in the header. Tag and cover support includes
 M4A, native FLAC, and MP3. The current mappings cover the documented track types, visual metadata, and rate-one edits.
@@ -114,12 +111,12 @@ Mirrored, scaled, or perspective movie and track matrices report `Unsupported`.
 A format or codec combination outside the table returns a format or support error.
 
 Ogg Opus preserves OpusHead, pre-skip, and final-packet trim. The reader validates page CRCs and
-assembles continued packets. At a chain boundary it emits an updated `MediaTrack` before the new link's
-packets. Each link begins at the previous link's audible end. Its leading packets can precede that point
-on the coded timeline. Random input builds a bounded link and page index on the first seek query. The
-80 ms Opus preroll stays within the selected link. After `Seek()`, use the replayed description to open or
-reset the decoder for that link. The writer emits one packet per page for a single logical stream and
-accepts up to 1 ms of timestamp rounding for WebM interoperability. Supported streams use mapping family zero.
+assembles continued packets. Each link begins at the previous link's audible end and emits a
+`TrackDecodeStart`, including when its configuration matches an earlier link. Its leading packets
+can precede the event's absolute `first_audible_pts` in media time. Random input builds a bounded link
+and page index on the first seek query. The 80 ms Opus preroll stays within the selected link.
+The writer emits one packet per page for a single logical stream and accepts up to 1 ms of timestamp
+rounding for WebM interoperability. Supported streams use mapping family zero.
 [Ogg Opus mapping and seeking](https://www.rfc-editor.org/rfc/rfc7845.html#section-4.6)
 
 Native FLAC validates frame geometry, position, and checksums. Random input uses checked `SEEKTABLE`
@@ -130,12 +127,12 @@ timing must begin at the stream origin. The STREAMINFO PCM checksum belongs to t
 
 MP3 handles MPEG-1, MPEG-2 and MPEG-2.5 Layer III with a fixed sample rate and layout. The reader understands
 Xing/Info and VBRI frame counts and recognized LAME delay and padding. It builds a bounded frame index and
-returns an earlier reservoir restart point as `decode_start`. The writer requires a restartable first frame,
+returns an earlier reservoir restart point as `decode_start_pts`. The writer requires a restartable first frame,
 copies the original audio bytes, and rebuilds Xing/Info frame and byte counts, its seek table, and supplied
 gapless information. The demuxer's audio window describes the encoder trim on the coded timeline.
 
 Native FLAC and MP3 expose common text and retained JPEG or PNG front-cover bytes through
-`MediaTrack::audio_metadata`. Supported text fields are title, artist, album, track number, genre, and date.
+`MediaDemuxer::AudioMetadata()`. Supported text fields are title, artist, album, track number, genre, and date.
 FLAC uses Vorbis comments and PICTURE. MP3 reads ID3v2.3 and v2.4 and writes ID3v2.4. Copying a track to its
 native format rewrites these fields without modifying the compressed audio. The output mapping supports one
 track and requires a seekable destination for final metadata. [ID3 frame definitions](https://id3.org/id3v2.4.0-frames)
@@ -146,19 +143,25 @@ Open a `File` or `FileReference` through the SDK. Choose `OpenRandomAccess()` fo
 regular MP4 with metadata after media data. The session takes ownership of the stream, including on open failure.
 The SDK determines which file providers expose synchronous streams.
 
-`Tracks()` provides a borrowed view of the known descriptions. `Read()` yields a packet or an updated description.
-Use the most recent description for that track before interpreting its packet. A successful empty result means
-EOF for a fixed input. Truncated packets and malformed sample tables are errors. A returned `BufferReference` keeps its bytes alive
-across reads, seeks, and session closure.
+`Tracks()` provides a borrowed view of the known tracks and their sample descriptions. `Read()` returns
+a packet or a `TrackDecodeStart` before the first packet of a selected track, a configuration change,
+a new Ogg link, or the first packet after a seek or reselection. Use the event's index to configure or
+reset the decoder. If supplied, `first_audible_pts` is an absolute lower bound in media time and stays
+fixed when seeking within the same sequence. Apply packet trim before mapping the remaining decoded
+interval to presentation. A successful empty read means EOF for a fixed input. Packet bytes stay
+alive across reads, seeks, and session closure.
 
-`FindSeekPoint()` preserves the read position. `Seek()` uses indexed anchors in MP4, MOV, Matroska, and WebM,
-sample frames in WAVE and RF64, or packet anchors in Ogg, native FLAC, and MP3. Check the returned point and its
-evidence before starting a decoder. A reference-track anchor can also affect the starting positions of other
-selected tracks. The first packet read from each track after a seek is preceded by its description.
+`FindSeekPoint()` preserves the read position. Both seek APIs take presentation time. `SeekPoint::presentation_time`
+identifies the anchor and `decode_start_pts` identifies the media PTS of the first required packet on the reference
+track. For AAC in MP4 or MOV, the reader resolves the edit first and includes the contiguous preceding access
+unit when it shares the configuration. For Opus, the presentation anchor respects the known audible start
+while decode start retains codec delay or link pre-skip. Other selected tracks can start at different media
+times. For AVC and HEVC, an independent point has verified IDR syntax. VP9 seeking uses the container sync
+flag and the decoder checks the first frame header.
 
 Fixed fMP4 can be read from the start one fragment batch at a time. On sized random-access inputs, a batch can
 include several fragments that share media data. Their sample ranges are checked against complete `mdat` boxes.
-Fixed inputs establish the final duration and trailing audio trim at EOF. Preview and export read packets as needed.
+Fixed inputs establish final sample coverage at EOF. Preview and export read packets as needed.
 
 Time-based queries on random-access fMP4 build a retained index through verified fragments. The index has a
 one-million-sample limit and uses 64-bit byte offsets. Direct single-track `sidx` entries can locate a fragment
@@ -179,19 +182,21 @@ when `Tracks()` contains an unknown codec. A sequential input requires Info and 
 AVC carries the AVCDecoderConfigurationRecord in CodecPrivate. VP8 uses complete codec packets
 without CodecPrivate. Use container sync marks when submitting VP8 or VP9 for indexed output.
 
-Matroska Block time is a presentation clock adjusted by the track's CodecDelay. The reader leaves DTS absent.
-BlockDuration, DefaultDuration, and known codec frame durations supply timing where available. Opus preserves
-OpusHead and pre-skip on its 48 kHz decoded sample grid. `seek_preroll` and `discard_padding` retain
-the track preroll and signed per-packet trim.
+The reader converts stored Block time to media PTS using the track's CodecDelay and leaves DTS absent.
+BlockDuration, DefaultDuration, and known codec frame durations supply timing where available. Opus
+retains OpusHead, the track's `seek_preroll`, and signed `discard_padding`. When a writer records the
+audible duration of a trimmed Opus Block, the reader can recover its coded duration from the packet.
 
-Random input uses Cues from SeekHead or finds existing tail Cues by following EBML element boundaries.
-Each returned anchor is matched to a Block on its reference track. An Opus seek can start before the
-anchor at the returned `decode_start`. A file with no usable Cues for that track reports
-`IndexUnavailable` for seek. Sequential preview and WAV export can continue using the packet timestamps and trim.
+Random Matroska uses Cues, including discoverable tail Cues. Fixed, sized random-access WebM uses
+advertised Cues or scans Cluster headers and Block prefixes as needed. When only video has Cues, the
+reader searches nearby Clusters for Opus anchors and preroll. A scan from the beginning provides fallback
+coverage and retains its per-track anchors for later seeks. Video starts at a sync Block. Sequential
+input cannot seek. Matroska with no usable Cues reports `IndexUnavailable`.
+[Matroska timing and indexing](https://www.rfc-editor.org/rfc/rfc9559.html)
 
 ## Write and finish
 
-Call `ValidateOutput()` before creating or truncating the destination. A `SequentialWrite` requirement accepts a
+Pass the same tracks and `MediaMuxerOptions` to `ValidateOutput()` and `Open()`. Validate before creating or truncating the destination. A `SequentialWrite` requirement accepts a
 fresh `OutputStream` or an empty writable `RandomAccessStream`. `RandomWrite` requires the latter.
 `ContainerLayout::FastStart` is a regular MP4 output layout. It returns `RandomReadWrite` and
 places the movie box before media data at `Finish()`, using bounded copying on the supplied stream.
@@ -208,8 +213,7 @@ values against that grid.
 Matroska and WebM use a 1 ms output timestamp grid. The writer keeps the supplied decode order per track
 and rounds absolute packet times and duration boundaries. WebM additionally requires nondecreasing
 stored Block times. Output uses a single Segment, bounded Clusters, and one packet per Block. Finish
-writes available video sync Cues or audio Cues for audio-only output. Output duration is absent from
-the initial header.
+writes available video sync Cues or audio Cues for audio-only output. The initial output header omits duration.
 
 `priming_samples` and OpusHead must describe the initial delay before opening the writer.
 Supply packet trim through `discard_padding` before submitting the affected packet. Positive values
@@ -230,7 +234,7 @@ partial files. When a destination only exposes `AsyncOutputStream`, an applicati
 container in a writable temporary file and copy it through the SDK's asynchronous streams.
 
 The current bounds include eight tracks, 32 sample descriptions per MP4 or MOV track, 256 edits per track, 16 MiB per
-packet, 64 MiB per metadata box, and one million indexed MP4 packets. The Matroska and WebM Cue table also
-uses a one-million-entry limit. A QuickTime PCM index entry can cover many
+packet, 64 MiB per metadata box, and one million indexed MP4 packets. The Matroska and WebM Cue table and the WebM Block scan each
+have a one-million-entry limit. A QuickTime PCM index entry can cover many
 sample frames. See [the container contract test](../tests/container_contract.cpp) for codec packet round trips and
 [the container fixtures](../tests/fixtures/container/README.md) for independent input samples.

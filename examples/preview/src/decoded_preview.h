@@ -8,6 +8,7 @@
 
 #include <huxerui/external_texture.h>
 #include <huxerui/file.h>
+#include <huxerui/media_codec.h>
 #include <huxerui/media_container.h>
 #include <huxerui/resource.h>
 #include <huxerui/task.h>
@@ -17,10 +18,12 @@
 #endif
 
 namespace media_preview {
+#ifdef MEDIA_PREVIEW_TEST_EXPORTS
 #if defined(__APPLE__) && TARGET_OS_OSX
 inline constexpr bool preview_reordered_export = true;
 #else
 inline constexpr bool preview_reordered_export = false;
+#endif
 #endif
 
 #if defined(__ANDROID__) || defined(__APPLE__) || defined(__EMSCRIPTEN__) || defined(_WIN32) || defined(__linux__)
@@ -92,11 +95,8 @@ float Seconds(huxerui::media::MediaTimestamp time);
 huxerui::media::MediaTimestamp TimeAt(float seconds);
 bool TrimAudio(huxerui::media::AudioFrame& frame, huxerui::media::MediaTimestamp target,
                std::optional<huxerui::media::MediaTimestamp> end);
-
-struct EditMapping {
-  huxerui::media::MediaPresentationRange media;
-  std::int64_t shift;
-};
+const huxerui::media::MediaTrack::Edit* EditAt(std::span<const huxerui::media::MediaTrack::Edit> edits,
+                                              huxerui::media::MediaTimestamp time);
 
 class AudioEditQueue {
 public:
@@ -104,12 +104,62 @@ public:
   void Reset();
   void Push(const huxerui::media::AudioFrame& frame);
   std::optional<huxerui::media::AudioFrame> Read(huxerui::media::MediaTimestamp start,
-      std::optional<huxerui::media::MediaTimestamp> end);
+      const huxerui::media::AudioFormat& format, bool drained);
 
 private:
-  std::vector<EditMapping> edits_;
+  std::vector<huxerui::media::MediaTrack::Edit> edits_;
+  std::vector<huxerui::media::MediaPresentationSlice> slices_;
   std::deque<huxerui::media::AudioFrame> ready_;
   std::optional<std::int64_t> next_;
+  std::optional<huxerui::media::MediaTimestamp> trailing_end_;
+};
+
+struct AudioDecodeStart {
+  huxerui::media::MediaSampleDescription description;
+  std::optional<huxerui::media::MediaTimestamp> first_audible_pts;
+};
+
+struct AudioInput {
+  using Item = std::variant<huxerui::media::ContainerPacket, AudioDecodeStart>;
+
+  explicit AudioInput(std::shared_ptr<const huxerui::File> file);
+  std::optional<Item> Read();
+  bool Seek(huxerui::media::MediaTimestamp target);
+
+  std::shared_ptr<const huxerui::File> file;
+  huxerui::media::MediaDemuxer source;
+  huxerui::media::MediaTrack track;
+  std::optional<huxerui::media::MediaPresentationRange> range;
+  huxerui::media::MediaTimestamp origin;
+  float duration = 0;
+};
+
+huxerui::media::AudioFormat PlaybackFormat(const huxerui::media::MediaSampleDescription& description);
+
+class AudioDecode {
+public:
+  explicit AudioDecode(std::shared_ptr<AudioInput> input);
+  huxerui::Task<bool> Seek(huxerui::media::MediaTimestamp target);
+  huxerui::Task<bool> Pump();
+
+  std::optional<huxerui::media::AudioFrame> frame;
+  bool ended = false;
+
+private:
+  void Configure(const AudioDecodeStart& start);
+
+  std::shared_ptr<AudioInput> input_;
+  huxerui::media::MediaTimestamp target_;
+  huxerui::media::AudioFormat format_;
+  std::optional<huxerui::media::AudioDecoder> decoder_;
+  std::optional<AudioDecodeStart> pending_start_;
+  std::optional<huxerui::media::ContainerPacket> pending_;
+  std::optional<huxerui::media::MediaTimestamp> first_audible_pts_;
+  std::optional<std::int64_t> next_pts_;
+  std::deque<huxerui::media::MediaPresentationRange> windows_;
+  std::optional<AudioEditQueue> edits_;
+  bool sealed_ = false;
+  bool drained_ = false;
 };
 
 std::shared_ptr<const huxerui::File> TemporaryFile(const huxerui::File& directory, std::string_view suffix);
@@ -123,12 +173,14 @@ huxerui::Task<void> PlayContainer(std::shared_ptr<const huxerui::File> file, Cli
 huxerui::Task<void> PlayAudio(std::shared_ptr<const huxerui::File> file, ClipControls controls);
 huxerui::Task<std::shared_ptr<const huxerui::File>> CopyAudioClip(
     std::shared_ptr<const huxerui::File> file, huxerui::File temporary);
-huxerui::Task<std::shared_ptr<const huxerui::File>> ExportWave(
-    std::shared_ptr<const huxerui::File> file, huxerui::File temporary);
 huxerui::Task<std::shared_ptr<const huxerui::File>> CopyClip(
     std::shared_ptr<const huxerui::File> file, huxerui::File temporary,
     std::optional<huxerui::media::ContainerFormat> format = {});
+#ifdef MEDIA_PREVIEW_TEST_EXPORTS
+huxerui::Task<std::shared_ptr<const huxerui::File>> ExportWave(
+    std::shared_ptr<const huxerui::File> file, huxerui::File temporary);
 huxerui::Task<std::shared_ptr<const huxerui::File>> ExportClip(
     std::shared_ptr<const huxerui::File> file, huxerui::File temporary, bool reorder = false,
     huxerui::media::VideoStorage storage = huxerui::media::VideoStorage::Cpu);
+#endif
 }

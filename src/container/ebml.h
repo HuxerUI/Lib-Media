@@ -58,7 +58,7 @@ std::string_view Text(ByteView data);
 std::int64_t SignedTime(std::uint64_t value);
 std::int64_t ScaleTime(std::int64_t ticks, std::uint64_t scale);
 std::int64_t ToNs(MediaTimestamp time);
-std::optional<MediaTimestamp> CodecDuration(const MediaTrack& track, ByteView packet, ContainerErrorCode error);
+std::optional<MediaTimestamp> CodecDuration(const MediaSampleDescription& track, ByteView packet, ContainerErrorCode error);
 
 void PutVint(Bytes& out, std::uint64_t value);
 void PutId(Bytes& out, std::uint32_t id);

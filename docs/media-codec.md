@@ -4,17 +4,19 @@
 [codec issue #20](https://github.com/HuxerUI/HuxerUI/issues/20). Link `HuxerUI::Media` with the installed public SDK.
 No `Install()`, View, Runtime, window, or application Task is needed. Existing MediaPlayer and photo-library APIs are unchanged.
 
-This guide covers AAC-LC, Opus, FLAC, and MP3 decoded to CPU PCM, and length-prefixed AVC and HEVC decoded to CPU YUV.
+This guide covers AAC-LC, Opus, FLAC, and MP3 decoded to CPU PCM, and AVC, HEVC, and supported VP9 decoded to CPU YUV.
 The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264 and HEVC. Codec sessions do not
 demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
 
-`VideoDecoderConfig::codec` uses `CodecId` from `<huxerui/media_format.h>` and defaults to `CodecId::H264`.
-Use `CodecId::H264` or `CodecId::Hevc`. Other identifiers return `InvalidArgument`. When decoding a
-supported demuxed track, assign `MediaTrack::codec` directly to the decoder configuration.
+`VideoDecoderConfig::codec` and `AudioDecoderConfig::codec` use `CodecId` from `<huxerui/media_format.h>`.
+They default to H.264 and AAC respectively. When reading from a container, use the codec and initialization
+data from the `MediaSampleDescription` selected by `TrackDecodeStart`. Audio also uses the sample rate and
+channel layout. [Container read and seek](media-container.md#read-and-seek)
 
-`AudioDecoderConfig::codec` uses the same `CodecId` and defaults to `CodecId::Aac`. Use the audio track's
-codec, `initialization_data`, sample rate, and channel layout to configure a demuxed stream.
+VP9 profile 0 accepts complete WebM packets with empty initialization data and CPU NV12 or I420 output
+on supported macOS hardware. Use `VideoDecoder::Probe()` for the source dimensions. Creation and reset
+require a key-marked VP9 key frame.
 
 For HEVC decoding, set `VideoDecoderConfig::codec` to `CodecId::Hevc` and supply an `hvcC` record with complete
 out-of-band VPS, SPS, and PPS for a single-layer stream. Request NV12 or I420 for Main and P010 for Main10.
@@ -160,7 +162,7 @@ cleanup and final callback dispatch. There is no blocking proxy to another event
   [AudioConverter priming information](https://developer.apple.com/documentation/audiotoolbox/audioconverterprimeinfo)
 - FLAC takes complete native frames and the 34-byte STREAMINFO payload. Sample rate and mono/stereo layout must
   match STREAMINFO. MP3 takes complete MPEG Layer III frames with empty initialization data. After a seek, start at
-  the demuxer's `decode_start` to rebuild the MP3 bit reservoir. Linux and Web remove synthesis delay from raw MP3
+  the demuxer's `decode_start_pts` to rebuild the MP3 bit reservoir. Linux and Web remove synthesis delay from raw MP3
   PCM and recover the trailing samples during drain. Apply the track's presentation interval to the resulting PCM.
 - AVC uses avcC and its 1-, 2-, or 4-byte NAL lengths. The initial subset is progressive 8-bit 4:2:0 Baseline/Main/High,
   continuous complete input, at most 16 reference pictures. An SPS may declare frame-number gaps allowed; that flag

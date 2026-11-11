@@ -7,21 +7,13 @@ Mp4EditTimeline Mp4Edits(std::span<const MediaTrack::Edit> edits, std::uint32_t 
                          std::uint32_t media_scale, ContainerErrorCode error) {
   if (edits.size() > MaxMp4Edits) Fail(ContainerErrorCode::LimitExceeded, "MP4 edit list exceeds its limit");
   Mp4EditTimeline timeline{CommonScale(movie_scale, media_scale), {}};
-  std::int64_t previous_media_end = 0;
   for (const auto& edit : edits) {
-    const auto length = ExactTicks(edit.duration, movie_scale);
-    if (length <= 0) Fail(error, "MP4 edit duration must be positive");
-    const auto duration = ExactTicks(edit.duration, timeline.scale);
-    const auto end = AddTime(timeline.duration, duration);
-    if (edit.media_start) {
-      ExactTicks(*edit.media_start, media_scale);
-      const auto start = ExactTicks(*edit.media_start, timeline.scale);
-      if (start < previous_media_end) Fail(error, "MP4 media edits must be forward and nonoverlapping");
-      timeline.segments.push_back({timeline.duration, end, start});
-      previous_media_end = AddTime(start, duration);
-    }
-    timeline.duration = end;
+    ExactTicks(edit.duration, movie_scale);
+    if (edit.media_start) ExactTicks(*edit.media_start, media_scale);
   }
+  timeline.duration = VisitEdits(edits, timeline.scale, error, [&](auto begin, auto end, auto media, auto) {
+    timeline.segments.push_back({begin, end, media});
+  });
   if (timeline.segments.empty()) Fail(error, "MP4 edit list has no media interval");
   return timeline;
 }

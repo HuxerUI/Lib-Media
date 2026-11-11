@@ -125,15 +125,16 @@ struct AudioDecoderConfig {
   CodecId codec = CodecId::Aac;
 };
 
-/// @brief Configuration for decoding length-prefixed video access units to retained frames.
+/// @brief Configuration for decoding video packets to retained frames.
 ///
 /// AVC supports Baseline, Main, and High profiles with at most 16 reference pictures and continuous frame
 /// numbering. HEVC supports single-layer Main and Main10 4:2:0. Probe the concrete configuration for platform
-/// support, storage, and pixel layout. A fresh or reset video session requires an IDR access unit.
+/// support, storage, and pixel layout. A fresh or reset session requires an AVC/HEVC IDR or a VP9 key frame.
 /// @see VideoDecoder::Create(), VideoDecoder::Probe()
 struct VideoDecoderConfig {
   /// Decoder configuration of at most 64 KiB, either avcC with SPS/PPS or hvcC with complete VPS/SPS/PPS arrays.
-  /// Every submitted picture uses the configuration's NAL length field size of 1, 2, or 4 bytes.
+  /// AVC and HEVC pictures use the configuration's NAL length field size of 1, 2, or 4 bytes.
+  /// VP9 profile 0 uses empty initialization data and complete VP9 packets from WebM.
   Bytes initialization_data;
   /// Maximum coded luma width in pixels, in [1, 8192]. The backend can impose smaller limits.
   /// Together with height, configures the codec and sizes output reservations. Use a new session for larger bounds.
@@ -150,9 +151,9 @@ struct VideoDecoderConfig {
   /// Optional teardown callback with the resource and lifetime contract of AudioDecoderConfig::cleanup_completed.
   /// Returned platform frames may retain their retired image pool independently of this callback.
   std::function<void(CodecResult<void>)> cleanup_completed;
-  /// Coding of the supplied configuration and access units. Use CodecId::H264 or CodecId::Hevc.
-  /// Other values return CodecErrorCode::InvalidArgument. QueryCapabilities() describes the H.264 adapter.
-  /// Use Probe() to check a particular HEVC configuration.
+  /// Coding of the supplied configuration and packets. Use CodecId::H264, CodecId::Hevc, or CodecId::Vp9.
+  /// VP9 profile 0 is available with CPU output on supported macOS hardware.
+  /// QueryCapabilities() describes H.264. Use Probe() to check a particular HEVC or VP9 configuration.
   CodecId codec = CodecId::H264;
   /// Selects the returned frame storage. Platform storage requires a compatible codec on macOS, iOS, Android,
   /// Windows, or Web. On Web, create, use, and release a platform decoder and its frames on the browser main thread.
@@ -661,7 +662,7 @@ private:
 
 /// @brief Move-only video decoder with bounded queues and retained video frames.
 ///
-/// Submit complete picture access units in decode order and begin each stream with a key-marked IDR. Output
+/// Submit complete picture packets in decode order. Begin each stream with a key-marked AVC/HEVC IDR or VP9 key frame. Output
 /// arrives in presentation order. Backends that need a 16-frame reordering window can hold frames until more input
 /// arrives or Finish() drains it. Android MediaCodec publishes surface output in presentation order.
 /// See AudioDecoder for the shared execution, callback, and handle ownership contract.
@@ -700,9 +701,10 @@ public:
   /// @brief Retires the session as in Close(). Internal state remains alive through asynchronous teardown.
   ~VideoDecoder();
 
-  /// @brief Queues one complete length-prefixed picture access unit without waiting for platform decoding.
-  /// @param packet Access unit in decode order, with valid timing and NAL lengths matching initialization_data.
-  /// The first packet after creation or reset must contain an IDR and set key_frame. Keep bytes unchanged until return.
+  /// @brief Queues one complete picture packet without waiting for platform decoding.
+  /// @param packet Packet in decode order with valid timing. AVC and HEVC NAL lengths match initialization_data.
+  /// The first packet after creation or reset must contain an AVC/HEVC IDR or VP9 key frame and set key_frame.
+  /// Keep bytes unchanged until return.
   /// @return Accepted after copying the packet. WouldBlock leaves it unconsumed while startup or reset is pending
   /// or input capacity is exhausted. Failure reports packet rejection, InvalidState while draining or ended,
   /// Closed after retirement or on a moved-from handle, or the recorded operational error after fatal failure.
@@ -727,7 +729,8 @@ public:
   /// @brief Discards pending input and output and schedules a fresh stream with the same video configuration.
   ///
   /// Previously returned frames retain storage and reservations. TrySubmit() returns WouldBlock until the new
-  /// stream is ready. Start it with a key-marked IDR. Use Create() to change coded bounds or initialization data.
+  /// stream is ready. Start it with a key-marked AVC/HEVC IDR or VP9 key frame.
+  /// Use Create() to change coded bounds or initialization data.
   /// @return Success when the reset is accepted or already pending. InvalidState during startup or after a fatal
   /// error. Closed after retirement or on a moved-from handle.
   /// @see AudioDecoder::Reset()

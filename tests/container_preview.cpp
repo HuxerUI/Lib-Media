@@ -26,7 +26,7 @@ using namespace std::chrono_literals;
 namespace {
 
 constexpr VideoRectangle EditedAperture{2, 2, 316, 236};
-constexpr MediaTrack::PixelAspectRatio EditedAspect{4, 3};
+constexpr MediaSampleDescription::PixelAspectRatio EditedAspect{4, 3};
 constexpr std::int64_t OriginalSamples = 192000;
 constexpr std::int64_t EditedSamples = 24000;
 
@@ -43,6 +43,8 @@ std::shared_ptr<const File> Fixture(const char* name) {
   return std::make_shared<const File>(File(MEDIA_FIXTURES).Child(name));
 }
 
+std::optional<ContainerPacket> ReadPacket(MediaDemuxer& demux);
+
 std::shared_ptr<const File> EditedClip(const File& source, const File& directory,
     MediaPresentationRange video_edit = {{1, 4}, {7, 2}}, std::optional<std::int64_t> audio_packet_end = {}) {
   auto input = Require(MediaDemuxer::Open(Require(source.OpenRandomAccess())));
@@ -52,28 +54,30 @@ std::shared_ptr<const File> EditedClip(const File& source, const File& directory
     return std::size_t(std::ranges::find(tracks, id, &MediaTrack::id) - tracks.begin());
   };
   std::array<std::vector<ContainerPacket>, 2> packets;
-  while (auto item = Require(input.Read())) {
-    auto& packet = std::get<ContainerPacket>(*item);
-    packets.at(index(packet.track_id)).push_back(std::move(packet));
-  }
+  while (auto packet = ReadPacket(input)) packets.at(index(packet->track_id)).push_back(std::move(*packet));
   for (std::size_t i = 0; i < tracks.size(); ++i) {
     auto& track = tracks[i];
+    const auto first_edit = std::ranges::find_if(track.edits, [](const auto& edit) { return edit.media_start.has_value(); });
+    const auto media_start = first_edit != track.edits.end() ? *first_edit->media_start : MediaTimestamp{0, 1};
     if (track.kind == TrackKind::Video) {
-      track.visible = EditedAperture;
-      track.pixel_aspect_ratio = EditedAspect;
-      track.presentation_edit = video_edit;
+      auto& description = track.descriptions.front();
+      description.visible = EditedAperture;
+      description.pixel_aspect_ratio = EditedAspect;
+      constexpr std::uint32_t clock = 90000;
+      const auto start = video_edit.start.Rescale(clock)->ticks, end = video_edit.end.Rescale(clock)->ticks;
+      track.edits = {{{start, clock}, {}},
+                    {{end - start, clock}, MediaTimestamp{media_start.Rescale(clock)->ticks + start, clock}}};
     }
     if (track.kind == TrackKind::Audio) {
+      Check(first_edit != track.edits.end(), "The AAC fixture needs an authored priming edit");
       if (audio_packet_end) {
         auto& last = packets[i].back();
-        const auto duration = *audio_packet_end - last.pts->Rescale(48000)->ticks;
+        const auto duration = *audio_packet_end + media_start.Rescale(48000)->ticks - last.pts->Rescale(48000)->ticks;
         Check(duration > 0 && MediaTimestamp{duration, 48000}.Compare(*last.duration) < 0,
               "The tail fixture must shorten the final AAC packet");
         last.duration = MediaTimestamp{duration, 48000};
-        track.padding_samples.reset();
       } else {
-        track.padding_samples = track.padding_samples.value_or(0) + OriginalSamples - EditedSamples;
-        track.presentation_edit->end = {EditedSamples, 48000};
+        first_edit->duration = {EditedSamples, 48000};
       }
       packets[i].front().sync_sample = false;
       packets[i].back().sync_sample = false;
@@ -174,59 +178,76 @@ void Until(testing::UiTest& ui, const std::exception_ptr& failure, Condition con
   Check(condition(), error);
 }
 
+void AppendPictureTimes(const MediaTrack& track, const ContainerPacket& packet, std::vector<MediaTimestamp>& times) {
+  const auto clock = packet.pts->timescale;
+  const auto end = MediaTimestamp{packet.pts->ticks + packet.duration->Rescale(clock)->ticks, clock};
+  std::vector<MediaPresentationSlice> slices;
+  Require(MapToPresentation(track.edits, *packet.pts, end, slices));
+  for (const auto& slice : slices) times.push_back(slice.presentation.start);
+}
+
 void CheckExport(const File& source, const File& output, std::int64_t audio_samples, bool reorder = false,
     VideoStorage storage = VideoStorage::Cpu) {
   auto input = Require(MediaDemuxer::Open(Require(source.OpenRandomAccess())));
   auto exported = Require(MediaDemuxer::Open(Require(output.OpenRead())));
   Check(exported.Format() == ContainerFormat::Mp4 && exported.Tracks().size() == 2,
         "Export is not a sequentially readable two-track MP4");
-  const auto audio = std::ranges::find(exported.Tracks(), CodecId::Aac, &MediaTrack::codec);
-  const auto video = std::ranges::find(exported.Tracks(), CodecId::H264, &MediaTrack::codec);
-  Check(audio != exported.Tracks().end() && video != exported.Tracks().end(), "Export lost the AAC or H.264 track");
+  const auto audio = std::ranges::find(exported.Tracks(), TrackKind::Audio, &MediaTrack::kind);
+  const auto video = std::ranges::find(exported.Tracks(), TrackKind::Video, &MediaTrack::kind);
+  Check(audio != exported.Tracks().end() && video != exported.Tracks().end() &&
+        audio->descriptions.front().codec == CodecId::Aac && video->descriptions.front().codec == CodecId::H264,
+        "Export lost the AAC or H.264 track");
   Check(exported.PresentationRange(audio->id) == MediaPresentationRange{{0, 1}, {audio_samples, 48000}},
         "Export changed the effective audio presentation range");
   const auto source_video = std::ranges::find(input.Tracks(), TrackKind::Video, &MediaTrack::kind);
-  Check(source_video != input.Tracks().end() && source_video->coded_width && source_video->coded_height,
-        "The source has no coded video dimensions");
-  auto expected = source_video->visible.value_or(
-      VideoRectangle{0, 0, *source_video->coded_width, *source_video->coded_height});
+  Check(source_video != input.Tracks().end(), "The source has no video");
+  const auto& original = source_video->descriptions.front();
+  const auto& encoded = video->descriptions.front();
+  auto expected = original.visible.value_or(VideoRectangle{0, 0, *original.coded_width, *original.coded_height});
   if (storage == VideoStorage::Platform) {
     expected.width = std::max(2u, (expected.width / 2) & ~1u);
     expected.height = std::max(2u, (expected.height / 2) & ~1u);
   }
-  const auto actual = video->visible.value_or(VideoRectangle{0, 0, *video->coded_width, *video->coded_height});
+  const auto actual = encoded.visible.value_or(VideoRectangle{0, 0, *encoded.coded_width, *encoded.coded_height});
   Check(actual == VideoRectangle{0, 0, expected.width, expected.height}, "Export lost the source's visible area");
-  Check(video->pixel_aspect_ratio == source_video->pixel_aspect_ratio, "Export changed the display aspect ratio");
-  Check(video->presentation_edit == input.PresentationRange(source_video->id) &&
-        exported.PresentationRange(video->id) == input.PresentationRange(source_video->id),
+  Check(encoded.pixel_aspect_ratio == original.pixel_aspect_ratio, "Export changed the display aspect ratio");
+  Check(exported.PresentationRange(video->id) == input.PresentationRange(source_video->id),
         "Export changed the effective video presentation range");
   std::vector<MediaTimestamp> input_pictures, exported_pictures;
-  while (auto item = Require(input.Read())) {
-    const auto& packet = std::get<ContainerPacket>(*item);
-    if (packet.track_id == video->id && packet.pts && packet.pts->ticks >= 0) input_pictures.push_back(*packet.pts);
+  std::size_t input_count = 0, output_count = 0;
+  while (auto packet = ReadPacket(input)) {
+    if (packet->track_id != source_video->id) continue;
+    ++input_count;
+    AppendPictureTimes(*source_video, *packet, input_pictures);
   }
-  std::int64_t coded_audio = 0;
-  std::optional<MediaTimestamp> last_dts;
+  std::int64_t audible_samples = 0;
+  std::vector<MediaPresentationSlice> slices;
+  std::optional<MediaTimestamp> last_dts, last_pts;
   bool reordered = false;
-  while (auto item = Require(exported.Read())) {
-    const auto& packet = std::get<ContainerPacket>(*item);
-    if (packet.track_id == video->id) {
-      Check(packet.pts && packet.dts && packet.duration, "Export lost video timing");
-      if (last_dts) Check(packet.dts->Compare(*last_dts) > 0, "Export DTS moved backwards");
-      if (!reorder) Check(packet.pts == packet.dts, "Export reorders its Baseline video");
-      if (!exported_pictures.empty()) reordered |= packet.pts->Compare(exported_pictures.back()) < 0;
-      last_dts = packet.dts;
-      exported_pictures.push_back(*packet.pts);
+  while (auto packet = ReadPacket(exported)) {
+    if (packet->track_id == video->id) {
+      Check(packet->pts && packet->dts && packet->duration, "Export lost video timing");
+      if (last_dts) Check(packet->dts->Compare(*last_dts) > 0, "Export DTS moved backwards");
+      if (!reorder) Check(packet->pts == packet->dts, "Export reorders its Baseline video");
+      if (last_pts) reordered |= packet->pts->Compare(*last_pts) < 0;
+      last_dts = packet->dts;
+      last_pts = packet->pts;
+      ++output_count;
+      AppendPictureTimes(*video, *packet, exported_pictures);
     } else {
-      coded_audio += packet.duration->Rescale(48000)->ticks;
+      const auto pts = packet->pts->Rescale(48000)->ticks;
+      Require(MapToPresentation(audio->edits, {pts, 48000},
+          {pts + packet->duration->Rescale(48000)->ticks, 48000}, slices));
+      for (const auto& slice : slices)
+        audible_samples += slice.presentation.end.Rescale(48000)->ticks - slice.presentation.start.Rescale(48000)->ticks;
     }
   }
   const auto earlier = [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; };
   std::ranges::sort(input_pictures, earlier);
   std::ranges::sort(exported_pictures, earlier);
-  Check(!input_pictures.empty() && input_pictures == exported_pictures, "Export changed picture presentation times");
-  Check(coded_audio - std::int64_t(audio->priming_samples.value_or(0) + audio->padding_samples.value_or(0)) == audio_samples,
-        "Export changed the trimmed audio length");
+  Check(input_count == output_count && !input_pictures.empty() && input_pictures == exported_pictures,
+        "Export changed picture presentation times");
+  Check(audible_samples == audio_samples, "Export changed the trimmed audio length");
   if (reorder) std::cout << "VideoToolbox reordered output: " << reordered << '\n';
 }
 
@@ -266,28 +287,32 @@ void CheckCopy(const File& source, const File& output, ContainerFormat format) {
   Check(copy.Format() == format && copy.Tracks().size() == original.Tracks().size(), "Packet copy changed the track set");
   for (const auto& track : original.Tracks()) {
     const auto found = std::ranges::find(copy.Tracks(), track.id, &MediaTrack::id);
-    Check(found != copy.Tracks().end() && found->codec == track.codec && found->sample_entry == track.sample_entry &&
-          found->initialization_data == track.initialization_data && found->visible == track.visible &&
-          found->rotation == track.rotation && found->pixel_aspect_ratio == track.pixel_aspect_ratio &&
-          found->video_extensions == track.video_extensions && found->presentation_edit == track.presentation_edit &&
+    Check(found != copy.Tracks().end() && found->rotation == track.rotation &&
           found->edits == track.edits && found->references == track.references &&
           copy.PresentationRange(track.id) == original.PresentationRange(track.id) &&
           found->priming_samples == track.priming_samples && found->padding_samples == track.padding_samples,
-          "Packet copy changed the track description or presentation metadata");
-    const auto descriptions = original.SampleDescriptions(track.id);
-    const auto copied = copy.SampleDescriptions(track.id);
+          "Packet copy changed the track or its presentation metadata");
+    const auto& descriptions = track.descriptions;
+    const auto& copied = found->descriptions;
     Check(descriptions.size() == copied.size(), "Packet copy lost a sample description");
-    for (std::size_t i = 0; i < descriptions.size(); ++i)
-      Check(descriptions[i].initialization_data == copied[i].initialization_data &&
-            descriptions[i].coded_width == copied[i].coded_width && descriptions[i].coded_height == copied[i].coded_height,
+    for (std::size_t i = 0; i < descriptions.size(); ++i) {
+      const auto& a = descriptions[i];
+      const auto& b = copied[i];
+      Check(a.codec == b.codec && a.sample_entry == b.sample_entry && a.visible == b.visible &&
+            a.pixel_aspect_ratio == b.pixel_aspect_ratio && a.video_extensions == b.video_extensions &&
+            a.initialization_data == b.initialization_data && a.coded_width == b.coded_width && a.coded_height == b.coded_height,
             "Packet copy changed a sample description");
+    }
     auto before = open(source), after = open(output);
     Require(before.SelectTracks(std::span(&track.id, 1)));
     Require(after.SelectTracks(std::span(&track.id, 1)));
     while (const auto expected = ReadPacket(before)) {
       const auto actual = ReadPacket(after);
+      const bool duration_matches = actual && (actual->duration == expected->duration ||
+          (format == ContainerFormat::WebM && actual->duration && expected->duration &&
+           std::abs(media_preview::Ticks(*actual->duration, 1000000) - media_preview::Ticks(*expected->duration, 1000000)) <= 1000));
       Check(actual && actual->track_id == expected->track_id && actual->pts == expected->pts &&
-            actual->dts == expected->dts && actual->duration == expected->duration &&
+            actual->dts == expected->dts && duration_matches && actual->discard_padding == expected->discard_padding &&
             actual->sync_sample == expected->sync_sample &&
             actual->sample_description_index == expected->sample_description_index &&
             std::ranges::equal(actual->data.AsBytes(), expected->data.AsBytes()), "Packet copy changed access units or timing");
@@ -324,11 +349,11 @@ void CheckAudioCopy(const TaskScope& tasks, testing::UiTest& ui, const File& tem
 #endif
   auto copy = media_preview::Open(*result->file);
   const auto tracks = copy.Tracks();
-  const auto& tags = tracks.front().audio_metadata;
-  Check(copy.Format() == source.Format() && tracks.front().codec == original.codec &&
+  const auto tags = copy.AudioMetadata();
+  Check(copy.Format() == source.Format() && tracks.front().descriptions.front().codec == original.descriptions.front().codec &&
         copy.PresentationRange(tracks.front().id) == expected_range, "Audio packet copy changed the format or presentation range");
-  if (original.audio_metadata)
-    Check(tags && tags->title == original.audio_metadata->title && tags->cover, "Audio packet copy lost cover metadata");
+  if (const auto source_tags = source.AudioMetadata())
+    Check(tags && tags->title == source_tags->title && tags->cover, "Audio packet copy lost cover metadata");
   while (const auto expected = ReadPacket(source)) {
     const auto actual = ReadPacket(copy);
     Check(actual && actual->pts == expected->pts && actual->dts == expected->dts && actual->duration == expected->duration &&
@@ -347,24 +372,27 @@ void CheckAudioCopy(const TaskScope& tasks, testing::UiTest& ui, const File& tem
 }
 
 void CheckFragmentedTrim(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
-  for (const bool edited : {false, true}) {
+  enum class Edits { Trim, InnerGap, OuterGaps };
+  for (const auto edits : {Edits::Trim, Edits::InnerGap, Edits::OuterGaps}) {
     auto source = media_preview::Open(*Fixture("fragmented-aac.m4a"));
     auto track = source.Tracks().front();
-    const auto scale = *track.sample_rate;
+    const auto scale = *track.descriptions.front().sample_rate;
     constexpr std::int64_t head = 128, tail = 173, original = 22624;
+    constexpr std::int64_t leading = 512, trailing = 768;
     std::int64_t samples = original - head - tail;
-    if (edited) {
+    if (edits == Edits::InnerGap) {
       track.edits = {{{1024, scale}, MediaTimestamp{head, scale}}, {{256, scale}, {}},
                      {{1024, scale}, MediaTimestamp{8192, scale}}};
       samples = 2304;
+    } else if (edits == Edits::OuterGaps) {
+      track.edits = {{{leading, scale}, {}}, {{samples, scale}, MediaTimestamp{head, scale}}, {{trailing, scale}, {}}};
+      samples += leading + trailing;
     } else {
-      track.presentation_edit = MediaPresentationRange{{head, scale}, {original - tail, scale}};
-      track.priming_samples = head;
-      track.padding_samples = tail;
+      track.edits = {{{original - head - tail, scale}, MediaTimestamp{head, scale}}};
     }
     const auto input = media_preview::TemporaryFile(temporary, ".m4a");
     auto mux = Require(MediaMuxer::Open(Require(input->OpenWrite()), ContainerFormat::Mp4, std::span(&track, 1),
-                                       ContainerLayout::Fragmented));
+                                       {.layout = ContainerLayout::Fragmented}));
     while (auto packet = ReadPacket(source)) Check(!Require(mux.TryWrite(*packet)), "Fragmented AAC write blocked");
     Require(mux.Finish());
     std::shared_ptr<const File> output;
@@ -376,14 +404,20 @@ void CheckFragmentedTrim(const TaskScope& tasks, testing::UiTest& ui, const File
     Until(ui, failure, [&] { return bool(output); }, "Fragmented AAC could not export a trimmed WAV");
     const auto wave = media_preview::Open(*output);
     Check(wave.Duration() == MediaTimestamp{samples, scale}, "Fragmented AAC WAV has the wrong sample count");
-    if (edited) {
+    const auto check_silence = [&](std::int64_t position, std::size_t length) {
       auto seek = media_preview::Open(*output);
-      Check(Require(seek.Seek(seek.Tracks().front().id, {1024, scale})).has_value(), "Cannot locate the empty audio edit");
+      Check(Require(seek.Seek(seek.Tracks().front().id, {position, scale})).has_value(), "Cannot locate the empty audio edit");
       const auto packet = ReadPacket(seek);
-      Check(packet && packet->data.AsBytes().size() >= 256 * 4 &&
-            std::ranges::all_of(packet->data.AsBytes().first(256 * 4), [](std::byte value) {
+      const auto bytes = length * *track.descriptions.front().channel_count * sizeof(std::int16_t);
+      Check(packet && packet->data.AsBytes().size() >= bytes &&
+            std::ranges::all_of(packet->data.AsBytes().first(bytes), [](std::byte value) {
         return value == std::byte{0};
       }), "The empty audio edit did not produce silence");
+    };
+    if (edits == Edits::InnerGap) check_silence(1024, 256);
+    if (edits == Edits::OuterGaps) {
+      check_silence(0, leading);
+      check_silence(samples - trailing, trailing);
     }
     exporting.Cancel();
   }
@@ -427,13 +461,11 @@ void CheckDescriptionPreview(const TaskScope& tasks, testing::UiTest& ui, const 
   auto [second, second_packet] = read_idr(small);
   first.id = second.id = 1;
   first.timescale = second.timescale = 8;
-  first.presentation_edit = second.presentation_edit = {};
-  first.edits = second.edits = {{{4, 8}, MediaTimestamp{2, 8}}, {{1, 8}, {}}, {{4, 8}, MediaTimestamp{8, 8}}};
-  second.sample_description_index = 2;
-  const std::array descriptions{first, second};
+  first.edits = {{{4, 8}, MediaTimestamp{2, 8}}, {{1, 8}, {}}, {{4, 8}, MediaTimestamp{8, 8}}};
+  first.descriptions.push_back(second.descriptions.front());
   const auto clip = media_preview::TemporaryFile(temporary, ".mp4");
   auto mux = Require(MediaMuxer::Open(Require(clip->OpenRandomAccess(FileAccessMode::ReadWrite)),
-                                     ContainerFormat::Mp4, descriptions));
+                                     ContainerFormat::Mp4, std::span(&first, 1)));
   for (int i = 0; i < 16; ++i) {
     auto packet = i < 8 ? first_packet : second_packet;
     packet.track_id = first.id;
@@ -447,15 +479,15 @@ void CheckDescriptionPreview(const TaskScope& tasks, testing::UiTest& ui, const 
   Observations seen;
   std::exception_ptr failure;
   const auto preview = Play(tasks, clip, seen, failure);
-  Until(ui, failure, [&] { return seen.format && seen.format->width == *first.coded_width; },
+  Until(ui, failure, [&] { return seen.format && seen.format->width == *first.descriptions.front().coded_width; },
         "Preview missed the first AVC configuration");
   Check(seen.first_frame == MediaTimestamp{0, 8}, "Preview did not project the first edit to its presentation start");
-  Until(ui, failure, [&] { return seen.format && seen.format->width == *second.coded_width; },
+  Until(ui, failure, [&] { return seen.format && seen.format->width == *second.descriptions.front().coded_width; },
         "Preview did not drain and switch AVC configuration");
   Check(seen.first_frame && seen.first_frame->Compare({5, 8}) >= 0,
         "Preview presented the new configuration before the second edit");
   seen.paused = true;
-  for (const auto [target, width] : {std::pair{0.125F, *first.coded_width}, {0.75F, *second.coded_width}}) {
+  for (const auto [target, width] : {std::pair{0.125F, *first.descriptions.front().coded_width}, {0.75F, *second.descriptions.front().coded_width}}) {
     const auto epoch = seen.epoch;
     seen.seek = target;
     Until(ui, failure, [&] { return seen.epoch > epoch && seen.first_frame && seen.format && seen.format->width == width; },
@@ -469,13 +501,12 @@ void CheckDescriptionPreview(const TaskScope& tasks, testing::UiTest& ui, const 
   // An unused trex default can describe HDR even when the actual first sample is SDR.
   first.edits.clear();
   second.edits.clear();
-  std::erase_if(first.video_extensions, [](const auto& extension) { return extension.type == "colr"; });
-  first.video_extensions.push_back({"colr", {std::byte{'n'}, std::byte{'c'}, std::byte{'l'}, std::byte{'x'},
+  std::erase_if(first.descriptions.front().video_extensions, [](const auto& extension) { return extension.type == "colr"; });
+  first.descriptions.front().video_extensions.push_back({"colr", {std::byte{'n'}, std::byte{'c'}, std::byte{'l'}, std::byte{'x'},
       std::byte{0}, std::byte{9}, std::byte{0}, std::byte{16}, std::byte{0}, std::byte{9}, std::byte{0}}});
-  const std::array fragment_descriptions{first, second};
   const auto fragmented = media_preview::TemporaryFile(temporary, ".mp4");
   auto fragments = Require(MediaMuxer::Open(Require(fragmented->OpenWrite()), ContainerFormat::Mp4,
-                                           fragment_descriptions, ContainerLayout::Fragmented));
+                                           std::span(&first, 1), {.layout = ContainerLayout::Fragmented}));
   second_packet.track_id = second.id;
   second_packet.pts = second_packet.dts = MediaTimestamp{0, 8};
   second_packet.duration = MediaTimestamp{1, 8};
@@ -483,12 +514,12 @@ void CheckDescriptionPreview(const TaskScope& tasks, testing::UiTest& ui, const 
   Check(!Require(fragments.TryWrite(second_packet)), "Fragmented description fixture write blocked");
   Require(fragments.Finish());
   auto reader = media_preview::Open(*fragmented);
-  Check(reader.Tracks().front().sample_description_index == 1 &&
-        std::get<MediaTrack>(*Require(reader.Read())).sample_description_index == 2,
+  Check(reader.Tracks().front().descriptions.size() == 2 &&
+        std::get<TrackDecodeStart>(*Require(reader.Read())).sample_description_index == 2,
         "The fragmented fixture did not override its default description");
   seen = {};
   const auto sdr_preview = Play(tasks, fragmented, seen, failure);
-  Until(ui, failure, [&] { return seen.format && seen.format->width == *second.coded_width && seen.duration == 0.125F; },
+  Until(ui, failure, [&] { return seen.format && seen.format->width == *second.descriptions.front().coded_width && seen.duration == 0.125F; },
         "Preview did not use the first packet's SDR configuration and discovered duration");
   sdr_preview.Cancel();
   ui.Pump();
@@ -516,10 +547,38 @@ bool CodecAvailable(testing::UiTest& ui, const Config& config, Probe probe, cons
   return false;
 }
 
-VideoDecoderConfig VideoFixtureConfig(const MediaTrack& track, VideoPixelFormat output, VideoStorage storage) {
+VideoDecoderConfig VideoFixtureConfig(const MediaSampleDescription& track, VideoPixelFormat output, VideoStorage storage) {
   return {.initialization_data = track.initialization_data, .width = *track.coded_width,
       .height = *track.coded_height, .output = output, .codec = track.codec, .output_storage = storage};
 }
+
+#if defined(__APPLE__) && TARGET_OS_OSX
+void CheckNoCuesPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+  const auto input = Fixture("preview-vp9-opus-no-cues.webm");
+  const auto copy = RunMovieExport(tasks, ui, temporary, input, ContainerFormat::WebM);
+  CheckCopy(*input, *copy, ContainerFormat::WebM);
+  auto source = media_preview::Open(*input);
+  const auto config = VideoFixtureConfig(source.Tracks().front().descriptions.front(), VideoPixelFormat::NV12, VideoStorage::Cpu);
+  if (!CodecAvailable(ui, config, VideoDecoder::Probe, "VP9 profile 0 decoder")) return;
+  Observations seen;
+  std::exception_ptr failure;
+  const auto playing = Play(tasks, input, seen, failure);
+  Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.15F; },
+        "VP9/Opus preview did not start on a WebM without Cues");
+  for (const float target : {1.11F, 0.18F, 0.78F}) {
+    const auto epoch = seen.epoch;
+    seen.seek = target;
+    Until(ui, failure, [&] { return seen.epoch > epoch && seen.first_frame && seen.position > target + 0.02F; },
+          "VP9/Opus playback did not resume after seeking without Cues");
+    Check(media_preview::Seconds(*seen.first_frame) >= target - 0.001F &&
+          media_preview::Seconds(*seen.first_frame) < target + 0.1F,
+          "VP9 seek published a picture outside the target frame interval");
+  }
+  playing.Cancel();
+  ui.Pump();
+  std::cout << "VP9/Opus WebM without Cues passed preview, repeated seek, and packet-copy readback\n";
+}
+#endif
 
 void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
@@ -530,10 +589,10 @@ void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File
   const auto input = Fixture("preview-hevc-main.mp4");
   auto source = media_preview::Open(*input);
   const auto& track = source.Tracks().front();
-  auto decode = VideoFixtureConfig(track, VideoPixelFormat::NV12, storage);
+  auto decode = VideoFixtureConfig(track.descriptions.front(), VideoPixelFormat::NV12, storage);
   constexpr bool scale = storage == VideoStorage::Platform && media_preview::gpu_video_scaling_supported;
-  const auto width = scale ? (*track.coded_width / 2) & ~1u : *track.coded_width;
-  const auto height = scale ? (*track.coded_height / 2) & ~1u : *track.coded_height;
+  const auto width = scale ? (*track.descriptions.front().coded_width / 2) & ~1u : *track.descriptions.front().coded_width;
+  const auto height = scale ? (*track.descriptions.front().coded_height / 2) & ~1u : *track.descriptions.front().coded_height;
 #ifdef __EMSCRIPTEN__
   decode.output = VideoPixelFormat::Opaque;
 #endif
@@ -555,7 +614,7 @@ void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File
   const auto output = RunMovieExport(tasks, ui, temporary, input, {}, media_preview::preview_reordered_export, storage);
   auto result = media_preview::Open(*output);
   const auto& encoded = result.Tracks().front();
-  Check(encoded.codec == CodecId::Hevc && encoded.sample_entry == "hvc1", "HEVC export changed its format");
+  Check(encoded.descriptions.front().codec == CodecId::Hevc && encoded.descriptions.front().sample_entry == "hvc1", "HEVC export changed its format");
   const auto source_range = source.PresentationRange(track.id), result_range = result.PresentationRange(encoded.id);
   if (source_range && result_range && source_range != result_range) {
     const auto print = [](const MediaPresentationRange& range) {
@@ -566,10 +625,10 @@ void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File
     print(*result_range);
   }
   Check(source_range == result_range, "HEVC export changed its presentation range");
-  const auto visible = encoded.visible.value_or(VideoRectangle{0, 0, *encoded.coded_width, *encoded.coded_height});
+  const auto visible = encoded.descriptions.front().visible.value_or(VideoRectangle{0, 0, *encoded.descriptions.front().coded_width, *encoded.descriptions.front().coded_height});
   Check(visible == VideoRectangle{0, 0, width, height}, "HEVC export changed the requested visible dimensions");
   std::vector<MediaTimestamp> expected_pts, actual_pts;
-  while (const auto packet = ReadPacket(source)) expected_pts.push_back(*packet->pts);
+  while (const auto packet = ReadPacket(source)) AppendPictureTimes(track, *packet, expected_pts);
   std::optional<MediaTimestamp> last_dts;
   while (const auto packet = ReadPacket(result)) {
     Check(packet->pts && packet->dts && packet->duration &&
@@ -578,8 +637,9 @@ void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File
     Check(packet->pts == packet->dts, "Web HEVC export did not preserve presentation order");
 #endif
     last_dts = packet->dts;
-    actual_pts.push_back(*packet->pts);
+    AppendPictureTimes(encoded, *packet, actual_pts);
   }
+  std::ranges::sort(expected_pts, [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; });
   std::ranges::sort(actual_pts, [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; });
   Check(!expected_pts.empty() && actual_pts == expected_pts, "HEVC export changed the picture presentation times");
   std::cout << "HEVC Main preview export preserved " << actual_pts.size() << " picture times\n";
@@ -591,10 +651,10 @@ void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& 
   auto track = source.Tracks().front();
   const auto pre_skip = track.priming_samples.value();
   track.priming_samples = 0;
-  track.initialization_data[10] = track.initialization_data[11] = std::byte{};
+  track.descriptions.front().initialization_data[10] = track.descriptions.front().initialization_data[11] = std::byte{};
   auto mux = Require(MediaMuxer::Open(Require(link->OpenWrite()), ContainerFormat::Ogg, std::span(&track, 1)));
-  while (auto item = Require(source.Read())) {
-    auto packet = std::get<ContainerPacket>(std::move(*item));
+  while (auto item = ReadPacket(source)) {
+    auto packet = std::move(*item);
     packet.pts->ticks += static_cast<std::int64_t>(pre_skip);
     Check(!Require(mux.TryWrite(packet)), "Zero-pre-skip link requested another track");
   }
@@ -605,8 +665,9 @@ void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& 
   links.insert(links.end(), next.begin(), next.end());
   Check(chain->WriteBytes(links), "Could not stage the chained audio fixture");
   const auto streaming = Fixture("streaming-opus.webm");
+  const auto unindexed_av = Fixture("preview-vp9-opus-no-cues.webm");
   const auto mp3 = Fixture("tagged-mp3.mp3");
-  auto no_index = media_preview::Open(*streaming);
+  auto no_index = Require(MediaDemuxer::Open(Require(streaming->OpenRead())));
   const auto unavailable = no_index.FindSeekPoint(1, {0, 1});
   Check(!no_index.Duration() && !unavailable.Succeeded() && unavailable.Error().code == ContainerErrorCode::IndexUnavailable,
         "Streaming WebM unexpectedly has a duration or seek index");
@@ -618,11 +679,12 @@ void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& 
       Sample{chain, {107376 + 34344, 48000}},
       Sample{Fixture("webm-opus.webm"), {247200, 48000}},
       Sample{streaming, {35880, 48000}},
+      Sample{unindexed_av, {72000, 48000}},
       Sample{Fixture("tagged-flac.flac"), {50142, 44100}},
       Sample{mp3, {50142, 44100}},
       Sample{Fixture("tagged-aac.m4a"), {52800, 48000}}};
   const auto check_signal = [](MediaDemuxer& output, const char* message) {
-    const auto packet = std::get<ContainerPacket>(Require(output.Read()).value());
+    const auto packet = ReadPacket(output).value();
     const auto bytes = packet.data.AsBytes();
     constexpr auto sample_bytes = 120 * 2 * sizeof(std::int16_t);
     Check(bytes.size() >= sample_bytes, "WAV packet is too short for the signal check");
@@ -648,8 +710,8 @@ void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& 
       } catch (...) { failure = std::current_exception(); }
     });
     Until(ui, failure, [&] { return position > 0.03F; }, "Audio preview did not advance its PCM clock");
-    if (sample.file == streaming) {
-      Check(duration == 0, "Streaming WebM reported a known duration");
+    if (sample.file == streaming || sample.file == unindexed_av) {
+      Check(duration < 0.2F, "Streaming WebM scanned to discover duration before preview");
     } else {
       Check(std::abs(duration - media_preview::Seconds(sample.duration)) < 0.01F, "Wrong audio preview duration");
       if (sample.file == chain)
@@ -670,11 +732,11 @@ void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& 
     Until(ui, failure, [&] { return bool(wave); }, "Audio preview could not export a WAV");
     auto output = media_preview::Open(*wave);
     Check(output.Format() == ContainerFormat::Wave && output.Duration() == sample.duration &&
-          output.Tracks().front().codec == CodecId::PcmS16Le,
+          output.Tracks().front().descriptions.front().codec == CodecId::PcmS16Le,
           "Audio WAV readback lost PCM samples or trim");
     if (sample.file == chain) {
       Check(Require(output.Seek(1, {107376, 48000})).has_value(), "Could not read the second link's first samples");
-      Check(std::holds_alternative<MediaTrack>(Require(output.Read()).value()), "WAV seek lost its description");
+      Check(std::holds_alternative<TrackDecodeStart>(Require(output.Read()).value()), "WAV seek lost its description");
       check_signal(output, "The first packet of the zero-pre-skip link lost its decoded signal");
     }
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
@@ -698,6 +760,9 @@ int main(int argc, char** argv) {
     });
     testing::UiTest ui(app);
     const File temporary(std::filesystem::temp_directory_path().u8string());
+#if defined(__APPLE__) && TARGET_OS_OSX
+    CheckNoCuesPreview(tasks, ui, temporary);
+#endif
     CheckAudioCopy(tasks, ui, temporary, "tagged-mp3.mp3");
     CheckAudioCopy(tasks, ui, temporary, "tagged-aac.m4a");
     CheckAudioCopy(tasks, ui, temporary, "fragmented-aac.m4a");
@@ -751,7 +816,7 @@ int main(int argc, char** argv) {
 
     const auto main10 = Fixture("preview-hevc10.mov");
     const auto main10_source = media_preview::Open(*main10);
-    const auto main10_decode = VideoFixtureConfig(main10_source.Tracks().front(), VideoPixelFormat::P010, VideoStorage::Cpu);
+    const auto main10_decode = VideoFixtureConfig(main10_source.Tracks().front().descriptions.front(), VideoPixelFormat::P010, VideoStorage::Cpu);
     const auto main10_available = CodecAvailable(ui, main10_decode, VideoDecoder::Probe, "HEVC Main10 preview decoder");
     if (main10_available) {
       seen = {};
@@ -787,9 +852,14 @@ int main(int argc, char** argv) {
     constexpr auto shortened_samples = OriginalSamples - 22;
     const auto first_picture = EditedClip(*mp4, temporary, first_picture_edit, shortened_samples);
     auto short_input = Require(MediaDemuxer::Open(Require(first_picture->OpenRandomAccess())));
+    const auto short_video = std::ranges::find(short_input.Tracks(), TrackKind::Video, &MediaTrack::kind);
+    const auto clipped_sync = Require(short_input.FindSeekPoint(short_video->id, {0, 1}, SeekDirection::AtOrAfter));
+    Check(clipped_sync && clipped_sync->presentation_time == first_picture_edit.start &&
+          clipped_sync->decode_start_pts.Compare(*short_video->edits.back().media_start) < 0,
+          "Forward seek lost the decode start of an edit inside the first picture");
     const auto short_audio = std::ranges::find(short_input.Tracks(), TrackKind::Audio, &MediaTrack::kind);
-    Check(short_audio != short_input.Tracks().end() && short_audio->presentation_edit &&
-          short_audio->presentation_edit->end == MediaTimestamp{OriginalSamples, 48000} &&
+    Check(short_audio != short_input.Tracks().end() && !short_audio->edits.empty() &&
+          short_audio->edits.back().duration == MediaTimestamp{OriginalSamples, 48000} &&
           short_input.PresentationRange(short_audio->id) == MediaPresentationRange{{0, 1}, {shortened_samples, 48000}},
           "AAC presentation range extended past the shortened final packet");
     seen = {};
@@ -817,10 +887,10 @@ int main(int argc, char** argv) {
     const auto hlg = Fixture("preview-hevc-hlg.mov");
     const auto hdr = Require(MediaDemuxer::Open(Require(hlg->OpenRandomAccess())));
     const auto& hdr_track = hdr.Tracks().front();
-    Check(hdr_track.pixel_aspect_ratio == MediaTrack::PixelAspectRatio{4, 3}, "HLG fixture lost its pixel aspect");
+    Check(hdr_track.descriptions.front().pixel_aspect_ratio == MediaSampleDescription::PixelAspectRatio{4, 3}, "HLG fixture lost its pixel aspect");
     for (const auto box : {"colr", "dvvC"}) {
-      Check(std::ranges::find(hdr_track.video_extensions, box, &MediaTrack::VideoExtension::type) !=
-            hdr_track.video_extensions.end(), "HLG fixture lost a color or Dolby Vision extension");
+      Check(std::ranges::find(hdr_track.descriptions.front().video_extensions, box, &MediaSampleDescription::VideoExtension::type) !=
+            hdr_track.descriptions.front().video_extensions.end(), "HLG fixture lost a color or Dolby Vision extension");
     }
     const auto hdr_copy = run_export(hlg, ContainerFormat::Mp4);
     CheckCopy(*hlg, *hdr_copy, ContainerFormat::Mp4);
@@ -833,10 +903,10 @@ int main(int argc, char** argv) {
       const auto main10_export = run_export(main10, {}, media_preview::preview_reordered_export);
       const auto hevc = media_preview::Open(*main10_export);
       const auto& encoded_track = hevc.Tracks().front();
-      Check(encoded_track.codec == CodecId::Hevc && encoded_track.sample_entry == "hvc1" &&
+      Check(encoded_track.descriptions.front().codec == CodecId::Hevc && encoded_track.descriptions.front().sample_entry == "hvc1" &&
             encoded_track.rotation == VideoRotation::Clockwise90 &&
-            encoded_track.initialization_data.size() > 17 &&
-            (std::to_integer<unsigned>(encoded_track.initialization_data[17]) & 7) == 2,
+            encoded_track.descriptions.front().initialization_data.size() > 17 &&
+            (std::to_integer<unsigned>(encoded_track.descriptions.front().initialization_data[17]) & 7) == 2,
             "Main10 export lost its codec, rotation, or bit depth");
     }
     CheckAudioPreview(tasks, ui, temporary);

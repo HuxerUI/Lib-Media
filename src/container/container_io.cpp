@@ -223,4 +223,51 @@ std::optional<SeekPoint> ContainerReader::Find(std::uint32_t, MediaTimestamp, Se
   Fail(ContainerErrorCode::IndexUnavailable, "This layout has no covered seek index");
 }
 
+std::uint32_t ContainerReader::RegisterAudioDescription(MediaTrack& track, MediaSampleDescription description) {
+  auto& descriptions = track.descriptions;
+  const auto existing = std::ranges::find(descriptions, description.initialization_data,
+                                          &MediaSampleDescription::initialization_data);
+  if (existing != descriptions.end()) return static_cast<std::uint32_t>(existing - descriptions.begin()) + 1;
+  descriptions.push_back(std::move(description));
+  return static_cast<std::uint32_t>(descriptions.size());
+}
+
 } // namespace huxerui::media::detail
+
+namespace huxerui::media {
+
+ContainerResult<void> MapToPresentation(std::span<const MediaTrack::Edit> edits, MediaTimestamp media_begin,
+                                        MediaTimestamp media_end, std::vector<MediaPresentationSlice>& output) {
+  using namespace detail;
+  constexpr auto invalid = ContainerErrorCode::InvalidArgument;
+  output.clear();
+  auto result = ContainerCall<void>([&] {
+    if (!media_begin.timescale || !media_end.timescale || media_begin.Compare(media_end) > 0)
+      Fail(invalid, "Invalid media interval");
+    if (media_begin == media_end) return;
+    if (edits.empty()) {
+      output.push_back({media_begin, {media_begin, media_end}});
+      return;
+    }
+    const auto reduced_scale = [](MediaTimestamp time) -> std::uint32_t {
+      if (!time.timescale) Fail(invalid, "Zero presentation edit timescale");
+      const auto remainder = time.ticks % time.timescale;
+      return time.timescale / std::gcd<std::int64_t>(time.timescale, remainder);
+    };
+    auto scale = CommonScale(reduced_scale(media_begin), reduced_scale(media_end));
+    for (const auto& edit : edits) {
+      scale = CommonScale(scale, reduced_scale(edit.duration));
+      if (edit.media_start) scale = CommonScale(scale, reduced_scale(*edit.media_start));
+    }
+    const auto first = ExactTicks(media_begin, scale), last = ExactTicks(media_end, scale);
+    VisitEdits(edits, scale, invalid, [&](auto begin, auto, auto media, auto media_end) {
+      const auto low = std::max(first, media), high = std::min(last, media_end);
+      if (high > low) output.push_back({{low, scale},
+          {{AddTime(begin, low - media), scale}, {AddTime(begin, high - media), scale}}});
+    });
+  });
+  if (!result.Succeeded()) output.clear();
+  return result;
+}
+
+} // namespace huxerui::media

@@ -11,6 +11,9 @@ FFmpeg is a fixture-generation and interoperability tool for these tests.
 - `mkv-avc-aac.mkv` carries H.264 Main with reordered video, mono AAC-LC, and Cues.
 - `webm-vp8-opus.webm` carries VP8 and Opus with Cues and final discard padding.
 - `webm-vp9-opus.webm` carries VP9 and Opus with pre-skip, seek preroll, and final discard padding.
+- `preview-vp9-opus-no-cues.webm` carries 18 profile 0 VP9 pictures at 320x240 and 72000 audible Opus
+  samples. FFmpeg 9.0 wrote it through a pipe with no Cues or declared duration. Its last Opus Block
+  carries both the rounded audible BlockDuration and 648 samples of discard padding.
 - `webm-opus.webm` carries 247200 audible mono samples at 48 kHz with frequent Cues for testing preroll across
   Cluster boundaries. Its 258 coded packets each represent 960 samples, with 312 initial and 168 trailing samples trimmed.
 
@@ -33,6 +36,11 @@ ffmpeg -f lavfi -i testsrc2=size=64x48:rate=12:duration=1.25 \
 ffmpeg -f lavfi -i testsrc2=size=64x48:rate=12:duration=1.25 \
   -f lavfi -i sine=sample_rate=48000:duration=1.25 -c:v libvpx-vp9 -b:v 0 -crf 36 \
   -g 6 -lag-in-frames 0 -c:a libopus -b:a 32k webm-vp9-opus.webm
+ffmpeg -f lavfi -i 'testsrc2=size=320x240:rate=12:duration=1.5' \
+  -f lavfi -i 'sine=frequency=440:sample_rate=48000:duration=1.5' \
+  -c:v libvpx-vp9 -g 6 -lag-in-frames 0 -auto-alt-ref 0 -crf 40 -b:v 0 \
+  -pix_fmt yuv420p -colorspace bt709 -color_trc bt709 -color_primaries bt709 \
+  -c:a libopus -ac 1 -b:a 24k -cluster_time_limit 250 -live 1 -f webm pipe:1 > preview-vp9-opus-no-cues.webm
 ffmpeg -f lavfi -i sine=sample_rate=48000:duration=5.15 \
   -c:a libopus -b:a 16k -cluster_time_limit 250 webm-opus.webm
 ```

@@ -97,12 +97,13 @@ struct AudioPage {
 constexpr std::size_t MaxLinks = 4096;
 
 struct Link {
-  MediaTrack track;
+  MediaSampleDescription description;
+  std::uint16_t pre_skip = 0;
   std::uint32_t serial = 0;
   std::optional<std::int64_t> start;
   std::optional<std::int64_t> first;
 
-  std::int64_t Preskip() const { return static_cast<std::int64_t>(*track.priming_samples); }
+  std::int64_t Preskip() const { return pre_skip; }
   std::int64_t Time(std::int64_t granule) const {
     return AddTime(*start, SubTime(SubTime(granule, *first), Preskip()));
   }
@@ -144,11 +145,9 @@ Link ReadLink(ContainerInput& input, Cursor& cursor, std::optional<std::int64_t>
   if (count > fields.size() / 4) Fail(Bad, "Invalid OpusTags comment count");
   for (std::uint32_t i = 0; i < count; ++i) skip_string();
 
-  MediaTrack track{.id = 1, .kind = TrackKind::Audio, .codec = CodecId::Opus,
-                   .initialization_data = std::move(head.packets.front()), .timescale = Clock,
-                   .sample_rate = Clock, .channel_count = info.channels, .priming_samples = info.pre_skip,
-                   .seek_preroll = MediaTimestamp{Preroll, Clock}};
-  link.track = std::move(track);
+  link.description = {.codec = CodecId::Opus, .initialization_data = std::move(head.packets.front()),
+                      .sample_rate = Clock, .channel_count = info.channels};
+  link.pre_skip = info.pre_skip;
   return link;
 }
 
@@ -193,26 +192,29 @@ public:
   explicit OggReader(ContainerInput input) : ContainerReader(std::move(input), ContainerFormat::Ogg) {
     origin_ = this->input.Position();
     link_ = ReadLink(this->input, cursor_);
-    tracks.push_back(link_.track);
+    tracks.push_back({.id = 1, .kind = TrackKind::Audio, .timescale = Clock,
+        .descriptions = {link_.description}, .priming_samples = link_.pre_skip,
+        .seek_preroll = MediaTimestamp{Preroll, Clock}});
   }
 
-  std::optional<DemuxItem> Read() override {
+  std::optional<ContainerPacket> Read() override {
     while (ready_.empty()) {
       if (cursor_.ended) {
         if (!HasNextLink(input)) return {};
         if (++links_read_ > MaxLinks) Fail(ContainerErrorCode::LimitExceeded, "Ogg chain exceeds its link limit");
         link_ = ReadLink(input, cursor_, link_.End(cursor_));
-        tracks.front() = link_.track;
-        return DemuxItem(tracks.front());
+        description_index_ = RegisterAudioDescription(tracks.front(), link_.description);
+        active_descriptions[0] = 0;
       }
       auto audio = ReadAudioPage(input, cursor_, link_);
       if (audio.lengths.empty()) continue;
       if (!start) start = MediaTimestamp{*link_.start, Clock};
+      first_audible_pts[0] = MediaTimestamp{*link_.start, Clock};
       auto time = link_.Time(audio.first);
       for (std::size_t i = 0; i < audio.lengths.size(); ++i) {
         auto owner = std::make_shared<const Bytes>(std::move(audio.page.packets[i]));
         ContainerPacket packet{1, BufferReference(*owner, owner), MediaTimestamp{time, Clock},
-                               {}, MediaTimestamp{audio.lengths[i], Clock}, true};
+                               {}, MediaTimestamp{audio.lengths[i], Clock}, true, {}, description_index_};
         if (audio.padding && i + 1 == audio.lengths.size())
           packet.discard_padding = MediaTimestamp{audio.padding, Clock};
         ready_.push_back(std::move(packet));
@@ -225,7 +227,7 @@ public:
     }
     auto packet = std::move(ready_.front());
     ready_.pop_front();
-    return DemuxItem(std::move(packet));
+    return packet;
   }
 
   std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp target, SeekDirection direction, bool seek) override {
@@ -234,13 +236,15 @@ public:
     auto link = std::upper_bound(index_.begin(), index_.end(), target,
         [](MediaTimestamp time, const IndexedLink& entry) { return time.Compare({*entry.link.start, Clock}) < 0; });
     if (link != index_.begin()) --link;
-    const auto compare = [](const Anchor& anchor, MediaTimestamp time) {
-      return MediaTimestamp{anchor.time, Clock}.Compare(time) < 0;
-    };
     for (; link != index_.end(); ++link) {
       const auto& anchors = link->anchors;
-      auto point = std::lower_bound(anchors.begin(), anchors.end(), target, compare);
-      if (direction == SeekDirection::AtOrBefore && (point == anchors.end() || MediaTimestamp{point->time, Clock} != target)) {
+      const auto presented = [&](const Anchor& anchor) {
+        return MediaTimestamp{std::max(anchor.time, *link->link.start), Clock};
+      };
+      auto point = std::lower_bound(anchors.begin(), anchors.end(), target, [&](const Anchor& anchor, MediaTimestamp time) {
+        return presented(anchor).Compare(time) < 0;
+      });
+      if (direction == SeekDirection::AtOrBefore && (point == anchors.end() || presented(*point) != target)) {
         if (point == anchors.begin()) return {};
         --point;
       }
@@ -253,11 +257,11 @@ public:
         input.Seek(decode->offset);
         cursor_ = Cursor{.sequence = decode->sequence, .granule = decode->before};
         link_ = link->link;
-        tracks.front() = link_.track;
+        description_index_ = RegisterAudioDescription(tracks.front(), link_.description);
         links_read_ = static_cast<std::size_t>(link - index_.begin()) + 1;
         ready_.clear();
       }
-      return SeekPoint{id, {point->time, Clock}, SeekPoint::Kind::NeedsPreroll, point->offset,
+      return SeekPoint{id, presented(*point), SeekPoint::Kind::NeedsPreroll, point->offset,
                        MediaTimestamp{decode->time, Clock}};
     }
     return {};
@@ -311,6 +315,7 @@ private:
 
   Cursor cursor_;
   Link link_;
+  std::uint32_t description_index_ = 1;
   std::uint64_t origin_ = 0;
   std::size_t links_read_ = 1;
   std::deque<ContainerPacket> ready_;
@@ -339,8 +344,8 @@ void WritePage(ContainerOutput& out, ByteView packet, std::uint8_t flags,
 class OggWriter final : public ContainerWriter {
 public:
   OggWriter(ContainerOutput output, std::span<const MediaTrack> tracks)
-      : ContainerWriter(std::move(output), tracks), preskip_(ParseOpus(tracks.front().initialization_data, Argument).pre_skip) {
-    WritePage(this->output, tracks.front().initialization_data, Beginning, 0, sequence_++);
+      : ContainerWriter(std::move(output), tracks), preskip_(ParseOpus(tracks.front().descriptions.front().initialization_data, Argument).pre_skip) {
+    WritePage(this->output, tracks.front().descriptions.front().initialization_data, Beginning, 0, sequence_++);
     Bytes tags;
     Put(tags, Tag("Opus"));
     Put(tags, Tag("Tags"));
@@ -407,11 +412,12 @@ std::unique_ptr<ContainerWriter> OpenOggWriter(ContainerOutput output, std::span
 }
 void ValidateOgg(std::span<const MediaTrack> tracks) {
   if (tracks.size() != 1 || tracks.front().kind != TrackKind::Audio ||
-      tracks.front().codec != CodecId::Opus || tracks.front().framing != PacketFraming::CodecPacket)
+      tracks.front().descriptions.front().codec != CodecId::Opus || tracks.front().descriptions.front().framing != PacketFraming::CodecPacket)
     Fail(ContainerErrorCode::Unsupported, "Ogg output requires one Opus audio track");
   const auto& track = tracks.front();
-  const auto info = ParseOpus(track.initialization_data, Argument);
-  if (track.channel_count != info.channels || track.sample_rate != Clock ||
+  const auto& description = track.descriptions.front();
+  const auto info = ParseOpus(description.initialization_data, Argument);
+  if (description.channel_count != info.channels || description.sample_rate != Clock ||
       (track.priming_samples && track.priming_samples != info.pre_skip) || track.padding_samples.value_or(0) ||
       (track.seek_preroll && *track.seek_preroll != MediaTimestamp{Preroll, Clock}))
     Fail(Argument, "Ogg Opus track metadata differs from its mapping");

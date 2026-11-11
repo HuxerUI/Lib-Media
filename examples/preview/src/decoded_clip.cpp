@@ -111,8 +111,8 @@ std::int64_t PositiveDistance(std::int64_t end, std::int64_t start) {
   return end - start;
 }
 
-bool HasHdrMetadata(const MediaTrack& track) {
-  return std::ranges::any_of(track.video_extensions, [](const auto& extension) {
+bool HasHdrMetadata(const MediaSampleDescription& description) {
+  return std::ranges::any_of(description.video_extensions, [](const auto& extension) {
     if (extension.type == "dvcC" || extension.type == "dvvC") return true;
     if (extension.type != "colr" || extension.payload.size() < 10) return false;
     const std::string_view type(reinterpret_cast<const char*>(extension.payload.data()), 4);
@@ -123,48 +123,37 @@ bool HasHdrMetadata(const MediaTrack& track) {
   });
 }
 
-MediaTimestamp AudioEnd(const ContainerPacket& packet, const MediaTrack& track) {
-  if (!packet.pts || !packet.duration) throw std::runtime_error("Missing final AAC packet timing");
-  const auto scale = *track.sample_rate;
-  const auto start = Ticks(*packet.pts, scale);
-  const auto length = Ticks(*packet.duration, scale);
-  if (length < 0 || start > INT64_MAX - length) throw std::runtime_error("Invalid audio packet duration");
-  const auto end = start + length;
-  const auto padding = track.padding_samples.value_or(0);
-  if (padding > std::uint64_t(INT64_MAX) || end < INT64_MIN + std::int64_t(padding))
-    throw std::runtime_error("Invalid AAC trailing trim");
-  return {end - std::int64_t(padding), scale};
+MediaTimestamp IntervalEnd(MediaTimestamp start, MediaTimestamp duration) {
+  const auto scale = CommonClock(start.timescale, duration.timescale);
+  const auto ticks = Ticks(start, scale), length = Ticks(duration, scale);
+  if (length <= 0 || ticks > INT64_MAX - length) throw std::runtime_error("Invalid media interval");
+  return {ticks + length, scale};
+}
+
+std::optional<ContainerPacket> ReadPacket(MediaDemuxer& source) {
+  while (auto item = Require(source.Read())) {
+    if (auto* packet = std::get_if<ContainerPacket>(&*item)) return std::move(*packet);
+  }
+  return {};
 }
 
 struct TrackInput {
   TrackInput(std::shared_ptr<const File> file, MediaDemuxer source, MediaTrack track)
       : file(std::move(file)), source(std::move(source)), track(std::move(track)) {
-    const auto available = this->source.SampleDescriptions(this->track.id);
-    descriptions.assign(available.begin(), available.end());
     Require(this->source.SelectTracks(std::span(&this->track.id, 1)));
   }
 
-  const MediaTrack& Description(std::uint32_t index) const {
-    return descriptions.at(index - 1);
+  const MediaSampleDescription& Description(std::uint32_t index) const {
+    return track.descriptions.at(index - 1);
   }
 
-  void Prime() {
-    if (!buffered) buffered = Read();
-    if (buffered) track = CurrentTrack();
+  const MediaSampleDescription& InitialDescription() const {
+    return Description(buffered ? buffered->sample_description_index : 1);
   }
 
   std::optional<ContainerPacket> Read() {
     if (buffered) return std::exchange(buffered, std::nullopt);
-    while (auto item = Require(source.Read())) {
-      if (auto* packet = std::get_if<ContainerPacket>(&*item)) return std::move(*packet);
-    }
-    return {};
-  }
-
-  std::pair<std::optional<ContainerPacket>, bool> ReadAudio() {
-    auto packet = Read();
-    if (packet) buffered = Read();
-    return {std::move(packet), !buffered};
+    return ReadPacket(source);
   }
 
   const MediaTrack& CurrentTrack() const {
@@ -172,11 +161,12 @@ struct TrackInput {
   }
 
   std::optional<MediaPresentationRange> PresentationRange() const {
-    return source.Layout() == ContainerLayout::Fragmented ? track.presentation_edit : source.PresentationRange(track.id);
+    if (source.Layout() == ContainerLayout::Fragmented) return {};
+    return source.PresentationRange(track.id);
   }
 
-  std::uint32_t Seek(MediaTimestamp target, bool video) {
-    if (const auto range = video ? PresentationRange() : std::nullopt; range && range->start != range->end) {
+  std::uint32_t Seek(MediaTimestamp target) {
+    if (const auto range = PresentationRange(); range && range->start != range->end) {
       if (target.Compare(range->start) < 0) target = range->start;
       if (target.Compare(range->end) >= 0) {
         const auto scale = track.timescale.value_or(range->end.timescale);
@@ -187,17 +177,16 @@ struct TrackInput {
     }
     auto point = Require(source.Seek(track.id, target));
     if (!point) point = Require(source.Seek(track.id, target, SeekDirection::AtOrAfter));
-    if (!point || (video && point->kind != SeekPoint::Kind::Independent))
-      throw std::runtime_error("The file has no independent seek point at this position");
-    buffered.reset();
-    buffered = Read();
-    return buffered ? buffered->sample_description_index : track.sample_description_index;
+    if (!point || point->kind == SeekPoint::Kind::NeedsPreroll)
+      throw std::runtime_error("The file has no video seek point at this position");
+    buffered = ReadPacket(source);
+    if (!buffered) throw std::runtime_error("Video seek did not return a packet");
+    return buffered->sample_description_index;
   }
 
   std::shared_ptr<const File> file;
   MediaDemuxer source;
   MediaTrack track;
-  std::vector<MediaTrack> descriptions;
   std::optional<ContainerPacket> buffered;
 };
 
@@ -206,33 +195,17 @@ struct ClipInput {
     auto source = Open(*file);
     const auto track = Track(source, TrackKind::Video);
     if (!track) throw std::runtime_error("Decoded preview requires a video track");
-    if (const auto soundtrack = Track(source, TrackKind::Audio)) {
-      audio = std::make_shared<TrackInput>(file, Open(*file), *soundtrack);
-      audio->Prime();
-      const auto& active = audio->track;
-      if (active.codec != CodecId::Aac || !active.sample_rate ||
-          (active.channel_count != 1 && active.channel_count != 2))
-        throw std::runtime_error("Decoded preview requires mono or stereo AAC-LC audio");
-      if (const auto range = audio->PresentationRange()) {
-        if (range->start.ticks > 0) audio_start = range->start;
-        audio_end = range->end;
-      } else if (const auto observed = audio->source.PresentationRange(active.id); observed && observed->start.ticks > 0) {
-        audio_start = observed->start;
-      }
-    }
+    if (Track(source, TrackKind::Audio)) audio = std::make_shared<AudioInput>(file);
     video = std::make_shared<TrackInput>(std::move(file), std::move(source), *track);
-    video->Prime();
+    video->buffered = video->Read();
     if (!video->buffered) throw std::runtime_error("The video track contains no pictures");
   }
   std::shared_ptr<TrackInput> video;
-  std::shared_ptr<TrackInput> audio;
-  MediaTimestamp audio_start{0, 1};
-  std::optional<MediaTimestamp> audio_end;
+  std::shared_ptr<AudioInput> audio;
 };
 
 struct PacketFeed {
   std::optional<ContainerPacket> next;
-  std::optional<MediaTimestamp> end;
   std::uint32_t description = 1;
   bool sealed = false;
 
@@ -241,23 +214,11 @@ struct PacketFeed {
     sealed = false;
   }
 
-  template<class Decoder> Task<bool> Feed(std::shared_ptr<TrackInput> input, Decoder& decoder) {
+  Task<bool> Feed(std::shared_ptr<TrackInput> input, VideoDecoder& decoder) {
     if (sealed) co_return false;
     bool advanced = false;
     for (unsigned i = 0; i < 8; ++i) {
-      if (!next) {
-        if constexpr (std::is_same_v<Decoder, AudioDecoder>) {
-          if (end) {
-            next = co_await OnFileThread([input] { return input->Read(); });
-          } else {
-            auto [packet, last] = co_await OnFileThread([input] { return input->ReadAudio(); });
-            next = std::move(packet);
-            if (last && next && next->pts && next->duration) end = AudioEnd(*next, input->track);
-          }
-        } else {
-          next = co_await OnFileThread([input] { return input->Read(); });
-        }
-      }
+      if (!next) next = co_await OnFileThread([input] { return input->Read(); });
       if (!next || next->sample_description_index != description) {
         Require(decoder.Finish());
         sealed = true;
@@ -273,29 +234,25 @@ struct PacketFeed {
   }
 };
 
-AudioFormat PlaybackFormat(const MediaTrack& track) {
-  return {*track.sample_rate, AudioSampleFormat::S16, AudioPacking::Interleaved,
-          track.channel_count == 1 ? AudioChannelLayout::Mono : AudioChannelLayout::Stereo};
-}
-
-VideoDecoderConfig VideoConfig(const MediaTrack& track, VideoStorage storage) {
-  if ((track.codec != CodecId::H264 && track.codec != CodecId::Hevc) || !track.coded_width || !track.coded_height)
-    throw std::runtime_error("Decoded preview requires an H.264 or HEVC video track");
-  if (track.codec == CodecId::Hevc && track.sample_entry != "hvc1")
+VideoDecoderConfig VideoConfig(const MediaSampleDescription& description, VideoStorage storage) {
+  if ((description.codec != CodecId::H264 && description.codec != CodecId::Hevc && description.codec != CodecId::Vp9) ||
+      !description.coded_width || !description.coded_height)
+    throw std::runtime_error("Decoded preview requires an H.264, HEVC, or VP9 video track");
+  if (description.codec == CodecId::Hevc && description.sample_entry != "hvc1")
     throw std::runtime_error("The HEVC preview requires an hvc1 sample entry");
-  if (HasHdrMetadata(track))
+  if (HasHdrMetadata(description))
     throw std::runtime_error("HDR display needs an HDR surface. Use Copy Movie to retain the source metadata.");
   VideoDecoderConfig video_config;
-  video_config.codec = track.codec;
-  video_config.initialization_data = track.initialization_data;
-  video_config.width = *track.coded_width;
-  video_config.height = *track.coded_height;
+  video_config.codec = description.codec;
+  video_config.initialization_data = description.initialization_data;
+  video_config.width = *description.coded_width;
+  video_config.height = *description.coded_height;
   video_config.output_storage = storage;
-  if (track.codec == CodecId::H264) {
+  if (description.codec == CodecId::H264) {
     video_config.width = (video_config.width + 15) & ~15u;
     video_config.height = (video_config.height + 15) & ~15u;
   }
-  if (track.codec == CodecId::Hevc) {
+  if (description.codec == CodecId::Hevc) {
     if (video_config.initialization_data.size() >= 23 &&
         (std::to_integer<unsigned>(video_config.initialization_data[17]) & 7) == 2)
       video_config.output = VideoPixelFormat::P010;
@@ -314,19 +271,20 @@ VideoDecoderConfig VideoConfig(const MediaTrack& track, VideoStorage storage) {
   return video_config;
 }
 
-void ApplyVideoGeometry(VideoFrame& frame, const MediaTrack& track) {
+void ApplyVideoGeometry(VideoFrame& frame, const MediaSampleDescription& description, VideoRotation rotation) {
 #ifdef __EMSCRIPTEN__
-  if (frame.Storage() == VideoStorage::Platform && (track.rotation != VideoRotation::None ||
-      (track.visible && *track.visible != frame.format.visible) ||
-      (track.pixel_aspect_ratio && track.pixel_aspect_ratio->width != track.pixel_aspect_ratio->height)))
+  if (frame.Storage() == VideoStorage::Platform && (rotation != VideoRotation::None ||
+      (description.visible && *description.visible != frame.format.visible) ||
+      (description.pixel_aspect_ratio && description.pixel_aspect_ratio->width != description.pixel_aspect_ratio->height)))
     throw std::runtime_error("Select CPU video to apply this movie's container crop, rotation, or pixel aspect ratio");
 #endif
-  if (const auto& aspect = track.pixel_aspect_ratio) {
+  frame.format.rotation = rotation;
+  if (const auto& aspect = description.pixel_aspect_ratio) {
     frame.format.aspect_width = aspect->width;
     frame.format.aspect_height = aspect->height;
   }
-  if (!track.visible) return;
-  const auto crop = *track.visible;
+  if (!description.visible) return;
+  const auto crop = *description.visible;
   const auto decoded = frame.format.visible;
   const auto left = std::max(crop.x, decoded.x), top = std::max(crop.y, decoded.y);
   const auto right = std::min(crop.x + crop.width, decoded.x + decoded.width);
@@ -361,36 +319,23 @@ bool LimitPicture(VideoFrame& frame, const std::optional<MediaPresentationRange>
   return true;
 }
 
-std::vector<EditMapping> EditMappings(const MediaTrack& track) {
-  std::vector<EditMapping> result;
-  auto scale = track.timescale.value_or(1);
-  for (const auto& edit : track.edits) {
-    scale = CommonClock(scale, edit.duration.timescale);
-    if (edit.media_start) scale = CommonClock(scale, edit.media_start->timescale);
-  }
-  std::int64_t position = 0;
-  for (const auto& edit : track.edits) {
-    const auto length = Ticks(edit.duration, scale);
-    if (edit.media_start) {
-      const auto start = Ticks(*edit.media_start, scale);
-      result.push_back({{{start, scale}, {start + length, scale}}, position - start});
-    }
-    position += length;
-  }
-  return result;
+bool HasPictureAt(std::span<const MediaTrack::Edit> edits, MediaTimestamp time) {
+  if (edits.empty()) return true;
+  const auto* edit = EditAt(edits, time);
+  return edit && edit->media_start.has_value();
 }
 
-template<class Frame, class Clip>
-void PresentEdits(const Frame& frame, std::span<const EditMapping> edits, std::deque<Frame>& ready, Clip clip) {
-  for (const auto& edit : edits) {
+void PresentPicture(const VideoFrame& frame, std::span<const MediaTrack::Edit> edits,
+                    std::vector<MediaPresentationSlice>& slices, std::deque<VideoFrame>& ready) {
+  const auto end = IntervalEnd(frame.pts, frame.duration.value_or(MediaTimestamp{1, frame.pts.timescale}));
+  Require(MapToPresentation(edits, frame.pts, end, slices));
+  for (const auto& slice : slices) {
     auto part = frame;
-    if (!clip(part, edit.media)) continue;
-    const auto scale = CommonClock(part.pts.timescale, edit.media.start.timescale);
-    const auto shift = Ticks({edit.shift, edit.media.start.timescale}, scale);
-    const auto time = Ticks(part.pts, scale);
-    if ((shift > 0 && time > INT64_MAX - shift) || (shift < 0 && time < INT64_MIN - shift))
-      throw std::runtime_error("Presentation edit exceeds the preview timeline");
-    part.pts = {time + shift, scale};
+    part.pts = slice.presentation.start;
+    if (part.duration) {
+      const auto scale = CommonClock(part.pts.timescale, slice.presentation.end.timescale);
+      part.duration = MediaTimestamp{PositiveDistance(Ticks(slice.presentation.end, scale), Ticks(part.pts, scale)), scale};
+    }
     ready.push_back(std::move(part));
   }
 }
@@ -403,7 +348,22 @@ AudioFrame Silence(const AudioFormat& format, std::int64_t start, std::int64_t e
 
 } // namespace
 
-AudioEditQueue::AudioEditQueue(const MediaTrack& track) : edits_(EditMappings(track)) {}
+const MediaTrack::Edit* EditAt(std::span<const MediaTrack::Edit> edits, MediaTimestamp time) {
+  MediaTimestamp position{0, 1};
+  for (const auto& edit : edits) {
+    position = IntervalEnd(position, edit.duration);
+    if (time.Compare(position) < 0) return &edit;
+  }
+  return nullptr;
+}
+
+AudioEditQueue::AudioEditQueue(const MediaTrack& track) : edits_(track.edits) {
+  if (!edits_.empty() && !edits_.back().media_start) {
+    MediaTimestamp end{0, 1};
+    for (const auto& edit : edits_) end = IntervalEnd(end, edit.duration);
+    trailing_end_ = end;
+  }
+}
 
 void AudioEditQueue::Reset() {
   ready_.clear();
@@ -411,34 +371,54 @@ void AudioEditQueue::Reset() {
 }
 
 void AudioEditQueue::Push(const AudioFrame& frame) {
-  PresentEdits(frame, edits_, ready_, [](auto& part, const auto& media) {
-    return TrimAudio(part, media.start, media.end);
-  });
+  const auto rate = frame.format.sample_rate;
+  const auto end = IntervalEnd(frame.pts, {frame.sample_count, rate});
+  Require(MapToPresentation(edits_, frame.pts, end, slices_));
+  for (const auto& slice : slices_) {
+    auto part = frame;
+    const auto scale = CommonClock(slice.presentation.start.timescale, slice.presentation.end.timescale);
+    const auto length = PositiveDistance(Ticks(slice.presentation.end, scale), Ticks(slice.presentation.start, scale));
+    if (!TrimAudio(part, slice.media_start, IntervalEnd(slice.media_start, {length, scale}))) continue;
+    const auto shift = Ticks(slice.presentation.start, scale) - Ticks(slice.media_start, scale);
+    const auto offset = CeilTicks({shift, scale}, rate);
+    const auto pts = Ticks(part.pts, rate);
+    if ((offset > 0 && pts > INT64_MAX - offset) || (offset < 0 && pts < INT64_MIN - offset))
+      throw std::runtime_error("Edited audio exceeds its sample clock");
+    part.pts = {pts + offset, rate};
+    ready_.push_back(std::move(part));
+  }
 }
 
-std::optional<AudioFrame> AudioEditQueue::Read(MediaTimestamp start, std::optional<MediaTimestamp> end) {
+std::optional<AudioFrame> AudioEditQueue::Read(MediaTimestamp start, const AudioFormat& format, bool drained) {
+  const auto scale = format.sample_rate;
+  const auto requested = CeilTicks(start, scale);
+  const auto first = std::max(requested, next_.value_or(requested));
+  std::optional<AudioFrame> output;
   while (!ready_.empty()) {
     auto& frame = ready_.front();
-    const auto scale = frame.format.sample_rate;
-    const auto first = next_ && MediaTimestamp{*next_, scale}.Compare(start) > 0 ? MediaTimestamp{*next_, scale} : start;
-    if (!TrimAudio(frame, first, end)) {
+    if (!TrimAudio(frame, {first, scale}, {})) {
       ready_.pop_front();
       continue;
     }
     const auto time = Ticks(frame.pts, scale);
-    AudioFrame output;
-    if (next_ && time > *next_) {
-      output = Silence(frame.format, *next_, time);
+    if (time > first) {
+      output = Silence(frame.format, first, time);
     } else {
       output = std::move(frame);
       ready_.pop_front();
     }
-    const auto pts = Ticks(output.pts, scale);
-    if (pts > INT64_MAX - output.sample_count) throw std::runtime_error("Edited audio exceeds its sample clock");
-    next_ = pts + output.sample_count;
-    return output;
+    break;
   }
-  return {};
+  if (!output && drained && trailing_end_) {
+    const auto end = CeilTicks(*trailing_end_, scale);
+    if (end > first) output = Silence(format, first, end);
+  }
+  if (output) {
+    const auto pts = Ticks(output->pts, scale);
+    if (pts > INT64_MAX - output->sample_count) throw std::runtime_error("Edited audio exceeds its sample clock");
+    next_ = pts + output->sample_count;
+  }
+  return output;
 }
 
 Task<std::shared_ptr<const File>> StageClip(File temporary, std::optional<FileReference> selected,
@@ -474,28 +454,22 @@ Task<std::shared_ptr<const File>> StageClip(File temporary, std::optional<FileRe
 Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls, VideoStorage storage) {
   auto clip = co_await OnFileThread([file] { return ClipInput(file); });
   const auto& video_track = clip.video->track;
-  const auto video_config = VideoConfig(video_track, storage);
+  const auto& description = clip.video->InitialDescription();
+  const auto video_config = VideoConfig(description, storage);
   const auto video_range = clip.video->PresentationRange();
-  const auto video_edits = EditMappings(video_track);
-  std::optional<AudioEditQueue> audio_edits;
-  if (clip.audio && !clip.audio->track.edits.empty()) audio_edits.emplace(clip.audio->track);
-  const auto coded = VideoRectangle{0, 0, *video_track.coded_width, *video_track.coded_height};
-  const auto visible = video_track.visible.value_or(coded);
-  const auto aspect = video_track.pixel_aspect_ratio.value_or(MediaTrack::PixelAspectRatio{});
+  const auto& video_edits = video_track.edits;
+  const auto coded = VideoRectangle{0, 0, *description.coded_width, *description.coded_height};
+  const auto visible = description.visible.value_or(coded);
+  const auto aspect = description.pixel_aspect_ratio.value_or(MediaSampleDescription::PixelAspectRatio{});
   auto size = PresentationSize(visible, video_track.rotation, double(aspect.width) / aspect.height);
-  const auto create_video = [&](const MediaTrack& track) {
-    return Require(VideoDecoder::Create(VideoConfig(track, storage)));
-  };
-  const auto create_audio = [](const MediaTrack& track) {
-    AudioDecoderConfig config;
-    config.initialization_data = track.initialization_data;
-    config.output = PlaybackFormat(track);
-    return Require(AudioDecoder::Create(config));
+  const auto create_video = [&](std::uint32_t index) {
+    return Require(VideoDecoder::Create(VideoConfig(clip.video->Description(index), storage)));
   };
   std::shared_ptr<ExternalTexture> surface;
   auto video = [&] {
 #ifdef __ANDROID__
-    if (clip.video->descriptions.size() == 1 && video_track.edits.empty() &&
+    const bool single_interval = video_edits.empty() || (video_edits.size() == 1 && video_edits.front().media_start);
+    if (video_track.descriptions.size() == 1 && single_interval &&
         video_config.output == VideoPixelFormat::Opaque && visible == coded && video_track.rotation == VideoRotation::None) {
       auto preview = OpenPlatformModule<media::detail::SurfacePreview>(media::detail::surface_preview_type,
           media::detail::SurfacePreviewOptions{video_config, size});
@@ -505,12 +479,12 @@ Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls
 #endif
     return Require(VideoDecoder::Create(video_config));
   }();
-  std::optional<AudioDecoder> audio;
+  std::optional<AudioDecode> audio;
   std::optional<AudioPlaybackConfig> audio_playback;
   if (clip.audio) {
-    audio.emplace(create_audio(clip.audio->track));
+    audio.emplace(clip.audio);
     audio_playback.emplace();
-    audio_playback->format = PlaybackFormat(clip.audio->track);
+    audio_playback->format = PlaybackFormat(clip.audio->track.descriptions.front());
     if constexpr (preview_audio_session_supported) {
       audio_playback->cleanup_completed = [use = RetainPreviewAudioSession(true)](PlaybackResult<void>) mutable {
         use.reset();
@@ -557,44 +531,29 @@ Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls
   report_position(0);
   auto next_update = std::chrono::steady_clock::now();
   auto deadline = next_update + 15s;
-  PacketFeed audio_feed{.end = clip.audio_end, .description = clip.audio ? clip.audio->track.sample_description_index : 1};
-  PacketFeed video_feed{.description = video_track.sample_description_index};
+  PacketFeed video_feed{.description = clip.video->buffered->sample_description_index};
   std::optional<VideoFrame> picture;
   std::optional<VideoFrame> before_target;
-  std::optional<AudioFrame> samples;
   std::deque<VideoFrame> ready_video;
+  std::vector<MediaPresentationSlice> picture_slices;
   bool presented_first = false;
   bool video_ended = false, audio_ended = !audio;
   for (;;) {
     if (auto seek = controls.take_seek()) {
       target = TimeAt(std::clamp(*seek, 0.0F, known_duration().value_or(std::max(0.0F, *seek))));
-      const auto [video_description, audio_description] =
-          co_await OnFileThread([video = clip.video, audio = clip.audio, target] {
-        const auto picture = video->Seek(target, true);
-        std::uint32_t soundtrack = 1;
-        if (audio) {
-          const auto scale = *audio->track.sample_rate;
-          soundtrack = audio->Seek({Ticks(target, scale) - 1024, scale}, false);
-        }
-        return std::pair{picture, soundtrack};
-      });
+      const auto video_description = co_await OnFileThread([video = clip.video, target] { return video->Seek(target); });
+      audio_ended = !audio;
+      if (audio) audio_ended = !co_await audio->Seek(target);
       picture.reset();
       before_target.reset();
-      samples.reset();
       ready_video.clear();
-      if (audio_edits) audio_edits->Reset();
       if (video_description == video_feed.description) Require(video.Reset());
-      else video = create_video(clip.video->Description(video_description));
-      if (audio) {
-        if (audio_description == audio_feed.description) Require(audio->Reset());
-        else audio = create_audio(clip.audio->Description(audio_description));
-      }
-      audio_feed = {.end = clip.audio_end, .description = audio_description};
+      else video = create_video(video_description);
       video_feed = {.description = video_description};
       video_ended = false;
       presented_first = false;
-      audio_ended = !audio;
       epoch = Require(playback.Reset());
+      if (audio && audio_ended) Require(playback.FinishAudio(epoch));
       controls.reset_video(size, surface);
       image_published = false;
       playing = !controls.paused();
@@ -611,33 +570,19 @@ Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls
     bool advanced = false;
     if (running && (playing || !presented_first)) {
       if (audio && !audio_ended) {
-        advanced |= co_await audio_feed.Feed(clip.audio, *audio);
-        while (!audio_ended) {
-          if (samples) {
-            if (Require(playback.TrySubmitAudio(epoch, *samples)) == SubmitStatus::WouldBlock) break;
-            samples.reset();
+        for (unsigned i = 0; i < 8; ++i) {
+          if (audio->frame) {
+            if (Require(playback.TrySubmitAudio(epoch, *audio->frame)) == SubmitStatus::WouldBlock) break;
+            audio->frame.reset();
             advanced = true;
           }
-          const auto start = target.Compare(clip.audio_start) < 0 ? clip.audio_start : target;
-          if (audio_edits) {
-            samples = audio_edits->Read(start, audio_feed.end);
-            if (samples) continue;
-          }
-          auto item = Require(audio->TryRead());
-          if (!item) break;
-          if (auto* frame = std::get_if<AudioFrame>(&*item)) {
-            if (audio_edits) audio_edits->Push(*frame);
-            else if (TrimAudio(*frame, start, audio_feed.end)) samples = std::move(*frame);
-          } else if (std::holds_alternative<EndOfStream>(*item)) {
-            if (audio_feed.next) {
-              audio_feed.Resume();
-              audio = create_audio(clip.audio->Description(audio_feed.description));
-              advanced = true;
-              break;
-            }
+          if (audio->ended) {
             Require(playback.FinishAudio(epoch));
             audio_ended = true;
+            break;
           }
+          if (!co_await audio->Pump()) break;
+          advanced = true;
         }
       }
       if (!video_ended) {
@@ -654,8 +599,8 @@ Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls
             if (frame.pts.Compare(target) >= 0) {
               if (!presented_first) {
                 // A later track start stays on the playback clock. A seek inside the track can show its first picture immediately.
-                if (!playing || !video_range || video_range->start.Compare(target) <= 0)
-                  publish(frame);
+                if (HasPictureAt(video_edits, target) &&
+                    (!playing || !video_range || video_range->start.Compare(target) <= 0)) publish(frame);
                 presented_first = true;
                 before_target.reset();
               }
@@ -669,19 +614,18 @@ Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls
           if (!item) break;
           if (auto* frame = std::get_if<VideoFrame>(&*item)) {
             const auto& description = clip.video->Description(video_feed.description);
-            ApplyVideoGeometry(*frame, description);
-            frame->format.rotation = description.rotation;
+            ApplyVideoGeometry(*frame, description, video_track.rotation);
             if (video_edits.empty()) {
               if (LimitPicture(*frame, video_range)) ready_video.push_back(std::move(*frame));
             } else {
-              PresentEdits(*frame, video_edits, ready_video, LimitPicture);
+              PresentPicture(*frame, video_edits, picture_slices, ready_video);
             }
           } else if (std::holds_alternative<EndOfStream>(*item)) {
             if (video_feed.next) {
               if (video_feed.next->sync_sample != true)
                 throw std::runtime_error("A video configuration change requires a sync picture");
               video_feed.Resume();
-              video = create_video(clip.video->Description(video_feed.description));
+              video = create_video(video_feed.description);
               advanced = true;
               break;
             }
@@ -697,12 +641,7 @@ Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls
       advanced |= update.lag_ms.has_value();
       const auto snapshot = playback.Snapshot();
       if (snapshot.error) throw std::runtime_error(snapshot.error->message);
-      if (playing && image_published && snapshot.position && !video_edits.empty() &&
-          std::ranges::none_of(video_edits, [&](const auto& edit) {
-            const MediaTimestamp first{edit.media.start.ticks + edit.shift, edit.media.start.timescale};
-            const MediaTimestamp last{edit.media.end.ticks + edit.shift, edit.media.end.timescale};
-            return snapshot.position->Compare(first) >= 0 && snapshot.position->Compare(last) < 0;
-          })) {
+      if (playing && image_published && snapshot.position && !HasPictureAt(video_edits, *snapshot.position)) {
         controls.reset_video(size, surface);
         image_published = false;
       }
@@ -722,9 +661,11 @@ Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls
 
 namespace {
 
-MediaMuxer OpenMovieOutput(const File& output, ContainerFormat format, std::span<const MediaTrack> tracks) {
+MediaMuxer OpenMovieOutput(const File& output, ContainerFormat format, std::span<const MediaTrack> tracks,
+                           const std::optional<MediaAudioMetadata>& metadata = {}) {
   const auto layout = format == ContainerFormat::Mp4 ? ContainerLayout::FastStart : ContainerLayout::Default;
-  return Require(MediaMuxer::Open(Require(output.OpenRandomAccess(FileAccessMode::ReadWrite)), format, tracks, layout));
+  return Require(MediaMuxer::Open(Require(output.OpenRandomAccess(FileAccessMode::ReadWrite)), format, tracks,
+                                 {.layout = layout, .audio_metadata = metadata}));
 }
 
 void FinishMovie(MediaMuxer& mux, const File& output, std::size_t expected) {
@@ -742,16 +683,13 @@ struct MovieCopy {
     auto source = Open(*file);
     const auto format = target.value_or(source.Format());
     const auto movie = [](ContainerFormat value) { return value == ContainerFormat::Mp4 || value == ContainerFormat::Mov; };
-    if (!movie(source.Format()) || !movie(format))
-      throw std::runtime_error("The preview copies MP4 and MOV files");
+    if ((!movie(source.Format()) || !movie(format)) &&
+        !(source.Format() == ContainerFormat::WebM && format == ContainerFormat::WebM))
+      throw std::runtime_error("Copy supports MP4, MOV, and WebM");
     const std::vector source_tracks(source.Tracks().begin(), source.Tracks().end());
-    std::vector<MediaTrack> descriptions;
-    for (const auto& track : source_tracks) {
-      const auto available = source.SampleDescriptions(track.id);
-      descriptions.insert(descriptions.end(), available.begin(), available.end());
-    }
-    output = TemporaryFile(temporary, format == ContainerFormat::Mov ? ".mov" : ".mp4");
-    mux.emplace(OpenMovieOutput(*output, format, descriptions));
+    const auto suffix = format == ContainerFormat::WebM ? ".webm" : format == ContainerFormat::Mov ? ".mov" : ".mp4";
+    output = TemporaryFile(temporary, suffix);
+    mux.emplace(OpenMovieOutput(*output, format, source_tracks, source.AudioMetadata()));
     for (std::size_t i = 0; i < source_tracks.size(); ++i) {
       auto reader = i + 1 == source_tracks.size() ? std::move(source) : Open(*file);
       tracks.push_back({TrackInput(file, std::move(reader), source_tracks[i])});
@@ -797,6 +735,7 @@ struct MovieCopy {
   std::size_t packets = 0;
 };
 
+#ifdef MEDIA_PREVIEW_TEST_EXPORTS
 VideoFrame EncoderInput(VideoFrame frame) {
   const auto visible = frame.format.visible;
   if ((visible.x | visible.y | visible.width | visible.height) & 1u)
@@ -872,8 +811,9 @@ struct DecodeOrder {
 
 template<class Decoder, class Encoder, class FrameType>
 struct ExportTrack {
-  static constexpr bool Audio = std::is_same_v<Decoder, AudioDecoder>;
-  ExportTrack(std::shared_ptr<TrackInput> source, Decoder decoder)
+  static constexpr bool Audio = std::is_same_v<Decoder, AudioDecode>;
+  using Input = std::conditional_t<Audio, AudioInput, TrackInput>;
+  ExportTrack(std::shared_ptr<Input> source, Decoder decoder)
       : source(std::move(source)), decoder(std::move(decoder)) {}
 
   VideoFrame PrepareVideo(VideoFrame frame) {
@@ -902,9 +842,9 @@ struct ExportTrack {
         } else {
           if constexpr (Audio) {
             if (const auto* format = std::get_if<AudioEncodeFormat>(&*output)) {
-              queue.track = MediaTrack{.id = source->track.id, .kind = TrackKind::Audio, .codec = CodecId::Aac,
-                  .initialization_data = format->initialization_data, .timescale = format->sample_rate,
-                  .sample_rate = format->sample_rate, .channel_count = source->track.channel_count};
+              queue.track = MediaTrack{.id = source->track.id, .kind = TrackKind::Audio, .timescale = format->sample_rate,
+                  .descriptions = {{.codec = CodecId::Aac, .initialization_data = format->initialization_data,
+                      .sample_rate = format->sample_rate, .channel_count = source->track.descriptions.front().channel_count}}};
             } else {
               queue.trim = std::get<AudioEncodeSummary>(*output);
               if (!queue.trim.priming_samples || !queue.trim.padding_samples)
@@ -912,14 +852,13 @@ struct ExportTrack {
             }
           } else {
             const auto& format = std::get<VideoEncodeFormat>(*output);
-            const auto range = source->PresentationRange();
-            queue.track = MediaTrack{.id = source->track.id, .kind = TrackKind::Video, .codec = format.codec,
-                .framing = PacketFraming::LengthPrefixedNals, .initialization_data = format.initialization_data,
+            queue.track = MediaTrack{.id = source->track.id, .kind = TrackKind::Video,
                 .timescale = decode_order ? std::optional{decode_order->scale} : source->track.timescale,
-                .coded_width = format.width, .coded_height = format.height,
-                .visible = format.visible, .rotation = source->track.rotation,
-                .presentation_edit = range && range->start.ticks >= 0 ? range : source->track.presentation_edit,
-                .pixel_aspect_ratio = pixel_aspect_ratio};
+                .descriptions = {{.codec = format.codec, .framing = PacketFraming::LengthPrefixedNals,
+                    .initialization_data = format.initialization_data, .coded_width = format.width, .coded_height = format.height,
+                    .visible = format.visible, .pixel_aspect_ratio = pixel_aspect_ratio}},
+                .rotation = source->track.rotation, .edits = source->track.edits};
+
           }
         }
         co_return true;
@@ -935,7 +874,7 @@ struct ExportTrack {
         } else {
           VideoEncoderConfig config;
           config.input = frames.front().format;
-          config.codec = source->track.codec;
+          config.codec = source->track.descriptions.front().codec;
           config.input_storage = frames.front().Storage();
           if (config.input_storage == VideoStorage::Platform)
             config.bitrate = std::max(config.bitrate, config.input.width * config.input.height * 4u);
@@ -959,40 +898,44 @@ struct ExportTrack {
       finish_sent = true;
       co_return true;
     }
-    if (auto output = Require(decoder.TryRead())) {
-      if (auto* next = std::get_if<FrameType>(&*output)) {
-        if constexpr (Audio) {
-          if (TrimAudio(*next, audio_start, feed.end))
-            frames.push_back(std::move(*next));
-        } else {
-          ApplyVideoGeometry(*next, source->track);
+    if constexpr (Audio) {
+      const auto advanced = co_await decoder.Pump();
+      if (decoder.frame) {
+        frames.push_back(std::move(*decoder.frame));
+        decoder.frame.reset();
+      }
+      decoded_end = decoder.ended;
+      co_return advanced;
+    } else {
+      if (auto output = Require(decoder.TryRead())) {
+        if (auto* next = std::get_if<VideoFrame>(&*output)) {
+          const auto& description = source->track.descriptions.front();
+          ApplyVideoGeometry(*next, description, source->track.rotation);
           if (lookahead) {
             const auto scale = source->track.timescale.value_or(90000);
             const auto first = Ticks(lookahead->pts, scale), second = Ticks(next->pts, scale);
             lookahead->duration = MediaTimestamp{PositiveDistance(second, first), scale};
             frames.push_back(PrepareVideo(std::move(*lookahead)));
-          } else if (source->track.pixel_aspect_ratio || next->format.aspect_width != next->format.aspect_height) {
-            pixel_aspect_ratio = MediaTrack::PixelAspectRatio{next->format.aspect_width, next->format.aspect_height};
+          } else if (description.pixel_aspect_ratio || next->format.aspect_width != next->format.aspect_height) {
+            pixel_aspect_ratio = MediaSampleDescription::PixelAspectRatio{next->format.aspect_width, next->format.aspect_height};
           }
           lookahead = std::move(*next);
-        }
-      } else if (std::holds_alternative<EndOfStream>(*output)) {
-        if constexpr (!Audio) {
+        } else if (std::holds_alternative<EndOfStream>(*output)) {
           if (lookahead) {
             if (!lookahead->duration || lookahead->duration->ticks <= 0)
               throw std::runtime_error("The final picture needs a positive duration");
             frames.push_back(PrepareVideo(std::move(*lookahead)));
             lookahead.reset();
           }
+          decoded_end = true;
         }
-        decoded_end = true;
+        co_return true;
       }
-      co_return true;
+      co_return co_await feed.Feed(source, decoder);
     }
-    co_return co_await feed.Feed(source, decoder);
   }
 
-  std::shared_ptr<TrackInput> source;
+  std::shared_ptr<Input> source;
   Decoder decoder;
   std::optional<Encoder> encoder;
   PacketFeed feed;
@@ -1001,12 +944,12 @@ struct ExportTrack {
   std::optional<DecodeOrder> decode_order;
   std::deque<FrameType> frames;
   std::optional<FrameType> lookahead;
-  std::optional<MediaTrack::PixelAspectRatio> pixel_aspect_ratio;
-  MediaTimestamp audio_start{0, 1};
+  std::optional<MediaSampleDescription::PixelAspectRatio> pixel_aspect_ratio;
   bool decoded_end = false;
   bool finish_sent = false;
   bool submitting = false;
 };
+#endif
 
 } // namespace
 
@@ -1017,39 +960,38 @@ Task<std::shared_ptr<const File>> CopyClip(std::shared_ptr<const File> file, Fil
   co_return copy->output;
 }
 
+#ifdef MEDIA_PREVIEW_TEST_EXPORTS
 Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, File temporary, bool reorder,
     VideoStorage storage) {
   auto clip = co_await OnFileThread([file] { return ClipInput(file); });
-  if (clip.video->descriptions.size() > 1 || !clip.video->track.edits.empty() ||
-      (clip.audio && (clip.audio->descriptions.size() > 1 || !clip.audio->track.edits.empty())))
+  const auto simple = [](const MediaTrack& track) {
+    return track.descriptions.size() == 1 &&
+        std::ranges::count_if(track.edits, [](const auto& edit) { return edit.media_start.has_value(); }) <= 1;
+  };
+  if (!simple(clip.video->track) || (clip.audio && !simple(clip.audio->track)))
     throw std::runtime_error("Use Copy Movie to retain configuration changes and multi-segment edits");
   if (const auto range = clip.video->PresentationRange(); range && range->start == range->end)
     throw std::runtime_error("The video edit contains no pictures to export");
   ExportTrack<VideoDecoder, VideoEncoder, VideoFrame> video(
-      clip.video, Require(VideoDecoder::Create(VideoConfig(clip.video->track, storage))));
+      clip.video, Require(VideoDecoder::Create(VideoConfig(clip.video->InitialDescription(), storage))));
   bool ordered_pts = false;
 #if defined(__EMSCRIPTEN__)
-  ordered_pts = clip.video->track.codec == CodecId::Hevc;
+  ordered_pts = clip.video->InitialDescription().codec == CodecId::Hevc;
 #elif defined(__APPLE__) && TARGET_OS_IOS && TARGET_OS_SIMULATOR
-  if (clip.video->track.codec == CodecId::Hevc) reorder = true;
+  if (clip.video->InitialDescription().codec == CodecId::Hevc) reorder = true;
 #endif
   const auto clock = clip.video->track.timescale.value_or(90000);
   if (ordered_pts || reorder)
     video.decode_order.emplace(DecodeOrder{.scale = ordered_pts ? clock : CommonClock(clock, 1000000),
         .source_scale = clock, .ordered_pts = ordered_pts});
-  std::optional<ExportTrack<AudioDecoder, AudioEncoder, AudioFrame>> audio;
+  std::optional<ExportTrack<AudioDecode, AudioEncoder, AudioFrame>> audio;
   ExportQueue audio_copy;
   if (clip.audio) {
 #if defined(__EMSCRIPTEN__) || defined(__ANDROID__) || defined(_WIN32) || defined(__linux__)
     // Preserve source trim on backends that can omit AAC encoder delay and padding.
     audio_copy.track = clip.audio->track;
 #else
-    AudioDecoderConfig config;
-    config.initialization_data = clip.audio->track.initialization_data;
-    config.output = PlaybackFormat(clip.audio->track);
-    audio.emplace(clip.audio, Require(AudioDecoder::Create(config)));
-    audio->audio_start = clip.audio_start;
-    audio->feed.end = clip.audio_end;
+    audio.emplace(clip.audio, AudioDecode(clip.audio));
 #endif
   }
   auto output = co_await OnFileThread([temporary] { return TemporaryFile(temporary, ".mp4"); });
@@ -1062,10 +1004,10 @@ Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, F
     bool advanced = co_await video.Pump();
     if (audio) advanced |= co_await audio->Pump();
     if (audio_copy.track && !audio_copy.packet && !audio_copy.ended) {
-      audio_copy.packet = co_await OnFileThread([source = clip.audio] { return source->Read(); });
+      audio_copy.packet = co_await OnFileThread([source = clip.audio] { return ReadPacket(source->source); });
       if (audio_copy.packet) ++audio_copy.packets;
       else {
-        const auto& track = clip.audio->CurrentTrack();
+        const auto& track = clip.audio->track;
         audio_copy.trim.priming_samples = track.priming_samples;
         audio_copy.trim.padding_samples = track.padding_samples;
         audio_copy.ended = true;
@@ -1114,4 +1056,5 @@ Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, F
   });
   co_return output;
 }
+#endif
 } // namespace media_preview

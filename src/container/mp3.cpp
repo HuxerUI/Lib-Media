@@ -268,11 +268,11 @@ public:
     auto timing = ReadXing(bytes, info_);
     if (!timing) timing = ReadVbri(bytes, info_);
     if (timing) this->input.Skip(info_.length);
-    MediaTrack track{.id = 1, .kind = TrackKind::Audio, .codec = CodecId::Mp3, .timescale = info_.rate,
-                     .sample_rate = info_.rate, .channel_count = info_.channels,
+    MediaTrack track{.id = 1, .kind = TrackKind::Audio, .timescale = info_.rate,
+        .descriptions = {{.codec = CodecId::Mp3, .sample_rate = info_.rate, .channel_count = info_.channels}},
                      .priming_samples = timing ? timing->delay : std::nullopt,
                      .padding_samples = timing ? timing->padding : std::nullopt};
-    if (HasAudioMetadata(metadata)) track.audio_metadata = std::move(metadata);
+    if (HasAudioMetadata(metadata)) audio_metadata = std::move(metadata);
     Begin(std::move(track), timing ? timing->samples : std::nullopt);
   }
 
@@ -297,9 +297,10 @@ private:
 
 class Mp3Writer final : public ContainerWriter {
 public:
-  Mp3Writer(ContainerOutput output, std::span<const MediaTrack> descriptions)
-      : ContainerWriter(std::move(output), descriptions) {
-    if (const auto& tags = tracks.front().audio_metadata) WriteId3(this->output, *tags);
+  Mp3Writer(ContainerOutput output, std::span<const MediaTrack> tracks,
+             const std::optional<MediaAudioMetadata>& tags)
+      : ContainerWriter(std::move(output), tracks) {
+    if (tags) WriteId3(this->output, *tags);
     xing_offset_ = this->output.Position();
   }
 
@@ -307,7 +308,9 @@ public:
     const auto bytes = packet.data.AsBytes();
     const auto header = ParseMp3FrameHeader(bytes);
     const auto& track = tracks.front();
-    if (!header || header->length != bytes.size() || header->rate != track.sample_rate || header->channels != track.channel_count)
+    const auto& description = track.descriptions.front();
+    if (!header || header->length != bytes.size() || header->rate != description.sample_rate ||
+        header->channels != description.channel_count)
       Fail(ContainerErrorCode::InvalidArgument, "MP3 output requires matching complete MPEG Layer III frames");
     if (offsets_.size() == MaxContainerSamples)
       Fail(ContainerErrorCode::LimitExceeded, "MP3 output exceeds its frame index limit");
@@ -384,19 +387,20 @@ std::unique_ptr<ContainerReader> OpenMp3Reader(ContainerInput input) {
 
 void ValidateMp3(std::span<const MediaTrack> tracks) {
   constexpr std::array rates{8000u, 11025u, 12000u, 16000u, 22050u, 24000u, 32000u, 44100u, 48000u};
-  if (tracks.size() != 1 || tracks.front().kind != TrackKind::Audio || tracks.front().codec != CodecId::Mp3 ||
-      tracks.front().framing != PacketFraming::CodecPacket)
+  if (tracks.size() != 1 || tracks.front().kind != TrackKind::Audio || tracks.front().descriptions.front().codec != CodecId::Mp3 ||
+      tracks.front().descriptions.front().framing != PacketFraming::CodecPacket)
     Fail(ContainerErrorCode::Unsupported, "MP3 output requires one MPEG Layer III track");
   const auto& track = tracks.front();
-  if (std::ranges::find(rates, track.sample_rate.value_or(0)) == rates.end() ||
-      (track.channel_count != 1 && track.channel_count != 2) || !track.initialization_data.empty() ||
+  const auto& description = track.descriptions.front();
+  if (std::ranges::find(rates, description.sample_rate.value_or(0)) == rates.end() ||
+      (description.channel_count != 1 && description.channel_count != 2) || !description.initialization_data.empty() ||
       track.priming_samples.has_value() != track.padding_samples.has_value() ||
       track.priming_samples.value_or(0) > 4095 || track.padding_samples.value_or(0) > 4095)
     Fail(ContainerErrorCode::InvalidArgument, "Invalid MP3 output geometry or trim");
-  if (track.audio_metadata) ValidateAudioMetadata(*track.audio_metadata);
 }
 
-std::unique_ptr<ContainerWriter> OpenMp3Writer(ContainerOutput output, std::span<const MediaTrack> tracks) {
-  return std::make_unique<Mp3Writer>(std::move(output), tracks);
+std::unique_ptr<ContainerWriter> OpenMp3Writer(ContainerOutput output, std::span<const MediaTrack> tracks,
+                                               const std::optional<MediaAudioMetadata>& tags) {
+  return std::make_unique<Mp3Writer>(std::move(output), tracks, tags);
 }
 } // namespace huxerui::media::detail

@@ -21,6 +21,7 @@ if ((APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND TAR
     add_executable(media_container_preview_tests container_preview.cpp
             "${MEDIA_PREVIEW_SOURCE_DIR}/decoded_clip.cpp" "${MEDIA_PREVIEW_SOURCE_DIR}/decoded_audio.cpp"
             "${MEDIA_PREVIEW_SOURCE_DIR}/frame_texture.cpp")
+    target_compile_definitions(media_container_preview_tests PRIVATE MEDIA_PREVIEW_TEST_EXPORTS=1)
     target_link_libraries(media_container_preview_tests PRIVATE huxerui_media ${MEDIA_TEST_FRAMEWORK} HuxerUI::testing)
     target_compile_features(media_container_preview_tests PRIVATE cxx_std_20)
     set_target_properties(media_container_preview_tests PROPERTIES CXX_EXTENSIONS OFF)

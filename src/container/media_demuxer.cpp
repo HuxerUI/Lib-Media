@@ -91,12 +91,7 @@ ContainerReader& MediaDemuxer::Require() const {
 ContainerFormat MediaDemuxer::Format() const { return Require().format; }
 ContainerLayout MediaDemuxer::Layout() const { return Require().layout; }
 std::span<const MediaTrack> MediaDemuxer::Tracks() const { return Require().tracks; }
-std::span<const MediaTrack> MediaDemuxer::SampleDescriptions(std::uint32_t track_id) const {
-  const auto& reader = Require();
-  const auto track = std::ranges::find(reader.tracks, track_id, &MediaTrack::id);
-  if (track == reader.tracks.end()) return {};
-  return reader.SampleDescriptions(static_cast<std::size_t>(track - reader.tracks.begin()));
-}
+std::optional<MediaAudioMetadata> MediaDemuxer::AudioMetadata() const { return Require().audio_metadata; }
 std::optional<MediaTimestamp> MediaDemuxer::StartTime() const { return Require().start; }
 std::optional<MediaTimestamp> MediaDemuxer::Duration() const { return Require().duration; }
 
@@ -118,14 +113,9 @@ ContainerResult<void> MediaDemuxer::SelectTracks(std::span<const std::uint32_t> 
         Fail(ContainerErrorCode::InvalidArgument, "Duplicate selected track");
       selection.push_back(id);
     }
-    auto descriptions = reader.describe;
-    for (auto& track : reader.tracks) {
-      const auto selected = selection.empty() || std::ranges::find(selection, track.id) != selection.end();
-      if (selected && !Selected(reader, track.id) && std::ranges::find(descriptions, track.id) == descriptions.end())
-        descriptions.push_back(track.id);
-    }
+    for (std::size_t i = 0; i < reader.tracks.size(); ++i)
+      if (!Selected(reader, reader.tracks[i].id)) reader.active_descriptions[i] = 0;
     reader.selected = std::move(selection);
-    reader.describe = std::move(descriptions);
   });
 }
 
@@ -133,28 +123,16 @@ ContainerResult<std::optional<DemuxItem>> MediaDemuxer::Read() {
   auto result = ContainerCall<std::optional<DemuxItem>>([&]() -> std::optional<DemuxItem> {
     auto& reader = Require();
     for (;;) {
-      std::optional<DemuxItem> item;
-      if (reader.pending) {
-        item = DemuxItem(std::move(*reader.pending));
-        reader.pending.reset();
-      } else {
-        item = reader.Read();
-      }
-      if (!item) return {};
-      if (auto* track = std::get_if<MediaTrack>(&*item)) {
-        if (!Selected(reader, track->id)) continue;
-        std::erase(reader.describe, track->id);
-        return item;
-      }
-      auto& packet = std::get<ContainerPacket>(*item);
-      if (!Selected(reader, packet.track_id)) continue;
-      if (std::erase(reader.describe, packet.track_id)) {
-        const auto index = PacketTrack(reader.tracks, packet.track_id);
-        // The packet retains its bytes while its effective description is delivered first.
-        reader.pending = std::move(packet);
-        return DemuxItem(reader.tracks[index]);
-      }
-      return item;
+      auto packet = reader.pending ? std::exchange(reader.pending, std::nullopt) : reader.Read();
+      if (!packet) return {};
+      if (!Selected(reader, packet->track_id)) continue;
+      const auto index = PacketTrack(reader.tracks, packet->track_id);
+      const auto description = packet->sample_description_index;
+      if (reader.active_descriptions[index] == description) return DemuxItem(std::move(*packet));
+      const TrackDecodeStart start{packet->track_id, description, reader.first_audible_pts[index]};
+      reader.active_descriptions[index] = description;
+      reader.pending = std::move(packet);
+      return DemuxItem(start);
     }
   });
   if (!result.Succeeded() && reader_) reader_->failed = true;
@@ -175,14 +153,10 @@ ContainerResult<std::optional<SeekPoint>> MediaDemuxer::Seek(
   return ContainerCall<std::optional<SeekPoint>>([&] {
     auto& reader = Require();
     ValidateSeek(reader, track_id, time, direction);
-    std::vector<std::uint32_t> descriptions;
-    for (auto& track : reader.tracks) {
-      if (Selected(reader, track.id)) descriptions.push_back(track.id);
-    }
     auto point = reader.Find(track_id, time, direction, true);
     if (point) {
       reader.pending.reset();
-      reader.describe = std::move(descriptions);
+      reader.active_descriptions.fill(0);
     }
     return point;
   });

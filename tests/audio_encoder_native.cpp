@@ -193,31 +193,35 @@ void M4aReadback(Encoded& encoded) {
   const auto& summary = encoded.summary;
   if (!summary.priming_samples || !summary.padding_samples) return;
   const auto rate = encoded.format.sample_rate;
-  const MediaTrack track{.id = 1, .kind = TrackKind::Audio, .codec = CodecId::Aac,
-      .initialization_data = encoded.format.initialization_data, .sample_rate = rate,
-      .channel_count = encoded.format.channel_layout == AudioChannelLayout::Mono ? 1u : 2u};
+  const MediaTrack track{.id = 1, .kind = TrackKind::Audio,
+      .descriptions = {{.codec = CodecId::Aac, .initialization_data = encoded.format.initialization_data,
+          .sample_rate = rate, .channel_count = encoded.format.channel_layout == AudioChannelLayout::Mono ? 1u : 2u}}};
   const auto path = std::filesystem::temp_directory_path() /
       ("lib-media-aac-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".m4a");
   const File file(path.u8string());
   auto mux = Take(MediaMuxer::Open(Take(file.OpenRandomAccess(FileAccessMode::ReadWrite, FileOpenMode::CreateNew)),
-      ContainerFormat::Mp4, std::span(&track, 1), ContainerLayout::FastStart));
+      ContainerFormat::Mp4, std::span(&track, 1), {.layout = ContainerLayout::FastStart}));
   for (const auto& packet : encoded.packets)
     Check(!Take(mux.TryWrite({1, packet.data, packet.pts, packet.dts, packet.duration, true})), "M4A AAC muxing stalled");
   Take(mux.EndTrack(1, summary.priming_samples, summary.padding_samples));
   Take(mux.Finish());
   auto demux = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
-  const auto& description = demux.Tracks().front();
-  Check(description.codec == CodecId::Aac && description.initialization_data == track.initialization_data &&
-      description.priming_samples == summary.priming_samples && description.padding_samples == summary.padding_samples,
+  const auto tracks = demux.Tracks();
+  const auto& description = tracks.front().descriptions.front();
+  const auto origin = encoded.packets.front().pts.Rescale(rate)->ticks;
+  Check(description.codec == CodecId::Aac && description.initialization_data == track.descriptions.front().initialization_data &&
+      !tracks.front().edits.empty() &&
+      tracks.front().edits.back().media_start == MediaTimestamp{static_cast<std::int64_t>(*summary.priming_samples), rate},
       "M4A changed AAC initialization or trim");
   const auto start = *summary.input_start->Rescale(rate);
-  Check(demux.PresentationRange(description.id) == MediaPresentationRange{start,
+  Check(demux.PresentationRange(track.id) == MediaPresentationRange{start,
       {start.ticks + static_cast<std::int64_t>(summary.input_samples), rate}}, "M4A changed the audible sample interval");
+  Check(std::holds_alternative<TrackDecodeStart>(*Take(demux.Read())), "M4A lost its decode start");
   for (auto& packet : encoded.packets) {
     auto item = Take(demux.Read());
     Check(bool(item), "M4A lost an encoded AAC packet");
     auto& actual = std::get<ContainerPacket>(*item);
-    Check(actual.pts == packet.pts && actual.duration == packet.duration &&
+    Check(actual.pts == MediaTimestamp{packet.pts.Rescale(rate)->ticks - origin, rate} && actual.duration == packet.duration &&
         std::ranges::equal(actual.data.AsBytes(), packet.data.AsBytes()), "M4A changed the AAC packet");
     packet.data = std::move(actual.data);
   }

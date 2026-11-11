@@ -126,7 +126,7 @@ struct Clip {
 Clip ReadClip(const File& file) {
   auto source = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
   const auto video = std::ranges::find(source.Tracks(), TrackKind::Video, &MediaTrack::kind);
-  Check(video != source.Tracks().end() && video->timescale && video->coded_width && video->coded_height, "No timed video track");
+  Check(video != source.Tracks().end() && video->timescale && video->descriptions.front().coded_width && video->descriptions.front().coded_height, "No timed video track");
   Clip clip{.track = *video};
   Take(source.SelectTracks(std::span(&clip.track.id, 1)));
   while (auto item = Take(source.Read())) {
@@ -142,10 +142,11 @@ Clip ReadClip(const File& file) {
 }
 
 VideoDecoderConfig DecoderConfig(const MediaTrack& track, bool gpu) {
-  VideoDecoderConfig config{.initialization_data = track.initialization_data,
-      .width = *track.coded_width, .height = *track.coded_height, .codec = track.codec,
+  const auto& description = track.descriptions.front();
+  VideoDecoderConfig config{.initialization_data = description.initialization_data,
+      .width = *description.coded_width, .height = *description.coded_height, .codec = description.codec,
       .output_storage = gpu ? VideoStorage::Platform : VideoStorage::Cpu};
-  if (track.codec == CodecId::H264) {
+  if (description.codec == CodecId::H264) {
     config.width = (config.width + 15) & ~15u;
     config.height = (config.height + 15) & ~15u;
   }
@@ -542,7 +543,7 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
   constexpr bool allow_pts_as_dts = false;
 #endif
 #if defined(_WIN32) || (defined(__APPLE__) && TARGET_OS_IOS && TARGET_OS_SIMULATOR)
-  const bool reorder = clip.track.codec == CodecId::Hevc;
+  const bool reorder = clip.track.descriptions.front().codec == CodecId::Hevc;
 #else
   constexpr bool reorder = false;
 #endif
@@ -556,7 +557,7 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
   if (gpu) {
     if (!texture_input && !CodecAvailable<VideoDecoder>(decoder_config)) throw MissingHardware{};
     VideoEncoderConfig config{.input = watermark_format, .bitrate = bitrate,
-        .profile = H264Profile::Baseline, .codec = clip.track.codec, .input_storage = VideoStorage::Platform};
+        .profile = H264Profile::Baseline, .codec = clip.track.descriptions.front().codec, .input_storage = VideoStorage::Platform};
     if (reorder) config.max_b_frames = std::nullopt;
     if (!CodecAvailable<VideoEncoder>(config)) throw MissingHardware{};
   }
@@ -591,9 +592,10 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
       while (auto output = Take(encoder->codec.TryRead())) {
         progress = true;
         if (const auto* format = std::get_if<VideoEncodeFormat>(&*output)) {
-          const MediaTrack track{.id = 1, .kind = TrackKind::Video, .codec = format->codec,
-              .framing = PacketFraming::LengthPrefixedNals, .initialization_data = format->initialization_data,
-              .timescale = clock, .coded_width = format->width, .coded_height = format->height, .visible = format->visible};
+          const MediaTrack track{.id = 1, .kind = TrackKind::Video, .timescale = clock,
+              .descriptions = {{.codec = format->codec, .framing = PacketFraming::LengthPrefixedNals,
+                  .initialization_data = format->initialization_data, .coded_width = format->width,
+                  .coded_height = format->height, .visible = format->visible}}};
           mux.emplace(Take(MediaMuxer::Open(Take(file.OpenRandomAccess(FileAccessMode::WriteOnly, FileOpenMode::CreateNew)),
               ContainerFormat::Mp4, std::span(&track, 1))));
         } else if (const auto* packet = std::get_if<EncodedPacket>(&*output)) {
@@ -665,9 +667,9 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
               (gpu ? pending->planes.empty() : !pending->planes.empty()), "Unexpected encoder input frame storage");
         if (!encoder) {
           VideoEncoderConfig config{.input = pending->format, .bitrate = bitrate, .profile = H264Profile::Baseline,
-              .codec = clip.track.codec, .input_storage = decoder_config.output_storage};
+              .codec = clip.track.descriptions.front().codec, .input_storage = decoder_config.output_storage};
 #ifdef __APPLE__
-          if (gpu && regression && clip.track.codec == CodecId::H264) config.limits.input_items = 1;
+          if (gpu && regression && clip.track.descriptions.front().codec == CodecId::H264) config.limits.input_items = 1;
 #endif
           if (reorder) config.max_b_frames = std::nullopt;
           encoder.emplace(config);
@@ -726,8 +728,16 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
 #endif
   std::cout << '\n';
   const auto readback = ReadClip(file);
-  Check(readback.track.codec == clip.track.codec && readback.times == clip.times &&
-        readback.track.visible.value_or(VideoRectangle{0, 0, *readback.track.coded_width, *readback.track.coded_height}) ==
+  const auto& description = readback.track.descriptions.front();
+  Check(readback.times.size() == clip.times.size(), "MP4 readback changed the frame count");
+  std::vector<MediaPresentationSlice> slices;
+  for (std::size_t i = 0; i < readback.times.size(); ++i) {
+    const auto pts = readback.times[i];
+    Take(MapToPresentation(readback.track.edits, pts, {pts.ticks + 1, pts.timescale}, slices));
+    Check(slices.size() == 1 && slices.front().presentation.start == clip.times[i], "MP4 readback changed picture time");
+  }
+  Check(description.codec == clip.track.descriptions.front().codec &&
+        description.visible.value_or(VideoRectangle{0, 0, *description.coded_width, *description.coded_height}) ==
             VideoRectangle{0, 0, width, height}, "MP4 readback changed codec, visible geometry, or PTS");
   std::optional<MediaTimestamp> previous_dts;
   for (const auto& packet : readback.packets) {
@@ -738,7 +748,7 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
   }
   if (texture_input) {
 #ifdef _WIN32
-    if (readback.track.codec == CodecId::Hevc && !CodecAvailable<VideoDecoder>(DecoderConfig(readback.track, false))) {
+    if (readback.track.descriptions.front().codec == CodecId::Hevc && !CodecAvailable<VideoDecoder>(DecoderConfig(readback.track, false))) {
       std::cout << "HEVC SDK texture encoding and MP4 timing passed. Watermark decode requires an HEVC decoder.\n";
       return;
     }

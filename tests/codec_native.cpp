@@ -316,11 +316,11 @@ int main(int argc, char** argv) {
     video.initialization_data = Read(root / "avc.config");
     video.width = 64; video.height = 48;
     auto unsupported = video;
-    for (const auto codec : {CodecId::Aac, CodecId::Vp9, CodecId::Unknown}) {
+    for (const auto codec : {CodecId::Aac, CodecId::Unknown}) {
       unsupported.codec = codec;
       const auto rejected = VideoDecoder::Create(unsupported);
       Check(!rejected.Succeeded() && rejected.Error().code == CodecErrorCode::InvalidArgument,
-            "Video decoder must reject codec IDs outside H.264 and HEVC");
+            "Video decoder accepted an unrelated codec ID");
     }
     auto avc = Packets(root, "avc");
     Decode<VideoDecoder, VideoDecoderConfig, VideoFrame>(video, avc, avc.size());

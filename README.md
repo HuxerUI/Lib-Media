@@ -30,7 +30,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`media_player.h`](include/huxerui/media_player.h) |
 | Platform image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
-| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, and HEVC. Opus, FLAC, and MP3 also pass native decoding on Windows and Linux. See [decoder validation](#media-decoding). | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
+| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, HEVC, and macOS VP9 profile 0. Opus, FLAC, and MP3 also pass native decoding on Windows and Linux. See [decoder validation](#media-decoding). | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
 | HEVC encoding and decoding | Main and Main10 adapters for all six platforms. Linux Main/Main10 CPU round trips and preview export passed under WSL. See the [HEVC matrix](docs/media-codec.md#hevc) for device and runtime coverage. | `CodecId::Hevc`, `VideoEncoder`, `VideoDecoder`, and `VideoPixelFormat::P010` |
 | GPU video | SDR H.264 and HEVC Main platform frames and SDK texture input on macOS, Android, iOS, Windows, and supported Web browsers. Windows x64 passed H.264 GPU transcode and SDK texture encoding for H.264 and HEVC Main. See [GPU video](docs/gpu-video.md) for platform coverage. | `VideoStorage::Platform`, `MakeExternalTexture()`, and `MakeVideoFrame()` |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
@@ -354,8 +354,10 @@ window, or `Install()`, and does not reserve resources or select a different bac
 
 ## Media containers
 
-`MediaDemuxer` reads tracks and packets from SDK streams. `MediaMuxer` writes packets to a fresh stream and
-finalizes it through `Finish()`. Both sessions are synchronous. Use the [container guide](docs/media-container.md)
+`MediaDemuxer` reads tracks and packets from SDK streams. Each track holds its sample descriptions.
+`TrackDecodeStart` identifies the configuration and any audible start before the corresponding packets.
+Packet timestamps use the media clock. `MapToPresentation()` applies track edits to decoded intervals.
+`MediaMuxer` writes packets and finalizes the output through `Finish()`. Both sessions are synchronous. Use the [container guide](docs/media-container.md)
 for format mappings, seek behavior, output requirements, and packet ownership. Audio-only MP4 is saved as
 `.m4a` and supports AAC-LC or ALAC packets, supported text tags, front-cover artwork, and exact presentation trim.
 
@@ -439,53 +441,29 @@ The [preview](examples/preview) exercises the library through four tabs.
 | Video | Local/reference/URL sources, playback controls, progress, seeking, volume, looping, and video fitting |
 | Music | Audio playback using the same player API without a video surface |
 | Library | Platform image/video/mixed selection, capability-aware multi-select, retained references, and publication |
-| Frames | Seek decoded video or audio, copy compatible packets, encode H.264, export PCM to WAV, and save the prepared file |
+| Frames | Open, preview, and seek decoded video or audio, then copy and save compatible files |
 
 The Library tab disables multi-select when the maximum is below two; otherwise it requests up to three items within
 the platform limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
 FilePicker explicitly to obtain a source. Switching tabs unmounts the previous session and cancels its pending work.
 
-The Frames tab decodes files through `MediaDemuxer` and `DecodedPlayback`. Local MP4, MOV, and fragmented MP4
-can use a seek index to restart the decoders and replace the texture for each playback epoch. Effective track ranges
-limit visible pictures and PCM to the intersection of sample coverage and edits. The preview drains and switches
-decoder configurations at sample-description boundaries and maps rate-one edits onto the playback clock. Fragmented
-MP4 playback starts from the first packet's configuration and updates its duration as packets are read. The bundled
-file has reordered H.264 pictures, uneven frame intervals, and AAC priming. The Frames preview can also present
-rotated SDR HEVC when the selected decoder exposes CPU I420, NV12, or P010.
+The Frames tab uses `MediaDemuxer` and `DecodedPlayback` to preview and seek MP4, MOV, and supported WebM
+files. It switches decoders at sample-description boundaries and applies track edits to decoded pictures and PCM.
+The bundled H.264/AAC sample has reordered pictures, uneven frame intervals, and AAC priming. On supported
+macOS hardware, CPU preview also plays VP9 profile 0 with Opus in WebM without Cues.
 
-Switch **CPU video** to **GPU video** to preview supported SDR platform frames. Android can send the selected picture
-directly to `SurfaceStreamTexture`. macOS, Android, iOS, and supported Windows setups can export a half-size MP4 with
-GPU scaling. On Web, GPU video publishes the browser frame and encodes at its visible size. Both paths reopen the MP4
-before enabling Save Movie.
-See the [frame storage contract and GPU performance comparison](docs/gpu-video.md).
+Switch **CPU video** to **GPU video** for supported SDR platform frames. Android can preview directly to
+`SurfaceStreamTexture`. See the [frame storage contract and GPU performance comparison](docs/gpu-video.md).
 
-“Open audio” reuses the Frames controls for Ogg Opus, audio in WebM/MKA, native FLAC, MP3, and M4A. It plays decoded PCM
-and supports repeated seeks, including across chained Ogg links. Sequential preview and WAV export also work with
-WebM audio that has no seek index. “Export WAV” writes and reopens S16 PCM at the source rate and layout. “Copy Audio”
-keeps FLAC, MP3, or AAC/ALAC M4A packets, their presentation interval, supported tags, and cover art. It can also
-copy fragmented AAC into a regular M4A. AAC-LC M4A supports PCM preview and WAV export. Native M4A copies use
-fast-start. Web copies yield between packet batches and leave the M4A index after the media data. Use “Save Audio”
-to save the prepared file.
+**Open audio** plays supported Ogg Opus, WebM/MKA, FLAC, MP3, and AAC M4A sources. **Copy Audio** keeps
+compatible FLAC, MP3, and AAC/ALAC M4A packets, supported tags, and artwork. **Copy Movie** keeps compatible
+MP4, MOV, or WebM access units, sample descriptions, timing, and supported metadata. The copy is reopened
+before the save action becomes available. Browser input is staged in memory and limited to 128 MiB.
 
-“Copy Movie” rewrites compatible tracks into MP4 or MOV with the original access units, timing, sample descriptions,
-authored edits, and supported visual metadata. MOV copies also retain timecode, boxed timed metadata, and their track
-associations. This includes HLG and Dolby Vision configuration on the
-HEVC packet-copy path. “Encode MP4” encodes SDR H.264 or HEVC using the source codec and writes fast-start MP4. macOS allows B pictures
-and uses explicit encoder DTS, as does HEVC on the iOS Simulator. Web HEVC uses automatic B-picture selection and
-can export when encoder output has strictly increasing presentation timestamps. The zero-B-picture H.264 path
-uses Baseline. The output container preserves the display pixel aspect ratio. Android, Windows, Linux, and Web pass AAC
-packets through. The Apple platforms encode PCM and require a known AAC trim summary.
-
-Both actions reopen the finished file before “Save Movie” can publish it. Changing the source or preparing another
-result clears the previous export. The separate save action lets the browser picker start from a fresh click.
-Browser input is staged in memory and limited to 128 MiB.
-
-The [shared preview integration test](tests/container_preview.cpp) checks seeks, presentation edits, export, and
-packet copy on macOS, Windows, and Linux. The HEVC fixture cases require the matching codec configurations to pass
-`Probe()`. The [texture contract test](tests/frame_texture_contract.cpp) checks cropped, padded CPU frames and successive
-publications. Android 12 and iOS Simulator passed headless cross-fragment seek and HLG MOV packet-copy checks.
-iOS Simulator also decoded the SDR Main10 fixture to P010.
-The [roadmap](docs/media-roadmap.md#delivery-order) tracks iPhone camera-original and HDR display acceptance.
+The [preview integration test](tests/container_preview.cpp) covers repeated seeks, presentation edits,
+configuration changes, packet copy, encoded MP4 readback, and WAV sample counts including authored silence.
+The encoding and WAV export entry points are built into the test target. Hardware cases use
+`Probe()` for the concrete configuration. The [roadmap](docs/media-roadmap.md) tracks remaining device acceptance.
 
 ### Build and run
 

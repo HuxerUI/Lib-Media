@@ -236,7 +236,7 @@ CodecId PcmType(unsigned bits, bool big, bool floating, bool signed_integer) {
   Fail(Unsupported, "Unsupported QuickTime PCM sample type");
 }
 
-void ReadPcmDescription(const BoxView& entry, MediaTrack& track) {
+void ReadPcmDescription(const BoxView& entry, MediaSampleDescription& track) {
   const auto version = Number<std::uint16_t>(entry.bytes, 8);
   std::uint32_t channels = 0, rate = 0, declared_frame_bytes = 0;
   if (entry.tag == Tag("lpcm") && version == 2) {
@@ -291,16 +291,9 @@ void ReadPcmDescription(const BoxView& entry, MediaTrack& track) {
   const auto frame_bytes = (MovPcmBits(track.codec) / 8) * channels;
   if (!rate || !channels || channels > 64 || (version && frame_bytes != declared_frame_bytes))
     Fail(Invalid, "Inconsistent QuickTime PCM channels, rate, or frame size");
-  track.kind = TrackKind::Audio;
   track.sample_rate = rate;
   track.channel_count = channels;
 }
-
-struct EditList {
-  std::int64_t empty = 0;
-  std::optional<std::int64_t> media_start;
-  std::int64_t duration = 0;
-};
 
 std::int64_t SignedTicks(std::uint64_t value) {
   if (value > std::numeric_limits<std::int64_t>::max())
@@ -308,8 +301,7 @@ std::int64_t SignedTicks(std::uint64_t value) {
   return static_cast<std::int64_t>(value);
 }
 
-EditList ParseEdits(ByteView edit, std::uint32_t movie_scale, std::uint32_t media_scale,
-                    std::vector<MediaTrack::Edit>& extended) {
+std::vector<MediaTrack::Edit> ParseEdits(ByteView edit, std::uint32_t movie_scale, std::uint32_t media_scale) {
   if (edit.empty()) return {};
   const auto list = Child(edit, "elst");
   CheckVersion(list, 1);
@@ -327,18 +319,11 @@ EditList ParseEdits(ByteView edit, std::uint32_t movie_scale, std::uint32_t medi
     if (start < -1) Fail(Invalid, "Invalid MP4 edit media position");
     edits.push_back({{length, movie_scale}, start == -1 ? std::nullopt : std::optional(MediaTimestamp{start, media_scale})});
   }
-  if (edits.empty()) return {};
-  if (edits.back().media_start && (edits.size() == 1 || (edits.size() == 2 && !edits.front().media_start)))
-    return {edits.size() == 2 ? edits.front().duration.ticks : 0, edits.back().media_start->ticks, edits.back().duration.ticks};
-  extended = std::move(edits);
-  return {};
+  return edits;
 }
 
 struct TrackIndex {
   std::uint32_t scale = 0;
-  std::uint32_t clock = 0;
-  std::int64_t shift = 0;
-  EditList edit;
   std::optional<Mp4EditTimeline> timeline;
   std::optional<MediaPresentationRange> presentation_range;
   std::optional<std::pair<std::int64_t, std::int64_t>> coverage;
@@ -352,9 +337,7 @@ struct TrackIndex {
   std::optional<std::int64_t> next_dts;
   bool defaults = false;
 
-  MediaTimestamp Time(std::int64_t ticks) const {
-    return {AddTime(ExactTicks({ticks, scale}, clock), shift), clock};
-  }
+  MediaTimestamp Time(std::int64_t ticks) const { return {ticks, scale}; }
 };
 
 void IndexSyncSamples(TrackIndex& track) {
@@ -396,7 +379,7 @@ template<class Visit> void VisitChunks(ByteView stbl, std::uint32_t count, std::
   if (entry != mappings || index != count) Fail(Invalid, "MP4 chunk table does not cover all samples");
 }
 
-void ParsePcmSamples(ByteView stbl, TrackIndex& index, const MediaTrack& track, std::size_t remaining) {
+void ParsePcmSamples(ByteView stbl, TrackIndex& index, const MediaSampleDescription& track, std::size_t remaining) {
   const auto frame_bytes = (MovPcmBits(track.codec) / 8) * *track.channel_count;
   const auto rate = *track.sample_rate;
   if (index.scale % rate) Fail(Unsupported, "QuickTime PCM track clock is not an integer multiple of its sample rate");
@@ -566,7 +549,7 @@ public:
     if (growing_) EnableFragmentIndex();
   }
 
-  std::optional<DemuxItem> Read() override {
+  std::optional<ContainerPacket> Read() override {
     const bool indexed = layout == ContainerLayout::Default || fragment_indexed_;
     const bool seekable = input.Random() && (indexed || input.Size());
     for (;;) {
@@ -588,7 +571,7 @@ public:
     }
     const auto ref = order_[cursor_++];
     const auto& sample = Sample(indexes_, ref);
-    if (tracks[ref.track].sample_entry == "tmcd" && sample.size != 4)
+    if (tracks[ref.track].descriptions[sample.description - 1].sample_entry == "tmcd" && sample.size != 4)
       Fail(Invalid, "QuickTime timecode requires four-byte samples");
     if (seekable) {
       input.Seek(sample.offset);
@@ -599,20 +582,8 @@ public:
     auto data = Own(input.ReadBytes(sample.size));
     if (!seekable && !indexed && whole_stream_) UpdateCoverage(track, std::span(&sample, 1));
     const auto pts = track.Time(sample.pts), dts = track.Time(sample.dts);
-    ContainerPacket packet{tracks[ref.track].id, std::move(data), pts, dts,
+    return ContainerPacket{tracks[ref.track].id, std::move(data), pts, dts,
                            MediaTimestamp{sample.duration, track.scale}, sample.sync, {}, sample.description};
-    auto& active = tracks[ref.track];
-    if (active.sample_description_index == sample.description) return packet;
-    auto description = descriptions_[ref.track][sample.description - 1];
-    if (active.audio_metadata) description.audio_metadata = std::move(active.audio_metadata);
-    active = std::move(description);
-    pending = std::move(packet);
-    return active;
-  }
-
-  std::span<const MediaTrack> SampleDescriptions(std::size_t track) const override {
-    return descriptions_[track].size() == 1 ? ContainerReader::SampleDescriptions(track)
-                                             : std::span<const MediaTrack>(descriptions_[track]);
   }
 
   std::optional<MediaPresentationRange> PresentationRange(std::size_t track) const override {
@@ -629,42 +600,12 @@ public:
       while (!IndexCovers(index, time, direction) && IndexNextFragment()) {}
     }
     const auto& track = indexes_[index];
-    std::optional<std::uint32_t> at;
-    std::int64_t shift = 0;
-    if (const auto& timeline = track.timeline) {
-      const auto clock = timeline->scale;
-      auto in_segment = [&](const Mp4EditSegment& segment) {
-        const bool forward = direction == SeekDirection::AtOrAfter;
-        const MediaTimestamp begin{segment.begin, clock}, end{segment.end, clock};
-        if (forward ? time.Compare(end) >= 0 : time.Compare(begin) < 0) return false;
-        const auto ticks = time.Compare(begin) < 0 ? segment.begin : time.Compare(end) >= 0 ? segment.end - 1 :
-            DirectionalTicks(time, clock, forward);
-        const auto media = AddTime(segment.media, ticks - segment.begin);
-        auto candidate = FindSample(track, {media, clock}, direction);
-        if (!candidate) return false;
-        if (forward && track.Time(track.samples[*candidate].pts).Compare(
-                {AddTime(segment.media, segment.end - segment.begin), clock}) >= 0) return false;
-        at = candidate;
-        shift = SubTime(segment.begin, segment.media);
-        return true;
-      };
-      if (direction == SeekDirection::AtOrAfter) {
-        for (const auto& segment : timeline->segments) if (in_segment(segment)) break;
-      } else {
-        for (auto segment = timeline->segments.rbegin(); segment != timeline->segments.rend(); ++segment)
-          if (in_segment(*segment)) break;
-      }
-    } else {
-      at = FindSample(track, time, direction);
-    }
-    if (!at) return {};
-    const auto& sample = track.samples[*at];
-    auto anchor = track.Time(sample.pts);
-    if (track.timeline)
-      anchor = {AddTime(ExactTicks(anchor, track.timeline->scale), shift), track.timeline->scale};
-    auto point = SeekSample(index, sample, anchor);
+    const auto anchor = FindAnchor(track, time, direction);
+    if (!anchor) return {};
+    const auto decode = DecodeStart(index, track, anchor->sample);
+    auto point = SeekSample(index, track, *anchor, decode);
     if (seek) {
-      const auto entry = std::lower_bound(order_.begin(), order_.end(), sample.offset,
+      const auto entry = std::lower_bound(order_.begin(), order_.end(), track.samples[decode].offset,
           [&](SampleRef ref, std::uint64_t offset) { return Sample(indexes_, ref).offset < offset; });
       cursor_ = static_cast<std::size_t>(entry - order_.begin());
       read_floor_ = 0;
@@ -673,6 +614,49 @@ public:
   }
 
 private:
+  struct Anchor {
+    std::uint32_t sample;
+    MediaTimestamp presentation_time;
+    bool preroll;
+  };
+
+  static std::optional<Anchor> FindAnchor(const TrackIndex& track, MediaTimestamp time, SeekDirection direction) {
+    if (!track.timeline) {
+      if (const auto sample = FindSample(track, time, direction))
+        return Anchor{*sample, track.Time(track.samples[*sample].pts), false};
+      return {};
+    }
+    const auto& timeline = *track.timeline;
+    const bool forward = direction == SeekDirection::AtOrAfter;
+    auto find_in = [&](const Mp4EditSegment& segment) -> std::optional<Anchor> {
+      const auto clock = timeline.scale;
+      const MediaTimestamp begin{segment.begin, clock}, end{segment.end, clock};
+      if (forward ? time.Compare(end) >= 0 : time.Compare(begin) < 0) return {};
+      if (!track.coverage || track.Time(track.coverage->second).Compare({segment.media, clock}) <= 0 ||
+          track.Time(track.coverage->first).Compare({AddTime(segment.media, segment.end - segment.begin), clock}) >= 0)
+        return {};
+      const auto ticks = time.Compare(begin) < 0 ? segment.begin : time.Compare(end) >= 0 ? segment.end - 1 :
+          DirectionalTicks(time, clock, forward);
+      const auto media = AddTime(segment.media, ticks - segment.begin);
+      auto sample = forward && time.Compare(begin) <= 0
+          ? FindSample(track, {media, clock}, SeekDirection::AtOrBefore) : std::nullopt;
+      if (!sample) sample = FindSample(track, {media, clock}, direction);
+      if (!sample) return {};
+      const auto pts = ExactTicks(track.Time(track.samples[*sample].pts), clock);
+      if (pts >= AddTime(segment.media, segment.end - segment.begin)) return {};
+      const auto projected = AddTime(segment.begin, SubTime(pts, segment.media));
+      return Anchor{*sample, {std::max(projected, segment.begin), clock}, projected < segment.begin};
+    };
+    if (forward) {
+      for (const auto& segment : timeline.segments)
+        if (auto anchor = find_in(segment)) return anchor;
+    } else {
+      for (auto segment = timeline.segments.rbegin(); segment != timeline.segments.rend(); ++segment)
+        if (auto anchor = find_in(*segment)) return anchor;
+    }
+    return {};
+  }
+
   static std::optional<std::uint32_t> FindSample(const TrackIndex& track, MediaTimestamp target,
                                                  SeekDirection direction) {
     const auto& points = track.sync;
@@ -690,8 +674,22 @@ private:
     return {};
   }
 
-  SeekPoint SeekSample(std::size_t index, const Mp4Sample& sample, MediaTimestamp time) {
-    const auto& description = descriptions_[index][sample.description - 1];
+  bool IsAac(std::size_t index, const Mp4Sample& sample) const {
+    return tracks[index].descriptions[sample.description - 1].codec == CodecId::Aac;
+  }
+
+  std::uint32_t DecodeStart(std::size_t index, const TrackIndex& track, std::uint32_t sample) const {
+    if (!sample || !IsAac(index, track.samples[sample])) return sample;
+    const auto& previous = track.samples[sample - 1];
+    const auto& anchor = track.samples[sample];
+    // AAC needs the preceding access unit for overlap when it belongs to the same decoding sequence.
+    return previous.description == anchor.description && AddTime(previous.dts, previous.duration) == anchor.dts
+        ? sample - 1 : sample;
+  }
+
+  SeekPoint SeekSample(std::size_t index, const TrackIndex& track, const Anchor& anchor, std::uint32_t decode) {
+    const auto& sample = track.samples[anchor.sample];
+    const auto& description = tracks[index].descriptions[sample.description - 1];
     auto kind = description.framing == PacketFraming::LengthPrefixedNals ? SeekPoint::Kind::SyncMarked
                                                                         : SeekPoint::Kind::Independent;
     const bool avc = description.codec == CodecId::H264;
@@ -711,7 +709,8 @@ private:
       }
       input.Seek(previous);
     }
-    return {tracks[index].id, time, kind, sample.offset, {}};
+    if (decode != anchor.sample) kind = SeekPoint::Kind::NeedsPreroll;
+    return {tracks[index].id, anchor.presentation_time, kind, sample.offset, track.Time(track.samples[decode].pts)};
   }
 
   static std::int64_t DirectionalTicks(MediaTimestamp time, std::uint32_t scale, bool forward) {
@@ -783,17 +782,14 @@ private:
         std::erase_if(refs, [&](const auto& ref) {
           return std::ranges::find(tracks, ref.track_id, &MediaTrack::id) == tracks.end();
         });
-        for (auto& description : descriptions_[i]) description.references = refs;
       }
     }
     if (layout == ContainerLayout::Fragmented) {
       if (count) Fail(Unsupported, "MP4 hybrid sample tables and fragments are unsupported");
       ReadDefaults(extensions);
     }
-    if (format == ContainerFormat::Mp4 && tracks.size() == 1 && tracks.front().kind == TrackKind::Audio) {
-      tracks.front().audio_metadata = ReadAudioMetadata(movie);
-      descriptions_.front().front().audio_metadata = tracks.front().audio_metadata;
-    }
+    if (format == ContainerFormat::Mp4 && tracks.size() == 1 && tracks.front().kind == TrackKind::Audio)
+      audio_metadata = ReadAudioMetadata(movie);
   }
 
   void ReadTrack(ByteView box, std::size_t& count) {
@@ -817,7 +813,7 @@ private:
       Fail(Invalid, "MP4 track IDs must be nonzero and unique");
     const auto mdhd = Child(mdia, "mdhd");
     CheckVersion(mdhd, 1);
-    index.clock = index.scale = Number<std::uint32_t>(mdhd, Version(mdhd) ? 20 : 12);
+    index.scale = Number<std::uint32_t>(mdhd, Version(mdhd) ? 20 : 12);
     if (!index.scale) Fail(Invalid, "Zero MP4 track timescale");
     track.timescale = index.scale;
     const auto references = Child(Child(minf, "dinf"), "dref");
@@ -835,15 +831,21 @@ private:
       Fail(ContainerErrorCode::LimitExceeded, "MP4 track has too many sample descriptions");
     if (format == ContainerFormat::Mov) track.references = ReadReferences(Child(box, "tref", false));
     auto entries = description.subspan(8);
-    std::vector<MediaTrack> descriptions;
+    track.kind = handler == Tag("vide") ? TrackKind::Video : handler == Tag("soun") ? TrackKind::Audio : TrackKind::Data;
+    if (track.kind == TrackKind::Video) {
+      const auto rotation = Rotation(tkhd, Version(tkhd) ? 52 : 40);
+      track.rotation = static_cast<VideoRotation>(
+          (static_cast<unsigned>(movie_rotation_) + static_cast<unsigned>(rotation)) % 4);
+    }
+    auto& descriptions = track.descriptions;
+    descriptions.reserve(index.description_count);
     for (std::uint32_t i = 1; i <= index.description_count; ++i) {
       const auto entry = NextBox(entries);
       if (data && (handler == Tag("tmcd") ? entry.tag != Tag("tmcd") : entry.tag != Tag("mebx"))) return;
       if (Number<std::uint16_t>(entry.bytes, 6) != 1)
         Fail(Unsupported, "Unsupported MP4 sample description reference");
-      auto described = track;
-      described.sample_description_index = i;
-      ReadDescription(entry, handler, tkhd, described);
+      MediaSampleDescription described;
+      ReadDescription(entry, handler, described);
       if (!descriptions.empty()) {
         const auto& first = descriptions.front();
         if ((first.codec != CodecId::H264 && first.codec != CodecId::Hevc && first.codec != CodecId::Aac) ||
@@ -854,33 +856,24 @@ private:
       descriptions.push_back(std::move(described));
     }
     if (!entries.empty()) Fail(Invalid, "Unexpected bytes after MP4 sample descriptions");
-    track = descriptions.front();
-    if (MovPcmBits(track.codec)) {
-      ParsePcmSamples(stbl, index, track, MaxContainerSamples - count);
+    const auto& primary = descriptions.front();
+    if (MovPcmBits(primary.codec)) {
+      ParsePcmSamples(stbl, index, primary, MaxContainerSamples - count);
     } else {
       ParseSamples(stbl, index, MaxContainerSamples - count);
     }
-    index.edit = ParseEdits(Child(box, "edts", false), movie_scale_, index.scale, track.edits);
+    track.edits = ParseEdits(Child(box, "edts", false), movie_scale_, index.scale);
     if (!track.edits.empty()) index.timeline = Mp4Edits(track.edits, movie_scale_, index.scale, Invalid);
-    ApplyEdits(track, index);
     UpdateCoverage(index, index.samples);
-    SetPresentation(track, index);
-    const auto& window = track.presentation_edit ? track.presentation_edit : index.presentation_range;
-    if (window && (!start || window->start.Compare(*start) < 0)) start = window->start;
+    SetPresentation(index);
+    if (const auto& window = index.presentation_range; window && window->start != window->end &&
+        (!start || window->start.Compare(*start) < 0)) start = window->start;
     count += index.samples.size();
-    for (auto& description : descriptions) {
-      description.timescale = track.timescale;
-      description.presentation_edit = track.presentation_edit;
-      description.edits = track.edits;
-      description.priming_samples = track.priming_samples;
-      description.padding_samples = track.padding_samples;
-    }
-    tracks.push_back(index.samples.empty() ? descriptions.front() : descriptions[index.samples.front().description - 1]);
-    descriptions_.push_back(std::move(descriptions));
+    tracks.push_back(std::move(track));
     indexes_.push_back(std::move(index));
   }
 
-  void ReadDescription(const BoxView& entry, std::uint32_t handler, ByteView tkhd, MediaTrack& track) {
+  void ReadDescription(const BoxView& entry, std::uint32_t handler, MediaSampleDescription& track) {
     if (handler == Tag("soun") && entry.tag == Tag("mp4a")) {
       const auto version = Number<std::uint16_t>(entry.bytes, 8);
       if (version > 1 || (version && format != ContainerFormat::Mov))
@@ -893,7 +886,6 @@ private:
       track.initialization_data = AacInitialization(descriptor);
       auto config = ParseAac(track.initialization_data);
       if (!config.Succeeded()) Fail(Unsupported, config.Error().message);
-      track.kind = TrackKind::Audio;
       track.codec = CodecId::Aac;
       track.sample_rate = config.Value().sample_rate;
       track.channel_count = config.Value().channels;
@@ -904,13 +896,11 @@ private:
       if (Number<std::uint32_t>(full) != 0) Fail(Unsupported, "Unsupported ALAC configuration box version");
       const auto config = full.subspan(4);
       const auto alac = ParseAlac(config, Invalid);
-      track.kind = TrackKind::Audio;
       track.codec = CodecId::Alac;
       track.sample_rate = alac.sample_rate;
       track.channel_count = alac.channels;
       track.initialization_data.assign(config.begin(), config.end());
     } else if (handler == Tag("vide")) {
-      track.kind = TrackKind::Video;
       const auto width = Number<std::uint16_t>(entry.bytes, 24), height = Number<std::uint16_t>(entry.bytes, 26);
       if (!width || !height) Fail(Invalid, "Invalid MP4 visual sample dimensions");
       track.coded_width = width;
@@ -939,12 +929,8 @@ private:
         track.framing = PacketFraming::LengthPrefixedNals;
         track.initialization_data.assign(config.begin(), config.end());
       }
-      const auto rotation = Rotation(tkhd, Version(tkhd) ? 52 : 40);
-      track.rotation = static_cast<VideoRotation>(
-          (static_cast<unsigned>(movie_rotation_) + static_cast<unsigned>(rotation)) % 4);
       ReadVisualMetadata(extensions, track, mov_visual);
     } else if (format == ContainerFormat::Mov && (entry.tag == Tag("tmcd") || entry.tag == Tag("mebx"))) {
-      track.kind = TrackKind::Data;
       track.framing = PacketFraming::ContainerSample;
       track.sample_entry = EntryName(entry.tag);
       const auto data = entry.bytes.subspan(8);
@@ -972,7 +958,7 @@ private:
     return result;
   }
 
-  static void ReadVisualMetadata(ByteView extensions, MediaTrack& track, bool mov_visual) {
+  static void ReadVisualMetadata(ByteView extensions, MediaSampleDescription& track, bool mov_visual) {
     while (!extensions.empty()) {
       if (mov_visual && extensions.size() == 4 && Number<std::uint32_t>(extensions) == 0) break;
       const auto box = NextBox(extensions);
@@ -984,28 +970,15 @@ private:
           Fail(Invalid, "Duplicate or malformed MP4 pixel aspect ratio");
         const auto width = Number<std::uint32_t>(box.bytes), height = Number<std::uint32_t>(box.bytes, 4);
         if (!width || !height) Fail(Invalid, "Zero MP4 pixel aspect spacing");
-        track.pixel_aspect_ratio = MediaTrack::PixelAspectRatio{width, height};
+        track.pixel_aspect_ratio = MediaSampleDescription::PixelAspectRatio{width, height};
       } else if (Mp4VideoExtensionTag(box.tag)) {
         auto type = EntryName(box.tag);
-        if (std::ranges::find(track.video_extensions, type, &MediaTrack::VideoExtension::type) != track.video_extensions.end())
+        if (std::ranges::find(track.video_extensions, type, &MediaSampleDescription::VideoExtension::type) != track.video_extensions.end())
           Fail(Invalid, "Duplicate MP4 visual extension");
         ValidateMp4VideoExtension(box.tag, box.bytes, track.codec, Invalid);
         track.video_extensions.push_back({std::move(type), Bytes(box.bytes.begin(), box.bytes.end())});
       }
     }
-  }
-
-  void ApplyEdits(MediaTrack& track, TrackIndex& index) {
-    const auto& edit = index.edit;
-    if (!edit.media_start) return;
-    const MediaTimestamp leading{edit.empty, movie_scale_};
-    if (edit.duration)
-      track.presentation_edit = MediaPresentationRange{leading, {AddTime(edit.empty, edit.duration), movie_scale_}};
-    // Only introduce a common scale if the movie edit cannot be represented on the track clock.
-    const auto track_ticks = leading.Rescale(index.scale);
-    if (!track_ticks || *track_ticks != leading) index.clock = CommonScale(movie_scale_, index.scale);
-    index.shift = SubTime(ExactTicks(leading, index.clock), ExactTicks({*edit.media_start, index.scale}, index.clock));
-    track.timescale = index.clock;
   }
 
   static void UpdateCoverage(TrackIndex& index, std::span<const Mp4Sample> samples) {
@@ -1019,7 +992,7 @@ private:
     }
   }
 
-  void SetPresentation(MediaTrack& track, TrackIndex& index, bool complete = true) const {
+  static void SetPresentation(TrackIndex& index) {
     index.presentation_range.reset();
     if (!index.coverage) return;
     const auto [first, last] = *index.coverage;
@@ -1035,27 +1008,12 @@ private:
         if (!index.presentation_range) index.presentation_range = MediaPresentationRange{begin, end};
         else index.presentation_range->end = end;
       }
-      return;
-    }
-    const auto earlier = [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; };
-    const auto& edit = index.edit;
-    auto begin = index.Time(first), end = index.Time(last);
-    if (edit.media_start) begin = std::max(begin, MediaTimestamp{edit.empty, movie_scale_}, earlier);
-    if (track.presentation_edit) end = std::min(end, track.presentation_edit->end, earlier);
-    index.presentation_range = MediaPresentationRange{begin, std::max(begin, end, earlier)};
-    if (!track.sample_rate || !edit.media_start) return;
-    const auto rate = *track.sample_rate;
-    auto trim = [&](MediaTimestamp time) -> std::optional<std::uint64_t> {
-      const auto frames = time.Rescale(rate);
-      if (frames && *frames == time && frames->ticks >= 0) return static_cast<std::uint64_t>(frames->ticks);
-      return {};
-    };
-    track.priming_samples = trim({SubTime(*edit.media_start, first), index.scale});
-    if (complete && edit.duration) {
-      auto scale = CommonScale(movie_scale_, index.scale);
-      auto tail = SubTime(ExactTicks({SubTime(last, *edit.media_start), index.scale}, scale),
-                          ExactTicks({edit.duration, movie_scale_}, scale));
-      track.padding_samples = trim({tail, scale});
+      if (!index.presentation_range) {
+        const MediaTimestamp begin{timeline->segments.front().begin, timeline->scale};
+        index.presentation_range = MediaPresentationRange{begin, begin};
+      }
+    } else {
+      index.presentation_range = MediaPresentationRange{index.Time(first), index.Time(last)};
     }
   }
 
@@ -1070,7 +1028,6 @@ private:
       track.default_description = Number<std::uint32_t>(box.bytes, 8);
       if (track.defaults || !track.default_description || track.default_description > track.description_count)
         Fail(Invalid, "Invalid MP4 fragment default description");
-      tracks[i] = descriptions_[i][track.default_description - 1];
       track.default_duration = Number<std::uint32_t>(box.bytes, 12);
       track.default_size = Number<std::uint32_t>(box.bytes, 16);
       track.default_flags = Number<std::uint32_t>(box.bytes, 20);
@@ -1112,18 +1069,22 @@ private:
   bool IndexCovers(std::size_t id, MediaTimestamp time, SeekDirection direction) const {
     if (scan_offset_ == *input.Size()) return true;
     const auto& track = indexes_[id];
-    if (track.timeline) return false;
-    const auto candidate = FindSample(track, time, direction);
-    const auto match = candidate ? std::optional(track.Time(track.samples[*candidate].pts)) : std::nullopt;
-    if (match == time) return true;
+    const auto anchor = FindAnchor(track, time, direction);
+    if (anchor && !anchor->preroll && anchor->presentation_time == time) return true;
     if (!track.next_dts) return false;
     // An unseen sync picture can have the minimum signed composition offset.
-    const auto earliest = MediaTimestamp{*track.next_dts + std::int64_t(INT32_MIN), track.scale}.Rescale(track.clock);
-    if (!earliest || (track.shift > 0 && earliest->ticks > INT64_MAX - track.shift) ||
-        (track.shift < 0 && earliest->ticks < INT64_MIN - track.shift)) return false;
-    const MediaTimestamp lower_bound{earliest->ticks + track.shift, track.clock};
-    return direction == SeekDirection::AtOrBefore ? lower_bound.Compare(time) > 0
-                                                  : match && lower_bound.Compare(*match) >= 0;
+    const auto lower_bound = track.Time(*track.next_dts + std::int64_t(INT32_MIN));
+    if (direction == SeekDirection::AtOrAfter)
+      return anchor && !anchor->preroll && lower_bound.Compare(track.Time(track.samples[anchor->sample].pts)) >= 0;
+    if (!track.timeline) return lower_bound.Compare(time) > 0;
+    const auto& [scale, segments, duration] = *track.timeline;
+    for (auto segment = segments.rbegin(); segment != segments.rend(); ++segment) {
+      if (time.Compare({segment->begin, scale}) < 0) continue;
+      const auto position = time.Compare({segment->end, scale}) >= 0
+          ? segment->end - 1 : DirectionalTicks(time, scale, false);
+      return lower_bound.Compare({AddTime(segment->media, position - segment->begin), scale}) > 0;
+    }
+    return true;
   }
 
   struct FragmentBatch {
@@ -1152,7 +1113,7 @@ private:
           batch.emplace();
           batch->tracks.reserve(indexes_.size());
           for (const auto& index : indexes_) {
-            batch->tracks.push_back({.scale = index.scale, .clock = index.clock, .shift = index.shift,
+            batch->tracks.push_back({.scale = index.scale,
                 .description_count = index.description_count, .default_description = index.default_description,
                 .default_duration = index.default_duration, .default_size = index.default_size, .default_flags = index.default_flags,
                 .next_dts = standalone ? std::nullopt : index.next_dts});
@@ -1241,12 +1202,18 @@ private:
   }
 
   std::optional<SeekPoint> FindEmbedded(std::size_t index, MediaTimestamp target, SeekDirection direction, bool seek) {
-    if (growing_ || fragment_indexed_ || !input.Size() || indexes_.size() != 1 ||
-        indexes_[index].timeline || indexes_[index].shift) return {};
+    if (growing_ || fragment_indexed_ || !input.Size() || indexes_.size() != 1) return {};
+    const auto& timeline = indexes_[index].timeline;
+    if (timeline) {
+      const auto& edit = timeline->segments.front();
+      if (timeline->segments.size() != 1 || edit.media != edit.begin || target.Compare({edit.begin, timeline->scale}) < 0 ||
+          target.Compare({edit.end, timeline->scale}) >= 0) return {};
+    }
     const auto previous = input.Position();
     std::optional<FragmentBatch> batch;
     std::optional<SeekPoint> point;
     std::uint64_t next_offset = 0;
+    std::uint64_t decode_offset = 0;
     try {
       if (!segment_index_) {
         segment_index_.emplace();
@@ -1278,8 +1245,16 @@ private:
               track.Time(track.coverage->first) == ref->start && track.Time(track.coverage->second) == ref->end) {
             if (auto candidate = FindSample(track, target, direction)) {
               const auto& sample = track.samples[*candidate];
-              point = SeekSample(index, sample, track.Time(sample.pts));
-              if (point->kind != SeekPoint::Kind::Independent) point.reset();
+              const auto time = track.Time(sample.pts);
+              const bool inside_edit = !timeline || (time.Compare({timeline->segments.front().begin, timeline->scale}) >= 0 &&
+                                                    time.Compare({timeline->segments.front().end, timeline->scale}) < 0);
+              // At the start of a later AAC fragment the incremental index can resolve its predecessor.
+              if (inside_edit && (*candidate || !IsAac(index, sample) || ref == segment_index_->begin())) {
+                const auto decode = DecodeStart(index, track, *candidate);
+                point = SeekSample(index, track, {*candidate, time, false}, decode);
+                if (point->kind == SeekPoint::Kind::SyncMarked) point.reset();
+                else decode_offset = track.samples[decode].offset;
+              }
             }
           }
         }
@@ -1298,7 +1273,7 @@ private:
       indexes_[index].samples = std::move(batch->tracks[index].samples);
       indexes_[index].next_dts = batch->tracks[index].next_dts;
       order_ = std::move(batch->order);
-      const auto entry = std::lower_bound(order_.begin(), order_.end(), *point->byte_offset,
+      const auto entry = std::lower_bound(order_.begin(), order_.end(), decode_offset,
           [&](SampleRef ref, std::uint64_t offset) { return Sample(indexes_, ref).offset < offset; });
       cursor_ = static_cast<std::size_t>(entry - order_.begin());
     }
@@ -1307,15 +1282,10 @@ private:
 
   void PublishFragmentCoverage(bool complete) {
     std::optional<MediaTimestamp> first, end;
-    for (std::size_t i = 0; i < indexes_.size(); ++i) {
-      auto& index = indexes_[i];
-      SetPresentation(tracks[i], index, complete);
-      for (auto& description : descriptions_[i]) {
-        description.priming_samples = tracks[i].priming_samples;
-        description.padding_samples = tracks[i].padding_samples;
-      }
-      const auto& window = tracks[i].presentation_edit ? tracks[i].presentation_edit : index.presentation_range;
-      if (window && (!first || window->start.Compare(*first) < 0)) first = window->start;
+    for (auto& index : indexes_) {
+      SetPresentation(index);
+      const auto& window = index.presentation_range;
+      if (window && window->start != window->end && (!first || window->start.Compare(*first) < 0)) first = window->start;
       const auto track_end = index.timeline ? std::optional(MediaTimestamp{index.timeline->duration, index.timeline->scale})
                                            : window ? std::optional(window->end) : std::nullopt;
       if (track_end && (!end || track_end->Compare(*end) > 0)) end = track_end;
@@ -1512,7 +1482,6 @@ private:
   }
 
   std::vector<TrackIndex> indexes_;
-  std::vector<std::vector<MediaTrack>> descriptions_;
   std::vector<SampleRef> order_;
   MediaRanges media_;
   std::uint32_t movie_scale_ = 0;

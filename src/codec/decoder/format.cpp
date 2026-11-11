@@ -4,6 +4,9 @@
 #include "format/platform_video_storage.h"
 
 #include <array>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 namespace huxerui::media::detail {
 namespace {
@@ -192,6 +195,15 @@ CodecResult<void> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
     if (!samples.Succeeded()) return CodecResult<void>::Failure(samples.Error());
   }
   if (const auto* video = std::get_if<VideoDecoderConfig>(&config)) {
+    if (video->codec == CodecId::Vp9) {
+      const auto bytes = packet.data.AsBytes();
+      const auto header = std::to_integer<unsigned>(bytes.front());
+      if ((header & 0xf0) != 0x80) return invalid("VP9 requires a profile 0 frame header");
+      if (needs_key && (!packet.key_frame || (header & 0x0c) || bytes.size() < 4 ||
+                        bytes[1] != std::byte{0x49} || bytes[2] != std::byte{0x83} || bytes[3] != std::byte{0x42}))
+        return invalid("VP9 requires a key frame after creation/reset");
+      return CodecResult<void>::Success();
+    }
     if (video->codec == CodecId::Hevc) {
       const auto length = (std::to_integer<unsigned>(video->initialization_data[21]) & 3u) + 1;
       try {
@@ -261,8 +273,15 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
       } catch (const std::invalid_argument& error) {
         return R::Failure(Error(CodecErrorCode::InvalidArgument, error.what()));
       }
+    } else if (video.codec == CodecId::Vp9) {
+#if defined(__APPLE__) && TARGET_OS_OSX
+      if (platform_storage || !eight_bit || !video.initialization_data.empty())
+        return R::Failure(Error(CodecErrorCode::Unsupported, "VP9 profile 0 requires CPU output and empty initialization data"));
+#else
+      return R::Failure(Error(CodecErrorCode::Unsupported, "VP9 decoding is unavailable on this platform"));
+#endif
     } else {
-      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video decoding requires H.264 or HEVC"));
+      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video decoding requires H.264, HEVC, or VP9"));
     }
     frame_bytes = VideoImageBytes(video.width, video.height, video.output);
     minimum = 34;

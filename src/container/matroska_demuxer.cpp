@@ -107,7 +107,7 @@ std::uint32_t Dimension(ByteView data) {
   return static_cast<std::uint32_t>(value);
 }
 
-void ReadVideo(ByteView fields, MediaTrack& track) {
+void ReadVideo(ByteView fields, MediaSampleDescription& track) {
   std::uint32_t top = 0, bottom = 0, left = 0, right = 0;
   while (!fields.empty()) {
     const auto field = ReadField(fields);
@@ -126,7 +126,7 @@ void ReadVideo(ByteView fields, MediaTrack& track) {
   if (left || right || top || bottom) track.visible = VideoRectangle{left, top, width - left - right, height - top - bottom};
 }
 
-void ReadAudio(ByteView fields, MediaTrack& track) {
+void ReadAudio(ByteView fields, MediaSampleDescription& track) {
   track.channel_count = 1;
   track.sample_rate = 8000;
   while (!fields.empty()) {
@@ -194,9 +194,9 @@ public:
     DiscoverTracks();
   }
 
-  std::optional<DemuxItem> Read() override {
+  std::optional<ContainerPacket> Read() override {
     for (;;) {
-      if (lace_cursor_ < lace_.size()) return DemuxItem(std::move(lace_[lace_cursor_++]));
+      if (lace_cursor_ < lace_.size()) return std::move(lace_[lace_cursor_++]);
       lace_.clear();
       lace_cursor_ = 0;
       auto element = Next();
@@ -235,74 +235,125 @@ public:
   std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp time, SeekDirection direction, bool seek) override {
     if (!input.Random()) return ContainerReader::Find(id, time, direction, seek);
     const auto track = PacketTrack(tracks, id);
-    if (tracks[track].codec == CodecId::Unknown) Fail(Unsupported, "No packet mapping for the requested Matroska track");
-
-    auto query = [&]() -> std::optional<std::pair<SeekPoint, Anchor>> {
-      LoadCues();
-      const auto& index = cues_[track];
-      if (index.empty()) Fail(ContainerErrorCode::IndexUnavailable, "No Matroska Cues for the requested track");
-      const auto after = direction == SeekDirection::AtOrAfter;
-      auto at = after
-          ? std::lower_bound(index.begin(), index.end(), time, [&](const Cue& cue, MediaTimestamp target) {
-              return MediaTimestamp{Time(cue.ticks, track), Nanoseconds}.Compare(target) < 0;
-            })
-          : std::upper_bound(index.begin(), index.end(), time, [&](MediaTimestamp target, const Cue& cue) {
-              return target.Compare({Time(cue.ticks, track), Nanoseconds}) < 0;
-            });
-      if ((after && at == index.end()) || (!after && at == index.begin())) return {};
-      if (!after) --at;
-      auto anchor = Locate(at->cluster, track, at->ticks, at->block);
-      if (!anchor) Fail(BadData, "Matroska Cue does not point to a matching Block");
-      if (tracks[track].kind == TrackKind::Video && !anchor->sync)
-        Fail(ContainerErrorCode::IndexUnavailable, "Matroska Cue does not identify a video sync block");
-      SeekPoint point{id, {anchor->time, Nanoseconds}, SeekPoint::Kind::SyncMarked, anchor->block, {}};
-      auto decode = *anchor;
-      if (tracks[track].seek_preroll && tracks[track].seek_preroll->ticks > 0) {
-        const auto desired = SubTime(anchor->time, ToNs(*tracks[track].seek_preroll));
-        const auto start = std::upper_bound(index.begin(), index.end(), desired, [&](auto value, const Cue& cue) {
-          return value < Time(cue.ticks, track);
-        });
-        // Before the first indexed preroll point, start at the first Block of this track.
-        std::optional<Anchor> earlier;
-        if (start != index.begin()) {
-          const auto& cue = *std::prev(start);
-          earlier = Locate(cue.cluster, track, cue.ticks, cue.block);
-        } else if (first_cluster_) {
-          earlier = Locate(*first_cluster_, track, {});
-        }
-        if (!earlier || earlier->time > anchor->time)
-          Fail(ContainerErrorCode::IndexUnavailable, "Matroska index does not cover the required preroll");
-        decode = *earlier;
-        point.kind = SeekPoint::Kind::NeedsPreroll;
-        point.decode_start = MediaTimestamp{decode.time, Nanoseconds};
-      }
-      return std::pair{point, decode};
-    };
+    if (tracks[track].descriptions.front().codec == CodecId::Unknown)
+      Fail(Unsupported, "No packet mapping for the requested Matroska track");
 
     const auto previous = input.Position();
-    std::optional<std::pair<SeekPoint, Anchor>> result;
+    std::optional<SeekPoint> point;
+    std::optional<Anchor> first;
+    std::array<std::optional<std::uint64_t>, MaxContainerTracks> floors;
     try {
-      result = query();
+      LoadCues();
+      if (const auto anchor = FindAnchor(track, time, direction)) {
+        auto decode = *anchor;
+        if (auto preroll = FindPreroll(track, anchor->time)) {
+          if (preroll->block > anchor->block)
+            Fail(ContainerErrorCode::IndexUnavailable, "Matroska index does not cover the required preroll");
+          decode = *preroll;
+        }
+        point = SeekPoint{id, AnchorTime(track, anchor->time, true),
+            decode.block < anchor->block ? SeekPoint::Kind::NeedsPreroll : SeekPoint::Kind::SyncMarked,
+            anchor->block, {decode.time, Nanoseconds}};
+        if (seek) {
+          first = decode;
+          floors[track] = decode.block;
+          if (CanScan()) {
+            for (std::size_t i = 0; i < tracks.size(); ++i) {
+              if (i == track || !Selected(i) || tracks[i].descriptions.front().codec == CodecId::Unknown) continue;
+              std::optional<Anchor> start;
+              if (tracks[i].kind == TrackKind::Audio) {
+                start = FindPreroll(i, anchor->time);
+              } else if (tracks[i].kind == TrackKind::Video) {
+                start = FindAnchor(i, point->presentation_time, SeekDirection::AtOrBefore);
+                if (!start) start = FindAnchor(i, point->presentation_time, SeekDirection::AtOrAfter);
+              }
+              if (!start) continue;
+              floors[i] = start->block;
+              if (start->block < first->block) first = *start;
+            }
+          }
+        }
+      }
     } catch (...) {
       input.Seek(previous);
       throw;
     }
-    if (!seek || !result) {
+    if (!first) {
       input.Seek(previous);
-    } else {
-      input.Seek(result->second.cluster);
-      seek_offset_ = result->second.block;
-      pending_.reset();
-      in_cluster_ = false;
-      cluster_end_.reset();
-      lace_.clear();
-      lace_cursor_ = 0;
+      return point;
     }
-    if (!result) return {};
-    return result->first;
+    input.Seek(first->cluster);
+    seek_offset_ = first->block;
+    track_floors_ = floors;
+    at_start_ = false;
+    pending_.reset();
+    in_cluster_ = false;
+    cluster_end_.reset();
+    lace_.clear();
+    lace_cursor_ = 0;
+    return point;
   }
 
 private:
+  bool CanScan() const { return format == ContainerFormat::WebM && input.Size().has_value(); }
+
+  bool Selected(std::size_t track) const {
+    return selected.empty() || std::ranges::find(selected, tracks[track].id) != selected.end();
+  }
+
+  MediaTimestamp AnchorTime(std::size_t track, std::int64_t pts, bool presentation) const {
+    if (presentation && first_audible_pts[track]) pts = std::max(pts, first_audible_pts[track]->ticks);
+    return {pts, Nanoseconds};
+  }
+
+  void RecordAudioStart(std::size_t track, std::int64_t pts) {
+    if (tracks[track].kind == TrackKind::Audio && !first_audible_pts[track])
+      first_audible_pts[track] = MediaTimestamp{AddTime(pts, states_[track].delay), Nanoseconds};
+  }
+
+  std::optional<Anchor> FindAnchor(std::size_t track, MediaTimestamp time, SeekDirection direction,
+                                   bool presentation = true) {
+    const auto& index = cues_[track];
+    if (first_cluster_ && tracks[track].kind == TrackKind::Audio && !first_audible_pts[track] &&
+        (cues_position_ || !index.empty())) {
+      if (const auto first = Locate(*first_cluster_, track, {})) RecordAudioStart(track, first->time);
+      while (presentation && !index.empty() && CanScan() && states_[track].delay &&
+             !first_audible_pts[track] && !scan_complete_) ScanCluster();
+    }
+    if (index.empty()) {
+      if (CanScan()) return FindBlock(track, time, direction, presentation);
+      Fail(ContainerErrorCode::IndexUnavailable, "No Matroska Cues for the requested track");
+    }
+    const auto after = direction == SeekDirection::AtOrAfter;
+    auto at = after
+        ? std::lower_bound(index.begin(), index.end(), time, [&](const Cue& cue, MediaTimestamp target) {
+            return AnchorTime(track, Time(cue.ticks, track), presentation).Compare(target) < 0;
+          })
+        : std::upper_bound(index.begin(), index.end(), time, [&](MediaTimestamp target, const Cue& cue) {
+            return target.Compare(AnchorTime(track, Time(cue.ticks, track), presentation)) < 0;
+          });
+    if ((after && at == index.end()) || (!after && at == index.begin())) return {};
+    if (!after) --at;
+    auto anchor = Locate(at->cluster, track, at->ticks, at->block);
+    if (!anchor) Fail(BadData, "Matroska Cue does not point to a matching Block");
+    if (tracks[track].kind == TrackKind::Video && !anchor->sync)
+      Fail(ContainerErrorCode::IndexUnavailable, "Matroska Cue does not identify a video sync block");
+    return anchor;
+  }
+
+  std::optional<Anchor> FindPreroll(std::size_t track, std::int64_t time) {
+    const auto preroll = tracks[track].seek_preroll;
+    if (!preroll || !preroll->ticks) return {};
+    const MediaTimestamp desired{SubTime(time, ToNs(*preroll)), Nanoseconds};
+    auto earlier = FindAnchor(track, desired, SeekDirection::AtOrBefore, false);
+    if (CanScan() && cues_[track].empty())
+      return earlier ? earlier : FindAnchor(track, desired, SeekDirection::AtOrAfter, false);
+    if (!earlier && first_cluster_) earlier = Locate(*first_cluster_, track, {});
+    if (!earlier || earlier->time > time)
+      Fail(ContainerErrorCode::IndexUnavailable, "Matroska index does not cover the required preroll");
+    return earlier;
+  }
+
   void DiscoverTracks() {
     bool info = false;
     std::optional<std::uint64_t> tracks_position, info_position;
@@ -381,6 +432,7 @@ private:
       if (entry.id != 0xae) continue;
       if (tracks.size() == MaxContainerTracks) Fail(ContainerErrorCode::LimitExceeded, "Too many Matroska tracks");
       MediaTrack track;
+      auto& description = track.descriptions.emplace_back();
       TrackState state;
       std::uint64_t type = 0;
       ByteView audio, video;
@@ -395,7 +447,7 @@ private:
           case 0x86: codec = Text(field.data); break;
           case 0x63a2:
             if (field.data.size() > 65536) Fail(ContainerErrorCode::LimitExceeded, "Matroska codec private data exceeds 64 KiB");
-            track.initialization_data.assign(field.data.begin(), field.data.end());
+            description.initialization_data.assign(field.data.begin(), field.data.end());
             break;
           case 0x23e383: state.default_duration = SignedTime(UInt(field.data)); break;
           case 0x23314f: custom_clock |= Float(field.data) != 1; break;
@@ -415,53 +467,54 @@ private:
       track.kind = type == 1 ? TrackKind::Video : type == 2 ? TrackKind::Audio :
                    type == 17 ? TrackKind::Subtitle : TrackKind::Data;
       if (!encodings && !custom_clock) ReadCodec(track, state, codec, audio, video);
-      if (track.codec == CodecId::Unknown) track.framing = PacketFraming::ContainerSample;
+      if (description.codec == CodecId::Unknown) description.framing = PacketFraming::ContainerSample;
       tracks.push_back(std::move(track));
       states_.push_back(state);
     }
   }
 
   void ReadCodec(MediaTrack& track, const TrackState& state, std::string_view codec, ByteView audio, ByteView video) {
+    auto& description = track.descriptions.front();
     if (track.kind == TrackKind::Video) {
       if (codec == "V_MPEGH/ISO/HEVC" && format == ContainerFormat::Matroska) {
-        HevcNalLength(track.initialization_data, false, BadData);
-        track.codec = CodecId::Hevc;
-        track.framing = PacketFraming::LengthPrefixedNals;
+        HevcNalLength(description.initialization_data, false, BadData);
+        description.codec = CodecId::Hevc;
+        description.framing = PacketFraming::LengthPrefixedNals;
       } else if (codec == "V_MPEG4/ISO/AVC" && format == ContainerFormat::Matroska) {
-        const auto config = ParseAvc(track.initialization_data);
+        const auto config = ParseAvc(description.initialization_data);
         if (!config.Succeeded()) {
           if (config.Error().code == CodecErrorCode::Unsupported) return;
           Fail(BadData, config.Error().message);
         }
-        track.codec = CodecId::H264;
-        track.framing = PacketFraming::LengthPrefixedNals;
-      } else if (codec == "V_VP8" && format == ContainerFormat::WebM && track.initialization_data.empty()) {
-        track.codec = CodecId::Vp8;
+        description.codec = CodecId::H264;
+        description.framing = PacketFraming::LengthPrefixedNals;
+      } else if (codec == "V_VP8" && format == ContainerFormat::WebM && description.initialization_data.empty()) {
+        description.codec = CodecId::Vp8;
       } else if (codec == "V_VP9" && format == ContainerFormat::WebM) {
-        track.codec = CodecId::Vp9;
+        description.codec = CodecId::Vp9;
       }
-      if (track.codec != CodecId::Unknown) ReadVideo(video, track);
+      if (description.codec != CodecId::Unknown) ReadVideo(video, description);
     } else if (track.kind == TrackKind::Audio && codec == "A_OPUS") {
-      if (track.initialization_data.size() >= 19 && Number<std::uint8_t>(track.initialization_data, 18) != 0) return;
-      const auto opus = ParseOpus(track.initialization_data, BadData);
-      ReadAudio(audio, track);
-      if (track.channel_count != opus.channels || (opus.input_rate && track.sample_rate != opus.input_rate) ||
+      if (description.initialization_data.size() >= 19 && Number<std::uint8_t>(description.initialization_data, 18) != 0) return;
+      const auto opus = ParseOpus(description.initialization_data, BadData);
+      ReadAudio(audio, description);
+      if (description.channel_count != opus.channels || (opus.input_rate && description.sample_rate != opus.input_rate) ||
           state.delay < opus.Delay() || state.delay - opus.Delay() > 1)
         Fail(BadData, "OpusHead does not match Matroska audio channels, frequency, or CodecDelay");
-      track.codec = CodecId::Opus;
-      track.sample_rate = 48000;
+      description.codec = CodecId::Opus;
+      description.sample_rate = 48000;
       track.priming_samples = opus.pre_skip;
     } else if (track.kind == TrackKind::Audio && codec == "A_AAC" && format == ContainerFormat::Matroska) {
-      const auto config = AacLcInitialization(track.initialization_data);
+      const auto config = AacLcInitialization(description.initialization_data);
       const auto aac = ParseAac(config);
       if (!aac.Succeeded()) return;
-      track.initialization_data.resize(config.size());
-      ReadAudio(audio, track);
-      if (track.sample_rate != aac.Value().sample_rate || track.channel_count != aac.Value().channels)
+      description.initialization_data.resize(config.size());
+      ReadAudio(audio, description);
+      if (description.sample_rate != aac.Value().sample_rate || description.channel_count != aac.Value().channels)
         Fail(BadData, "Matroska AAC metadata does not match AudioSpecificConfig");
-      track.codec = CodecId::Aac;
+      description.codec = CodecId::Aac;
       if (state.delay) {
-        const auto trim = MediaTimestamp{state.delay, Nanoseconds}.Rescale(*track.sample_rate);
+        const auto trim = MediaTimestamp{state.delay, Nanoseconds}.Rescale(*description.sample_rate);
         if (!trim || std::abs(SubTime(ToNs(*trim), state.delay)) > 1)
           Fail(Unsupported, "Matroska AAC delay does not align to decoded sample frames");
         track.priming_samples = static_cast<std::uint64_t>(trim->ticks);
@@ -491,23 +544,35 @@ private:
     const auto header = ReadBlockHeader(payload);
     const auto index = TrackIndex(header.track);
     const auto& track = tracks[index];
-    if (!selected.empty() && std::ranges::find(selected, track.id) == selected.end()) return;
-    if (track.codec == CodecId::Unknown || block.codec_state)
-      Fail(Unsupported, "Unsupported Matroska track or changing codec state");
-    const auto sizes = LaceSizes(payload, (header.flags >> 1) & 3);
+    const auto& description = track.descriptions.front();
     const auto ticks = AddTime(cluster_ticks, header.relative_time);
     const auto pts = Time(ticks, index);
+    if (at_start_) RecordAudioStart(index, pts);
+    if (!Selected(index) || (track_floors_[index] && element.position < *track_floors_[index])) return;
+    if (description.codec == CodecId::Unknown || block.codec_state)
+      Fail(Unsupported, "Unsupported Matroska track or changing codec state");
+    const auto sizes = LaceSizes(payload, (header.flags >> 1) & 3);
     const auto total = block.duration ? std::optional{ScaleTime(SignedTime(*block.duration), scale_)} : std::nullopt;
     const bool sync = simple ? (header.flags & 128) != 0 : !block.reference;
     std::optional<std::int64_t> elapsed{0};
     for (std::size_t i = 0; i < sizes.size(); ++i) {
       const auto frame = Slice(payload, 0, sizes[i]);
       if (frame.empty() || frame.size() > MaxContainerPacket) Fail(BadData, "Invalid Matroska packet size");
-      auto length = CodecDuration(track, frame, BadData);
+      auto length = CodecDuration(description, frame, BadData);
       if (!length && states_[index].default_duration) length = MediaTimestamp{*states_[index].default_duration, Nanoseconds};
       if (total && elapsed && i + 1 == sizes.size()) {
         if (*elapsed > *total) Fail(BadData, "Matroska BlockDuration is shorter than its lace");
-        length = MediaTimestamp{*total - *elapsed, Nanoseconds};
+        auto frame_duration = *total - *elapsed;
+        if (description.codec == CodecId::Opus && sizes.size() == 1 && length && block.discard && *block.discard > 0) {
+          // Some writers use the audible duration for a trimmed Opus Block. Keep the coded duration
+          // when the signaled interval agrees with the Opus TOC and padding within timestamp rounding.
+          const auto coded = ToNs(*length);
+          const auto padding = *block.discard;
+          const auto tolerance = static_cast<std::int64_t>(std::min<std::uint64_t>(scale_ / 2, 500000));
+          if (padding <= coded && frame_duration < coded && std::abs(frame_duration - (coded - padding)) <= tolerance)
+            frame_duration = coded;
+        }
+        length = MediaTimestamp{frame_duration, Nanoseconds};
       }
       std::optional<MediaTimestamp> discard;
       if (block.discard && ((*block.discard < 0 && i == 0) || (*block.discard >= 0 && i + 1 == sizes.size()))) {
@@ -523,8 +588,8 @@ private:
       lace_.push_back({track.id, owner.Slice(offset, frame.size()), presentation, {}, length, sync, discard});
       if (elapsed && length) {
         // AAC has a rational sample clock. Round the accumulated frame time once for each lace position.
-        if (track.codec == CodecId::Aac && i + 1 < sizes.size())
-          elapsed = ToNs({static_cast<std::int64_t>(1024 * (i + 1)), *track.sample_rate});
+        if (description.codec == CodecId::Aac && i + 1 < sizes.size())
+          elapsed = ToNs({static_cast<std::int64_t>(1024 * (i + 1)), *description.sample_rate});
         else
           elapsed = AddTime(*elapsed, ToNs(*length));
       } else {
@@ -577,8 +642,12 @@ private:
 
   void LoadCues() {
     if (!cues_.empty()) return;
-    const auto position = cues_position_ ? cues_position_ : FindCues();
-    if (!position) Fail(ContainerErrorCode::IndexUnavailable, "Matroska Segment has no Cues");
+    const auto position = cues_position_ ? cues_position_ : CanScan() ? std::nullopt : FindCues();
+    if (!position) {
+      if (!CanScan()) Fail(ContainerErrorCode::IndexUnavailable, "Matroska Segment has no Cues");
+      cues_.resize(tracks.size());
+      return;
+    }
     const auto body = ReadBody(input, IndexedElement(*position, Cues));
     ByteView fields(body);
     std::vector<std::vector<Cue>> parsed(tracks.size());
@@ -615,40 +684,195 @@ private:
     cues_ = std::move(parsed);
   }
 
+  struct IndexedBlock {
+    BlockHeader header;
+    bool sync;
+    bool codec_state;
+  };
+
+  BlockHeader ReadBlockPrefix(const Element& element) {
+    std::array<std::byte, 12> bytes;
+    const auto prefix = std::span(bytes).first(static_cast<std::size_t>(
+        std::min<std::uint64_t>(*element.end - element.data, bytes.size())));
+    if (!input.ReadExact(prefix)) Fail(BadData, "Truncated Matroska Block");
+    ByteView payload(prefix);
+    const auto header = ReadBlockHeader(payload);
+    if (payload.empty()) Fail(BadData, "Matroska Block has no frame data");
+    SkipElement(input, element);
+    return header;
+  }
+
+  IndexedBlock ReadIndexedBlock(const Element& element) {
+    if (element.id == SimpleBlock) {
+      const auto header = ReadBlockPrefix(element);
+      return {header, (header.flags & 128) != 0, false};
+    }
+    std::optional<BlockHeader> header;
+    bool sync = true, codec_state = false;
+    for (std::size_t i = 0; input.Position() < *element.end; ++i) {
+      if (i == ElementBudget) Fail(ContainerErrorCode::LimitExceeded, "Matroska BlockGroup exceeds its element budget");
+      const auto field = *ReadElement(input, element.end);
+      if (field.id == Block) {
+        if (header) Fail(BadData, "Duplicate Matroska Block");
+        header = ReadBlockPrefix(field);
+      } else {
+        sync &= field.id != ReferenceBlock;
+        codec_state |= field.id == 0xa4;
+        SkipElement(input, field);
+      }
+    }
+    if (!header) Fail(BadData, "Matroska BlockGroup has no Block");
+    return {*header, sync, codec_state};
+  }
+
+  template<class Visit>
+  void VisitCluster(const Element& cluster, Visit visit) {
+    const auto end = cluster.end ? cluster.end : segment_end_;
+    std::optional<std::int64_t> timestamp;
+    for (std::size_t i = 0; i < ElementBudget; ++i) {
+      const auto element = ReadElement(input, end);
+      if (!element) return;
+      if (!cluster.end && SegmentChild(element->id)) {
+        input.Seek(element->position);
+        return;
+      }
+      if (element->id == Timestamp) {
+        if (timestamp) Fail(BadData, "Duplicate Cluster timestamp");
+        timestamp = SignedTime(UInt(ReadBody(input, *element, 8)));
+      } else if (element->id == SimpleBlock || element->id == BlockGroup) {
+        if (!timestamp) Fail(BadData, "Matroska Cluster has no timestamp before its Blocks");
+        const auto block = ReadIndexedBlock(*element);
+        const auto ticks = AddTime(*timestamp, block.header.relative_time);
+        if (!visit(element->position, ticks, block)) return;
+      } else {
+        SkipElement(input, *element);
+      }
+    }
+    Fail(ContainerErrorCode::LimitExceeded, "Matroska Cluster exceeds its element budget");
+  }
+
   std::optional<Anchor> Locate(std::uint64_t cluster, std::size_t track, std::optional<std::int64_t> time,
                                std::optional<std::uint64_t> block = {}) {
     const auto parent = IndexedElement(cluster, Cluster);
     const auto end = parent.end ? parent.end : segment_end_;
     const auto expected = block ? std::optional{AddOffset(parent.data, *block)} : std::nullopt;
     if (expected && end && *expected >= *end) Fail(BadData, "Matroska Cue block offset exceeds its Cluster");
-    std::optional<std::int64_t> timestamp;
-    for (std::size_t i = 0; i < ElementBudget; ++i) {
-      const auto element = ReadElement(input, end);
-      if (!element || (!parent.end && SegmentChild(element->id))) return {};
-      if (element->position - parent.data > MaxContainerMetadata)
-        Fail(ContainerErrorCode::IndexUnavailable, "Matroska Cluster search exceeded its budget");
-      if (expected && element->position > *expected) return {};
-      if (element->id == Timestamp) {
-        timestamp = SignedTime(UInt(ReadBody(input, *element, 8)));
-      } else if (element->id == SimpleBlock || element->id == BlockGroup) {
-        if (!timestamp) Fail(BadData, "Matroska Cluster has no timestamp before its Blocks");
-        if (expected && element->position != *expected) {
-          SkipElement(input, *element);
-          continue;
-        }
-        const auto bytes = ReadBody(input, *element, MaxContainerPacket + 4096);
-        const bool simple = element->id == SimpleBlock;
-        const auto block = simple ? BlockFields{bytes, {}, {}, false, false} : Group(bytes);
-        auto data = block.data;
-        const auto header = ReadBlockHeader(data);
-        const auto ticks = AddTime(*timestamp, header.relative_time);
-        if (header.track == states_[track].number && (!time || ticks == *time))
-          return Anchor{cluster, element->position, Time(ticks, track), simple ? (header.flags & 128) != 0 : !block.reference};
-      } else {
-        SkipElement(input, *element);
+    std::optional<Anchor> anchor;
+    VisitCluster(parent, [&](auto position, auto ticks, const IndexedBlock& entry) {
+      if (expected && position > *expected) return false;
+      if ((!expected || position == *expected) && entry.header.track == states_[track].number &&
+          (!time || ticks == *time) && !entry.codec_state) {
+        anchor = Anchor{cluster, position, Time(ticks, track), entry.sync};
+        return false;
       }
+      return true;
+    });
+    return anchor;
+  }
+
+  std::optional<Element> NextCluster() {
+    for (std::size_t i = 0; i < ElementBudget; ++i) {
+      const auto element = ReadElement(input, segment_end_);
+      if (!element || element->id == Cluster) return element;
+      SkipElement(input, *element);
     }
-    Fail(ContainerErrorCode::IndexUnavailable, "Matroska Block search exceeded its element budget");
+    Fail(ContainerErrorCode::LimitExceeded, "Too many elements between WebM Clusters");
+  }
+
+  bool CanAnchor(std::size_t track, const IndexedBlock& block) const {
+    return !block.codec_state && tracks[track].descriptions.front().codec != CodecId::Unknown &&
+        (tracks[track].kind != TrackKind::Video || block.sync);
+  }
+
+  void ScanCluster() {
+    if (!first_cluster_) {
+      scan_complete_ = true;
+      return;
+    }
+    input.Seek(scan_offset_.value_or(*first_cluster_));
+    const auto cluster = NextCluster();
+    if (!cluster) {
+      scan_complete_ = true;
+      return;
+    }
+
+    std::array<std::optional<std::int64_t>, MaxContainerTracks> last;
+    for (std::size_t i = 0; i < tracks.size(); ++i)
+      if (!scanned_[i].empty()) last[i] = scanned_[i].back().time;
+    auto count = scan_count_;
+    std::vector<std::pair<std::size_t, Anchor>> found;
+    VisitCluster(*cluster, [&](auto position, auto ticks, const IndexedBlock& block) {
+      if (++count > MaxContainerSamples) Fail(ContainerErrorCode::LimitExceeded, "WebM seek scan exceeds its Block limit");
+      const auto track = TrackIndex(block.header.track);
+      if (!CanAnchor(track, block)) return true;
+      const auto time = Time(ticks, track);
+      if (last[track] && time < *last[track]) Fail(Unsupported, "WebM seek anchors must be ordered within each track");
+      last[track] = time;
+      found.emplace_back(track, Anchor{cluster->position, position, time, block.sync});
+      return true;
+    });
+    for (const auto& [track, anchor] : found) {
+      RecordAudioStart(track, anchor.time);
+      scanned_[track].push_back(anchor);
+    }
+    scan_offset_ = input.Position();
+    scan_count_ = count;
+  }
+
+  std::optional<Cue> CueBefore(std::size_t track, MediaTimestamp time) const {
+    std::optional<Cue> best;
+    for (const auto& index : cues_) {
+      const auto next = std::lower_bound(index.begin(), index.end(), time, [&](const Cue& cue, MediaTimestamp target) {
+        return MediaTimestamp{Time(cue.ticks, track), Nanoseconds}.Compare(target) < 0;
+      });
+      if (next != index.begin() && (!best || std::prev(next)->ticks > best->ticks)) best = *std::prev(next);
+    }
+    return best;
+  }
+
+  std::optional<Anchor> FindBlock(std::size_t track, MediaTimestamp time, SeekDirection direction, bool presentation) {
+    const bool forward = direction == SeekDirection::AtOrAfter;
+    const auto cue = !presentation || !states_[track].delay || first_audible_pts[track]
+        ? CueBefore(track, time) : std::nullopt;
+    if (cue && cue->cluster != first_cluster_) {
+      std::optional<Anchor> before, after;
+      std::size_t blocks = 0;
+      for (std::optional cluster = IndexedElement(cue->cluster, Cluster); cluster; cluster = NextCluster()) {
+        VisitCluster(*cluster, [&](auto position, auto ticks, const IndexedBlock& block) {
+          if (++blocks > MaxContainerSamples) Fail(ContainerErrorCode::LimitExceeded, "WebM seek scan exceeds its Block limit");
+          if (block.header.track != states_[track].number || !CanAnchor(track, block)) return true;
+          const Anchor anchor{cluster->position, position, Time(ticks, track), block.sync};
+          if (before && anchor.time < before->time) Fail(Unsupported, "WebM seek anchors must be ordered within each track");
+          const auto relation = AnchorTime(track, anchor.time, presentation).Compare(time);
+          if (relation < 0 || (relation == 0 && !forward)) {
+            before = anchor;
+            return true;
+          }
+          after = anchor;
+          return false;
+        });
+        if (after) break;
+      }
+      // A matching earlier Block proves that the Cue scan covered the search boundary.
+      if (before) return forward ? after : before;
+    }
+    const auto& index = scanned_[track];
+    const auto timestamp = [&](const Anchor& entry) { return AnchorTime(track, entry.time, presentation); };
+    for (;;) {
+      if (forward) {
+        const auto at = std::lower_bound(index.begin(), index.end(), time, [&](const auto& entry, auto value) {
+          return timestamp(entry).Compare(value) < 0;
+        });
+        if (at != index.end()) return *at;
+        if (scan_complete_) return {};
+      } else if (scan_complete_ || (!index.empty() && timestamp(index.back()).Compare(time) > 0)) {
+        const auto after = std::upper_bound(index.begin(), index.end(), time, [&](auto value, const auto& entry) {
+          return value.Compare(timestamp(entry)) < 0;
+        });
+        return after == index.begin() ? std::nullopt : std::optional(*std::prev(after));
+      }
+      ScanCluster();
+    }
   }
 
   std::uint64_t segment_data_ = 0;
@@ -656,11 +880,17 @@ private:
   std::uint64_t scale_ = DefaultTimestampScale;
   std::optional<Element> pending_;
   bool in_cluster_ = false;
+  bool at_start_ = true;
+  std::array<std::optional<std::uint64_t>, MaxContainerTracks> track_floors_;
   std::optional<std::int64_t> cluster_time_;
   std::vector<TrackState> states_;
   std::vector<ContainerPacket> lace_;
   std::size_t lace_cursor_ = 0;
   std::vector<std::vector<Cue>> cues_;
+  std::array<std::vector<Anchor>, MaxContainerTracks> scanned_;
+  std::optional<std::uint64_t> scan_offset_;
+  std::size_t scan_count_ = 0;
+  bool scan_complete_ = false;
 };
 } // namespace
 

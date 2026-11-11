@@ -46,6 +46,7 @@ unsigned ExtensibleFormat(ByteView suffix, unsigned bits, unsigned channels) {
 }
 
 void ReadFormat(ByteView bytes, MediaTrack& track, unsigned& alignment) {
+  auto& description = track.descriptions.front();
   auto format = Number<std::uint16_t>(bytes, 0, true);
   const auto channels = Number<std::uint16_t>(bytes, 2, true);
   const auto rate = Number<std::uint32_t>(bytes, 4, true);
@@ -57,16 +58,16 @@ void ReadFormat(ByteView bytes, MediaTrack& track, unsigned& alignment) {
       Fail(ContainerErrorCode::InvalidData, "Short WAVE extensible format");
     const auto suffix = Slice(bytes, 18, 22);
     format = ExtensibleFormat(suffix, bits, channels);
-    track.initialization_data.assign(suffix.begin(), suffix.end());
+    description.initialization_data.assign(suffix.begin(), suffix.end());
   }
-  track.codec = PcmCodec(format, bits);
+  description.codec = PcmCodec(format, bits);
   if (!channels || !rate || alignment != channels * (bits / 8) ||
       byte_rate != static_cast<std::uint64_t>(alignment) * rate)
     Fail(ContainerErrorCode::InvalidData, "Inconsistent WAVE sample rate, byte rate, or frame alignment");
   track.id = 1;
   track.kind = TrackKind::Audio;
-  track.sample_rate = track.timescale = rate;
-  track.channel_count = channels;
+  description.sample_rate = track.timescale = rate;
+  description.channel_count = channels;
 }
 
 class WaveReader final : public ContainerReader {
@@ -95,7 +96,7 @@ public:
     if (end < this->input.Position() || (this->input.Size() && end > *this->input.Size()))
       Fail(ContainerErrorCode::InvalidData, "WAVE length exceeds input");
 
-    MediaTrack track;
+    MediaTrack track{.descriptions = {{}}};
     std::size_t chunks = 0;
     while (end - this->input.Position() >= 8) {
       if (++chunks > 4096 || (!this->input.Random() && this->input.Position() > MaxContainerMetadata))
@@ -116,8 +117,8 @@ public:
         offset_ = this->input.Position();
         frames_ = static_cast<std::int64_t>(size / alignment_);
         odd_ = size & 1;
-        start = MediaTimestamp{0, *track.sample_rate};
-        duration = MediaTimestamp{frames_, *track.sample_rate};
+        start = MediaTimestamp{0, *track.descriptions.front().sample_rate};
+        duration = MediaTimestamp{frames_, *track.descriptions.front().sample_rate};
         tracks.push_back(std::move(track));
         return;
       } else {
@@ -129,7 +130,7 @@ public:
     Fail(ContainerErrorCode::InvalidData, "Missing WAVE data chunk");
   }
 
-  std::optional<DemuxItem> Read() override {
+  std::optional<ContainerPacket> Read() override {
     if (cursor_ == frames_) {
       if (odd_) {
         input.Skip(1);
@@ -141,7 +142,7 @@ public:
     const auto frames = std::min<std::int64_t>(frames_ - cursor_, std::max(1u, 16384 / alignment_));
     const auto size = static_cast<std::size_t>(frames) * alignment_;
     auto bytes = Own(input.ReadBytes(size));
-    const auto time = MediaTimestamp{cursor_, *tracks[0].sample_rate};
+    const auto time = MediaTimestamp{cursor_, *tracks[0].descriptions.front().sample_rate};
     cursor_ += frames;
     return ContainerPacket{1, std::move(bytes), time, time, MediaTimestamp{frames, time.timescale}, true};
   }
@@ -149,7 +150,7 @@ public:
   std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp time, SeekDirection direction, bool seek) override {
     if (seek && !input.Random()) Fail(ContainerErrorCode::NeedRandomAccess, "WAVE input cannot seek");
     if (!frames_) return {};
-    const auto rate = *tracks[0].sample_rate;
+    const auto rate = *tracks[0].descriptions.front().sample_rate;
     const MediaTimestamp first{0, rate}, last{frames_ - 1, rate};
     std::int64_t frame = 0;
     if (time.Compare(first) < 0) {
@@ -168,7 +169,7 @@ public:
       input.Seek(offset);
       cursor_ = frame;
     }
-    return SeekPoint{id, {frame, rate}, SeekPoint::Kind::Independent, offset, {}};
+    return SeekPoint{id, {frame, rate}, SeekPoint::Kind::Independent, offset, {frame, rate}};
   }
 
 private:
@@ -184,12 +185,13 @@ public:
   WaveWriter(ContainerOutput output, ContainerFormat format, std::span<const MediaTrack> tracks)
       : ContainerWriter(std::move(output), tracks), rf64_(format == ContainerFormat::Rf64) {
     const auto& track = tracks[0];
-    const auto bits = Bits(track.codec);
-    const auto channels = *track.channel_count;
-    const auto rate = *track.sample_rate;
+    const auto& description = track.descriptions.front();
+    const auto bits = Bits(description.codec);
+    const auto channels = *description.channel_count;
+    const auto rate = *description.sample_rate;
     alignment_ = channels * (bits / 8);
-    const std::uint16_t coding = track.codec == CodecId::PcmF32Le ? 3 : 1;
-    const bool extensible = channels > 2 || !track.initialization_data.empty();
+    const std::uint16_t coding = description.codec == CodecId::PcmF32Le ? 3 : 1;
+    const bool extensible = channels > 2 || !description.initialization_data.empty();
     Bytes header;
     Put(header, Tag(rf64_ ? "RF64" : "RIFF"));
     Put(header, rf64_ ? 0xffffffffu : 0u, true);
@@ -209,13 +211,13 @@ public:
     Put<std::uint16_t>(header, static_cast<std::uint16_t>(bits), true);
     if (extensible) {
       Put<std::uint16_t>(header, 22, true);
-      if (track.initialization_data.empty()) {
+      if (description.initialization_data.empty()) {
         Put<std::uint16_t>(header, static_cast<std::uint16_t>(bits), true);
         Put(header, 0u, true);
         Put<std::uint32_t>(header, coding, true);
         Append(header, WaveGuidTail);
       } else {
-        Append(header, track.initialization_data);
+        Append(header, description.initialization_data);
       }
     } else if (coding == 3) {
       Put<std::uint16_t>(header, 0, true);
@@ -236,7 +238,7 @@ public:
     const auto bytes = packet.data.AsBytes();
     if (bytes.size() % alignment_) Fail(ContainerErrorCode::InvalidArgument, "WAVE packet splits a sample frame");
     const auto frames = static_cast<std::int64_t>(bytes.size() / alignment_);
-    const auto rate = *tracks[0].sample_rate;
+    const auto rate = *tracks[0].descriptions.front().sample_rate;
     const MediaTimestamp time{frames_, rate}, length{frames, rate};
     if ((packet.pts && *packet.pts != time) || (packet.dts && *packet.dts != time) ||
         (packet.duration && *packet.duration != length))
@@ -288,19 +290,20 @@ private:
 
 void ValidateWave(std::span<const MediaTrack> tracks) {
   if (tracks.size() != 1 || tracks[0].kind != TrackKind::Audio ||
-      tracks[0].framing != PacketFraming::CodecPacket)
+      tracks[0].descriptions.front().framing != PacketFraming::CodecPacket)
     Fail(ContainerErrorCode::Unsupported, "WAVE requires one interleaved PCM track");
   const auto& track = tracks[0];
-  const auto bits = Bits(track.codec);
-  const auto channels = track.channel_count.value_or(0), rate = track.sample_rate.value_or(0);
+  const auto& description = track.descriptions.front();
+  const auto bits = Bits(description.codec);
+  const auto channels = description.channel_count.value_or(0), rate = description.sample_rate.value_or(0);
   const auto alignment = static_cast<std::uint64_t>(channels) * (bits / 8);
   if (!channels || !rate || alignment > 65535 || alignment * rate > 0xffffffffu ||
       (track.timescale && track.timescale != rate))
     Fail(ContainerErrorCode::InvalidArgument, "Invalid WAVE sample rate, clock, or channel count");
   if (track.priming_samples.value_or(0) || track.padding_samples.value_or(0))
     Fail(ContainerErrorCode::Unsupported, "WAVE cannot preserve compressed audio trim");
-  if (!track.initialization_data.empty() &&
-      PcmCodec(ExtensibleFormat(track.initialization_data, bits, channels), bits) != track.codec)
+  if (!description.initialization_data.empty() &&
+      PcmCodec(ExtensibleFormat(description.initialization_data, bits, channels), bits) != description.codec)
     Fail(ContainerErrorCode::InvalidArgument, "WAVE extensible configuration does not match its coding");
 }
 

@@ -36,7 +36,7 @@ class FramedAudioReader : public ContainerReader {
 public:
   FramedAudioReader(ContainerInput input, ContainerFormat format) : ContainerReader(std::move(input), format) {}
 
-  std::optional<DemuxItem> Read() override;
+  std::optional<ContainerPacket> Read() override;
   std::optional<SeekPoint> Find(std::uint32_t, MediaTimestamp target, SeekDirection direction, bool seek) override;
   std::optional<MediaPresentationRange> PresentationRange(std::size_t) const override;
 
@@ -56,7 +56,7 @@ private:
   void BuildIndex();
   void CheckEnd(std::int64_t samples);
   MediaTimestamp At(std::int64_t samples) const {
-    return {samples - priming_, *tracks.front().sample_rate};
+    return {samples - priming_, *tracks.front().descriptions.front().sample_rate};
   }
 
   std::uint64_t first_ = 0;

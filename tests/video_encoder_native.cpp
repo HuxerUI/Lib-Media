@@ -318,12 +318,13 @@ Encoded ReadbackMp4(Encoded encoded, const File& file) {
   constexpr std::uint32_t scale = 9000000;
   const auto first = PictureTime(0, encoded.variable);
   const auto end = PictureTime(static_cast<unsigned>(encoded.packets.size()), encoded.variable);
-  const MediaTrack track{.id = 1, .kind = TrackKind::Video, .codec = format.codec,
-      .framing = PacketFraming::LengthPrefixedNals, .initialization_data = format.initialization_data,
-      .timescale = scale, .coded_width = format.width, .coded_height = format.height, .visible = format.visible,
-      .presentation_edit = MediaPresentationRange{first, end}};
+  const MediaTrack track{.id = 1, .kind = TrackKind::Video, .timescale = scale,
+      .descriptions = {{.codec = format.codec, .framing = PacketFraming::LengthPrefixedNals,
+          .initialization_data = format.initialization_data, .coded_width = format.width,
+          .coded_height = format.height, .visible = format.visible}},
+      .edits = {{first, {}}, {{end.ticks - first.ticks, end.timescale}, first}}};
   auto mux = Take(MediaMuxer::Open(Take(file.OpenRandomAccess(FileAccessMode::ReadWrite, FileOpenMode::CreateNew)),
-      ContainerFormat::Mp4, std::span(&track, 1), ContainerLayout::FastStart));
+      ContainerFormat::Mp4, std::span(&track, 1), {.layout = ContainerLayout::FastStart}));
   auto dts = [&](const EncodedPacket& packet) {
     if (!encoded.reordered) return *packet.pts.Rescale(scale);
     Check(packet.dts.has_value(), "Reordered encoder output did not provide DTS");
@@ -340,7 +341,11 @@ Encoded ReadbackMp4(Encoded encoded, const File& file) {
   }
   Take(mux.Finish());
   auto demux = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
-  const auto& read_track = demux.Tracks().front();
+  const auto tracks = demux.Tracks();
+  const auto& read_track = tracks.front().descriptions.front();
+  const auto origin = dts(encoded.packets.front()).ticks;
+  Check(demux.PresentationRange(track.id) == MediaPresentationRange{first, end}, "MP4 changed the presentation timeline");
+  Check(std::holds_alternative<TrackDecodeStart>(*Take(demux.Read())), "MP4 lost its decode start");
   Check(read_track.codec == format.codec && (format.codec != CodecId::Hevc || read_track.sample_entry == "hvc1") &&
       read_track.coded_width == format.width && read_track.coded_height == format.height &&
       read_track.initialization_data == format.initialization_data &&
@@ -350,11 +355,11 @@ Encoded ReadbackMp4(Encoded encoded, const File& file) {
     auto item = Take(demux.Read());
     Check(bool(item), "MP4 lost a packet");
     auto& actual = std::get<ContainerPacket>(*item);
-    Check(actual.pts == expected.pts && actual.dts == expected.dts && actual.duration == expected.duration &&
+    Check(actual.pts == MediaTimestamp{expected.pts.Rescale(scale)->ticks - origin, scale} &&
+        actual.dts == MediaTimestamp{expected.dts->Rescale(scale)->ticks - origin, scale} && actual.duration == expected.duration &&
         actual.sync_sample == expected.key_frame && std::ranges::equal(actual.data.AsBytes(), expected.data.AsBytes()),
         "MP4 changed a packet");
     expected.data = std::move(actual.data);
-    expected.dts = actual.dts;
   }
   Check(!Take(demux.Read()), "MP4 has extra packets");
   return encoded;

@@ -1,120 +1,40 @@
 # Lib-Media roadmap
 
-The goal is to give a video editor the primitives it needs to open media, locate packets, decode and present frames,
-encode output, and finish a playable file. The [capability table](../README.md#capabilities) and the individual guides
-record current support. Each planned capability has its own format, direction, platform, and I/O requirements.
+Lib-Media provides container I/O, codec sessions, decoded playback, platform playback, and system media
+selection and publication. See the [capability table](../README.md#capabilities) for current platform coverage.
 
-## Delivery order
+## Container and playback regression paths
 
-| Order | Work | Acceptance |
-| --- | --- | --- |
-| Current | GPU video | macOS and Android 12 exercise retained H.264 and HEVC Main frames, GPU crop and scale, preview, and MP4 readback. Android has a direct Surface preview. The iOS Simulator exercises the independent Apple adapter. Windows x64 passed H.264 GPU transcode and SDK texture encoding for H.264 and HEVC Main. Web publishes and encodes retained browser frames. See [GPU video](gpu-video.md) for validation and performance. |
-| Implemented | Long MP4/MOV/fMP4 ingest and packet copy | Incremental fMP4 indexes, direct `sidx` seek, append-only input, same-codec sample description changes, rate-one edit sequences, declared fragmented AAC trim, and MOV timecode and boxed timed metadata. Shared regressions cover a sparse file above 4 GiB, configuration switches, WAV sample counts, and MOV metadata readback. See [container coverage](media-container.md). |
-| Delivered | HEVC encode/decode and M4A | Main and Main10 MP4 round trips on macOS and Ubuntu 24.04/WSL, Main on Android 12 and Chrome, and reordered Main/Main10 on the iOS Simulator. Main preview export passes on Linux, Chrome, and the iOS Simulator. Linux also passes rotated Main10 preview and export. AAC-LC and ALAC M4A preserve the packet timeline, tags, and cover. Fragmented AAC can be copied into regular M4A. See the [HEVC matrix](media-codec.md#hevc) for remaining platform checks. |
-| Delivered | Chained Ogg, Opus/FLAC/MP3 decoding, native audio packet copy, and WAV export | macOS, Android 12 hardware, Windows 11, and Ubuntu 24.04/WSL pass preview, repeated seek, packet copy, and WAV readback. Windows and Linux also check exact packet PTS, drain, and reset. See the [six-platform audio matrix](media-codec.md#opus-flac-and-mp3). |
-| Delivered | Track presentation intervals, local fMP4 seek, MP4/MOV packet copy and reordered export | The shared preview integration passes on macOS, Windows, and Linux. macOS also passes independent B-picture readback. Android 12 hardware and iOS Simulator pass headless FFmpeg-generated fMP4 seek and HLG HEVC MOV-to-MP4 copy with identical access units and supported metadata. iOS Simulator decodes SDR Main10 MOV to P010. |
-| Remaining acceptance | iPhone camera originals and additional desktop and browser runs | On an iPhone, import a camera-original MOV, verify SDR preview and repeated seeks, then save a packet copy and check its display transform, timing, and color metadata independently. Validate HDR presentation separately. Run Windows HEVC CPU round trips and GPU transcode with installed HEVC transforms, and expand physical Linux and browser checks. |
-| Remaining audio acceptance | Expand native audio backend coverage | Check physical iOS, additional Linux plugin and audio server combinations, and additional browsers. |
-
-## File and URL playback
-
-- Verify local files, picker-provided references, and HTTPS on all six platforms. Exercise load and source
-  replacement, buffering and error recovery, repeated seeking, looping and natural end, view resize, fitting,
-  and rotation. Record container, codec, and protocol behavior for each platform player.
-- Add playback rate, audio and subtitle track selection, HTTP request headers, or additional input sources as
-  applications need them. Evaluate playlists, picture-in-picture, system media controls, background playback,
-  DRM, casting, and downloads as separate features.
-
-See the [player guide](../README.md#media-playback) and its [device checks](../README.md#automated-and-device-checks).
-
-## Decoded playback
-
-- Run real audio and video through the current `DecodedPlayback` queues. Measure first presentation, A/V offset,
-  long-run drift, and recovery after underrun. Cover pause and resume, video hold and late-frame handling,
-  both track-end orders, and audible drain.
-- Verify repeated seeks across demuxing, decoder reset, and playback epoch changes. Check that old submissions are
-  rejected and that the preview clears or replaces its previously published image when required.
-- Measure audio output interruptions and device changes on physical iOS and Linux, including PipeWire's PulseAudio
-  service. Expand browser and audio-device coverage for AudioWorklet, startup, pause, and drain.
-
-See the [decoded playback design](codec-design.md#decoded-playback-boundary) and [HuxerUI #102](https://github.com/HuxerUI/HuxerUI/issues/102).
-
-## Codecs and shared frame formats
-
-- Finish platform acceptance for AAC-LC and H.264. Cover Android encoding hardware, iOS device decoding, independent
-  iOS encoder builds and device runs, iOS capability queries, Linux hardware and plugin combinations,
-  and browser runtime behavior. Compare each capability claim with actual configuration and session behavior.
-- Expand AAC configurations, sample rates, input sample formats, and channel layouts as supported by each backend.
-  Verify priming and tail padding through encoding, muxing, decoding, and PCM playback.
-- Exercise H.264 profile and B-picture controls, keyframe requests, variable frame intervals, and codec configuration
-  changes. Preserve PTS, DTS, duration, and the evidence for independently decodable output. Android and Web H.264
-  encoding currently omit DTS. Windows may omit DTS when variable timing makes its codec clock unsuitable.
-- Complete HEVC platform acceptance on physical iOS, Windows with HEVC transforms installed, physical Linux, and
-  additional Android and browser configurations. Verify Main10 CPU paths and ordered/reordered output where supported.
-  Evaluate ProRes, AV1, VP8/VP9, and Vorbis by platform and direction. Add capability and configuration coverage with each codec.
-- Validate the [SDR GPU path](gpu-video.md) on physical iOS and test Windows HEVC transcode across more hardware.
-  Expand browser coverage and extend the path to Linux. Verify ten-bit storage, HDR metadata, and
-  presentation separately. Measure GPU copies, synchronization, buffer reuse, and resource release for each backend
-  and renderer.
-
-See the [codec guide](media-codec.md), [codec validation](media-codec.md#validation), and [HuxerUI #20](https://github.com/HuxerUI/HuxerUI/issues/20).
-
-## Container coverage
-
-### Existing containers
-
-| Container | Remaining work |
+| Input | Acceptance |
 | --- | --- |
-| MP4, M4A, MOV, fMP4 | Broader embedded index layouts, additional edit rates and repeated media ranges, AV1 and other needed codec mappings, additional MOV metadata mappings and display transforms, and device acceptance with iPhone originals. |
-| Matroska, MKA, WebM | Additional mappings such as VP8, VP9, AV1, FLAC, and Vorbis for Matroska, and AV1 and Vorbis for WebM. Extend Opus beyond mapping family zero. Cover files without Cues, timestamp precision beyond the current 1 ms output grid, and subtitle, chapter, attachment, and tag preservation. |
-| WAVE and RF64 | RF64 additional-size entries, large-file interoperation, and further PCM or channel layouts where needed. |
-| ADTS | Additional AAC configurations and transport variants driven by input samples. |
+| MP4 with multiple rate-one edits and sample descriptions | Keep media timestamps and the description table stable. Map the decoded intervals, seek across gaps and configurations, and preserve the edits and packets through MP4/MOV copy. Verify fragmented AAC head and tail trim through WAV sample counts. |
+| VP9 and Opus WebM without Cues | Open and read without building an index. Seek through a bounded random-access Cluster scan, start video at a sync Block, and include Opus preroll. Verify macOS CPU preview and packet-copy readback. |
+| Chained Ogg Opus | Keep one track with stable description indices. Restart decoding at each link, preserve its absolute audible start, and verify seek and WAV sample counts. |
 
-Across containers, verify multi-track offsets, B-picture ordering, variable frame intervals, audio trim,
-seek preroll, and the evidence attached to a seek point. Matroska reads AVC and HEVC in stored order with PTS;
-the MP4 writer requires explicit DTS. Support a cross-container export only when the required decode timing is available
-or established by the chosen codec path. Preserve rotation, crop, aspect ratio, color, HDR, channel layout, and auxiliary
-tracks and metadata where the mapping supports them. Report unsupported preservation requests clearly. Use the existing
-`ValidateOutput()` for write validation and add read, seek, or metadata queries when a caller needs to inspect those
-capabilities before opening.
+The Frames example opens, previews, seeks, copies, and saves supported files. The integration tests exercise
+reordered encoding, GPU crop and scale, encoded MP4 readback, and WAV export.
+[Container guide](media-container.md) · [Preview integration test](../tests/container_preview.cpp)
 
-### New containers and elementary streams
+## Remaining platform acceptance
 
-| Format | Planned coverage |
-| --- | --- |
-| Ogg extensions | Vorbis, FLAC, Theora, and chained output. |
-| Native FLAC extensions | Multichannel decode and additional native metadata blocks. |
-| MPEG audio extensions | MP2 frame mapping and additional ID3 frames. |
-| Wave64, AIFF, AIFC, CAF | PCM and floating-point descriptions, byte order, channel layout, and file lengths. |
-| 3GP | ISO BMFF brands and supported track and codec mappings. |
-| MPEG-TS, M2TS, MTS | Programs and tracks, PES assembly, clock wrap and discontinuities, sequential I/O, and seek. |
-| AVI and OpenDML AVI | Tracks, timing, indexes, and large-file RIFF segments. |
-| FLV | Tags, codec configurations, timestamps, and separately verified codec mappings. |
-| Annex B AVC and HEVC | Parameter sets, access unit boundaries, length-prefix conversion, and input with absent timestamps. |
+- Import a camera-original HEVC MOV on an iPhone. Verify SDR preview, repeated seeks, and packet-copy readback
+  with its transform, color metadata, and timing. Exercise HDR display with a compatible surface.
+- Complete physical iOS, Windows HEVC, Linux audio-device, Android hardware, and additional browser runs.
+  Check codec probes, pause and seek, A/V synchronization, drain, GPU frame reuse, and cleanup.
+  [Codec matrix](media-codec.md) · [GPU video validation](gpu-video.md)
+- Verify platform players with local files, picker references, and HTTPS. Check selection, retained references,
+  and publication on Android and iOS. [Playback checks](../README.md#automated-and-device-checks) ·
+  [Media library checks](media-library.md#preview-and-validation)
 
-Evaluate standalone SRT, WebVTT, and ASS/SSA, ASF/WMA/WMV, MPEG-PS/VOB, MXF, and HEIF/AVIF item support
-against actual ingest and export needs. The [container guide](media-container.md) tracks supported combinations
-and endpoint requirements.
+## Candidate format work
 
-## System media library
+Use application inputs and independent readback to scope each format, direction, and platform.
 
-- Verify Android and iOS selection and publication on devices. Cover mixed and multiple selection, large and
-  cloud-backed videos, retained references, legacy Android routes, denied access, cancellation, and unmount.
-- Evaluate device-library browsing separately when the editor needs a custom asset browser. Scope enumeration,
-  pagination, albums, limited library access, and change notifications. Evaluate additional platform integrations
-  against their system library capabilities and application requirements.
+- Extend MP4/MOV/fMP4 for needed sample entries, index layouts, edits, and metadata. Extend Matroska/WebM
+  for needed codecs, timestamp precision, and subtitle, chapter, and tag preservation.
+- Evaluate additional audio mappings and PCM containers, including Vorbis, multichannel FLAC, AIFF, CAF,
+  and Wave64. Evaluate AV1, VP8/VP9, and ProRes codec adapters by platform and direction.
+- Evaluate transport streams, AVI, Annex B, and standalone subtitles against actual ingest requirements.
 
-See the [media library guide](media-library.md#preview-and-validation) and [HuxerUI #125](https://github.com/HuxerUI/HuxerUI/issues/125).
-
-## Integration and acceptance
-
-- Maintain a platform matrix covering build, runtime, and device acceptance. Exercise SDK `File` and
-  `FileReference` inputs, sequential and random-access streams, and the platforms and providers that expose them.
-- Use external fixtures and verify output with independent tools and platform players. Include large files above
-  4 GiB, short reads and writes, truncation, malformed indexes, cancellation, and I/O failures. Measure long-run
-  memory use and verify worker shutdown, pending callbacks, and resource release.
-- Keep the preview and export example small. Lib-Media provides packets, seek points, timestamps, codecs, frames,
-  playback clocks, and container I/O. Lib-AVKit owns FFmpeg fallback and backend selection, precise frame extraction
-  and GOP caches, thumbnails and waveforms, resampling and mixing, compositing and color processing, timeline and
-  export orchestration, and HLS/DASH manifests and segment scheduling. The editing application owns projects,
-  interactions, undo and redo, and progress UI.
+Lib-AVKit owns backend selection, precise extraction, thumbnails, audio processing, compositing, timeline
+and export orchestration, and adaptive streaming. The editing application owns project state and interactions.

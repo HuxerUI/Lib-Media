@@ -1,23 +1,23 @@
 #include "mp4.h"
+#include "framed_audio.h"
 
 namespace huxerui::media {
 namespace {
 using namespace detail;
 using Requirement = MediaMuxer::OutputRequirement;
 
-Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout) {
+Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks, const MediaMuxerOptions& options) {
+  const auto layout = options.layout;
   const bool mp4 = format == ContainerFormat::Mp4 || format == ContainerFormat::Mov;
   if (tracks.empty()) Fail(ContainerErrorCode::InvalidArgument, "A container needs at least one track");
-  const auto track_count = static_cast<std::size_t>(std::ranges::count(tracks, 1u, &MediaTrack::sample_description_index));
-  if (tracks.size() > MaxContainerTracks * (mp4 ? MaxMp4Descriptions : 1) || track_count > MaxContainerTracks)
-    Fail(ContainerErrorCode::LimitExceeded, "Too many output tracks or descriptions");
+  if (tracks.size() > MaxContainerTracks) Fail(ContainerErrorCode::LimitExceeded, "Too many output tracks");
   for (auto it = tracks.begin(); it != tracks.end(); ++it) {
-    if (!it->id || !it->sample_description_index ||
-        std::ranges::any_of(std::ranges::subrange(tracks.begin(), it), [&](const auto& before) {
-          return before.id == it->id && before.sample_description_index == it->sample_description_index;
-        }))
-      Fail(ContainerErrorCode::InvalidArgument, "Output track IDs and description indices must identify unique descriptions");
-    if (!mp4 && it->sample_description_index != 1)
+    if (!it->id || std::ranges::find(std::ranges::subrange(tracks.begin(), it), it->id, &MediaTrack::id) != it)
+      Fail(ContainerErrorCode::InvalidArgument, "Output track IDs must be nonzero and unique");
+    if (it->descriptions.empty()) Fail(ContainerErrorCode::InvalidArgument, "An output track needs a sample description");
+    if (it->descriptions.size() > MaxMp4Descriptions)
+      Fail(ContainerErrorCode::LimitExceeded, "Too many output sample descriptions");
+    if (!mp4 && it->descriptions.size() != 1)
       Fail(ContainerErrorCode::Unsupported, "Output format requires a single sample description per track");
     if (it->timescale == 0) Fail(ContainerErrorCode::InvalidArgument, "Zero output track timescale");
     if (it->seek_preroll && (!it->seek_preroll->timescale || it->seek_preroll->ticks < 0))
@@ -25,23 +25,25 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
     if (it->seek_preroll && it->seek_preroll->ticks &&
         format != ContainerFormat::Matroska && format != ContainerFormat::WebM && format != ContainerFormat::Ogg)
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain track seek preroll");
-    if (it->initialization_data.size() > 65536)
-      Fail(ContainerErrorCode::LimitExceeded, "Output track configuration exceeds 64 KiB");
-    if (it->presentation_edit && (!it->edits.empty() ||
-        it->presentation_edit->start.Compare(it->presentation_edit->end) != -1))
-      Fail(ContainerErrorCode::InvalidArgument, "Invalid track presentation edit");
-    if ((it->presentation_edit || !it->edits.empty() || it->pixel_aspect_ratio || !it->video_extensions.empty()) && !mp4)
-      Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied presentation metadata");
+    if (!it->edits.empty() && !mp4)
+      Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied presentation edits");
     if (!it->references.empty() && format != ContainerFormat::Mov)
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain QuickTime track references");
-    if (it->kind != TrackKind::Video && (it->pixel_aspect_ratio || !it->video_extensions.empty()))
-      Fail(ContainerErrorCode::InvalidArgument, "Visual metadata requires a video track");
-    if (it->audio_metadata && format != ContainerFormat::Flac && format != ContainerFormat::Mp3 &&
-        (format != ContainerFormat::Mp4 || track_count != 1 || it->kind != TrackKind::Audio ||
+    for (const auto& description : it->descriptions) {
+      if (description.initialization_data.size() > 65536)
+        Fail(ContainerErrorCode::LimitExceeded, "Output track configuration exceeds 64 KiB");
+      if (description.pixel_aspect_ratio || !description.video_extensions.empty()) {
+        if (it->kind != TrackKind::Video) Fail(ContainerErrorCode::InvalidArgument, "Visual metadata requires a video track");
+        if (!mp4) Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied visual metadata");
+      }
+    }
+  }
+  if (options.audio_metadata) {
+    if (format != ContainerFormat::Flac && format != ContainerFormat::Mp3 &&
+        (format != ContainerFormat::Mp4 || tracks.size() != 1 || tracks.front().kind != TrackKind::Audio ||
          layout == ContainerLayout::Fragmented))
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied audio tags");
-    if (it->audio_metadata && it->sample_description_index != 1)
-      Fail(ContainerErrorCode::InvalidArgument, "Audio tags belong to the first sample description");
+    ValidateAudioMetadata(*options.audio_metadata);
   }
   if (layout != ContainerLayout::Default && (format != ContainerFormat::Mp4 ||
       (layout != ContainerLayout::Fragmented && layout != ContainerLayout::FastStart)))
@@ -59,7 +61,7 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
       return Requirement::SequentialWrite;
     case ContainerFormat::Mp4:
     case ContainerFormat::Mov:
-      ValidateMp4(format, tracks, layout);
+      ValidateMp4(format, tracks, options);
       if (layout == ContainerLayout::FastStart) return Requirement::RandomReadWrite;
       return layout == ContainerLayout::Fragmented ? Requirement::SequentialWrite : Requirement::RandomWrite;
     case ContainerFormat::Matroska:
@@ -77,8 +79,8 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
 }
 
 std::unique_ptr<ContainerWriter> OpenWriter(ContainerOutput output, ContainerFormat format,
-                                            std::span<const MediaTrack> tracks, ContainerLayout layout) {
-  const auto requirement = Validate(format, tracks, layout);
+                                            std::span<const MediaTrack> tracks, const MediaMuxerOptions& options) {
+  const auto requirement = Validate(format, tracks, options);
   if (requirement != Requirement::SequentialWrite && !output.Random())
     Fail(ContainerErrorCode::NeedRandomAccess, "This container layout requires random writes");
   if (requirement == Requirement::RandomReadWrite) output.RequireReadable();
@@ -88,11 +90,11 @@ std::unique_ptr<ContainerWriter> OpenWriter(ContainerOutput output, ContainerFor
     case ContainerFormat::Adts: return OpenAdtsWriter(std::move(output), tracks);
     case ContainerFormat::Ogg: return OpenOggWriter(std::move(output), tracks);
     case ContainerFormat::Mp4:
-    case ContainerFormat::Mov: return OpenMp4Writer(std::move(output), format, tracks, layout);
+    case ContainerFormat::Mov: return OpenMp4Writer(std::move(output), format, tracks, options);
     case ContainerFormat::Matroska:
     case ContainerFormat::WebM: return OpenMatroskaWriter(std::move(output), format, tracks);
-    case ContainerFormat::Flac: return OpenFlacWriter(std::move(output), tracks);
-    case ContainerFormat::Mp3: return OpenMp3Writer(std::move(output), tracks);
+    case ContainerFormat::Flac: return OpenFlacWriter(std::move(output), tracks, options.audio_metadata);
+    case ContainerFormat::Mp3: return OpenMp3Writer(std::move(output), tracks, options.audio_metadata);
   }
   Fail(ContainerErrorCode::Unsupported, "Unsupported output container");
 }
@@ -104,21 +106,21 @@ MediaMuxer& MediaMuxer::operator=(MediaMuxer&&) noexcept = default;
 MediaMuxer::~MediaMuxer() = default;
 
 ContainerResult<MediaMuxer::OutputRequirement> MediaMuxer::ValidateOutput(
-    ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout) {
-  return ContainerCall<OutputRequirement>([&] { return Validate(format, tracks, layout); });
+    ContainerFormat format, std::span<const MediaTrack> tracks, const MediaMuxerOptions& options) {
+  return ContainerCall<OutputRequirement>([&] { return Validate(format, tracks, options); });
 }
 
 ContainerResult<MediaMuxer> MediaMuxer::Open(
-    OutputStream output, ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout) {
+    OutputStream output, ContainerFormat format, std::span<const MediaTrack> tracks, const MediaMuxerOptions& options) {
   return ContainerCall<MediaMuxer>([&] {
-    return MediaMuxer(OpenWriter(ContainerOutput(std::move(output)), format, tracks, layout));
+    return MediaMuxer(OpenWriter(ContainerOutput(std::move(output)), format, tracks, options));
   });
 }
 
 ContainerResult<MediaMuxer> MediaMuxer::Open(
-    RandomAccessStream output, ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout) {
+    RandomAccessStream output, ContainerFormat format, std::span<const MediaTrack> tracks, const MediaMuxerOptions& options) {
   return ContainerCall<MediaMuxer>([&] {
-    return MediaMuxer(OpenWriter(ContainerOutput(std::move(output)), format, tracks, layout));
+    return MediaMuxer(OpenWriter(ContainerOutput(std::move(output)), format, tracks, options));
   });
 }
 
@@ -134,8 +136,8 @@ ContainerResult<std::optional<std::uint32_t>> MediaMuxer::TryWrite(const Contain
         (packet.duration && (!packet.duration->timescale || packet.duration->ticks < 0)) ||
         (packet.discard_padding && !packet.discard_padding->timescale))
       Fail(ContainerErrorCode::InvalidArgument, "Invalid container packet timing");
-    if (packet.sample_description_index != 1 && !writer_->SupportsSampleDescriptions())
-      Fail(ContainerErrorCode::Unsupported, "Output format requires a single sample description per track");
+    if (packet.sample_description_index > writer_->tracks[index].descriptions.size())
+      Fail(ContainerErrorCode::InvalidArgument, "Packet references an undeclared sample description");
     if (packet.discard_padding && packet.discard_padding->ticks && !writer_->SupportsPacketTrim())
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain packet discard padding");
     return writer_->Write(index, packet);

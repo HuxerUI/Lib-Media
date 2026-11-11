@@ -3,6 +3,7 @@
 #include <huxerui/media_container.h>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <limits>
 #include <string_view>
@@ -151,23 +152,45 @@ std::uint32_t CommonScale(std::uint32_t first, std::uint32_t second);
 std::int64_t ExactTicks(MediaTimestamp time, std::uint32_t scale);
 std::uint32_t PacketTrack(std::span<const MediaTrack> tracks, std::uint32_t id);
 
+template<class Visit>
+std::int64_t VisitEdits(std::span<const MediaTrack::Edit> edits, std::uint32_t scale,
+                        ContainerErrorCode error, Visit visit) {
+  std::int64_t begin = 0, previous_media_end = 0;
+  for (const auto& edit : edits) {
+    const auto length = ExactTicks(edit.duration, scale);
+    if (length <= 0) Fail(error, "Presentation edit duration must be positive");
+    const auto end = AddTime(begin, length);
+    if (edit.media_start) {
+      const auto media = ExactTicks(*edit.media_start, scale);
+      if (media < previous_media_end) Fail(error, "Media edits must be forward and nonoverlapping");
+      previous_media_end = AddTime(media, length);
+      visit(begin, end, media, previous_media_end);
+    }
+    begin = end;
+  }
+  return begin;
+}
+
 class ContainerReader {
 public:
   ContainerReader(ContainerInput input, ContainerFormat format) : input(std::move(input)), format(format) {}
   virtual ~ContainerReader() = default;
-  virtual std::optional<DemuxItem> Read() = 0;
-  virtual std::span<const MediaTrack> SampleDescriptions(std::size_t track) const { return {&tracks[track], 1}; }
+  virtual std::optional<ContainerPacket> Read() = 0;
   virtual std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp time, SeekDirection direction, bool seek);
   virtual std::optional<MediaPresentationRange> PresentationRange(std::size_t) const { return {}; }
+
+  std::uint32_t RegisterAudioDescription(MediaTrack& track, MediaSampleDescription description);
 
   ContainerInput input;
   ContainerFormat format;
   ContainerLayout layout = ContainerLayout::Default;
   std::vector<MediaTrack> tracks;
+  std::optional<MediaAudioMetadata> audio_metadata;
   std::optional<MediaTimestamp> start;
   std::optional<MediaTimestamp> duration;
   std::vector<std::uint32_t> selected;
-  std::vector<std::uint32_t> describe;
+  std::array<std::uint32_t, MaxContainerTracks> active_descriptions{};
+  std::array<std::optional<MediaTimestamp>, MaxContainerTracks> first_audible_pts;
   std::optional<ContainerPacket> pending;
   bool failed = false;
 };
@@ -180,7 +203,6 @@ public:
   virtual std::optional<std::uint32_t> Write(std::uint32_t track, const ContainerPacket& packet) = 0;
   virtual void TrackEnded(std::uint32_t) {}
   virtual bool SupportsTrim() const { return false; }
-  virtual bool SupportsSampleDescriptions() const { return false; }
   virtual bool SupportsPacketTrim() const { return false; }
   virtual void Finish() = 0;
 
@@ -192,8 +214,10 @@ public:
 std::unique_ptr<ContainerReader> OpenWaveReader(ContainerInput input, ContainerFormat format);
 void ValidateFlac(std::span<const MediaTrack> tracks);
 void ValidateMp3(std::span<const MediaTrack> tracks);
-std::unique_ptr<ContainerWriter> OpenFlacWriter(ContainerOutput output, std::span<const MediaTrack> tracks);
-std::unique_ptr<ContainerWriter> OpenMp3Writer(ContainerOutput output, std::span<const MediaTrack> tracks);
+std::unique_ptr<ContainerWriter> OpenFlacWriter(ContainerOutput output, std::span<const MediaTrack> tracks,
+                                               const std::optional<MediaAudioMetadata>& tags);
+std::unique_ptr<ContainerWriter> OpenMp3Writer(ContainerOutput output, std::span<const MediaTrack> tracks,
+                                              const std::optional<MediaAudioMetadata>& tags);
 std::unique_ptr<ContainerWriter> OpenWaveWriter(ContainerOutput output, ContainerFormat format,
                                                 std::span<const MediaTrack> tracks);
 void ValidateWave(std::span<const MediaTrack> tracks);
@@ -209,8 +233,8 @@ bool LooksLikeMp3(ByteView bytes);
 std::unique_ptr<ContainerReader> OpenMp4Reader(ContainerInput input, std::optional<ContainerFormat> hint,
                                                ContainerInputMode mode);
 std::unique_ptr<ContainerWriter> OpenMp4Writer(ContainerOutput output, ContainerFormat format,
-                                               std::span<const MediaTrack> tracks, ContainerLayout layout);
-void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout);
+                                               std::span<const MediaTrack> tracks, const MediaMuxerOptions& options);
+void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, const MediaMuxerOptions& options);
 std::unique_ptr<ContainerReader> OpenMatroskaReader(ContainerInput input, std::optional<ContainerFormat> hint);
 std::unique_ptr<ContainerWriter> OpenMatroskaWriter(ContainerOutput output, ContainerFormat format,
                                                     std::span<const MediaTrack> tracks);

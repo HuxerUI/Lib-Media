@@ -34,7 +34,8 @@ void FramedAudioReader::Begin(MediaTrack track, std::optional<std::uint64_t> cod
   padding_ = static_cast<std::int64_t>(track.padding_samples.value_or(0));
   coded_samples_ = coded_samples;
   tracks.push_back(std::move(track));
-  start = MediaTimestamp{0, *tracks.front().sample_rate};
+  start = MediaTimestamp{0, *tracks.front().descriptions.front().sample_rate};
+  first_audible_pts[0] = start;
   if (coded_samples) {
     if (*coded_samples < std::uint64_t(priming_ + padding_) || *coded_samples > INT64_MAX)
       Fail(ContainerErrorCode::InvalidData, "Audio header has an invalid sample count");
@@ -58,7 +59,7 @@ void FramedAudioReader::SeekFrame(std::uint64_t offset, std::int64_t samples) {
   position_ = samples;
 }
 
-std::optional<DemuxItem> FramedAudioReader::Read() {
+std::optional<ContainerPacket> FramedAudioReader::Read() {
   auto frame = ReadFrame(position_);
   if (!frame) {
     CheckEnd(position_);
@@ -119,7 +120,7 @@ std::optional<SeekPoint> FramedAudioReader::Find(std::uint32_t id, MediaTimestam
   if (seek) SeekFrame(decode->offset, decode->samples);
   const auto kind = format == ContainerFormat::Mp3 ? SeekPoint::Kind::NeedsPreroll : SeekPoint::Kind::Independent;
   return SeekPoint{id, At(point->samples), kind, point->offset,
-                   kind == SeekPoint::Kind::NeedsPreroll ? std::optional{At(decode->samples)} : std::nullopt};
+                   At(decode->samples)};
 }
 
 } // namespace huxerui::media::detail

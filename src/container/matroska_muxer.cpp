@@ -13,25 +13,27 @@ constexpr std::uint32_t TickRate = Nanoseconds / DefaultTimestampScale;
 constexpr std::size_t ClusterTarget = 4 * 1024 * 1024;
 
 std::string_view CodecName(ContainerFormat format, const MediaTrack& track) {
+  const auto& description = track.descriptions.front();
   if (track.kind == TrackKind::Video) {
-    if (format == ContainerFormat::Matroska && track.codec == CodecId::H264) return "V_MPEG4/ISO/AVC";
-    if (format == ContainerFormat::Matroska && track.codec == CodecId::Hevc) return "V_MPEGH/ISO/HEVC";
-    if (format == ContainerFormat::WebM && track.codec == CodecId::Vp8) return "V_VP8";
-    if (format == ContainerFormat::WebM && track.codec == CodecId::Vp9) return "V_VP9";
+    if (format == ContainerFormat::Matroska && description.codec == CodecId::H264) return "V_MPEG4/ISO/AVC";
+    if (format == ContainerFormat::Matroska && description.codec == CodecId::Hevc) return "V_MPEGH/ISO/HEVC";
+    if (format == ContainerFormat::WebM && description.codec == CodecId::Vp8) return "V_VP8";
+    if (format == ContainerFormat::WebM && description.codec == CodecId::Vp9) return "V_VP9";
   }
   if (track.kind == TrackKind::Audio) {
-    if (track.codec == CodecId::Opus) return "A_OPUS";
-    if (format == ContainerFormat::Matroska && track.codec == CodecId::Aac) return "A_AAC";
+    if (description.codec == CodecId::Opus) return "A_OPUS";
+    if (format == ContainerFormat::Matroska && description.codec == CodecId::Aac) return "A_AAC";
   }
   Fail(Unsupported, "Unsupported Matroska or WebM track mapping");
 }
 
 std::int64_t Delay(const MediaTrack& track) {
-  if (track.codec == CodecId::Opus) return ParseOpus(track.initialization_data, BadArgument).Delay();
+  const auto& description = track.descriptions.front();
+  if (description.codec == CodecId::Opus) return ParseOpus(description.initialization_data, BadArgument).Delay();
   if (!track.priming_samples.value_or(0)) return 0;
-  if (!track.sample_rate || *track.priming_samples > std::numeric_limits<std::int64_t>::max())
+  if (!description.sample_rate || *track.priming_samples > std::numeric_limits<std::int64_t>::max())
     Fail(BadArgument, "Matroska codec delay requires a valid audio sample grid");
-  return ToNs({static_cast<std::int64_t>(*track.priming_samples), *track.sample_rate});
+  return ToNs({static_cast<std::int64_t>(*track.priming_samples), *description.sample_rate});
 }
 
 std::int64_t OutputTicks(std::int64_t ns) {
@@ -39,43 +41,44 @@ std::int64_t OutputTicks(std::int64_t ns) {
 }
 
 void WriteTrack(Bytes& entries, ContainerFormat format, const MediaTrack& track) {
+  const auto& description = track.descriptions.front();
   Master(entries, 0xae, [&](Bytes& entry) {
     PutUInt(entry, 0xd7, track.id);
     PutUInt(entry, 0x73c5, track.id);
     PutUInt(entry, 0x83, track.kind == TrackKind::Video ? 1u : 2u);
     PutUInt(entry, 0x9c, 0);
     PutText(entry, 0x86, CodecName(format, track));
-    if (!track.initialization_data.empty()) PutElement(entry, 0x63a2, track.initialization_data);
+    if (!description.initialization_data.empty()) PutElement(entry, 0x63a2, description.initialization_data);
     if (track.kind == TrackKind::Video) {
       Master(entry, 0xe0, [&](Bytes& video) {
-        PutUInt(video, 0xb0, *track.coded_width);
-        PutUInt(video, 0xba, *track.coded_height);
-        if (track.visible) {
-          const auto rect = *track.visible;
+        PutUInt(video, 0xb0, *description.coded_width);
+        PutUInt(video, 0xba, *description.coded_height);
+        if (description.visible) {
+          const auto rect = *description.visible;
           if (rect.x) PutUInt(video, 0x54cc, rect.x);
           if (rect.y) PutUInt(video, 0x54bb, rect.y);
-          const auto right = *track.coded_width - rect.x - rect.width;
-          const auto bottom = *track.coded_height - rect.y - rect.height;
+          const auto right = *description.coded_width - rect.x - rect.width;
+          const auto bottom = *description.coded_height - rect.y - rect.height;
           if (right) PutUInt(video, 0x54dd, right);
           if (bottom) PutUInt(video, 0x54aa, bottom);
         }
       });
     } else {
-      const auto opus = track.codec == CodecId::Opus;
+      const auto opus = description.codec == CodecId::Opus;
       const auto delay = Delay(track);
       if (delay || opus || track.priming_samples) PutUInt(entry, 0x56aa, delay);
       Master(entry, 0xe1, [&](Bytes& audio) {
-        auto sampling_frequency = *track.sample_rate;
+        auto sampling_frequency = *description.sample_rate;
         if (opus) {
-          const auto original = ParseOpus(track.initialization_data, BadArgument).input_rate;
+          const auto original = ParseOpus(description.initialization_data, BadArgument).input_rate;
           if (original) sampling_frequency = original;
         }
         PutFloat(audio, 0xb5, sampling_frequency);
         if (opus && sampling_frequency != 48000) PutFloat(audio, 0x78b5, 48000);
-        PutUInt(audio, 0x9f, *track.channel_count);
+        PutUInt(audio, 0x9f, *description.channel_count);
       });
     }
-    if (track.seek_preroll || track.codec == CodecId::Opus)
+    if (track.seek_preroll || description.codec == CodecId::Opus)
       PutUInt(entry, 0x56bb, track.seek_preroll ? ToNs(*track.seek_preroll) : OpusSeekPreroll);
   });
 }
@@ -109,10 +112,11 @@ public:
       : ContainerWriter(std::move(stream), tracks), webm_(format == ContainerFormat::WebM), states_(tracks.size()) {
     for (std::size_t i = 0; i < tracks.size(); ++i) {
       states_[i].delay = Delay(tracks[i]);
-      if (tracks[i].codec == CodecId::Hevc)
-        states_[i].nal_length = HevcNalLength(tracks[i].initialization_data, false, BadArgument);
-      if (tracks[i].codec == CodecId::H264)
-        states_[i].nal_length = ParseAvc(tracks[i].initialization_data).Value().length_size;
+      const auto& description = tracks[i].descriptions.front();
+      if (description.codec == CodecId::Hevc)
+        states_[i].nal_length = HevcNalLength(description.initialization_data, false, BadArgument);
+      if (description.codec == CodecId::H264)
+        states_[i].nal_length = ParseAvc(description.initialization_data).Value().length_size;
       has_video_ |= tracks[i].kind == TrackKind::Video;
     }
     Bytes header;
@@ -160,7 +164,8 @@ public:
       Fail(Unsupported, "Block time is outside the supported Matroska or WebM timeline");
     const auto& track = tracks[index];
     const auto data = packet.data.AsBytes();
-    const auto intrinsic = CodecDuration(track, data, BadArgument);
+    const auto& description = track.descriptions.front();
+    const auto intrinsic = CodecDuration(description, data, BadArgument);
     const auto discard = packet.discard_padding ? std::optional{ToNs(*packet.discard_padding)} : std::nullopt;
     if (discard) {
       if (track.kind != TrackKind::Audio || !intrinsic)
@@ -186,8 +191,8 @@ public:
     }
     bool independent = track.kind == TrackKind::Audio;
     // AVC and HEVC can derive a sync flag from an IDR. VPx uses the caller's container sync flag.
-    if (track.codec == CodecId::H264) independent = AvcIdr(data, state.nal_length, BadArgument);
-    if (track.codec == CodecId::Hevc) independent = HevcIdr(data, state.nal_length, false, BadArgument);
+    if (description.codec == CodecId::H264) independent = AvcIdr(data, state.nal_length, BadArgument);
+    if (description.codec == CodecId::Hevc) independent = HevcIdr(data, state.nal_length, false, BadArgument);
     state.pending = PendingBlock{Bytes(data.begin(), data.end()), time,
                                  webm_ ? time : (packet.dts ? ToNs(*packet.dts) : stored),
                                  duration, discard, packet.sync_sample.value_or(independent)};
@@ -333,45 +338,46 @@ private:
 void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks) {
   for (const auto& track : tracks) {
     CodecName(format, track);
+    const auto& description = track.descriptions.front();
     if (track.padding_samples.value_or(0))
       Fail(Unsupported, "Matroska tail trim must be supplied in the last packet");
     if (track.rotation != VideoRotation::None)
       Fail(Unsupported, "Matroska output does not retain a track display rotation");
     if (track.seek_preroll) ToNs(*track.seek_preroll);
     if (track.kind == TrackKind::Video) {
-      const auto width = track.coded_width.value_or(0), height = track.coded_height.value_or(0);
+      const auto width = description.coded_width.value_or(0), height = description.coded_height.value_or(0);
       if (!width || !height || track.priming_samples.value_or(0))
         Fail(BadArgument, "Invalid Matroska video dimensions or trim");
-      if (track.visible && (!track.visible->width || !track.visible->height || track.visible->x >= width ||
-          track.visible->y >= height || track.visible->width > width - track.visible->x ||
-          track.visible->height > height - track.visible->y))
+      if (description.visible && (!description.visible->width || !description.visible->height || description.visible->x >= width ||
+          description.visible->y >= height || description.visible->width > width - description.visible->x ||
+          description.visible->height > height - description.visible->y))
         Fail(BadArgument, "Matroska visible rectangle exceeds coded bounds");
-      if (track.codec == CodecId::H264 || track.codec == CodecId::Hevc) {
-        if (track.framing != PacketFraming::LengthPrefixedNals)
+      if (description.codec == CodecId::H264 || description.codec == CodecId::Hevc) {
+        if (description.framing != PacketFraming::LengthPrefixedNals)
           Fail(Unsupported, "Matroska AVC and HEVC require length-prefixed access units");
-        if (track.codec == CodecId::H264) {
-          const auto config = ParseAvc(track.initialization_data);
+        if (description.codec == CodecId::H264) {
+          const auto config = ParseAvc(description.initialization_data);
           if (!config.Succeeded()) Fail(Unsupported, config.Error().message);
         } else {
-          HevcNalLength(track.initialization_data, false, BadArgument);
+          HevcNalLength(description.initialization_data, false, BadArgument);
         }
-      } else if (track.framing != PacketFraming::CodecPacket) {
+      } else if (description.framing != PacketFraming::CodecPacket) {
         Fail(Unsupported, "WebM VP8 and VP9 require complete codec packets");
-      } else if (track.codec == CodecId::Vp8 && !track.initialization_data.empty()) {
+      } else if (description.codec == CodecId::Vp8 && !description.initialization_data.empty()) {
         Fail(BadArgument, "WebM VP8 has no codec private data");
       }
     } else {
-      if (track.framing != PacketFraming::CodecPacket)
+      if (description.framing != PacketFraming::CodecPacket)
         Fail(Unsupported, "Matroska audio requires complete codec packets");
-      if (track.codec == CodecId::Opus) {
-        const auto opus = ParseOpus(track.initialization_data, BadArgument);
-        if (track.sample_rate != 48000 || track.channel_count != opus.channels ||
+      if (description.codec == CodecId::Opus) {
+        const auto opus = ParseOpus(description.initialization_data, BadArgument);
+        if (description.sample_rate != 48000 || description.channel_count != opus.channels ||
             (track.priming_samples && track.priming_samples != opus.pre_skip))
           Fail(BadArgument, "Opus track does not match its 48 kHz timeline, channels, or pre-skip");
       } else {
-        const auto aac = ParseAac(track.initialization_data);
+        const auto aac = ParseAac(description.initialization_data);
         if (!aac.Succeeded()) Fail(Unsupported, aac.Error().message);
-        if (track.sample_rate != aac.Value().sample_rate || track.channel_count != aac.Value().channels)
+        if (description.sample_rate != aac.Value().sample_rate || description.channel_count != aac.Value().channels)
           Fail(BadArgument, "Matroska AAC track does not match AudioSpecificConfig");
       }
       Delay(track);
