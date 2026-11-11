@@ -202,12 +202,16 @@ void Until(testing::UiTest& ui, const std::exception_ptr& failure, Condition con
   Check(condition(), error);
 }
 
-void AppendPictureTimes(const MediaTrack& track, const ContainerPacket& packet, std::vector<MediaTimestamp>& times) {
+std::vector<MediaPresentationSlice> PictureSlices(const MediaTrack& track, const ContainerPacket& packet) {
   const auto clock = packet.pts->timescale;
   const auto end = MediaTimestamp{packet.pts->ticks + packet.duration->Rescale(clock)->ticks, clock};
   std::vector<MediaPresentationSlice> slices;
   Require(MapToPresentation(track.edits, *packet.pts, end, slices));
-  for (const auto& slice : slices) times.push_back(slice.presentation.start);
+  return slices;
+}
+
+void AppendPictureTimes(const MediaTrack& track, const ContainerPacket& packet, std::vector<MediaTimestamp>& times) {
+  for (const auto& slice : PictureSlices(track, packet)) times.push_back(slice.presentation.start);
 }
 
 void CheckExport(const File& source, const File& output, std::int64_t audio_samples, bool reorder = false,
@@ -707,7 +711,29 @@ void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File
 #else
   constexpr auto storage = media_preview::gpu_video_supported ? VideoStorage::Platform : VideoStorage::Cpu;
 #endif
-  const auto input = Fixture("preview-hevc-main.mp4");
+  auto input = Fixture("preview-hevc-main.mp4");
+#if defined(__APPLE__) && TARGET_OS_IOS && TARGET_OS_SIMULATOR
+  {
+    auto reader = media_preview::Open(*input);
+    auto track = reader.Tracks().front();
+    constexpr std::uint32_t scale = 90000;
+    track.timescale = scale;
+    track.edits.clear();
+    input = media_preview::TemporaryFile(temporary, ".mp4");
+    auto mux = Require(MediaMuxer::Open(Require(input->OpenRandomAccess(FileAccessMode::ReadWrite)),
+        ContainerFormat::Mp4, std::span(&track, 1)));
+    std::int64_t pts = 0;
+    for (unsigned i = 0; i < 19; ++i) {
+      auto packet = ReadPacket(reader);
+      Check(packet.has_value(), "HEVC fixture has too few packets for variable timing");
+      packet->pts = packet->dts = MediaTimestamp{pts, scale};
+      packet->duration = MediaTimestamp{i % 2 ? 2103 : 3903, scale};
+      pts += packet->duration->ticks;
+      Check(!Require(mux.TryWrite(*packet)), "Variable HEVC fixture requested another track");
+    }
+    Require(mux.Finish());
+  }
+#endif
   auto source = media_preview::Open(*input);
   const auto& track = source.Tracks().front();
   auto decode = VideoFixtureConfig(track.descriptions.front(), VideoPixelFormat::NV12, storage);
@@ -748,22 +774,27 @@ void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File
   Check(source_range == result_range, "HEVC export changed its presentation range");
   const auto visible = encoded.descriptions.front().visible.value_or(VideoRectangle{0, 0, *encoded.descriptions.front().coded_width, *encoded.descriptions.front().coded_height});
   Check(visible == VideoRectangle{0, 0, width, height}, "HEVC export changed the requested visible dimensions");
-  std::vector<MediaTimestamp> expected_pts, actual_pts;
-  while (const auto packet = ReadPacket(source)) AppendPictureTimes(track, *packet, expected_pts);
-  std::optional<MediaTimestamp> last_dts;
+  std::vector<MediaPresentationRange> expected_pictures, actual_pictures;
+  while (const auto packet = ReadPacket(source))
+    for (const auto& slice : PictureSlices(track, *packet)) expected_pictures.push_back(slice.presentation);
+  std::optional<MediaTimestamp> next_dts;
   while (const auto packet = ReadPacket(result)) {
     Check(packet->pts && packet->dts && packet->duration &&
-          (!last_dts || packet->dts->Compare(*last_dts) > 0), "HEVC export lost increasing decode timestamps");
+          (!next_dts || *packet->dts == *next_dts), "HEVC export lost its contiguous decode timeline");
 #ifdef __EMSCRIPTEN__
     Check(packet->pts == packet->dts, "Web HEVC export did not preserve presentation order");
 #endif
-    last_dts = packet->dts;
-    AppendPictureTimes(encoded, *packet, actual_pts);
+    next_dts = MediaTimestamp{packet->dts->ticks + packet->duration->Rescale(packet->dts->timescale)->ticks,
+                              packet->dts->timescale};
+    for (const auto& slice : PictureSlices(encoded, *packet)) actual_pictures.push_back(slice.presentation);
   }
-  std::ranges::sort(expected_pts, [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; });
-  std::ranges::sort(actual_pts, [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; });
-  Check(!expected_pts.empty() && actual_pts == expected_pts, "HEVC export changed the picture presentation times");
-  std::cout << "HEVC Main preview export preserved " << actual_pts.size() << " picture times\n";
+  const auto before = [](const MediaPresentationRange& a, const MediaPresentationRange& b) {
+    return a.start.Compare(b.start) < 0;
+  };
+  std::ranges::sort(expected_pictures, before);
+  std::ranges::sort(actual_pictures, before);
+  Check(!expected_pictures.empty() && actual_pictures == expected_pictures, "HEVC export changed picture presentation intervals");
+  std::cout << "HEVC Main preview export preserved " << actual_pictures.size() << " picture presentation intervals\n";
 }
 
 void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {

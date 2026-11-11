@@ -178,7 +178,8 @@ public:
       Property(kVTCompressionPropertyKey_ProfileLevel, profile);
       const bool reorder = (hevc || config.profile != H264Profile::Baseline) && !config.max_b_frames;
       Property(kVTCompressionPropertyKey_AllowFrameReordering, reorder ? kCFBooleanTrue : kCFBooleanFalse);
-      Property(kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse, !reorder || (hevc && TARGET_OS_SIMULATOR));
+      // Simulator encoders can expose frame reordering without the Open GOP control.
+      Property(kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse, !reorder || TARGET_OS_SIMULATOR);
       VideoStatus(SetInteger(kVTCompressionPropertyKey_AverageBitRate, config.bitrate),
           "VideoToolbox rejected AverageBitRate", CodecErrorCode::Unsupported);
       VideoStatus(SetInteger(kVTCompressionPropertyKey_MaxKeyFrameInterval, config.key_frame_interval),

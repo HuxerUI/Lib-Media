@@ -769,40 +769,23 @@ struct ExportQueue {
 
 struct DecodeOrder {
   std::uint32_t scale;
-  std::uint32_t source_scale;
   bool ordered_pts = false;
-  std::optional<ContainerPacket> pending;
-  std::int64_t first_dts = 0;
-  std::int64_t total_duration = 0;
+  std::optional<std::int64_t> next_dts;
 
-  std::optional<ContainerPacket> Push(ContainerPacket packet) {
-    if (ordered_pts) {
-      if (!packet.pts || (pending && packet.pts->Compare(*pending->pts) <= 0))
-        throw std::runtime_error("MP4 export cannot use presentation timestamps for reordered video without DTS");
-      packet.dts = packet.pts;
-    } else if (packet.dts && source_scale < packet.dts->timescale) {
-      // Recover a source-clock tick only if it rounds back to the encoder's reported tick.
-      const auto exact = packet.dts->Rescale(source_scale);
-      if (exact && exact->Rescale(packet.dts->timescale) == packet.dts) packet.dts = exact;
-    }
+  ContainerPacket Apply(ContainerPacket packet) {
+    if (ordered_pts) packet.dts = packet.pts;
     if (!packet.dts || !packet.duration) throw std::runtime_error("MP4 export requires explicit DTS and duration");
-    const auto dts = Ticks(*packet.dts, scale);
+    const auto dts = next_dts && !ordered_pts ? *next_dts : Ticks(*packet.dts, scale);
+    if (ordered_pts && next_dts && dts != *next_dts)
+      throw std::runtime_error("MP4 export without DTS requires contiguous presentation timestamps");
     const auto duration = Ticks(*packet.duration, scale);
-    if (duration <= 0 || total_duration > INT64_MAX - duration)
+    if (duration <= 0 || dts > INT64_MAX - duration)
       throw std::runtime_error("Invalid encoded video duration");
-    total_duration += duration;
-    auto ready = std::exchange(pending, std::move(packet));
-    if (ready) ready->duration = MediaTimestamp{PositiveDistance(dts, Ticks(*ready->dts, scale)), scale};
-    else first_dts = dts;
-    return ready;
-  }
-
-  std::optional<ContainerPacket> Finish() {
-    if (!pending) return {};
-    const auto dts = Ticks(*pending->dts, scale);
-    const auto elapsed = dts == first_dts ? 0 : PositiveDistance(dts, first_dts);
-    pending->duration = MediaTimestamp{PositiveDistance(total_duration, elapsed), scale};
-    return std::exchange(pending, std::nullopt);
+    // Advance in decode order with the original frame durations so the last displayed frame keeps its duration.
+    packet.dts = MediaTimestamp{dts, scale};
+    packet.duration = MediaTimestamp{duration, scale};
+    next_dts = dts + duration;
+    return packet;
   }
 };
 
@@ -831,9 +814,8 @@ struct ExportTrack {
           // The automatic policy uses DecodeOrder to validate or supply the decode timeline.
           auto dts = decode_order ? packet->dts : std::optional{packet->pts};
           ContainerPacket sample{queue.track->id, packet->data, packet->pts, dts, packet->duration, packet->key_frame};
-          queue.packet = decode_order ? decode_order->Push(std::move(sample)) : std::optional{std::move(sample)};
+          queue.packet = decode_order ? decode_order->Apply(std::move(sample)) : std::move(sample);
         } else if (std::holds_alternative<EndOfStream>(*output)) {
-          if (decode_order) queue.packet = decode_order->Finish();
           queue.ended = true;
         } else {
           if constexpr (Audio) {
@@ -908,7 +890,7 @@ struct ExportTrack {
           const auto& description = source->track.descriptions.front();
           ApplyVideoGeometry(*next, description, source->track.rotation);
           if (lookahead) {
-            const auto scale = source->track.timescale.value_or(90000);
+            const auto scale = decode_order ? decode_order->scale : source->track.timescale.value_or(90000);
             const auto first = Ticks(lookahead->pts, scale), second = Ticks(next->pts, scale);
             lookahead->duration = MediaTimestamp{PositiveDistance(second, first), scale};
             frames.push_back(PrepareVideo(std::move(*lookahead)));
@@ -976,10 +958,11 @@ Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, F
 #elif defined(__APPLE__) && TARGET_OS_IOS && TARGET_OS_SIMULATOR
   if (clip.video->InitialDescription().codec == CodecId::Hevc) reorder = true;
 #endif
-  const auto clock = clip.video->track.timescale.value_or(90000);
-  if (ordered_pts || reorder)
-    video.decode_order.emplace(DecodeOrder{.scale = ordered_pts ? clock : CommonClock(clock, 1000000),
-        .source_scale = clock, .ordered_pts = ordered_pts});
+  if (ordered_pts || reorder) {
+    const auto fallback_scale = ordered_pts ? 90000u : 9000000u;
+    const auto scale = clip.video->track.timescale.value_or(fallback_scale);
+    video.decode_order.emplace(DecodeOrder{.scale = scale, .ordered_pts = ordered_pts});
+  }
   std::optional<ExportTrack<AudioDecode, AudioEncoder, AudioFrame>> audio;
   ExportQueue audio_copy;
   if (clip.audio) {

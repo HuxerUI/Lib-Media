@@ -355,10 +355,11 @@ reliable platform timing. Android/Web leave it absent. Windows uses a bounded fi
 pictures and omits DTS once variable input timing makes that clock unsuitable for the input timeline. Do not derive
 DTS from PTS or assume absent DTS means presentation order. A muxer must handle that limitation explicitly.
 
-The macOS preview enables High profile with automatic B pictures. It submits a bounded group of decoded pictures
-and retains one encoded packet until the next DTS establishes its decode duration. It keeps the source PTS and
-presentation window on an exact common clock. Export reports a timing error if the adapter does not provide the
-DTS required for that mode. The Baseline path explicitly disables reordering.
+The reordered MP4 export uses the source track's clock when available and falls back to 9 MHz. It preserves source
+PTS and converts the first reported DTS to the output clock. The same converted frame duration is written to MP4
+and used to advance DTS, preserving the final displayed picture's interval to the output clock's precision even
+when another picture follows it in decode order. Export requires DTS in this mode. The Baseline path explicitly
+disables reordering.
 
 The default video limits are four copied inputs/64 MiB and eight compressed outputs/32 MiB, with 4 MiB maximum per
 packet. Input must fit one packed picture. Output must fit at least two full maximum-packet reservations, or
@@ -374,7 +375,7 @@ fails with `ResourceExhausted`. Platform codec allocations and bounded conversio
 | Windows | System synchronous H.264 MFT; Baseline/Main/High, numeric B bounds 0..2 and Auto | Native round trips, real B reordering, requested IDR, variable PTS, crop, padded input and cleanup on Windows 11 |
 | Linux | GStreamer `x264enc` + `h264parse`; Baseline/Main/High, numeric B bounds 0..16 and Auto | Headless native round trips and shared contracts on Ubuntu 24.04/WSL; no GTK initialization |
 | Android | NDK MediaCodec API 28+; Main/High numeric B bounds require API 29+, with codec confirmation for positive bounds; interpretable packed I420/NV12 CPU input or Surface input | Baseline software fallback, Surface recording with 4 Mbps negotiated to 4.8 Mbps, and MP4 readback on Android 12 (TAS-AN00) |
-| iOS | Independent VideoToolbox implementation; zero or Auto B pictures; positive numeric bounds return `Unsupported` | Build/device validation pending |
+| iOS | Independent VideoToolbox implementation; zero or Auto B pictures; positive numeric bounds return `Unsupported` | Simulator Baseline/Main/High round trips and High profile automatic B pictures with variable-frame-rate MP4 readback |
 | macOS | Independent VideoToolbox implementation with the same B-policy limitation | Native H.264 round trips and two-slot output regression on Apple Silicon |
 | Web | WebCodecs quality mode; Baseline with zero/Auto, Main/High with Auto only | Chrome C++/WASM Baseline/Main/High round trips and Node bridge contracts |
 
@@ -406,7 +407,7 @@ when VideoToolbox rejects `MaxFrameDelayCount`. End of stream drains any remaini
 | Platform | HEVC backend | Validation |
 | --- | --- | --- |
 | Android | NDK MediaCodec, CPU byte buffers. P010 requires API 33+ and a codec exposing that layout. Encoding requires API 28+. | Main encode, `hvc1` MP4 readback, and decode on Android 12 hardware. The system software encoder was used. |
-| iOS | Independent VideoToolbox adapter. Physical device availability is configuration dependent. The simulator requires automatic B-picture selection. | Main and Main10 `hvc1` MP4 round trips with reordered PTS and platform DTS, plus Main preview export, on the iOS Simulator. |
+| iOS | Independent VideoToolbox adapter. Physical device availability is configuration dependent. The simulator requires automatic B-picture selection. | Simulator Main and Main10 `hvc1` MP4 round trips with reordered PTS and variable frame durations. Main preview export checks every picture's presentation interval. |
 | macOS | Independent VideoToolbox adapter. Zero or automatic B pictures. | Main and Main10 encode, `hvc1` MP4 readback, and decode on Apple Silicon. |
 | Windows | Synchronous Media Foundation CPU transforms and D3D11 hardware encoding for SDR Main. Main10 depends on the CPU transform accepting P010. Decoder output retains signaled BT.2020 primaries and matrix, PQ or HLG transfer, and nominal range. | Intel hardware encoded 20 SDK texture pictures to MP4, and Linux independently decoded and verified the watermarks. Windows CPU round trips and GPU transcode require a suitable installed HEVC decoder and remain pending. |
 | Linux | GStreamer `h265parse` with an installed decoder and `x265enc` for encoding. CPU P010 uses GStreamer conversion. | Main and Main10 CPU round trips and preview export passed under Ubuntu 24.04/WSL with GStreamer 1.24.2. The Main10 preview and export retain the rotated MOV's presentation geometry. |

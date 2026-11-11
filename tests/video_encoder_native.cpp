@@ -325,17 +325,18 @@ Encoded ReadbackMp4(Encoded encoded, const File& file) {
       .edits = {{first, {}}, {{end.ticks - first.ticks, end.timescale}, first}}};
   auto mux = Take(MediaMuxer::Open(Take(file.OpenRandomAccess(FileAccessMode::ReadWrite, FileOpenMode::CreateNew)),
       ContainerFormat::Mp4, std::span(&track, 1), {.layout = ContainerLayout::FastStart}));
-  auto dts = [&](const EncodedPacket& packet) {
-    if (!encoded.reordered) return *packet.pts.Rescale(scale);
-    Check(packet.dts.has_value(), "Reordered encoder output did not provide DTS");
-    return *packet.dts->Rescale(scale);
-  };
-  const auto decode_end = dts(encoded.packets.front()).ticks + MediaTimestamp{end.ticks - first.ticks, end.timescale}.Rescale(scale)->ticks;
-  for (std::size_t i = 0; i < encoded.packets.size(); ++i) {
-    auto& packet = encoded.packets[i];
-    packet.dts = dts(packet);
-    const auto next = i + 1 < encoded.packets.size() ? dts(encoded.packets[i + 1]).ticks : decode_end;
-    packet.duration = MediaTimestamp{next - packet.dts->ticks, scale};
+  const auto& first_packet = encoded.packets.front();
+  const auto first_dts = encoded.reordered ? first_packet.dts : std::optional{first_packet.pts};
+  Check(first_dts.has_value(), "Reordered encoder output did not provide DTS");
+  const auto origin = first_dts->Rescale(scale)->ticks;
+  auto next_dts = origin;
+  for (auto& packet : encoded.packets) {
+    Check(!encoded.reordered || packet.dts.has_value(), "Reordered encoder output did not provide DTS");
+    const auto duration = packet.duration ? packet.duration->Rescale(scale) : std::nullopt;
+    Check(duration && duration->ticks > 0 && next_dts <= INT64_MAX - duration->ticks,
+          "Encoded picture did not provide a valid duration");
+    packet.dts = MediaTimestamp{next_dts, scale};
+    next_dts += duration->ticks;
     Check(!Take(mux.TryWrite({1, packet.data, packet.pts, packet.dts, packet.duration, packet.key_frame})),
         "MP4 writer did not accept the packet");
   }
@@ -343,7 +344,6 @@ Encoded ReadbackMp4(Encoded encoded, const File& file) {
   auto demux = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
   const auto tracks = demux.Tracks();
   const auto& read_track = tracks.front().descriptions.front();
-  const auto origin = dts(encoded.packets.front()).ticks;
   Check(demux.PresentationRange(track.id) == MediaPresentationRange{first, end}, "MP4 changed the presentation timeline");
   Check(std::holds_alternative<TrackDecodeStart>(*Take(demux.Read())), "MP4 lost its decode start");
   Check(read_track.codec == format.codec && (format.codec != CodecId::Hevc || read_track.sample_entry == "hvc1") &&
@@ -611,7 +611,14 @@ int main(int argc, char** argv) {
 #endif
     auto config = Config(H264Profile::High, std::nullopt, VideoPixelFormat::I420, 242);
     auto encoded = Encode(config, 17); Decode(encoded, config);
-    auto variable = Encode(config, 17, true, true); Decode(variable, config);
+    auto variable = Encode(config, 17, true, true);
+#if defined(__APPLE__) && TARGET_OS_IOS && TARGET_OS_SIMULATOR
+    const auto time = std::chrono::steady_clock::now().time_since_epoch().count();
+    const File output((std::filesystem::temp_directory_path() / ("lib-media-avc-" + std::to_string(time) + ".mp4")).u8string());
+    variable = ReadbackMp4(std::move(variable), output);
+    Check(output.Delete(), "Cannot remove the simulator H.264 output");
+#endif
+    Decode(variable, config);
     auto narrow = Config(H264Profile::High, 0, VideoPixelFormat::NV12, 242, 322);
     Decode(Encode(narrow, 6), narrow);
     auto probed = std::make_shared<std::atomic<bool>>(false), supported = std::make_shared<std::atomic<bool>>(false);

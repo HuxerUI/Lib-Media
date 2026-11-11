@@ -575,9 +575,8 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
   media::detail::VideoFrameTransformer transformer;
   std::optional<TestSession<VideoEncoder>> encoder;
   std::optional<MediaMuxer> mux;
-  std::optional<ContainerPacket> last_packet;
   std::optional<bool> platform_dts;
-  std::int64_t first_dts = 0, total_duration = 0;
+  std::optional<std::int64_t> next_dts;
   std::optional<VideoFrame> pending, retained;
   std::optional<std::array<VideoFrame, 2>> watermarks;
   if (texture_input) watermarks = WatermarkFrames(watermark_format);
@@ -608,24 +607,21 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
             Check(*platform_dts == sample.dts.has_value(), "Platform decode timestamp availability changed");
             if (!sample.dts) {
               // Some Windows encoders use low-delay B pictures with the same decode and presentation order.
-              Check(allow_pts_as_dts && (!last_packet || packet->pts.Compare(*last_packet->pts) > 0),
+              Check(allow_pts_as_dts && (!next_dts || packet->pts == MediaTimestamp{*next_dts, clock}),
                     "Reordered encoder output has no decode timestamp");
               sample.dts = sample.pts;
             }
-            const auto exact = sample.dts->Rescale(source_clock);
-            if (exact && exact->Rescale(sample.dts->timescale) == sample.dts) sample.dts = exact;
-            const auto dts = sample.dts->Rescale(clock)->ticks;
-            total_duration += sample.duration->Rescale(clock)->ticks;
-            if (last_packet) {
-              last_packet->duration = MediaTimestamp{dts - last_packet->dts->Rescale(clock)->ticks, clock};
-              Check(!Take(mux->TryWrite(*last_packet)), "Muxer requested a different track");
-            } else {
-              first_dts = dts;
+            if (!next_dts) {
+              const auto exact = sample.dts->Rescale(source_clock);
+              if (exact && exact->Rescale(sample.dts->timescale) == sample.dts) sample.dts = exact;
+              next_dts = sample.dts->Rescale(clock)->ticks;
             }
-            last_packet = std::move(sample);
-          } else {
-            Check(!Take(mux->TryWrite(sample)), "Muxer requested a different track");
+            sample.dts = MediaTimestamp{*next_dts, clock};
+            const auto length = sample.duration->Rescale(clock)->ticks;
+            Check(length > 0 && *next_dts <= INT64_MAX - length, "Invalid encoded video duration");
+            *next_dts += length;
           }
+          Check(!Take(mux->TryWrite(sample)), "Muxer requested a different track");
           ++encoded;
         } else {
           ended = true;
@@ -691,10 +687,6 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
     else std::this_thread::sleep_for(1ms);
   }
   Check(ended && mux && decoded == clip.times.size() && encoded == decoded, "Video transcode stalled or changed frame count");
-  if (last_packet) {
-    last_packet->duration = MediaTimestamp{total_duration - (last_packet->dts->Rescale(clock)->ticks - first_dts), clock};
-    Check(!Take(mux->TryWrite(*last_packet)), "Muxer requested a different track");
-  }
   Take(mux->Finish());
   const auto wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   const auto cpu = ProcessCpuSeconds() - start_cpu;

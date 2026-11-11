@@ -291,7 +291,7 @@ struct ContainerPacket {
   std::optional<MediaTimestamp> pts;
   /// Decode time on the same timeline.
   std::optional<MediaTimestamp> dts;
-  /// Nonnegative packet duration on the container timeline.
+  /// Nonnegative packet duration on the container timeline. In MP4 and MOV this is the decode-time delta.
   std::optional<MediaTimestamp> duration;
   /// Known container sync flag. Absence means unavailable.
   std::optional<bool> sync_sample;
