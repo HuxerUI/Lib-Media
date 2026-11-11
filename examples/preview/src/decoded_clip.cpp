@@ -689,6 +689,8 @@ struct MovieCopy {
     auto options = MediaMuxerOptions{.audio_metadata = source.AudioMetadata()};
     if (format == ContainerFormat::Matroska || format == ContainerFormat::WebM)
       options.ebml_timestamp_scale = source.EbmlTimestampScale();
+    if (format == ContainerFormat::Matroska && source.Format() == ContainerFormat::Matroska)
+      options.matroska_metadata = Require(source.ReadMatroskaMetadata());
     mux.emplace(OpenMovieOutput(*output, format, source_tracks, std::move(options)));
     for (std::size_t i = 0; i < source_tracks.size(); ++i) {
       auto reader = i + 1 == source_tracks.size() ? std::move(source) : Open(*file);

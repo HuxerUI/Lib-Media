@@ -1477,6 +1477,98 @@ void MatroskaClockSeparation(const fs::path& directory) {
   Compare(ReadPacket(copied).value(), sample);
 }
 
+void MatroskaSubtitle(const fs::path& path) {
+  using namespace media::detail;
+  using namespace media::detail::ebml;
+  Bytes chapters;
+  Master(chapters, 0x45b9, [](Bytes& edition) {
+    Master(edition, 0xb6, [](Bytes& chapter) {
+      PutUInt(chapter, 0x73c4, 27);
+      PutUInt(chapter, 0x91, 0);
+    });
+  });
+  Bytes additions;
+  Master(additions, 0xa6, [](Bytes& more) { PutText(more, 0xa5, "cue identifier"); });
+  const MediaTrack subtitle{.id = 1, .kind = TrackKind::Subtitle,
+      .descriptions = {{.framing = PacketFraming::ContainerSample}},
+      .matroska = MediaTrack::MatroskaAttributes{.uid = 394, .subtitle_codec = "S_TEXT/WEBVTT"}};
+  const ContainerPacket cue{.track_id = 1, .pts = MediaTimestamp{2, 10}, .duration = MediaTimestamp{4, 10},
+      .matroska = ContainerPacket::MatroskaAttributes{.invisible = true, .block_additions = BytesRef(std::move(additions))}};
+  const auto file = Path(path);
+  auto writer = Take(MediaMuxer::Open(Take(file.OpenWrite()), ContainerFormat::Matroska, std::span(&subtitle, 1),
+                                      {.matroska_metadata = MatroskaMetadata{.chapters = BytesRef(std::move(chapters))}}));
+  Check(!Take(writer.TryWrite(cue)), "Matroska did not accept the empty subtitle cue");
+  Take(writer.Finish());
+  const auto bytes = Take(file.ReadBytes());
+  ByteView body(bytes);
+  Check(ReadField(body).id == Header && ReadVint(body, true).value == Segment && ReadVint(body).unknown,
+        "Matroska metadata fixture has an invalid Segment");
+  const auto segment = body;
+  std::vector<std::pair<std::uint32_t, std::uint64_t>> positions;
+  bool chapters_before_media = false;
+  while (!body.empty()) {
+    const auto offset = segment.size() - body.size();
+    const auto id = ReadField(body).id;
+    positions.emplace_back(id, offset);
+    if (id == Cluster) break;
+    chapters_before_media |= id == Chapters;
+  }
+  Check(chapters_before_media, "Matroska output put Chapters after the first Cluster");
+  auto reader = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+  const auto copy = ReadPacket(reader).value();
+  Check(copy.pts == cue.pts && copy.duration == cue.duration && copy.data.AsBytes().empty() && copy.matroska &&
+        copy.matroska->invisible && std::ranges::equal(copy.matroska->block_additions.AsBytes(), cue.matroska->block_additions.AsBytes()),
+        "Matroska changed an invisible cue or its BlockAdditions");
+
+  Bytes tags;
+  Master(tags, 0x7373, [](Bytes& tag) {
+    Master(tag, 0x63c0, [](Bytes& targets) { PutUInt(targets, 0x63c5, 394); });
+    Master(tag, 0x67c8, [](Bytes& entry) {
+      PutText(entry, 0x45a3, "TITLE");
+      PutText(entry, 0x4487, "Caption track");
+    });
+  });
+  const auto check_metadata = [&](const File& input) {
+    auto source = Take(MediaDemuxer::Open(Take(input.OpenRandomAccess())));
+    const auto metadata = Take(source.ReadMatroskaMetadata());
+    Check(!metadata.chapters.AsBytes().empty() && metadata.tags.size() == 1 &&
+          std::ranges::equal(metadata.tags.front().AsBytes(), tags), "Matroska lost metadata before or after the first Cluster");
+    Check(ReadPacket(source).value().pts == cue.pts, "Matroska metadata discovery moved the packet cursor");
+  };
+  auto unindexed = bytes;
+  PutElement(unindexed, Tags, tags);
+  const auto tail_file = Path(path.parent_path() / "subtitle-tail-tags.mkv");
+  Check(tail_file.WriteBytes(unindexed), "Could not write the Matroska metadata scan fixture");
+  check_metadata(tail_file);
+
+  Bytes padding;
+  // A metadata scan would exhaust its element budget before reaching the indexed Tags.
+  for (std::size_t i = 0; i < 65536; ++i) PutElement(padding, Void, {});
+  positions.emplace_back(Tags, segment.size() + padding.size());
+  const auto seek_head = [&](std::uint64_t base) {
+    Bytes head;
+    Master(head, SeekHead, [&](Bytes& entries) {
+      for (const auto& [id, offset] : positions) {
+        Master(entries, 0x4dbb, [&](Bytes& entry) {
+          PutUInt(entry, 0x53ab, id);
+          Bytes position;
+          Put(position, base + offset);
+          PutElement(entry, 0x53ac, position);
+        });
+      }
+    });
+    return head;
+  };
+  Bytes indexed(bytes.begin(), bytes.begin() + (bytes.size() - segment.size()));
+  Append(indexed, seek_head(seek_head(0).size()));
+  Append(indexed, segment);
+  Append(indexed, padding);
+  PutElement(indexed, Tags, tags);
+  const auto indexed_file = Path(path.parent_path() / "subtitle-indexed-tags.mkv");
+  Check(indexed_file.WriteBytes(indexed), "Could not write the Matroska metadata index fixture");
+  check_metadata(indexed_file);
+}
+
 File MatroskaWithoutCues(const File& source, const fs::path& destination) {
   using namespace huxerui::media::detail;
   using namespace ebml;
@@ -1783,6 +1875,7 @@ int main(int argc, char** argv) {
     PreciseVpxCopy(path, "vp8");
     PreciseVpxCopy(path, "vp9");
     MatroskaClockSeparation(path);
+    MatroskaSubtitle(path / "subtitle.mkv");
     WebmCuePreroll(path / "webm-cue-preroll.webm", false);
     WebmCuePreroll(path / "webm-cue-late-opus.webm", true);
     AudioFormats(path);

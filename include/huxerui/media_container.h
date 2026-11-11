@@ -7,6 +7,7 @@
 /// Each session owns its stream. Serialize calls on a caller-managed thread. See docs/media-container.md
 /// for the supported format, codec, layout, and stream combinations.
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -119,6 +120,23 @@ struct MediaAudioMetadata {
   std::optional<Cover> cover;
 };
 
+/// @brief Matroska Segment metadata retained for packet copy.
+///
+/// The retained EBML payloads omit their enclosing element ID and size. Pass the original tracks
+/// together with this metadata so chapter and tag targets keep their TrackUID associations.
+struct MatroskaMetadata {
+  /// UTF-8 Segment title. Empty means absent.
+  std::string title;
+  /// Segment UID referenced by linked chapters, if present.
+  std::optional<std::array<std::byte, 16>> segment_uid;
+  /// Chapters payload, including edition and chapter UIDs. Empty means absent.
+  BufferReference chapters;
+  /// Tags payloads in source order, including nested tags and their target UIDs.
+  std::vector<BufferReference> tags;
+  /// Attachments payload, including fonts that subtitle tracks can reference. Empty means absent.
+  BufferReference attachments;
+};
+
 /// @brief Codec configuration and sample-entry properties shared by packets in a track.
 struct MediaSampleDescription {
   /// @brief Width-to-height ratio of one coded pixel, before presentation rotation.
@@ -147,7 +165,7 @@ struct MediaSampleDescription {
   CodecId codec = CodecId::Unknown;
   /// Representation of packet bytes.
   PacketFraming framing = PacketFraming::CodecPacket;
-  /// Codec configuration in the representation specified by the mapping, such as the payload of an hvcC box.
+  /// Codec configuration in the representation specified by the mapping, such as the payload of an hvcC or av1C box.
   /// ALAC uses the 24-byte ALACSpecificConfig without the MP4 box header or version and flags. MOV timecode
   /// and timed metadata use the sample-entry payload after the reserved fields and data-reference index.
   Bytes initialization_data;
@@ -163,7 +181,7 @@ struct MediaSampleDescription {
   std::optional<VideoRectangle> visible;
   /// Four-character ISO BMFF or QuickTime sample entry for mappings that distinguish variants.
   /// HEVC retains hvc1 or hev1. ProRes retains its profile entry, such as apch. MOV data tracks use tmcd or mebx.
-  /// Empty selects hvc1 for HEVC. ProRes output requires an explicit profile entry.
+  /// Empty selects hvc1 for HEVC or av01 for AV1. ProRes output requires an explicit profile entry.
   std::string sample_entry;
   /// Explicit pixel spacing from a video sample entry. Absence leaves the source's aspect unspecified.
   std::optional<PixelAspectRatio> pixel_aspect_ratio = {};
@@ -202,6 +220,17 @@ struct MediaTrack {
     bool operator==(const Reference&) const = default;
   };
 
+  /// @brief Track attributes retained when copying a Matroska track.
+  struct MatroskaAttributes {
+    /// Stable TrackUID for chapter and tag references. An authored track defaults to its track ID.
+    std::optional<std::uint64_t> uid;
+    /// Original Matroska CodecID of an opaque subtitle track. Empty for audio and video.
+    std::string subtitle_codec;
+    /// Encoded TrackEntry child elements for name, language, selection flags, and attachment or Block links.
+    /// Preserve these bytes when copying the track.
+    Bytes fields;
+  };
+
   /// Session-local track identity.
   std::uint32_t id = 0;
   /// Media kind.
@@ -229,6 +258,8 @@ struct MediaTrack {
   /// Pass it through when copying these tracks. An explicit packet duration takes precedence, followed by
   /// the codec's intrinsic duration, when known, then this default.
   std::optional<MediaTimestamp> default_duration;
+  /// Original Matroska TrackUID and auxiliary attributes, if present.
+  std::optional<MatroskaAttributes> matroska;
 };
 
 /// @brief One interval retained when mapping a decoded media interval through a track edit list.
@@ -244,9 +275,17 @@ struct MediaPresentationSlice {
 /// Packets arrive in decode order within each track. Absent timing remains distinct from zero.
 /// Bytes returned by Read() are retained and remain readable after subsequent reads, seeks, and Close().
 struct ContainerPacket {
+  /// @brief Fields retained alongside a Matroska Block's packet data.
+  struct MatroskaAttributes {
+    /// The source Block asks the player to decode the packet without presenting it.
+    bool invisible = false;
+    /// BlockAdditions payload without its element ID or size. Empty means absent.
+    BufferReference block_additions;
+  };
+
   /// Identity of the track that describes these bytes.
   std::uint32_t track_id = 0;
-  /// Retained, nonempty packet bytes.
+  /// Retained packet bytes. Matroska subtitle cues can be empty.
   BufferReference data;
   /// Media PTS before applying track edits and trim.
   std::optional<MediaTimestamp> pts;
@@ -261,6 +300,8 @@ struct ContainerPacket {
   std::optional<MediaTimestamp> discard_padding = {};
   /// One-based index into the descriptions of the identified track.
   std::uint32_t sample_description_index = 1;
+  /// Retained Block attributes for Matroska output. Absence means no auxiliary fields are required.
+  std::optional<MatroskaAttributes> matroska;
 };
 
 /// @brief A covered index candidate or actual seek anchor on a reference track.
@@ -377,6 +418,11 @@ public:
   /// @return The Matroska or WebM Segment tick duration, including the format default when omitted in the file.
   /// Other formats return std::nullopt. Requires a live session and preserves the read position.
   std::optional<std::chrono::nanoseconds> EbmlTimestampScale() const;
+  /// @brief Reads metadata for a Matroska packet copy, including metadata after the Clusters.
+  /// Requires random access and preserves the read position. Uses SeekHead when it indexes the Segment header,
+  /// with a bounded element scan for unindexed input. Retained bytes survive session closure.
+  /// @return Segment metadata, or an error if the format, stream, or metadata cannot be read.
+  ContainerResult<MatroskaMetadata> ReadMatroskaMetadata();
   /// @return Tracks and their known sample descriptions, borrowed until the next session mutation.
   [[nodiscard]] std::span<const MediaTrack> Tracks() const;
   /// @return File tags and cover art, if recognized. Artwork retains its storage after closing.
@@ -446,6 +492,9 @@ struct MediaMuxerOptions {
   /// Positive nanoseconds per Matroska or WebM Segment tick. The default is one millisecond.
   /// To copy the source clock, pass MediaDemuxer::EbmlTimestampScale(). Other output formats require absence.
   std::optional<std::chrono::nanoseconds> ebml_timestamp_scale;
+  /// Metadata for Matroska output. Pass the original track attributes to preserve UID targets.
+  /// The writer copies these elements before Open() returns.
+  std::optional<MatroskaMetadata> matroska_metadata;
 };
 
 /// @brief Owns a synchronous, move-only container writing session.

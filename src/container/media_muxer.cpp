@@ -9,6 +9,8 @@ using Requirement = MediaMuxer::OutputRequirement;
 Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks, const MediaMuxerOptions& options) {
   const auto layout = options.layout;
   const bool mp4 = format == ContainerFormat::Mp4 || format == ContainerFormat::Mov;
+  if (options.matroska_metadata && format != ContainerFormat::Matroska)
+    Fail(ContainerErrorCode::Unsupported, "Matroska metadata requires Matroska output");
   if (options.ebml_timestamp_scale) {
     if (format != ContainerFormat::Matroska && format != ContainerFormat::WebM)
       Fail(ContainerErrorCode::Unsupported, "The EBML timestamp scale requires Matroska or WebM output");
@@ -72,7 +74,7 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
       return layout == ContainerLayout::Fragmented ? Requirement::SequentialWrite : Requirement::RandomWrite;
     case ContainerFormat::Matroska:
     case ContainerFormat::WebM:
-      ValidateMatroska(format, tracks);
+      ValidateMatroska(format, tracks, options);
       return Requirement::SequentialWrite;
     case ContainerFormat::Flac:
       ValidateFlac(tracks);
@@ -136,7 +138,8 @@ ContainerResult<std::optional<std::uint32_t>> MediaMuxer::TryWrite(const Contain
     const auto index = PacketTrack(writer_->tracks, packet.track_id);
     if (writer_->ended[index]) Fail(ContainerErrorCode::InvalidState, "Container output track has ended");
     const auto size = packet.data.AsBytes().size();
-    if (!size) Fail(ContainerErrorCode::InvalidArgument, "Empty container packet");
+    if (!size && writer_->tracks[index].kind != TrackKind::Subtitle)
+      Fail(ContainerErrorCode::InvalidArgument, "Empty container packet");
     if (size > MaxContainerPacket) Fail(ContainerErrorCode::LimitExceeded, "Container packet exceeds 16 MiB");
     if (!packet.sample_description_index || (packet.pts && !packet.pts->timescale) || (packet.dts && !packet.dts->timescale) ||
         (packet.duration && (!packet.duration->timescale || packet.duration->ticks < 0)) ||
@@ -146,6 +149,8 @@ ContainerResult<std::optional<std::uint32_t>> MediaMuxer::TryWrite(const Contain
       Fail(ContainerErrorCode::InvalidArgument, "Packet references an undeclared sample description");
     if (packet.discard_padding && packet.discard_padding->ticks && !writer_->SupportsPacketTrim())
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain packet discard padding");
+    if (packet.matroska && !writer_->SupportsMatroskaPacketAttributes())
+      Fail(ContainerErrorCode::Unsupported, "Output format cannot retain Matroska packet attributes");
     return writer_->Write(index, packet);
   });
   if (!result.Succeeded() && result.Error().code == ContainerErrorCode::Io) Close();

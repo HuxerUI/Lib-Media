@@ -1,4 +1,5 @@
 #include "mp4.h"
+#include "../codec/av1.h"
 #include "../codec/hevc.h"
 
 namespace huxerui::media::detail {
@@ -68,6 +69,22 @@ unsigned HevcNalLength(ByteView config, bool hvc1, ContainerErrorCode error) {
 bool HevcIdr(ByteView bytes, unsigned length_size, bool hvc1, ContainerErrorCode error) {
   try {
     return IsHevcIdr(bytes, length_size, hvc1, false);
+  } catch (const std::invalid_argument& failure) {
+    Fail(error, failure.what());
+  }
+}
+
+void ValidateAv1Configuration(ByteView config, ContainerErrorCode error) {
+  try {
+    ParseAv1Configuration(config);
+  } catch (const std::invalid_argument& failure) {
+    Fail(error, failure.what());
+  }
+}
+
+bool Av1Sync(ByteView bytes, ContainerErrorCode error) {
+  try {
+    return InspectAv1Packet(bytes).sync;
   } catch (const std::invalid_argument& failure) {
     Fail(error, failure.what());
   }

@@ -11,6 +11,10 @@ using namespace ebml;
 
 constexpr std::size_t ClusterTarget = 4 * 1024 * 1024;
 
+std::uint64_t TrackUid(const MediaTrack& track) {
+  return track.matroska ? track.matroska->uid.value_or(track.id) : track.id;
+}
+
 std::string_view CodecName(ContainerFormat format, const MediaTrack& track) {
   const auto& description = track.descriptions.front();
   if (track.kind == TrackKind::Video) {
@@ -18,11 +22,15 @@ std::string_view CodecName(ContainerFormat format, const MediaTrack& track) {
     if (format == ContainerFormat::Matroska && description.codec == CodecId::Hevc) return "V_MPEGH/ISO/HEVC";
     if (description.codec == CodecId::Vp8) return "V_VP8";
     if (description.codec == CodecId::Vp9) return "V_VP9";
+    if (description.codec == CodecId::Av1) return "V_AV1";
   }
   if (track.kind == TrackKind::Audio) {
     if (description.codec == CodecId::Opus) return "A_OPUS";
     if (format == ContainerFormat::Matroska && description.codec == CodecId::Aac) return "A_AAC";
   }
+  if (format == ContainerFormat::Matroska && track.kind == TrackKind::Subtitle &&
+      track.matroska && MatroskaSubtitleCodec(track.matroska->subtitle_codec))
+    return track.matroska->subtitle_codec;
   Fail(Unsupported, "Unsupported Matroska or WebM track mapping");
 }
 
@@ -39,11 +47,12 @@ void WriteTrack(Bytes& entries, ContainerFormat format, const MediaTrack& track)
   const auto& description = track.descriptions.front();
   Master(entries, 0xae, [&](Bytes& entry) {
     PutUInt(entry, 0xd7, track.id);
-    PutUInt(entry, 0x73c5, track.id);
-    PutUInt(entry, 0x83, track.kind == TrackKind::Video ? 1u : 2u);
+    PutUInt(entry, 0x73c5, format == ContainerFormat::Matroska ? TrackUid(track) : track.id);
+    PutUInt(entry, 0x83, track.kind == TrackKind::Video ? 1u : track.kind == TrackKind::Audio ? 2u : 17u);
     PutUInt(entry, 0x9c, 0);
     PutText(entry, 0x86, CodecName(format, track));
     if (!description.initialization_data.empty()) PutElement(entry, 0x63a2, description.initialization_data);
+    if (format == ContainerFormat::Matroska && track.matroska) Append(entry, track.matroska->fields);
     if (track.default_duration) PutUInt(entry, 0x23e383, ToNs(*track.default_duration));
     if (track.kind == TrackKind::Video) {
       Master(entry, 0xe0, [&](Bytes& video) {
@@ -59,7 +68,7 @@ void WriteTrack(Bytes& entries, ContainerFormat format, const MediaTrack& track)
           if (bottom) PutUInt(video, 0x54aa, bottom);
         }
       });
-    } else {
+    } else if (track.kind == TrackKind::Audio) {
       const auto opus = description.codec == CodecId::Opus;
       const auto delay = Delay(track);
       if (delay || opus || track.priming_samples) PutUInt(entry, 0x56aa, delay);
@@ -81,11 +90,13 @@ void WriteTrack(Bytes& entries, ContainerFormat format, const MediaTrack& track)
 
 struct PendingBlock {
   Bytes bytes;
+  Bytes additions;
   std::int64_t time;
   std::int64_t order;
   std::optional<std::uint64_t> duration;
   std::optional<std::int64_t> discard;
   bool sync;
+  bool invisible;
 };
 
 struct WriteTrackState {
@@ -104,9 +115,12 @@ struct WrittenCue {
 
 class MatroskaWriter final : public ContainerWriter {
 public:
-  MatroskaWriter(ContainerOutput stream, ContainerFormat format, std::span<const MediaTrack> tracks, std::int64_t scale)
+  MatroskaWriter(ContainerOutput stream, ContainerFormat format, std::span<const MediaTrack> tracks,
+                 const MediaMuxerOptions& options)
       : ContainerWriter(std::move(stream), tracks), webm_(format == ContainerFormat::WebM),
-        scale_(scale), states_(tracks.size()) {
+        scale_(options.ebml_timestamp_scale.value_or(std::chrono::nanoseconds{DefaultTimestampScale}).count()),
+        states_(tracks.size()) {
+    const auto& metadata = options.matroska_metadata;
     for (std::size_t i = 0; i < tracks.size(); ++i) {
       states_[i].delay = Delay(tracks[i]);
       const auto& description = tracks[i].descriptions.front();
@@ -136,14 +150,25 @@ public:
       PutUInt(info, 0x2ad7b1, scale_);
       PutText(info, 0x4d80, "Lib-Media");
       PutText(info, 0x5741, "Lib-Media");
+      if (metadata) {
+        if (metadata->segment_uid) PutElement(info, 0x73a4, *metadata->segment_uid);
+        if (!metadata->title.empty()) PutText(info, 0x7ba9, metadata->title);
+      }
     });
     Master(header, Tracks, [&](Bytes& entries) {
       for (const auto& track : tracks) WriteTrack(entries, format, track);
     });
     output.Write(header);
+    // Readers can discover chapters, tags, and subtitle fonts before reaching the media.
+    if (metadata) {
+      WriteMetadata(Chapters, metadata->chapters);
+      for (const auto& tags : metadata->tags) WriteMetadata(Tags, tags);
+      WriteMetadata(Attachments, metadata->attachments);
+    }
   }
 
   bool SupportsPacketTrim() const override { return true; }
+  bool SupportsMatroskaPacketAttributes() const override { return !webm_; }
 
   std::optional<std::uint32_t> Write(std::uint32_t index, const ContainerPacket& packet) override {
     RequireWritable();
@@ -161,6 +186,10 @@ public:
       Fail(Unsupported, "Block time is outside the supported Matroska or WebM timeline");
     const auto& track = tracks[index];
     const auto data = packet.data.AsBytes();
+    const auto additions = packet.matroska ? packet.matroska->block_additions.AsBytes() : ByteView{};
+    if (additions.size() > MaxContainerPacket - data.size())
+      Fail(ContainerErrorCode::LimitExceeded, "Matroska Block and its additions exceed the packet limit");
+    for (auto fields = additions; !fields.empty();) ReadField(fields);
     const auto& description = track.descriptions.front();
     const auto intrinsic = CodecDuration(description, data, BadArgument);
     const auto discard = packet.discard_padding ? std::optional{ToNs(*packet.discard_padding)} : std::nullopt;
@@ -187,13 +216,18 @@ public:
       }
       duration = static_cast<std::uint64_t>(ticks);
     }
-    bool independent = track.kind == TrackKind::Audio;
-    // AVC and HEVC can derive a sync flag from an IDR. VPx uses the caller's container sync flag.
+    bool independent = track.kind != TrackKind::Video;
+    // VPx uses the caller's sync flag. AVC, HEVC, and AV1 can derive it from the packet.
     if (description.codec == CodecId::H264) independent = AvcIdr(data, state.nal_length, BadArgument);
     if (description.codec == CodecId::Hevc) independent = HevcIdr(data, state.nal_length, false, BadArgument);
-    state.pending = PendingBlock{Bytes(data.begin(), data.end()), time,
+    if (description.codec == CodecId::Av1) {
+      independent = Av1Sync(data, BadArgument);
+      if (packet.sync_sample == true && !independent) Fail(BadArgument, "AV1 sync Block has no random-access key frame");
+    }
+    state.pending = PendingBlock{Bytes(data.begin(), data.end()), Bytes(additions.begin(), additions.end()), time,
                                  webm_ ? time : (packet.dts ? ToNs(*packet.dts) : stored),
-                                 duration, discard, packet.sync_sample.value_or(independent)};
+                                 duration, discard, packet.sync_sample.value_or(independent),
+                                 packet.matroska && packet.matroska->invisible};
     state.last_time = time;
     Drain();
     return {};
@@ -230,6 +264,16 @@ public:
   }
 
 private:
+  void WriteMetadata(std::uint32_t id, const BufferReference& payload) {
+    const auto bytes = payload.AsBytes();
+    if (bytes.empty()) return;
+    Bytes header;
+    PutId(header, id);
+    PutVint(header, bytes.size());
+    output.Write(header);
+    output.Write(bytes);
+  }
+
   std::int64_t OutputTicks(std::int64_t ns) const {
     auto ticks = ns / scale_;
     const auto remainder = ns % scale_;
@@ -277,7 +321,7 @@ private:
     const auto maximum = std::min<std::int64_t>(2000000000 / scale_, std::numeric_limits<std::int16_t>::max());
     if (!cluster_.empty() &&
         (relative < std::numeric_limits<std::int16_t>::min() || relative > maximum ||
-         cluster_.size() + packet.bytes.size() > ClusterTarget || (video_sync && relative > 0))) Flush();
+         cluster_.size() + packet.bytes.size() + packet.additions.size() > ClusterTarget || (video_sync && relative > 0))) Flush();
     if (cluster_.empty()) {
       cluster_time_ = std::max<std::int64_t>(0, packet.time);
       relative = SubTime(packet.time, cluster_time_);
@@ -289,8 +333,10 @@ private:
     Bytes prefix;
     PutVint(prefix, track.id);
     Put(prefix, static_cast<std::int16_t>(relative));
-    const bool simple = !packet.duration && !packet.discard;
-    Put<std::uint8_t>(prefix, simple && packet.sync ? 128 : 0);
+    const bool simple = !packet.duration && !packet.discard && packet.additions.empty();
+    auto flags = simple && packet.sync ? 128 : 0;
+    if (packet.invisible) flags |= BlockInvisible;
+    Put<std::uint8_t>(prefix, static_cast<std::uint8_t>(flags));
     const auto size = prefix.size() + packet.bytes.size();
     if (simple) {
       PutId(cluster_, SimpleBlock);
@@ -303,6 +349,7 @@ private:
       PutVint(block_header, size);
       if (packet.duration) PutUInt(fields, BlockDuration, *packet.duration);
       if (packet.discard) PutInt(fields, DiscardPadding, *packet.discard);
+      if (!packet.additions.empty()) PutElement(fields, BlockAdditions, packet.additions);
       // A dependent frame with no known reference timestamps uses ReferenceBlock zero.
       if (!packet.sync) PutInt(fields, ReferenceBlock, 0);
       PutId(cluster_, BlockGroup);
@@ -312,7 +359,7 @@ private:
       Append(cluster_, packet.bytes);
       Append(cluster_, fields);
     }
-    if (packet.time >= 0 && (video_sync || (!has_video_ && !audio_cued_[index]))) {
+    if (packet.time >= 0 && (video_sync || (!has_video_ && track.kind == TrackKind::Audio && !audio_cued_[index]))) {
       if (cues_.size() == MaxContainerSamples)
         Fail(ContainerErrorCode::LimitExceeded, "Matroska Cue table exceeds its limit");
       // The Cluster begins at the next output byte. The Block offset is relative to its payload.
@@ -345,10 +392,40 @@ private:
 };
 } // namespace
 
-void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks) {
+void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks, const MediaMuxerOptions& options) {
+  if (const auto& metadata = options.matroska_metadata) {
+    std::size_t remaining = MaxContainerMetadata;
+    const auto validate = [&](ByteView payload) {
+      if (payload.size() > remaining) Fail(ContainerErrorCode::LimitExceeded, "Matroska metadata exceeds its byte budget");
+      remaining -= payload.size();
+      while (!payload.empty()) ReadField(payload);
+    };
+    if (metadata->title.size() > 65536 || metadata->tags.size() > 65536)
+      Fail(ContainerErrorCode::LimitExceeded, "Matroska title or tag count exceeds its limit");
+    validate(metadata->chapters.AsBytes());
+    for (const auto& tags : metadata->tags) validate(tags.AsBytes());
+    validate(metadata->attachments.AsBytes());
+  }
+  std::array<std::uint64_t, MaxContainerTracks> uids{};
+  std::size_t uid_count = 0;
   for (const auto& track : tracks) {
     CodecName(format, track);
     const auto& description = track.descriptions.front();
+    if (format == ContainerFormat::Matroska) {
+      const auto uid = TrackUid(track);
+      const auto used = std::span(uids).first(uid_count);
+      if (!uid || std::ranges::find(used, uid) != used.end()) Fail(BadArgument, "Matroska TrackUIDs must be nonzero and unique");
+      uids[uid_count++] = uid;
+      if (track.matroska) {
+        ByteView fields(track.matroska->fields);
+        if (fields.size() > 65536) Fail(ContainerErrorCode::LimitExceeded, "Matroska track attributes exceed 64 KiB");
+        while (!fields.empty()) {
+          const auto field = ReadField(fields);
+          if (!MatroskaTrackAttribute(field.id) || (field.id == 0x6d80 && track.kind != TrackKind::Subtitle))
+            Fail(BadArgument, "Invalid retained Matroska track attribute");
+        }
+      }
+    }
     if (track.default_duration) {
       const auto ns = track.default_duration->Rescale(Nanoseconds);
       if (!ns || ns->ticks <= 0 || *ns != *track.default_duration)
@@ -377,11 +454,13 @@ void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks
           HevcNalLength(description.initialization_data, false, BadArgument);
         }
       } else if (description.framing != PacketFraming::CodecPacket) {
-        Fail(Unsupported, "Matroska VP8 and VP9 require complete codec packets");
+        Fail(Unsupported, "Matroska VP8, VP9, and AV1 require complete codec packets");
       } else if (description.codec == CodecId::Vp8 && !description.initialization_data.empty()) {
         Fail(BadArgument, "VP8 has no Matroska codec private data");
+      } else if (description.codec == CodecId::Av1) {
+        ValidateAv1Configuration(description.initialization_data, BadArgument);
       }
-    } else {
+    } else if (track.kind == TrackKind::Audio) {
       if (description.framing != PacketFraming::CodecPacket)
         Fail(Unsupported, "Matroska audio requires complete codec packets");
       if (description.codec == CodecId::Opus) {
@@ -396,13 +475,15 @@ void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks
           Fail(BadArgument, "Matroska AAC track does not match AudioSpecificConfig");
       }
       Delay(track);
+    } else if (description.framing != PacketFraming::ContainerSample || description.codec != CodecId::Unknown ||
+               track.priming_samples || track.seek_preroll) {
+      Fail(BadArgument, "Matroska subtitle copy requires an opaque timed subtitle track");
     }
   }
 }
 
 std::unique_ptr<ContainerWriter> OpenMatroskaWriter(ContainerOutput output, ContainerFormat format,
                                                     std::span<const MediaTrack> tracks, const MediaMuxerOptions& options) {
-  const auto scale = options.ebml_timestamp_scale.value_or(std::chrono::nanoseconds{DefaultTimestampScale});
-  return std::make_unique<MatroskaWriter>(std::move(output), format, tracks, scale.count());
+  return std::make_unique<MatroskaWriter>(std::move(output), format, tracks, options);
 }
 } // namespace huxerui::media::detail

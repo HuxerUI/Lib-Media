@@ -91,6 +91,9 @@ ContainerReader& MediaDemuxer::Require() const {
 ContainerFormat MediaDemuxer::Format() const { return Require().format; }
 ContainerLayout MediaDemuxer::Layout() const { return Require().layout; }
 std::optional<std::chrono::nanoseconds> MediaDemuxer::EbmlTimestampScale() const { return Require().EbmlTimestampScale(); }
+ContainerResult<MatroskaMetadata> MediaDemuxer::ReadMatroskaMetadata() {
+  return ContainerCall<MatroskaMetadata>([&] { return Require().ReadMatroskaMetadata(); });
+}
 std::span<const MediaTrack> MediaDemuxer::Tracks() const { return Require().tracks; }
 std::optional<MediaAudioMetadata> MediaDemuxer::AudioMetadata() const { return Require().audio_metadata; }
 std::optional<MediaTimestamp> MediaDemuxer::StartTime() const { return Require().start; }

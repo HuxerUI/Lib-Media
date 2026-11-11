@@ -13,11 +13,11 @@ Pass the description selected by a packet to the corresponding decoder for a sup
 
 | Container | Packets | Input | Output |
 | --- | --- | --- | --- |
-| Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC or ALAC, and length-prefixed AVC or HEVC | Random access, or sequential when movie metadata precedes samples | Random write; fast-start requires random read/write |
+| Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC or ALAC, length-prefixed AVC or HEVC, and AV1 temporal units | Random access, or sequential when movie metadata precedes samples | Random write; fast-start requires random read/write |
 | Fragmented MP4 | AAC, AVC, and HEVC | Sequential from initialization. Sized random-access input supports incremental seek, including growing files. | Sequential or random write |
 | QuickTime MOV | AAC, AVC, HEVC, ProRes, packed interleaved PCM, timecode, and boxed timed metadata | Random access, or sequential when movie metadata precedes samples | Random write |
-| Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, VP8, VP9, raw AAC-LC, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
-| WebM | VP8, VP9, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
+| Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, VP8, VP9, AV1, raw AAC-LC, mapping-family-zero Opus, and opaque subtitle samples | Sequential or random access | Sequential or random write |
+| WebM | VP8, VP9, AV1, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
 | RIFF WAVE and RF64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
 | MPEG-4 ADTS | One raw mono/stereo AAC-LC access unit per frame | Sequential or random access | Sequential or random write |
 | Ogg | Mapping-family-zero Opus, including chained logical streams on input | Sequential or random access | Sequential or random write for one logical stream |
@@ -157,7 +157,8 @@ track. For AAC in MP4 or MOV, the reader resolves the edit first and includes th
 unit when it shares the configuration. For Opus, the presentation anchor respects the known audible start
 while decode start retains codec delay or link pre-skip. Other selected tracks can start at different media
 times. For AVC and HEVC, an independent point has verified IDR syntax. VP9 seeking uses the container sync
-flag and the decoder checks the first frame header. VP8 uses the same contract.
+flag and the decoder checks the first frame header. VP8 and AV1 use the same contract, with AV1 requiring a
+sequence header before its first displayed key frame.
 
 Fixed fMP4 can be read from the start one fragment batch at a time. On sized random-access inputs, a batch can
 include several fragments that share media data. Their sample ranges are checked against complete `mdat` boxes.
@@ -198,6 +199,30 @@ without Cues completes the bounded scan on the first index query so sync timesta
 of packet order. The reader opens without scanning media Clusters and video seeks start at a sync Block.
 Sequential inputs report `IndexUnavailable` for seeking. [Matroska timing and indexing](https://www.rfc-editor.org/rfc/rfc9559.html)
 
+### AV1 packet copy
+
+MP4 uses the `av01` sample entry, `av1C` configuration, and `av01` compatible brand. Matroska and WebM use `V_AV1`
+and the same configuration record in `CodecPrivate`. Pass the `MediaSampleDescription`, complete temporal units,
+and timing through the muxer. AV1 output uses regular or fast-start MP4, or the EBML layouts above. Writers check
+marked sync packets before building seek entries. Decoder availability is independent of packet copy.
+[AV1 in MP4](https://aomediacodec.github.io/av1-isobmff/) · [Matroska codec mappings](https://www.matroska.org/technical/codec_specs.html)
+
+### Matroska subtitle and metadata copy
+
+Matroska subtitle tracks expose their `S_` CodecID in `MediaTrack::matroska` and use `ContainerSample` framing.
+Copy their original codec private bytes and timed packets, including `ContainerPacket::matroska` for the invisible
+flag and BlockAdditions. Track attributes retain TrackUID, names, languages, selection flags, attachment links, and
+subtitle content encodings. The preview selects audio and video tracks. A subtitle with changing Block codec state
+or a custom track clock has no supported copy mapping.
+
+For a full Matroska copy, call `ReadMatroskaMetadata()` on the random-access input and pass its result as
+`MediaMuxerOptions::matroska_metadata` with the original tracks. The query reads the title, Segment UID, Chapters,
+Tags, and Attachments, including subtitle fonts. It uses SeekHead to locate metadata when the index covers Info and
+Tracks. Otherwise it scans a bounded number of element headers and skips sized Cluster payloads. It preserves the
+input position and retains up to 64 MiB of element payloads. TrackUIDs and the original metadata
+keep chapter and tag associations intact. The writer places these elements before the first Cluster so players
+can discover them at open. [Matroska element definitions](https://www.matroska.org/technical/elements.html)
+
 ## Write and finish
 
 Pass the same tracks and `MediaMuxerOptions` to `ValidateOutput()` and `Open()`. Validate before creating or truncating the destination. A `SequentialWrite` requirement accepts a
@@ -208,7 +233,7 @@ Readers report this as a regular MP4 layout. The actual
 open and subsequent I/O can still report SDK errors, including permissions or insufficient space.
 
 For MP4 and MOV, choose an exact output clock using the track's `timescale`. MP4 defaults to the audio sample rate or
-90 kHz for video. Supply PTS and duration, and explicit DTS for AVC and HEVC. AAC and ProRes decode
+90 kHz for video. Supply PTS and duration, and explicit DTS for AVC, HEVC, and AV1. AAC and ProRes decode
 time can use PTS. An omitted AAC duration is one 1024-sample access unit. Each track's decode times
 must follow a contiguous grid. Presentation times may move backwards across successive packets with
 B pictures. WAVE, ADTS, and MOV PCM can derive timing from sample counts and validate any supplied

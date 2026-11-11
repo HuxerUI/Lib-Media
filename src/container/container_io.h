@@ -179,6 +179,7 @@ public:
   virtual std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp time, SeekDirection direction, bool seek);
   virtual std::optional<MediaPresentationRange> PresentationRange(std::size_t) const { return {}; }
   virtual std::optional<std::chrono::nanoseconds> EbmlTimestampScale() const { return {}; }
+  virtual MatroskaMetadata ReadMatroskaMetadata();
 
   std::uint32_t RegisterAudioDescription(MediaTrack& track, MediaSampleDescription description);
 
@@ -205,6 +206,7 @@ public:
   virtual void TrackEnded(std::uint32_t) {}
   virtual bool SupportsTrim() const { return false; }
   virtual bool SupportsPacketTrim() const { return false; }
+  virtual bool SupportsMatroskaPacketAttributes() const { return false; }
   virtual void Finish() = 0;
 
   ContainerOutput output;
@@ -239,6 +241,6 @@ void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, con
 std::unique_ptr<ContainerReader> OpenMatroskaReader(ContainerInput input, std::optional<ContainerFormat> hint);
 std::unique_ptr<ContainerWriter> OpenMatroskaWriter(ContainerOutput output, ContainerFormat format,
                                                     std::span<const MediaTrack> tracks, const MediaMuxerOptions& options);
-void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks);
+void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks, const MediaMuxerOptions& options);
 
 } // namespace huxerui::media::detail

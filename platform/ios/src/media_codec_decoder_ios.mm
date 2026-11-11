@@ -1,3 +1,4 @@
+#include "codec/av1.h"
 #include "codec/decoder/backend.h"
 #include "media_video_ios.h"
 #include "codec/decoder/copy.h"
@@ -136,6 +137,19 @@ public:
           (__bridge CFDictionaryRef)extensions, &description_);
       if (@available(iOS 17.0, *))
         specification = @{(__bridge NSString*)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @YES};
+    } else if (video.codec == CodecId::Av1) {
+      if (@available(iOS 17.0, *)) {
+        if (!VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1))
+          return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "AV1 hardware decoding is unavailable"));
+        const auto& config = video.initialization_data;
+        NSDictionary* extensions = @{(__bridge NSString*)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms:
+            @{@"av1C": [NSData dataWithBytes:config.data() length:config.size()]}};
+        status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_AV1, video.width, video.height,
+            (__bridge CFDictionaryRef)extensions, &description_);
+        specification = @{(__bridge NSString*)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @YES};
+      } else {
+        return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "AV1 decoding requires iOS 17 or later"));
+      }
     } else if (video.codec == CodecId::Hevc) {
       const auto hevc = ParseHevcConfiguration(video.initialization_data, true, true);
       add_parameters(hevc.parameters);
@@ -191,7 +205,8 @@ public:
     if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "Cannot create compressed video sample"));
     VTDecodeInfoFlags flags = 0;
     const auto& video = std::get<VideoDecoderConfig>(config_);
-    const bool hidden = video.codec == CodecId::Vp9 && !Vp9PacketDisplays(bytes).Value();
+    const bool hidden = (video.codec == CodecId::Vp9 && !Vp9PacketDisplays(bytes).Value()) ||
+        (video.codec == CodecId::Av1 && !InspectAv1Packet(bytes).pictures);
     status = VTDecompressionSessionDecodeFrame(video_, sample, hidden ? kVTDecodeFrame_DoNotOutputFrame : 0,
         hidden ? this : nullptr, &flags);
     CFRelease(sample);

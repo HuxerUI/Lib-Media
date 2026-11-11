@@ -9,6 +9,7 @@ selection and publication. See the [capability table](../README.md#capabilities)
 | --- | --- |
 | MP4 with multiple rate-one edits and sample descriptions | Keep media timestamps and the description table stable. Map the decoded intervals, seek across gaps and configurations, and preserve the edits and packets through MP4/MOV copy. Verify fragmented AAC head and tail trim through WAV sample counts. |
 | VP8/VP9 and Opus in WebM and MKV | Seek with Cues or a bounded Cluster scan. Verify late Opus preroll and Web reference packet backpressure. Compare packets, submillisecond timestamps, and trim after WebM/MKV copy. |
+| AV1 in WebM, MKV, and regular MP4 | Preview 8-bit SDR frames and seek from marked key packets. Compare original packets after copy. Retain MKV subtitle timings, chapter and tag targets, and attachments. |
 | Matroska HEVC and AAC | Verify HEVC preview and repeated seeks. Keep the source Segment tick for negative video PTS and retain AAC sample timing when copying compatible audio to M4A. |
 | Chained Ogg Opus | Keep one track with stable description indices. Restart decoding at each link, preserve its absolute audible start, and verify seek and WAV sample counts. |
 
@@ -35,7 +36,7 @@ Use application inputs and independent readback to scope each format, direction,
 - Extend MP4/MOV/fMP4 for needed sample entries, index layouts, edits, and metadata. Extend Matroska/WebM
   for needed codecs and subtitle, chapter, and tag preservation.
 - Evaluate additional audio mappings and PCM containers, including Vorbis, multichannel FLAC, AIFF, CAF,
-  and Wave64. Evaluate AV1 and ProRes codec adapters by platform and direction.
+  and Wave64. Evaluate ProRes adapters and further AV1 profiles or encoding by platform and direction.
 - Evaluate transport streams, AVI, Annex B, and standalone subtitles against actual ingest requirements.
 
 Lib-AVKit owns backend selection, precise extraction, thumbnails, audio processing, compositing, timeline

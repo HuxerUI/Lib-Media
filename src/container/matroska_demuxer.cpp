@@ -11,6 +11,10 @@ using namespace ebml;
 
 constexpr std::size_t ElementBudget = 65536;
 
+bool IsRetainedMetadata(std::uint64_t id) {
+  return id == Chapters || id == Tags || id == Attachments;
+}
+
 struct TrackState {
   std::uint64_t number = 0;
   std::int64_t delay = 0;
@@ -22,6 +26,7 @@ struct BlockFields {
   std::optional<std::int64_t> discard;
   bool reference = false;
   bool codec_state = false;
+  ByteView additions;
 };
 
 BlockFields Group(ByteView bytes) {
@@ -36,6 +41,10 @@ BlockFields Group(ByteView bytes) {
       case BlockDuration: group.duration = UInt(field.data); break;
       case ReferenceBlock: group.reference = true; break;
       case DiscardPadding: group.discard = SInt(field.data); break;
+      case BlockAdditions:
+        if (field.data.empty() || !group.additions.empty()) Fail(BadData, "Invalid Matroska BlockAdditions");
+        group.additions = field.data;
+        break;
       case 0xa4: group.codec_state = true; break;
     }
   }
@@ -200,6 +209,44 @@ public:
 
   std::optional<std::chrono::nanoseconds> EbmlTimestampScale() const override {
     return std::chrono::nanoseconds{SignedTime(scale_)};
+  }
+
+  MatroskaMetadata ReadMatroskaMetadata() override {
+    if (format != ContainerFormat::Matroska) return ContainerReader::ReadMatroskaMetadata();
+    if (!input.Random()) Fail(ContainerErrorCode::NeedRandomAccess, "Reading Matroska metadata requires random access");
+    if (metadata_loaded_) return metadata_;
+
+    const auto previous = input.Position();
+    auto retained = metadata_;
+    std::size_t remaining = MaxContainerMetadata;
+    const auto read_metadata = [&](const Element& element) {
+      if (!IsRetainedMetadata(element.id)) return true;
+      auto bytes = ReadBody(input, element, remaining);
+      remaining -= bytes.size();
+      auto payload = Own(std::move(bytes));
+      if (element.id == Tags) retained.tags.push_back(std::move(payload));
+      else {
+        auto& destination = element.id == Chapters ? retained.chapters : retained.attachments;
+        if (!destination.AsBytes().empty()) Fail(BadData, "Duplicate Matroska Chapters or Attachments");
+        destination = std::move(payload);
+      }
+      return true;
+    };
+    try {
+      if (metadata_index_) {
+        for (const auto& [offset, id] : *metadata_index_)
+          read_metadata(IndexedElement(SegmentPosition(offset), id));
+      } else if (!VisitSegment(read_metadata)) {
+        Fail(ContainerErrorCode::LimitExceeded, "Matroska metadata discovery exceeds its element budget");
+      }
+    } catch (...) {
+      input.Seek(previous);
+      throw;
+    }
+    input.Seek(previous);
+    metadata_ = std::move(retained);
+    metadata_loaded_ = true;
+    return metadata_;
   }
 
   std::optional<ContainerPacket> Read() override {
@@ -377,9 +424,16 @@ private:
   void DiscoverTracks() {
     bool info = false;
     std::optional<std::uint64_t> tracks_position, info_position;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> metadata_positions;
+    const auto remember_metadata = [&](std::uint64_t id, std::uint64_t offset) {
+      if (format != ContainerFormat::Matroska || !IsRetainedMetadata(id)) return;
+      if (metadata_positions.size() == ElementBudget)
+        Fail(ContainerErrorCode::LimitExceeded, "Matroska metadata index exceeds its element budget");
+      metadata_positions.emplace_back(offset, static_cast<std::uint32_t>(id));
+    };
     std::size_t boxes = 0;
     while (auto element = ReadElement(input, segment_end_)) {
-      if (++boxes > ElementBudget || element->position - segment_data_ > MaxContainerMetadata)
+      if (++boxes > ElementBudget || ((!info || tracks.empty()) && element->position - segment_data_ > MaxContainerMetadata))
         Fail(ContainerErrorCode::LimitExceeded, "Matroska header discovery exceeds its budget");
       if (element->id == Cluster) {
         first_cluster_ = element->position;
@@ -410,11 +464,21 @@ private:
           if (*id == Cues) cues_position_ = SegmentPosition(*offset);
           if (*id == Tracks) tracks_position = SegmentPosition(*offset);
           if (*id == Info) info_position = SegmentPosition(*offset);
+          remember_metadata(*id, *offset);
         }
       } else {
         if (element->id == Cues) cues_position_ = element->position;
+        remember_metadata(element->id, element->position - segment_data_);
         SkipElement(input, *element);
       }
+    }
+    // A complete SeekHead indexes Info and Tracks as well as the retained metadata. Include metadata
+    // already seen before the first Cluster, and read the payloads in their original order.
+    if (format == ContainerFormat::Matroska && info_position && tracks_position) {
+      std::ranges::sort(metadata_positions);
+      const auto duplicates = std::ranges::unique(metadata_positions);
+      metadata_positions.erase(duplicates.begin(), duplicates.end());
+      metadata_index_ = std::move(metadata_positions);
     }
     if (!tracks.empty() && info) return;
     if (pending_ && !input.Random()) Fail(ContainerErrorCode::NeedRandomAccess, "Matroska metadata follows its first Cluster");
@@ -435,6 +499,13 @@ private:
       const auto field = ReadField(fields);
       if (field.id == 0x2ad7b1) scale_ = UInt(field.data);
       if (field.id == 0x4489) length = Float(field.data);
+      if (format == ContainerFormat::Matroska) {
+        if (field.id == 0x7ba9) metadata_.title = Text(field.data);
+        if (field.id == 0x73a4) {
+          if (field.data.size() != 16 || metadata_.segment_uid) Fail(BadData, "Invalid Matroska Segment UID");
+          std::ranges::copy(field.data, metadata_.segment_uid.emplace().begin());
+        }
+      }
     }
     if (!scale_ || scale_ > std::numeric_limits<std::int64_t>::max())
       Fail(BadData, "Invalid Matroska timestamp scale");
@@ -453,6 +524,7 @@ private:
       if (tracks.size() == MaxContainerTracks) Fail(ContainerErrorCode::LimitExceeded, "Too many Matroska tracks");
       MediaTrack track;
       auto& description = track.descriptions.emplace_back();
+      MediaTrack::MatroskaAttributes attributes;
       TrackState state;
       std::uint64_t type = 0;
       ByteView audio, video;
@@ -460,6 +532,7 @@ private:
       bool encodings = false, custom_clock = false;
       auto data = entry.data;
       while (!data.empty()) {
+        const auto encoded = data;
         const auto field = ReadField(data);
         switch (field.id) {
           case 0xd7: state.number = UInt(field.data); break;
@@ -478,6 +551,18 @@ private:
           case 0xe1: audio = field.data; break;
           case 0x6d80: encodings = true; break;
         }
+        if (format == ContainerFormat::Matroska) {
+          if (field.id == 0x73c5) {
+            const auto uid = UInt(field.data);
+            if (attributes.uid || !uid) Fail(BadData, "Invalid Matroska TrackUID");
+            attributes.uid = uid;
+          } else if (MatroskaTrackAttribute(field.id)) {
+            const auto length = encoded.size() - data.size();
+            if (length > 65536 - attributes.fields.size())
+              Fail(ContainerErrorCode::LimitExceeded, "Matroska track attributes exceed 64 KiB");
+            Append(attributes.fields, encoded.first(length));
+          }
+        }
       }
       if (!state.number || std::ranges::find(states_, state.number, &TrackState::number) != states_.end() ||
           !type || codec.empty())
@@ -488,6 +573,11 @@ private:
                    type == 17 ? TrackKind::Subtitle : TrackKind::Data;
       if (!encodings && !custom_clock) ReadCodec(track, state, codec, audio, video);
       if (description.codec == CodecId::Unknown) description.framing = PacketFraming::ContainerSample;
+      if (format == ContainerFormat::Matroska && track.kind == TrackKind::Subtitle &&
+          !custom_clock && !state.delay && MatroskaSubtitleCodec(codec))
+        attributes.subtitle_codec = codec;
+      if (attributes.uid || !attributes.fields.empty() || !attributes.subtitle_codec.empty())
+        track.matroska = std::move(attributes);
       tracks.push_back(std::move(track));
       states_.push_back(state);
     }
@@ -512,6 +602,9 @@ private:
         description.codec = CodecId::Vp8;
       } else if (codec == "V_VP9") {
         description.codec = CodecId::Vp9;
+      } else if (codec == "V_AV1") {
+        ValidateAv1Configuration(description.initialization_data, BadData);
+        description.codec = CodecId::Av1;
       }
       if (description.codec != CodecId::Unknown) ReadVideo(video, description);
     } else if (track.kind == TrackKind::Audio && codec == "A_OPUS") {
@@ -569,15 +662,19 @@ private:
     const auto pts = Time(ticks, index);
     if (at_start_) RecordAudioStart(index, pts);
     if (!Selected(index) || (track_floors_[index] && element.position < *track_floors_[index])) return;
-    if (description.codec == CodecId::Unknown || block.codec_state)
+    const bool subtitle = track.matroska && !track.matroska->subtitle_codec.empty();
+    if ((description.codec == CodecId::Unknown && !subtitle) || block.codec_state)
       Fail(Unsupported, "Unsupported Matroska track or changing codec state");
     const auto sizes = LaceSizes(payload, (header.flags >> 1) & 3);
+    const bool additions = format == ContainerFormat::Matroska && !block.additions.empty();
+    const bool invisible = format == ContainerFormat::Matroska && (header.flags & BlockInvisible);
+    if (additions && sizes.size() != 1) Fail(Unsupported, "Cannot separate BlockAdditions from a Matroska lace");
     const auto total = block.duration ? std::optional{ScaleTime(SignedTime(*block.duration), scale_)} : std::nullopt;
     const bool sync = simple ? (header.flags & 128) != 0 : !block.reference;
     std::optional<std::int64_t> elapsed{0};
     for (std::size_t i = 0; i < sizes.size(); ++i) {
       const auto frame = Slice(payload, 0, sizes[i]);
-      if (frame.empty() || frame.size() > MaxContainerPacket) Fail(BadData, "Invalid Matroska packet size");
+      if ((!subtitle && frame.empty()) || frame.size() > MaxContainerPacket) Fail(BadData, "Invalid Matroska packet size");
       auto length = CodecDuration(description, frame, BadData);
       if (!length) length = track.default_duration;
       if (total && elapsed && i + 1 == sizes.size()) {
@@ -606,6 +703,14 @@ private:
       if (elapsed) presentation = MediaTimestamp{AddTime(pts, *elapsed), Nanoseconds};
       const auto offset = static_cast<std::size_t>(frame.data() - bytes.data());
       lace_.push_back({track.id, owner.Slice(offset, frame.size()), presentation, {}, length, sync, discard});
+      if (invisible || additions) {
+        auto& attributes = lace_.back().matroska.emplace();
+        attributes.invisible = invisible;
+        if (additions) {
+          const auto offset = static_cast<std::size_t>(block.additions.data() - bytes.data());
+          attributes.block_additions = owner.Slice(offset, block.additions.size());
+        }
+      }
       if (elapsed && length) {
         // AAC has a rational sample clock. Round the accumulated frame time once for each lace position.
         if (description.codec == CodecId::Aac && i + 1 < sizes.size())
@@ -643,22 +748,33 @@ private:
     return *element;
   }
 
-  std::optional<std::uint64_t> FindCues() {
+  template<class Visit>
+  bool VisitSegment(Visit visit) {
     input.Seek(segment_data_);
     bool unknown_cluster = false;
     for (std::size_t i = 0; i < ElementBudget; ++i) {
       const auto element = ReadElement(input, segment_end_);
-      if (!element || element->id == Segment || element->id == Header) return {};
+      if (!element || element->id == Segment || element->id == Header) return true;
       if (unknown_cluster && !SegmentChild(element->id)) {
         SkipElement(input, *element);
         continue;
       }
       unknown_cluster = element->id == Cluster && !element->end;
-      if (element->id == Cues) return element->position;
+      if (!visit(*element)) return true;
       if (!unknown_cluster) SkipElement(input, *element);
     }
-    if (CanScan()) return {};
-    Fail(ContainerErrorCode::IndexUnavailable, "Matroska Cues discovery exceeded its element budget");
+    return false;
+  }
+
+  std::optional<std::uint64_t> FindCues() {
+    std::optional<std::uint64_t> position;
+    const auto covered = VisitSegment([&](const Element& element) {
+      if (element.id != Cues) return true;
+      position = element.position;
+      return false;
+    });
+    if (!covered && !CanScan()) Fail(ContainerErrorCode::IndexUnavailable, "Matroska Cues discovery exceeded its element budget");
+    return position;
   }
 
   void LoadCues() {
@@ -720,7 +836,8 @@ private:
     if (!input.ReadExact(prefix)) Fail(BadData, "Truncated Matroska Block");
     ByteView payload(prefix);
     const auto header = ReadBlockHeader(payload);
-    if (payload.empty()) Fail(BadData, "Matroska Block has no frame data");
+    if (payload.empty() && tracks[TrackIndex(header.track)].kind != TrackKind::Subtitle)
+      Fail(BadData, "Matroska Block has no frame data");
     SkipElement(input, element);
     return header;
   }
@@ -956,6 +1073,9 @@ private:
   std::optional<std::uint64_t> scan_offset_;
   std::size_t scan_count_ = 0;
   bool scan_complete_ = false;
+  std::optional<std::vector<std::pair<std::uint64_t, std::uint32_t>>> metadata_index_;
+  MatroskaMetadata metadata_;
+  bool metadata_loaded_ = false;
 };
 } // namespace
 

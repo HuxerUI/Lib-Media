@@ -1,3 +1,4 @@
+#include "codec/av1.h"
 #include "codec/decoder/backend.h"
 #include "codec/decoder/copy.h"
 #include "codec/hevc.h"
@@ -35,6 +36,30 @@ std::optional<std::string> Vp9CodecString(const VideoDecoderConfig& video) {
   });
   if (level == std::end(levels)) return {};
   return "vp09.00." + std::to_string(std::max(level->id, Vp9Level(video.initialization_data).Value())) + ".08";
+}
+
+std::string Av1CodecString(const VideoDecoderConfig& video) {
+  const auto config = ParseAv1Configuration(video.initialization_data);
+  std::string codec = "av01.0.";
+  if (config.level < 10) codec += '0';
+  codec += std::to_string(config.level);
+  codec += config.high_tier ? "H.08" : "M.08";
+  return codec;
+}
+
+Bytes SizedAv1Packet(std::span<const std::byte> bytes, std::size_t offset) {
+  const auto header_size = (std::to_integer<unsigned>(bytes[offset]) & 4) ? 2u : 1u;
+  const auto payload = bytes.subspan(offset + header_size);
+  Bytes packet(bytes.begin(), bytes.begin() + offset + header_size);
+  packet[offset] |= std::byte{2};
+  auto size = payload.size();
+  do {
+    const auto digit = size & 127;
+    size >>= 7;
+    packet.push_back(static_cast<std::byte>(digit | (size ? 128 : 0)));
+  } while (size);
+  packet.insert(packet.end(), payload.begin(), payload.end());
+  return packet;
 }
 
 class WebDecoder final : public DecoderBackend {
@@ -86,6 +111,8 @@ public:
         const auto codec = Vp9CodecString(video);
         if (!codec) return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "VP9 coded bounds exceed WebCodecs levels"));
         options.set("codec", *codec);
+      } else if (video.codec == CodecId::Av1) {
+        options.set("codec", Av1CodecString(video));
       }
       options.set("platform", platform);
       options.set("tenBit", video.output == VideoPixelFormat::P010);
@@ -103,7 +130,14 @@ public:
   CodecResult<SubmitStatus> Submit(const EncodedPacket& packet) override {
     const auto pts = packet.pts.Rescale(1000000).value().ticks;
     const auto duration = packet.duration ? val(double(packet.duration->Rescale(1000000).value().ticks)) : val::null();
-    const auto bytes = packet.data.AsBytes();
+    auto bytes = packet.data.AsBytes();
+    Bytes sized;
+    if (const auto* video = std::get_if<VideoDecoderConfig>(&config_); video && video->codec == CodecId::Av1) {
+      if (const auto offset = InspectAv1Packet(bytes).unsized_obu) {
+        sized = SizedAv1Packet(bytes, *offset);
+        bytes = sized;
+      }
+    }
     // Retain the session's input credit until WebCodecs dequeues the decode request.
     queued_input_.push_back(packet.data);
     bridge_.call<void>("submit", id_, Uint8(bytes), double(pts), duration, packet.key_frame);

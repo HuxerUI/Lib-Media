@@ -92,7 +92,34 @@ Bytes ReadBody(ContainerInput& input, const Element& element, std::size_t limit)
 
 bool SegmentChild(std::uint32_t id) {
   return id == SeekHead || id == Info || id == Tracks || id == Cluster || id == Cues ||
-         id == 0x1941a469 || id == 0x1043a770 || id == 0x1254c367;
+         id == Attachments || id == Chapters || id == Tags;
+}
+
+bool MatroskaTrackAttribute(std::uint32_t id) {
+  switch (id) {
+    case 0x536e: // Name
+    case 0x22b59c: // Language
+    case 0x22b59d: // LanguageBCP47
+    case 0xb9: // FlagEnabled
+    case 0x88: // FlagDefault
+    case 0x55aa: // FlagForced
+    case 0x55ab: // FlagHearingImpaired
+    case 0x55ac: // FlagVisualImpaired
+    case 0x55ad: // FlagTextDescriptions
+    case 0x55ae: // FlagOriginal
+    case 0x55af: // FlagCommentary
+    case 0x7446: // AttachmentLink
+    case 0x55ee: // MaxBlockAdditionID
+    case 0x41e4: // BlockAdditionMapping
+    case 0x6d80: // ContentEncodings
+      return true;
+    default: return false;
+  }
+}
+
+bool MatroskaSubtitleCodec(std::string_view codec) {
+  return codec.starts_with("S_") && codec.size() > 2 && codec.size() <= 128 &&
+      std::ranges::all_of(codec, [](char byte) { return byte >= '!' && byte <= '~'; });
 }
 
 std::uint64_t UInt(ByteView data) {

@@ -45,7 +45,8 @@ if ((ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linu
         target_include_directories(media_container_preview_tests PRIVATE "${PROJECT_SOURCE_DIR}/platform/web/src")
         target_compile_definitions(media_container_preview_tests PRIVATE MEDIA_FIXTURES="/fixtures/container")
         foreach (fixture IN ITEMS tagged-mp3.mp3 tagged-aac.m4a fragmented-aac.m4a preview-hevc-main.mp4
-                webm-vp8-opus.webm preview-vp9-opus-no-cues.webm mkv-hevc-aac.mkv)
+                webm-vp8-opus.webm preview-vp9-opus-no-cues.webm mkv-hevc-aac.mkv
+                preview-av1.webm preview-av1.mkv preview-av1.mp4)
             target_link_options(media_container_preview_tests PRIVATE
                     "SHELL:--preload-file \"${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container/${fixture}@/fixtures/container/${fixture}\"")
         endforeach ()

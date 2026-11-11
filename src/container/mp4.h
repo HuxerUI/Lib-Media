@@ -71,6 +71,8 @@ void ValidateMp4VideoExtension(std::uint32_t tag, ByteView payload, CodecId code
 bool AvcIdr(ByteView bytes, unsigned length_size, ContainerErrorCode error);
 unsigned HevcNalLength(ByteView config, bool hvc1, ContainerErrorCode error);
 bool HevcIdr(ByteView bytes, unsigned length_size, bool hvc1, ContainerErrorCode error);
+void ValidateAv1Configuration(ByteView config, ContainerErrorCode error);
+bool Av1Sync(ByteView bytes, ContainerErrorCode error);
 bool ProResEntry(std::uint32_t tag);
 void ValidateMovDataDescription(std::string_view entry, ByteView data, ContainerErrorCode error);
 unsigned MovPcmBits(CodecId codec);

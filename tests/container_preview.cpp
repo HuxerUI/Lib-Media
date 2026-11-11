@@ -306,10 +306,25 @@ std::shared_ptr<const File> RunMovieExport(const TaskScope& tasks, testing::UiTe
 
 void CheckCopy(const File& source, const File& output, ContainerFormat format) {
   auto open = [](const File& file) { return Require(MediaDemuxer::Open(Require(file.OpenRandomAccess()))); };
-  const auto original = open(source);
-  const auto copy = open(output);
+  auto original = open(source);
+  auto copy = open(output);
+  const auto equal_bytes = [](const BufferReference& a, const BufferReference& b) {
+    return std::ranges::equal(a.AsBytes(), b.AsBytes());
+  };
+  const auto equal_attributes = [&](const auto& a, const auto& b) {
+    if (!a || !b) return a.has_value() == b.has_value();
+    return a->invisible == b->invisible && equal_bytes(a->block_additions, b->block_additions);
+  };
+  const bool matroska = original.Format() == ContainerFormat::Matroska && format == ContainerFormat::Matroska;
   Check(copy.Format() == format && copy.Tracks().size() == original.Tracks().size(), "Packet copy changed the track set");
   Check(copy.EbmlTimestampScale() == original.EbmlTimestampScale(), "Packet copy changed the EBML Segment tick");
+  if (matroska) {
+    const auto before = Require(original.ReadMatroskaMetadata());
+    const auto after = Require(copy.ReadMatroskaMetadata());
+    Check(before.title == after.title && before.segment_uid == after.segment_uid && equal_bytes(before.chapters, after.chapters) &&
+          std::ranges::equal(before.tags, after.tags, equal_bytes) && equal_bytes(before.attachments, after.attachments),
+          "Packet copy changed Matroska chapters, tags, or attachments");
+  }
   for (const auto& track : original.Tracks()) {
     const auto found = std::ranges::find(copy.Tracks(), track.id, &MediaTrack::id);
     Check(found != copy.Tracks().end() && found->rotation == track.rotation &&
@@ -318,6 +333,11 @@ void CheckCopy(const File& source, const File& output, ContainerFormat format) {
           found->priming_samples == track.priming_samples && found->padding_samples == track.padding_samples &&
           found->seek_preroll == track.seek_preroll && found->default_duration == track.default_duration,
           "Packet copy changed the track or its presentation metadata");
+    if (matroska && track.matroska) {
+      Check(found->matroska && found->matroska->uid == track.matroska->uid &&
+            found->matroska->subtitle_codec == track.matroska->subtitle_codec && found->matroska->fields == track.matroska->fields,
+            "Packet copy changed Matroska TrackUID, language, or subtitle mapping");
+    }
     const auto& descriptions = track.descriptions;
     const auto& copied = found->descriptions;
     Check(descriptions.size() == copied.size(), "Packet copy lost a sample description");
@@ -338,7 +358,8 @@ void CheckCopy(const File& source, const File& output, ContainerFormat format) {
             actual->dts == expected->dts && actual->duration == expected->duration && actual->discard_padding == expected->discard_padding &&
             actual->sync_sample == expected->sync_sample &&
             actual->sample_description_index == expected->sample_description_index &&
-            std::ranges::equal(actual->data.AsBytes(), expected->data.AsBytes()), "Packet copy changed access units or timing");
+            equal_bytes(actual->data, expected->data) && equal_attributes(actual->matroska, expected->matroska),
+            "Packet copy changed access units or timing");
     }
     Check(!ReadPacket(after), "Packet copy added access units");
   }
@@ -632,6 +653,54 @@ void CheckMatroskaHevcPreview(const TaskScope& tasks, testing::UiTest& ui, const
   std::cout << "Matroska HEVC passed preview, repeated seek, and packet-copy readback\n";
 }
 
+void CheckAv1Preview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary, const char* name) {
+  const auto input = Fixture(name);
+  auto source = media_preview::Open(*input);
+  const auto format = source.Format();
+  const auto& video = source.Tracks().front();
+  const auto config = VideoFixtureConfig(video.descriptions.front(), VideoPixelFormat::NV12, VideoStorage::Cpu);
+  Check(config.codec == CodecId::Av1, "AV1 source lost its sample mapping");
+  if (format == ContainerFormat::Matroska) {
+    const auto metadata = Require(source.ReadMatroskaMetadata());
+    const auto subtitle = std::ranges::find(source.Tracks(), TrackKind::Subtitle, &MediaTrack::kind);
+    Check(metadata.title == "AV1 with captions" && !metadata.chapters.AsBytes().empty() && !metadata.tags.empty() &&
+          !metadata.attachments.AsBytes().empty() && subtitle != source.Tracks().end() && subtitle->matroska &&
+          subtitle->matroska->subtitle_codec == "S_TEXT/UTF8", "AV1 MKV fixture did not expose its retained metadata and captions");
+  }
+  const auto copy = RunMovieExport(tasks, ui, temporary, input, format);
+  CheckCopy(*input, *copy, format);
+  if (format == ContainerFormat::WebM) {
+    const auto matroska = RunMovieExport(tasks, ui, temporary, input, ContainerFormat::Matroska);
+    CheckCopy(*input, *matroska, ContainerFormat::Matroska);
+    const auto webm = RunMovieExport(tasks, ui, temporary, matroska, ContainerFormat::WebM);
+    CheckCopy(*input, *webm, ContainerFormat::WebM);
+  }
+  auto reopened = media_preview::Open(*copy);
+  Require(reopened.SelectTracks(std::span(&video.id, 1)));
+  for (const auto time : {MediaTimestamp{9, 10}, MediaTimestamp{2, 10}}) {
+    const auto point = Require(reopened.Seek(video.id, time));
+    const auto packet = ReadPacket(reopened);
+    Check(point && point->presentation_time.Compare(time) <= 0 && packet && packet->sync_sample == true &&
+          packet->pts == point->decode_start_pts, "AV1 seek did not start at a sync packet");
+  }
+  if (!CodecAvailable(ui, config, VideoDecoder::Probe, name)) return;
+  Observations seen;
+  std::exception_ptr failure;
+  const auto playing = Play(tasks, copy, seen, failure);
+  Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.12F; }, "AV1 preview did not start");
+  for (const float target : {0.91F, 0.23F, 0.74F}) {
+    const auto epoch = seen.epoch;
+    seen.seek = target;
+    Until(ui, failure, [&] { return seen.epoch > epoch && seen.first_frame && seen.position > target + 0.02F; },
+          "AV1 preview did not resume after seeking");
+    const auto pts = media_preview::Seconds(*seen.first_frame);
+    Check(pts >= target - 0.001F && pts < target + 0.1F, "AV1 seek displayed the wrong picture");
+  }
+  playing.Cancel();
+  ui.Pump();
+  std::cout << name << " passed AV1 preview, repeated seek, and packet-copy readback\n";
+}
+
 void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
   constexpr auto storage = VideoStorage::Cpu;
@@ -833,6 +902,8 @@ int main(int argc, char** argv) {
     }
 #endif
     CheckMatroskaHevcPreview(tasks, ui, temporary);
+    for (const auto* name : {"preview-av1.webm", "preview-av1.mkv", "preview-av1.mp4"})
+      CheckAv1Preview(tasks, ui, temporary, name);
     CheckAudioCopy(tasks, ui, temporary, "tagged-mp3.mp3");
     CheckAudioCopy(tasks, ui, temporary, "tagged-aac.m4a");
     CheckAudioCopy(tasks, ui, temporary, "fragmented-aac.m4a");

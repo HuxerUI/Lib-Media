@@ -1,4 +1,5 @@
 #include "format.h"
+#include "../av1.h"
 #include "../hevc.h"
 #include "container/container_io.h"
 #include "format/platform_video_storage.h"
@@ -274,6 +275,19 @@ CodecResult<bool> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
         return invalid("VP9 requires a key frame after creation/reset");
       return Vp9PacketDisplays(bytes);
     }
+    if (video->codec == CodecId::Av1) {
+      try {
+        const auto info = InspectAv1Packet(packet.data.AsBytes());
+        if ((needs_key || packet.key_frame) && (!packet.key_frame || !info.sync))
+          return invalid("AV1 requires a marked key packet with an in-band sequence header");
+        if (info.pictures > 1 || info.spatial_layers || (info.sequence &&
+            (!info.sequence->sdr_420 || info.sequence->width > video->width || info.sequence->height > video->height)))
+          return R::Failure(Error(CodecErrorCode::Unsupported, "AV1 requires single-layer 8-bit SDR 4:2:0 within the configured bounds"));
+        return R::Success(info.pictures != 0);
+      } catch (const std::invalid_argument& error) {
+        return invalid(error.what());
+      }
+    }
     if (video->codec == CodecId::Hevc) {
       const auto length = (std::to_integer<unsigned>(video->initialization_data[21]) & 3u) + 1;
       try {
@@ -343,6 +357,16 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
       } catch (const std::invalid_argument& error) {
         return R::Failure(Error(CodecErrorCode::InvalidArgument, error.what()));
       }
+    } else if (video.codec == CodecId::Av1) {
+      try {
+        const auto description = ParseAv1Configuration(video.initialization_data);
+        if (platform_storage || !eight_bit || description.profile != 0 || !description.eight_bit_420 ||
+            (description.sequence && (!description.sequence->sdr_420 || description.sequence->width > video.width ||
+                                      description.sequence->height > video.height)))
+          return R::Failure(Error(CodecErrorCode::Unsupported, "AV1 requires 8-bit SDR 4:2:0 with CPU NV12 or I420 output"));
+      } catch (const std::invalid_argument& error) {
+        return R::Failure(Error(CodecErrorCode::InvalidArgument, error.what()));
+      }
     } else if (video.codec == CodecId::Vp8 || video.codec == CodecId::Vp9) {
       if (!eight_bit)
         return R::Failure(Error(CodecErrorCode::Unsupported, "VP8 and VP9 profile 0 require eight-bit output"));
@@ -363,7 +387,7 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
         return R::Failure(Error(CodecErrorCode::Unsupported, "This VP8/VP9 adapter provides CPU output"));
 #endif
     } else {
-      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video decoding requires H.264, HEVC, VP8, or VP9"));
+      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Unsupported video decoder codec"));
     }
     frame_bytes = VideoImageBytes(video.width, video.height, video.output);
     minimum = 34;

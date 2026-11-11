@@ -122,6 +122,7 @@ Bytes Descriptor(std::uint8_t type, ByteView data) {
 
 std::string_view VideoEntry(const MediaSampleDescription& track) {
   if (!track.sample_entry.empty()) return track.sample_entry;
+  if (track.codec == CodecId::Av1) return "av01";
   return track.codec == CodecId::Hevc ? "hvc1" : "avc1";
 }
 
@@ -233,6 +234,8 @@ void SampleDescription(Bytes& bytes, TrackKind kind, const MediaSampleDescriptio
       Put<std::uint16_t>(bytes, 0xffff);
       if (track.codec == CodecId::H264 || track.codec == CodecId::Hevc)
         Box(bytes, track.codec == CodecId::Hevc ? "hvcC" : "avcC", [&] { Append(bytes, track.initialization_data); });
+      else if (track.codec == CodecId::Av1)
+        Box(bytes, "av1C", [&] { Append(bytes, track.initialization_data); });
       if (track.visible && *track.visible != VideoRectangle{0, 0, *track.coded_width, *track.coded_height}) {
         const auto rect = *track.visible;
         Box(bytes, "clap", [&] {
@@ -481,6 +484,8 @@ public:
         if (audio_only && !fragmented_) Put(header, Tag("M4A "));
         if (std::ranges::any_of(tracks, [](const auto& track) { return track.descriptions.front().codec == CodecId::H264; }))
           Put(header, Tag("avc1"));
+        if (std::ranges::any_of(tracks, [](const auto& track) { return track.descriptions.front().codec == CodecId::Av1; }))
+          Put(header, Tag("av01"));
       }
     });
     this->output.Write(header);
@@ -564,6 +569,9 @@ public:
       const auto length = (Number<std::uint8_t>(description.initialization_data, avc ? 4 : 21) & 3) + 1;
       independent = avc ? AvcIdr(data, length, WriteError)
                         : HevcIdr(data, length, VideoEntry(description) == "hvc1", WriteError);
+    } else if (description.codec == CodecId::Av1) {
+      independent = Av1Sync(data, WriteError);
+      if (packet.sync_sample == true && !independent) Fail(WriteError, "AV1 sync sample has no random-access key frame");
     }
     if (track.kind == TrackKind::Data && description.sample_entry == "tmcd" && data.size() != 4)
       Fail(WriteError, "QuickTime timecode requires four-byte samples");
@@ -771,7 +779,7 @@ void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, con
     if (track.id == 0xffffffffu) Fail(WriteError, "MP4 track ID leaves no next track ID");
     const auto& primary = track.descriptions.front();
     if (track.descriptions.size() > 1 &&
-        (primary.codec != CodecId::H264 && primary.codec != CodecId::Hevc && primary.codec != CodecId::Aac))
+        (primary.codec != CodecId::H264 && primary.codec != CodecId::Hevc && primary.codec != CodecId::Av1 && primary.codec != CodecId::Aac))
       Fail(WriteError, "This MP4 codec requires one sample description");
     for (const auto& ref : track.references) {
       const auto target = std::ranges::find(tracks, ref.track_id, &MediaTrack::id);
@@ -830,6 +838,11 @@ void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, con
         } else if (description.codec == CodecId::Hevc && description.framing == PacketFraming::LengthPrefixedNals &&
                    (VideoEntry(description) == "hvc1" || VideoEntry(description) == "hev1")) {
           HevcNalLength(description.initialization_data, VideoEntry(description) == "hvc1", WriteError);
+        } else if (description.codec == CodecId::Av1 && format == ContainerFormat::Mp4 &&
+                   description.framing == PacketFraming::CodecPacket && VideoEntry(description) == "av01") {
+          if (options.layout == ContainerLayout::Fragmented)
+            Fail(ContainerErrorCode::Unsupported, "AV1 output requires regular or fast-start MP4");
+          ValidateAv1Configuration(description.initialization_data, WriteError);
         } else if (description.codec != CodecId::ProRes || format != ContainerFormat::Mov ||
                    description.framing != PacketFraming::CodecPacket || description.sample_entry.size() != 4 ||
                    !ProResEntry(Tag(description.sample_entry)) || !description.initialization_data.empty()) {

@@ -120,6 +120,7 @@ enum class CodecId {
   Hevc,     ///< High Efficiency Video Coding.
   Vp8,      ///< VP8 coded pictures.
   Vp9,      ///< VP9 coded pictures.
+  Av1,      ///< AV1 coded temporal units.
   ProRes,   ///< Apple ProRes coded pictures. The sample entry identifies the profile.
 
   Aac,      ///< Advanced Audio Coding.
@@ -143,7 +144,8 @@ enum class CodecId {
 /// @brief A complete compressed access unit with timing on the source's media timeline.
 ///
 /// Supply one complete codec packet, such as a raw AAC access unit, a length-prefixed AVC or HEVC access unit,
-/// a VP8 frame, or a VP9 frame or superframe. Keep data address-stable and unchanged throughout TrySubmit().
+/// a VP8 frame, a VP9 frame or superframe, or an AV1 temporal unit. Keep data address-stable and unchanged
+/// throughout TrySubmit().
 /// BufferReference retains the backing owner, which may still
 /// be mutable. Accepted packets are copied before TrySubmit() returns, so the caller can then reuse the source bytes.
 /// Keep a packet available for retry when submission returns SubmitStatus::WouldBlock.
@@ -164,8 +166,8 @@ struct EncodedPacket {
   std::optional<MediaTimestamp> dts;
   /// Optional nonnegative duration with a positive timescale. An absent duration and a zero duration are distinct.
   std::optional<MediaTimestamp> duration;
-  /// Marks a random-access unit. The first video packet after Create() or Reset() must begin with an IDR or VP8/VP9 key frame
-  /// and set this flag.
+  /// Marks a random-access unit. The first video packet after Create() or Reset() must carry an IDR or
+  /// VP8, VP9, or AV1 key frame and set this flag.
   /// AudioEncoder output always sets this flag; VideoEncoder derives it from actual IDR syntax.
   bool key_frame = false;
 };

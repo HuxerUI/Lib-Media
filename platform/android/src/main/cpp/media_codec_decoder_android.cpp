@@ -95,6 +95,8 @@ public:
       mime = "video/x-vnd.on2.vp8";
     } else if (video->codec == CodecId::Vp9) {
       mime = "video/x-vnd.on2.vp9";
+    } else if (video->codec == CodecId::Av1) {
+      mime = "video/av01";
     }
     codec_ = AMediaCodec_createDecoderByType(mime);
     if (!codec_) return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "No Android decoder for this MIME type"));
@@ -126,6 +128,8 @@ public:
         length_size_ = ParseHevcConfiguration(video->initialization_data, true, false).length;
         const auto header = HevcAnnexBConfiguration(video->initialization_data);
         AMediaFormat_setBuffer(format, "csd-0", header.data(), header.size());
+      } else if (video->codec == CodecId::Av1) {
+        AMediaFormat_setBuffer(format, "csd-0", video->initialization_data.data(), video->initialization_data.size());
       } else if (video->codec == CodecId::H264) {
         auto avc = ParseAvc(video->initialization_data).Value();
         length_size_ = avc.length_size;

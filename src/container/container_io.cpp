@@ -223,6 +223,10 @@ std::optional<SeekPoint> ContainerReader::Find(std::uint32_t, MediaTimestamp, Se
   Fail(ContainerErrorCode::IndexUnavailable, "This layout has no covered seek index");
 }
 
+MatroskaMetadata ContainerReader::ReadMatroskaMetadata() {
+  Fail(ContainerErrorCode::Unsupported, "Matroska metadata requires a Matroska input");
+}
+
 std::uint32_t ContainerReader::RegisterAudioDescription(MediaTrack& track, MediaSampleDescription description) {
   auto& descriptions = track.descriptions;
   const auto existing = std::ranges::find(descriptions, description.initialization_data,

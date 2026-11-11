@@ -20,6 +20,9 @@
 namespace huxerui::media::detail {
 namespace {
 using Microsoft::WRL::ComPtr;
+// The AV01 media subtype also works with SDK headers that predate MFVideoFormat_AV1.
+constexpr GUID Av1Subtype{0x31305641, 0, 0x0010, {0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71}};
+
 struct MfFailure { CodecError error; };
 void Require(HRESULT status, const char* operation, CodecErrorCode code = CodecErrorCode::PlatformFailure) {
   if (FAILED(status)) throw MfFailure{Error(code, operation, std::to_string(status))};
@@ -77,13 +80,14 @@ public:
       const auto* video = std::get_if<VideoDecoderConfig>(&config_);
       const bool hevc = video && video->codec == CodecId::Hevc;
       const bool vpx = video && (video->codec == CodecId::Vp8 || video->codec == CodecId::Vp9);
+      const bool av1 = video && video->codec == CodecId::Av1;
       const GUID subtype = audio ? AudioSubtype(audio->codec) : hevc ? MFVideoFormat_HEVC :
-          vpx ? (video->codec == CodecId::Vp8 ? MFVideoFormat_VP80 : MFVideoFormat_VP90) : MFVideoFormat_H264;
+          av1 ? Av1Subtype : vpx ? (video->codec == CodecId::Vp8 ? MFVideoFormat_VP80 : MFVideoFormat_VP90) : MFVideoFormat_H264;
       if (audio && audio->codec != CodecId::Aac) {
         const MFT_REGISTER_TYPE_INFO type{MFMediaType_Audio, subtype};
         Require(OpenSynchronousTransform(MFT_CATEGORY_AUDIO_DECODER, &type, nullptr, decoder_),
             "No synchronous Media Foundation audio decoder for this codec", CodecErrorCode::Unsupported);
-      } else if (hevc || vpx) {
+      } else if (hevc || vpx || av1) {
         const MFT_REGISTER_TYPE_INFO type{MFMediaType_Video, subtype};
         Require(OpenSynchronousTransform(MFT_CATEGORY_VIDEO_DECODER, &type, nullptr, decoder_),
             "No synchronous Media Foundation decoder for this video codec", CodecErrorCode::Unsupported);
@@ -104,7 +108,7 @@ public:
         ConfigureAudioInput(*input.Get(), *audio);
         if (audio->codec == CodecId::Flac) parameters_ = AudioDecoderHeader(*audio);
       } else {
-        if (!vpx) {
+        if (!vpx && !av1) {
           ComPtr<IMFAttributes> attributes;
           Require(decoder_->GetAttributes(&attributes), "Cannot configure video buffering");
           Require(attributes->SetUINT32(MF_LOW_LATENCY, TRUE), "Cannot bound video startup buffering");
@@ -117,7 +121,7 @@ public:
               eAVEncH265VProfile_Main_420_10 : eAVEncH265VProfile_Main_420_8), "Cannot set HEVC profile");
           Require(input->SetBlob(MF_MT_MPEG_SEQUENCE_HEADER, reinterpret_cast<const UINT8*>(parameters_.data()),
               static_cast<UINT32>(parameters_.size())), "Cannot set HEVC initialization data");
-        } else if (!vpx) {
+        } else if (!vpx && !av1) {
           const auto avc = ParseAvc(video->initialization_data).Value();
           length_size_ = avc.length_size;
           for (const auto& parameter : avc.parameters) {
@@ -126,7 +130,8 @@ public:
           }
         }
       }
-      Require(decoder_->SetInputType(0, input.Get(), 0), "Decoder rejected input format");
+      Require(decoder_->SetInputType(0, input.Get(), 0), "Decoder rejected input format",
+          av1 ? CodecErrorCode::Unsupported : CodecErrorCode::PlatformFailure);
       Negotiate();
       if (audio && audio->codec == CodecId::Mp3)
         mp3_.emplace(audio->output, AudioSampleLimit(*audio).Value());

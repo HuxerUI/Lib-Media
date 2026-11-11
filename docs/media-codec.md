@@ -4,7 +4,7 @@
 [codec issue #20](https://github.com/HuxerUI/HuxerUI/issues/20). Link `HuxerUI::Media` with the installed public SDK.
 No `Install()`, View, Runtime, window, or application Task is needed. Existing MediaPlayer and photo-library APIs are unchanged.
 
-This guide covers AAC-LC, Opus, FLAC, and MP3 decoded to CPU PCM, and AVC, HEVC, VP8, and VP9 decoded to video frames.
+This guide covers AAC-LC, Opus, FLAC, and MP3 decoded to CPU PCM, and AVC, HEVC, VP8, VP9, and AV1 decoded to video frames.
 The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264 and HEVC. Codec sessions do not
 demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
@@ -134,6 +134,28 @@ level. The browser and the installed decoder determine which configurations can 
 Android and Web can also request platform frame storage for compatible decoder configurations.
 Matroska/WebM packet copy and seek use the shared C++ container implementation on all six platforms.
 [Container format mappings](media-container.md#supported-combinations)
+
+### AV1
+
+Set `VideoDecoderConfig::codec` to `CodecId::Av1`. Pass the AV1 configuration record from the sample description
+and submit one low-overhead temporal unit per packet. A marked key packet carries its sequence header before a
+displayed key frame. Sequence headers may repeat within the temporal unit. Each temporal unit can present at most
+one picture. Hidden frames update decoder references.
+The decoder supports one spatial layer, eight-bit SDR Main 4:2:0, and CPU NV12 or I420 output.
+Use `Probe()` with the actual configuration.
+
+| Platform | Decoder |
+| --- | --- |
+| Android | MediaCodec `video/av01` with the configuration record as codec-specific data |
+| iOS and macOS | Independent VideoToolbox adapters with `av1C` and hardware capability checks |
+| Windows | Installed synchronous Media Foundation transform for `AV01` |
+| Linux | GStreamer `av1parse` and an installed compatible decoder |
+| Web | WebCodecs `av01` with the record's level and tier and in-band sequence headers |
+
+The Chrome WASM preview test opens AV1 WebM, MKV, and MP4 copies, plays them, and seeks backward and forward.
+The Android and iOS adapters build with the SDK. The macOS test host reported AV1 hardware unavailable and ran
+container seek and copy checks. Windows and Linux runtime support depends on the installed decoder.
+[AV1 in MP4](https://aomediacodec.github.io/av1-isobmff/) · [WebCodecs AV1 registration](https://www.w3.org/TR/webcodecs-av1-codec-registration/)
 
 ### Opus, FLAC, and MP3
 

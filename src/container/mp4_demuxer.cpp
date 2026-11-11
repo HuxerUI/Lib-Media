@@ -690,8 +690,8 @@ private:
   SeekPoint SeekSample(std::size_t index, const TrackIndex& track, const Anchor& anchor, std::uint32_t decode) {
     const auto& sample = track.samples[anchor.sample];
     const auto& description = tracks[index].descriptions[sample.description - 1];
-    auto kind = description.framing == PacketFraming::LengthPrefixedNals ? SeekPoint::Kind::SyncMarked
-                                                                        : SeekPoint::Kind::Independent;
+    auto kind = description.framing == PacketFraming::LengthPrefixedNals || description.codec == CodecId::Av1
+        ? SeekPoint::Kind::SyncMarked : SeekPoint::Kind::Independent;
     const bool avc = description.codec == CodecId::H264;
     const bool hvc1 = description.codec == CodecId::Hevc && description.sample_entry == "hvc1";
     if ((avc || hvc1) && input.Random()) {
@@ -919,6 +919,10 @@ private:
         track.sample_entry = EntryName(entry.tag);
         config = Child(extensions, "hvcC", true, mov_visual);
         HevcNalLength(config, entry.tag == Tag("hvc1"), Invalid);
+      } else if (entry.tag == Tag("av01") && format == ContainerFormat::Mp4) {
+        track.codec = CodecId::Av1;
+        config = Child(extensions, "av1C", true);
+        ValidateAv1Configuration(config, Invalid);
       } else if (format == ContainerFormat::Mov && ProResEntry(entry.tag)) {
         track.codec = CodecId::ProRes;
         track.sample_entry = EntryName(entry.tag);
@@ -926,7 +930,7 @@ private:
         Fail(Unsupported, "Unsupported MP4 or QuickTime video sample entry");
       }
       if (!config.empty()) {
-        track.framing = PacketFraming::LengthPrefixedNals;
+        if (track.codec != CodecId::Av1) track.framing = PacketFraming::LengthPrefixedNals;
         track.initialization_data.assign(config.begin(), config.end());
       }
       ReadVisualMetadata(extensions, track, mov_visual);

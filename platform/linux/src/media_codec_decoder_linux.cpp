@@ -116,6 +116,11 @@ public:
       if (video.codec == CodecId::Vp8 || video.codec == CodecId::Vp9) {
         input = gst_caps_new_empty_simple(video.codec == CodecId::Vp8 ? "video/x-vp8" : "video/x-vp9");
         headers_ok = true;
+      } else if (video.codec == CodecId::Av1) {
+        parser_name = "av1parse";
+        input = gst_caps_new_simple("video/x-av1", "stream-format", G_TYPE_STRING, "obu-stream",
+            "alignment", G_TYPE_STRING, "tu", nullptr);
+        headers_ok = true;
       } else {
         parser_name = hevc ? "h265parse" : "h264parse";
         input = gst_caps_new_simple(hevc ? "video/x-h265" : "video/x-h264", "stream-format", G_TYPE_STRING,

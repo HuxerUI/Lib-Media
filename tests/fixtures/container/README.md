@@ -14,6 +14,13 @@ FFmpeg is a fixture-generation and interoperability tool for these tests.
 - `preview-vp9-opus-no-cues.webm` carries 18 profile 0 VP9 pictures at 320x240 and 72000 audible Opus
   samples. FFmpeg 9.0 wrote it through a pipe with no Cues or declared duration. Its last Opus Block
   carries both the rounded audible BlockDuration and 648 samples of discard padding.
+- `preview-av1.webm`, `preview-av1.mkv`, and `preview-av1.mp4` contain the same 24 Main 8-bit AV1 pictures at
+  320x240 and 15 fps. FFmpeg 9.0 encoded the test pattern with `libaom-av1`, CRF 40, a key interval of eight,
+  and eight frames of lookahead. The audio is a 600 Hz mono tone at 48 kHz in Opus for EBML and AAC-LC for MP4.
+  The MP4 repeats the sequence header in the second sync sample to exercise seek and copy with a valid repeated header.
+  The MKV additionally has two SubRip captions in an English default/forced track, two titled chapters,
+  global and track tags, and a text attachment. The preview test seeks across GOPs and checks all packet bytes,
+  timing, and retained MKV metadata after copy.
 - `webm-opus.webm` carries 247200 audible mono samples at 48 kHz with frequent Cues for testing preroll across
   Cluster boundaries. Its 258 coded packets each represent 960 samples, with 312 initial and 168 trailing samples trimmed.
 
