@@ -237,7 +237,7 @@ public:
       Require(input->SetGUID(MF_MT_SUBTYPE, ten_bit ? MFVideoFormat_P010 : MFVideoFormat_NV12), "Cannot select video input layout");
       if (!device_) Require(input->SetUINT32(MF_MT_DEFAULT_STRIDE, row), "Cannot set YUV stride");
       Require(encoder_->SetInputType(input_stream_, input.Get(), 0), "Video encoder rejected its input format", CodecErrorCode::Unsupported);
-      VerifyOutputControls();
+      VerifyOutputProfile();
       Require(encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0), "Cannot begin video encoding");
       streaming_ = true;
       Require(encoder_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0), "Cannot start video encoding");
@@ -416,14 +416,13 @@ private:
         config_.profile == H264Profile::Main ? eAVEncH264VProfile_Main : eAVEncH264VProfile_High;
   }
 
-  void VerifyOutputControls() {
+  void VerifyOutputProfile() {
     ComPtr<IMFMediaType> actual;
     Require(encoder_->GetOutputCurrentType(output_stream_, &actual), "Cannot query video output configuration");
-    UINT32 bitrate = 0, profile = 0;
-    Require(actual->GetUINT32(MF_MT_AVG_BITRATE, &bitrate), "Video bitrate is missing");
+    UINT32 profile = 0;
     Require(actual->GetUINT32(MF_MT_MPEG2_PROFILE, &profile), "Video profile is missing");
-    if (bitrate != config_.bitrate || profile != OutputProfile())
-      throw EncoderFailure{Error(CodecErrorCode::Unsupported, "Video encoder changed requested controls")};
+    if (profile != OutputProfile())
+      throw EncoderFailure{Error(CodecErrorCode::Unsupported, "Video encoder changed the requested profile")};
   }
 
   void RenegotiateAvcOutput() {
@@ -441,7 +440,7 @@ private:
         continue;
       SetColor(type.Get(), config_.input);
       Require(encoder_->SetOutputType(output_stream_, type.Get(), 0), "Cannot set updated hardware encoder output type");
-      VerifyOutputControls();
+      VerifyOutputProfile();
       return;
     }
   }

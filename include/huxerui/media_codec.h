@@ -366,7 +366,7 @@ struct VideoEncoderConfig {
   std::uint32_t frame_rate_numerator = 30;
   /// Positive denominator; 30000/1001 represents approximately 29.97 frames/second. The ratio cannot exceed 240 fps.
   std::uint32_t frame_rate_denominator = 1;
-  /// Positive target average bits per second, at most INT32_MAX. This is not a per-packet size guarantee.
+  /// Target average bitrate in bits per second, in [1, INT32_MAX]. The encoder may adjust the target.
   std::uint32_t bitrate = 4'000'000;
   /// Requested H.264 profile. HEVC derives its profile from input.pixel_format.
   H264Profile profile = H264Profile::High;

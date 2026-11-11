@@ -401,14 +401,11 @@ private:
     auto* format = AMediaCodec_getOutputFormat(codec_);
     if (!format) return R::Failure(Error(CodecErrorCode::InvalidData, "Android video output format is missing"));
     std::unique_ptr<AMediaFormat, decltype(&AMediaFormat_delete)> owner(format, AMediaFormat_delete);
-    std::int32_t actual = 0;
-    if (AMediaFormat_getInt32(format, "bitrate", &actual) && actual != std::int32_t(config_.bitrate))
-      return R::Failure(Error(CodecErrorCode::Unsupported, "Android changed the requested video bitrate",
-          std::to_string(config_.bitrate) + " to " + std::to_string(actual)));
-    if (config_.max_b_frames && AMediaFormat_getInt32(format, "output-reorder-depth", &actual) &&
-        (actual < 0 || std::uint32_t(actual) > *config_.max_b_frames))
+    std::int32_t reorder_depth = 0;
+    if (config_.max_b_frames && AMediaFormat_getInt32(format, "output-reorder-depth", &reorder_depth) &&
+        (reorder_depth < 0 || std::uint32_t(reorder_depth) > *config_.max_b_frames))
       return R::Failure(Error(CodecErrorCode::Unsupported, "Android changed the requested video reorder depth",
-          std::to_string(actual)));
+          std::to_string(reorder_depth)));
     Bytes description;
     for (const char* key : {"csd-0", "csd-1", "csd-2"}) {
       void* data = nullptr; std::size_t size = 0;

@@ -53,6 +53,15 @@ async function run() {
     env.api.close(id);
   }
   {
+    const env = environment(), id = env.api.open(options);
+    const probe = env.probes.shift();
+    probe.resolve({supported: true, config: {...probe.config, bitrate: 2400000}});
+    await turn();
+    assert.equal(env.api.ready(id), true);
+    assert.equal(env.encoders[0].config.bitrate, options.bitrate);
+    env.api.close(id);
+  }
+  {
     const env = environment(), id = await ready(env, {...options, layout: 'Opaque'});
     const source = {timestamp: 123, copyTo() { throw new Error('Unexpected pixel readback'); }};
     assert.equal(env.api.submit(id, source, 0, 33367), true);

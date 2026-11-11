@@ -1,5 +1,6 @@
 #include "codec/encoder/backend.h"
 
+#include <algorithm>
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 #include <gst/audio/audio.h>
@@ -194,8 +195,6 @@ public:
     config_ = config; config_.wakeup = {}; config_.cleanup_completed = {};
     const bool hevc = config.codec == CodecId::Hevc;
     const bool ten_bit = config.input.pixel_format == VideoPixelFormat::P010;
-    if (config.bitrate % 1000)
-      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "GStreamer video encoder bitrate must be an integral number of kbit/s"));
     if (config.frame_rate_numerator > INT32_MAX || config.frame_rate_denominator > INT32_MAX)
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "GStreamer frame-rate components exceed signed integer range"));
     GError* error = nullptr;
@@ -210,11 +209,14 @@ public:
     encoder_ = gst_element_factory_make(hevc ? "x265enc" : "x264enc", nullptr);
     auto* parser = gst_element_factory_make(hevc ? "h265parse" : "h264parse", nullptr);
     auto* convert = hevc ? gst_element_factory_make("videoconvert", nullptr) : nullptr;
-    if (!pipeline_ || !source_ || !sink_ || !encoder_ || !parser || (hevc && !convert)) {
+    auto* bitrate_property = encoder_ ? g_object_class_find_property(G_OBJECT_GET_CLASS(encoder_), "bitrate") : nullptr;
+    if (!pipeline_ || !source_ || !sink_ || !parser || (hevc && !convert) || !G_IS_PARAM_SPEC_UINT(bitrate_property)) {
       for (auto* element : {source_, sink_, encoder_, parser, convert}) if (element) gst_object_unref(element);
       source_ = sink_ = encoder_ = nullptr;
-      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Required GStreamer video encoder, parser, or converter is missing"));
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Required GStreamer video elements or bitrate control are unavailable"));
     }
+    const auto* bitrate_range = G_PARAM_SPEC_UINT(bitrate_property);
+    const auto target_kbps = std::clamp(guint((config.bitrate + 500u) / 1000u), bitrate_range->minimum, bitrate_range->maximum);
     const auto window = VideoEncoderWindow(config);
     row_bytes_ = config.input.width * (ten_bit ? 2 : 1);
     frame_bytes_ = std::size_t(row_bytes_) * config.input.height * 3 / 2;
@@ -223,21 +225,20 @@ public:
     g_object_set(sink_, "sync", FALSE, "max-buffers", guint(1), "drop", FALSE,
         "enable-last-sample", FALSE, "wait-on-eos", FALSE, nullptr);
     const auto bframes = VideoEncoderBFrames(config);
-    guint actual_bframes = bframes, bitrate = 0;
+    guint actual_bframes = bframes;
     if (hevc) {
       gst_util_set_object_arg(G_OBJECT(encoder_), "speed-preset", "ultrafast");
       gst_util_set_object_arg(G_OBJECT(encoder_), "tune", "zerolatency");
       const auto options = "open-gop=0:scenecut=0:frame-threads=1:bframes=" + std::to_string(bframes);
-      g_object_set(encoder_, "bitrate", guint(config.bitrate / 1000), "key-int-max", gint(config.key_frame_interval),
-          "option-string", options.c_str(), nullptr);
+      g_object_set(encoder_, "key-int-max", gint(config.key_frame_interval), "option-string", options.c_str(), nullptr);
     } else {
-      g_object_set(encoder_, "speed-preset", 3, "bitrate", guint(config.bitrate / 1000), "bframes", guint(bframes),
+      g_object_set(encoder_, "speed-preset", 3, "bframes", guint(bframes),
           "b-adapt", TRUE, "rc-lookahead", 0, "sync-lookahead", 0, "threads", guint(1),
           "key-int-max", guint(config.key_frame_interval), "byte-stream", FALSE,
           "cabac", config.profile != H264Profile::Baseline, "dct8x8", config.profile == H264Profile::High, nullptr);
       g_object_get(encoder_, "bframes", &actual_bframes, nullptr);
     }
-    g_object_get(encoder_, "bitrate", &bitrate, nullptr);
+    g_object_set(encoder_, "bitrate", target_kbps, nullptr);
     auto* input = gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, ten_bit ? "P010_10LE" : "NV12",
         "width", G_TYPE_INT, gint(config.input.width), "height", G_TYPE_INT, gint(config.input.height),
         "framerate", GST_TYPE_FRACTION, gint(config.frame_rate_numerator), gint(config.frame_rate_denominator),
@@ -273,7 +274,7 @@ public:
     } else {
       linked = gst_element_link_many(source_, encoder_, parser, sink_, nullptr);
     }
-    if (actual_bframes != bframes || bitrate != config.bitrate / 1000 || !linked)
+    if (actual_bframes != bframes || !linked)
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "GStreamer rejected video encoder controls"));
     bus_ = gst_element_get_bus(pipeline_);
     if (gst_element_set_state(pipeline_, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)

@@ -212,7 +212,7 @@
           if (!state.active) return;
           if (!support.supported || support.config.codec.toLowerCase() !== config.codec.toLowerCase() ||
               support.config.width !== config.width || support.config.height !== config.height ||
-              support.config.bitrate !== config.bitrate || support.config.latencyMode !== 'quality' ||
+              support.config.latencyMode !== 'quality' ||
               (options.hevc ? (support.config.hevc?.format ?? 'hevc') !== 'hevc' : support.config.avc?.format !== 'avc'))
             throw new Error('WebCodecs does not support the requested video configuration');
           if (options.layout === 'P010') {

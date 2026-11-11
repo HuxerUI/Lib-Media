@@ -337,6 +337,8 @@ Choose `H264Profile::Baseline`, `Main`, or `High`; the default is High. Profile 
 The expected frame rate is a positive rational at most 240 fps and guides compression/rate control. PTS and supplied
 positive duration remain authoritative, including variable frame intervals. PTS must increase strictly both as exact
 rational time and after microsecond rounding. Use a new session to change geometry, profile, bitrate, or color metadata.
+`bitrate` sets the target average in bits per second. The encoder may adjust the target. On Linux, the library
+converts the target to the nearest whole kbit/s within the GStreamer encoder's property range.
 `key_frame_interval` is a target distance in pictures. `RequestKeyFrame()` coalesces requests for a future IDR; it does
 not identify a specific input picture. Packet `key_frame` is derived from actual IDR syntax.
 
@@ -370,8 +372,8 @@ fails with `ResourceExhausted`. Platform codec allocations and bounded conversio
 | Platform | Backend and controls | Validation |
 | --- | --- | --- |
 | Windows | System synchronous H.264 MFT; Baseline/Main/High, numeric B bounds 0..2 and Auto | Native round trips, real B reordering, requested IDR, variable PTS, crop, padded input and cleanup on Windows 11 |
-| Linux | GStreamer `x264enc` + `h264parse`; Baseline/Main/High, numeric B bounds 0..16 and Auto; bitrate must be integral kbit/s | Headless native round trips and shared contracts on Ubuntu 24.04/WSL; no GTK initialization |
-| Android | NDK MediaCodec API 28+; Main/High numeric B bounds require API 29+, with codec confirmation for positive bounds; interpretable packed I420/NV12 input only | Baseline software fallback and MP4 export verified on Android 12; broader hardware validation pending |
+| Linux | GStreamer `x264enc` + `h264parse`; Baseline/Main/High, numeric B bounds 0..16 and Auto | Headless native round trips and shared contracts on Ubuntu 24.04/WSL; no GTK initialization |
+| Android | NDK MediaCodec API 28+; Main/High numeric B bounds require API 29+, with codec confirmation for positive bounds; interpretable packed I420/NV12 CPU input or Surface input | Baseline software fallback, Surface recording with 4 Mbps negotiated to 4.8 Mbps, and MP4 readback on Android 12 (TAS-AN00) |
 | iOS | Independent VideoToolbox implementation; zero or Auto B pictures; positive numeric bounds return `Unsupported` | Build/device validation pending |
 | macOS | Independent VideoToolbox implementation with the same B-policy limitation | Native H.264 round trips and two-slot output regression on Apple Silicon |
 | Web | WebCodecs quality mode; Baseline with zero/Auto, Main/High with Auto only | Chrome C++/WASM Baseline/Main/High round trips and Node bridge contracts |

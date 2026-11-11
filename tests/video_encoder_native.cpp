@@ -589,6 +589,7 @@ int main(int argc, char** argv) {
     for (auto count : {0u, 1u, 2u}) Encode(Config(H264Profile::High, 0), count);
     for (auto profile : {H264Profile::Baseline, H264Profile::Main, H264Profile::High}) {
       auto config = Config(profile, 0);
+      config.bitrate = 4'000'123;
       auto encoded = Encode(config, 20, true); Decode(encoded, config);
     }
     for (auto profile : {H264Profile::Main, H264Profile::High}) for (auto bframes : {1u, 2u}) {

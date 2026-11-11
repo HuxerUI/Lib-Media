@@ -205,14 +205,6 @@ public:
         Property(kVTCompressionPropertyKey_TransferFunction, Transfer(config.input.transfer));
       if (config.input.matrix != ColorMatrix::Unknown)
         Property(kVTCompressionPropertyKey_YCbCrMatrix, Matrix(config.input.matrix));
-      CFTypeRef actual = nullptr;
-      VideoStatus(VTSessionCopyProperty(session_, kVTCompressionPropertyKey_AverageBitRate, kCFAllocatorDefault, &actual),
-          "Cannot verify video bitrate", CodecErrorCode::Unsupported);
-      std::int64_t bitrate = 0;
-      const bool matches = actual && CFGetTypeID(actual) == CFNumberGetTypeID() &&
-          CFNumberGetValue(static_cast<CFNumberRef>(actual), kCFNumberSInt64Type, &bitrate) && bitrate == config.bitrate;
-      if (actual) CFRelease(actual);
-      if (!matches) throw VideoToolboxFailure{Error(CodecErrorCode::Unsupported, "VideoToolbox changed the requested bitrate")};
       VideoStatus(VTCompressionSessionPrepareToEncodeFrames(session_), "Cannot prepare video compression", CodecErrorCode::Unsupported);
       if (config.input_storage == VideoStorage::Cpu)
         scratch_.resize(std::size_t(config.input.width) * config.input.height * (ten_bit ? 6 : 3) / 2);
