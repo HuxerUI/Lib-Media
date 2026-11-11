@@ -92,7 +92,7 @@
         ? {codec: config.codec || 'mp4a.40.2', sampleRate: config.rate, numberOfChannels: config.channels,
            ...(description.length ? {description} : {})}
         : {codec: config.codec || 'avc1.' + Array.from(description.slice(1, 4), x => x.toString(16).padStart(2, '0')).join(''),
-           codedWidth: config.width, codedHeight: config.height, description};
+           codedWidth: config.width, codedHeight: config.height, ...(description.length ? {description} : {})};
       Type.isConfigSupported(codecConfig).then(support => {
         if (!state.active) return;
         if (!support.supported) throw new Error('WebCodecs does not support this configuration');
@@ -104,6 +104,7 @@
     },
     ready(id) { const s = sessions.get(id); return s && s.ready; },
     error(id) { return sessions.get(id)?.error || ''; },
+    queued(id) { return sessions.get(id).decoder.decodeQueueSize; },
     submit(id, bytes, pts, duration, key) {
       const state = sessions.get(id);
       try {

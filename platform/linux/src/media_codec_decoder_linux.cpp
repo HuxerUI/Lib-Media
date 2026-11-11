@@ -63,14 +63,13 @@ public:
     }
     const auto* audio = std::get_if<AudioDecoderConfig>(&config_);
     GstCaps* input;
-    const char* parser_name = "h264parse";
+    const char* parser_name = nullptr;
     bool headers_ok;
     std::optional<HevcSequence> sequence;
     if (audio) {
       audio_sample_limit_ = AudioSampleLimit(*audio).Value();
       const auto rate = int(audio->output.sample_rate), channels = int(audio->output.ChannelCount());
       const auto header = AudioDecoderHeader(*audio);
-      parser_name = nullptr;
       switch (audio->codec) {
         case CodecId::Aac:
           parser_name = "aacparse";
@@ -104,7 +103,6 @@ public:
       const auto& video = std::get<VideoDecoderConfig>(config_);
       const bool hevc = video.codec == CodecId::Hevc;
       if (hevc) {
-        parser_name = "h265parse";
         try {
           const auto description = ParseHevcConfiguration(video.initialization_data, true, true);
           const auto sps = std::ranges::find_if(description.parameters, [](const auto& nal) { return HevcNalType(nal) == 33; });
@@ -115,9 +113,15 @@ public:
         if (sequence->visible_width > video.width || sequence->visible_height > video.height)
           return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "HEVC picture exceeds the GStreamer decoder bounds"));
       }
-      input = gst_caps_new_simple(hevc ? "video/x-h265" : "video/x-h264", "stream-format", G_TYPE_STRING,
-          hevc ? "hvc1" : "avc", "alignment", G_TYPE_STRING, "au", nullptr);
-      headers_ok = SetDescription(input, video.initialization_data, false);
+      if (video.codec == CodecId::Vp8 || video.codec == CodecId::Vp9) {
+        input = gst_caps_new_empty_simple(video.codec == CodecId::Vp8 ? "video/x-vp8" : "video/x-vp9");
+        headers_ok = true;
+      } else {
+        parser_name = hevc ? "h265parse" : "h264parse";
+        input = gst_caps_new_simple(hevc ? "video/x-h265" : "video/x-h264", "stream-format", G_TYPE_STRING,
+            hevc ? "hvc1" : "avc", "alignment", G_TYPE_STRING, "au", nullptr);
+        headers_ok = SetDescription(input, video.initialization_data, false);
+      }
     }
     if (!headers_ok) {
       gst_caps_unref(input);

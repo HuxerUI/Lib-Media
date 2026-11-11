@@ -15,6 +15,9 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#ifdef __ANDROID__
+#include <media/NdkMediaCodec.h>
+#endif
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
@@ -22,6 +25,26 @@
 using namespace huxerui;
 using namespace huxerui::media;
 using namespace std::chrono_literals;
+
+#ifdef __ANDROID__
+namespace {
+std::optional<std::atomic<int>> pending_codecs;
+}
+
+extern "C" AMediaCodec* __real_AMediaCodec_createDecoderByType(const char* mime);
+extern "C" AMediaCodec* __wrap_AMediaCodec_createDecoderByType(const char* mime) {
+  auto* decoder = __real_AMediaCodec_createDecoderByType(mime);
+  if (decoder && pending_codecs) ++*pending_codecs;
+  return decoder;
+}
+
+extern "C" media_status_t __real_AMediaCodec_delete(AMediaCodec* codec);
+extern "C" media_status_t __wrap_AMediaCodec_delete(AMediaCodec* codec) {
+  const auto status = __real_AMediaCodec_delete(codec);
+  if (pending_codecs) --*pending_codecs;
+  return status;
+}
+#endif
 
 namespace {
 
@@ -121,6 +144,7 @@ struct Observations {
   float duration = 0;
   unsigned epoch = 0;
   bool paused = false;
+  bool retain_first_publication = false;
 };
 
 TaskHandle Play(const TaskScope& tasks, std::shared_ptr<const File> file, Observations& seen, std::exception_ptr& error,
@@ -132,7 +156,7 @@ TaskHandle Play(const TaskScope& tasks, std::shared_ptr<const File> file, Observ
           .reset_video = [&](Size size, const std::shared_ptr<ExternalTexture>& surface) {
             if (storage == VideoStorage::Platform) texture = surface ? surface : media_preview::MakeFrameTexture(size, storage);
             seen.size = size;
-            seen.first_frame.reset();
+            if (!seen.retain_first_publication) seen.first_frame.reset();
             ++seen.epoch;
           },
           .publish = [&](const VideoFrame& frame) {
@@ -285,12 +309,14 @@ void CheckCopy(const File& source, const File& output, ContainerFormat format) {
   const auto original = open(source);
   const auto copy = open(output);
   Check(copy.Format() == format && copy.Tracks().size() == original.Tracks().size(), "Packet copy changed the track set");
+  Check(copy.EbmlTimestampScale() == original.EbmlTimestampScale(), "Packet copy changed the EBML Segment tick");
   for (const auto& track : original.Tracks()) {
     const auto found = std::ranges::find(copy.Tracks(), track.id, &MediaTrack::id);
     Check(found != copy.Tracks().end() && found->rotation == track.rotation &&
           found->edits == track.edits && found->references == track.references &&
           copy.PresentationRange(track.id) == original.PresentationRange(track.id) &&
-          found->priming_samples == track.priming_samples && found->padding_samples == track.padding_samples,
+          found->priming_samples == track.priming_samples && found->padding_samples == track.padding_samples &&
+          found->seek_preroll == track.seek_preroll && found->default_duration == track.default_duration,
           "Packet copy changed the track or its presentation metadata");
     const auto& descriptions = track.descriptions;
     const auto& copied = found->descriptions;
@@ -308,11 +334,8 @@ void CheckCopy(const File& source, const File& output, ContainerFormat format) {
     Require(after.SelectTracks(std::span(&track.id, 1)));
     while (const auto expected = ReadPacket(before)) {
       const auto actual = ReadPacket(after);
-      const bool duration_matches = actual && (actual->duration == expected->duration ||
-          (format == ContainerFormat::WebM && actual->duration && expected->duration &&
-           std::abs(media_preview::Ticks(*actual->duration, 1000000) - media_preview::Ticks(*expected->duration, 1000000)) <= 1000));
       Check(actual && actual->track_id == expected->track_id && actual->pts == expected->pts &&
-            actual->dts == expected->dts && duration_matches && actual->discard_padding == expected->discard_padding &&
+            actual->dts == expected->dts && actual->duration == expected->duration && actual->discard_padding == expected->discard_padding &&
             actual->sync_sample == expected->sync_sample &&
             actual->sample_description_index == expected->sample_description_index &&
             std::ranges::equal(actual->data.AsBytes(), expected->data.AsBytes()), "Packet copy changed access units or timing");
@@ -552,33 +575,62 @@ VideoDecoderConfig VideoFixtureConfig(const MediaSampleDescription& track, Video
       .height = *track.coded_height, .output = output, .codec = track.codec, .output_storage = storage};
 }
 
-#if defined(__APPLE__) && TARGET_OS_OSX
-void CheckNoCuesPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
-  const auto input = Fixture("preview-vp9-opus-no-cues.webm");
-  const auto copy = RunMovieExport(tasks, ui, temporary, input, ContainerFormat::WebM);
-  CheckCopy(*input, *copy, ContainerFormat::WebM);
-  auto source = media_preview::Open(*input);
+void CheckVpxPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary,
+                     const std::shared_ptr<const File>& input) {
+  const auto matroska = RunMovieExport(tasks, ui, temporary, input, ContainerFormat::Matroska);
+  CheckCopy(*input, *matroska, ContainerFormat::Matroska);
+  const auto webm = RunMovieExport(tasks, ui, temporary, matroska, ContainerFormat::WebM);
+  CheckCopy(*input, *webm, ContainerFormat::WebM);
+  const auto source = media_preview::Open(*input);
   const auto config = VideoFixtureConfig(source.Tracks().front().descriptions.front(), VideoPixelFormat::NV12, VideoStorage::Cpu);
-  if (!CodecAvailable(ui, config, VideoDecoder::Probe, "VP9 profile 0 decoder")) return;
+  const bool vp8 = config.codec == CodecId::Vp8;
+  const auto* codec = vp8 ? "VP8" : "VP9 profile 0";
+  if (!CodecAvailable(ui, config, VideoDecoder::Probe, codec)) return;
+  const AudioDecoderConfig audio{.initialization_data = source.Tracks().back().descriptions.front().initialization_data,
+      .output = media_preview::PlaybackFormat(source.Tracks().back().descriptions.front()), .codec = CodecId::Opus};
+  if (!CodecAvailable(ui, audio, AudioDecoder::Probe, "Opus decoder")) return;
   Observations seen;
   std::exception_ptr failure;
-  const auto playing = Play(tasks, input, seen, failure);
+  const auto playing = Play(tasks, vp8 ? matroska : input, seen, failure);
   Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.15F; },
-        "VP9/Opus preview did not start on a WebM without Cues");
-  for (const float target : {1.11F, 0.18F, 0.78F}) {
+        "VP8/VP9 and Opus preview did not start");
+  for (const float target : {0.93F, 0.18F, 0.78F}) {
     const auto epoch = seen.epoch;
     seen.seek = target;
     Until(ui, failure, [&] { return seen.epoch > epoch && seen.first_frame && seen.position > target + 0.02F; },
-          "VP9/Opus playback did not resume after seeking without Cues");
+          "VP8/VP9 and Opus playback did not resume after seeking");
     Check(media_preview::Seconds(*seen.first_frame) >= target - 0.001F &&
           media_preview::Seconds(*seen.first_frame) < target + 0.1F,
-          "VP9 seek published a picture outside the target frame interval");
+          "VP8/VP9 seek published a picture outside the target frame interval");
   }
   playing.Cancel();
   ui.Pump();
-  std::cout << "VP9/Opus WebM without Cues passed preview, repeated seek, and packet-copy readback\n";
+  std::cout << codec << " and Opus passed preview, repeated seek, and WebM/MKV packet-copy readback\n";
 }
-#endif
+
+void CheckMatroskaHevcPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+  const auto input = Fixture("mkv-hevc-aac.mkv");
+  const auto copy = RunMovieExport(tasks, ui, temporary, input, ContainerFormat::Matroska);
+  CheckCopy(*input, *copy, ContainerFormat::Matroska);
+  const auto source = media_preview::Open(*input);
+  const auto config = VideoFixtureConfig(source.Tracks().front().descriptions.front(), VideoPixelFormat::NV12, VideoStorage::Cpu);
+  if (!CodecAvailable(ui, config, VideoDecoder::Probe, "Matroska HEVC preview decoder")) return;
+  Observations seen;
+  std::exception_ptr failure;
+  const auto playing = Play(tasks, copy, seen, failure);
+  Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.07F; }, "Matroska HEVC preview did not start");
+  for (const auto target : {0.25F, 0.08F}) {
+    const auto epoch = seen.epoch;
+    seen.seek = target;
+    Until(ui, failure, [&] { return seen.epoch > epoch && seen.first_frame && seen.position > target + 0.02F; },
+          "Matroska HEVC preview did not resume after seeking");
+    const auto pts = media_preview::Seconds(*seen.first_frame);
+    Check(pts >= target - 0.001F && pts < target + 0.1F, "Matroska HEVC seek displayed the wrong picture");
+  }
+  playing.Cancel();
+  ui.Pump();
+  std::cout << "Matroska HEVC passed preview, repeated seek, and packet-copy readback\n";
+}
 
 void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
@@ -760,9 +812,27 @@ int main(int argc, char** argv) {
     });
     testing::UiTest ui(app);
     const File temporary(std::filesystem::temp_directory_path().u8string());
-#if defined(__APPLE__) && TARGET_OS_OSX
-    CheckNoCuesPreview(tasks, ui, temporary);
+#ifndef __EMSCRIPTEN__
+    const bool vpx_only = argc == 3 && std::string_view(argv[1]) == "--vpx";
+    const File fixtures(vpx_only ? argv[2] : MEDIA_FIXTURES);
+#ifdef __ANDROID__
+    if (vpx_only) pending_codecs.emplace(0);
 #endif
+#else
+    const File fixtures(MEDIA_FIXTURES);
+#endif
+    for (const auto* name : {"webm-vp8-opus.webm", "preview-vp9-opus-no-cues.webm"})
+      CheckVpxPreview(tasks, ui, temporary, std::make_shared<const File>(fixtures.Child(name)));
+#ifndef __EMSCRIPTEN__
+    if (vpx_only) {
+#ifdef __ANDROID__
+      // Wait for decoder teardown before the headless process exits.
+      Until(ui, {}, [] { return pending_codecs->load() == 0; }, "Android preview decoder cleanup did not complete");
+#endif
+      return 0;
+    }
+#endif
+    CheckMatroskaHevcPreview(tasks, ui, temporary);
     CheckAudioCopy(tasks, ui, temporary, "tagged-mp3.mp3");
     CheckAudioCopy(tasks, ui, temporary, "tagged-aac.m4a");
     CheckAudioCopy(tasks, ui, temporary, "fragmented-aac.m4a");
@@ -862,7 +932,8 @@ int main(int argc, char** argv) {
           short_audio->edits.back().duration == MediaTimestamp{OriginalSamples, 48000} &&
           short_input.PresentationRange(short_audio->id) == MediaPresentationRange{{0, 1}, {shortened_samples, 48000}},
           "AAC presentation range extended past the shortened final packet");
-    seen = {};
+    // The audio clock can pass the short edit before the test observes the cleared preview.
+    seen = {.retain_first_publication = true};
     preview = Play(tasks, first_picture, seen, failure);
     Until(ui, failure, [&] { return seen.first_frame.has_value(); }, "The edit inside the first picture displayed nothing");
     Check(seen.first_frame == first_picture_edit.start && seen.first_duration == MediaTimestamp{1, 50},

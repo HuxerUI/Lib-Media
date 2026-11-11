@@ -1170,12 +1170,33 @@ void QuickTimeMetadata(const fs::path& path) {
   Check(pictures == expected.size() && metadata_samples == 1, "MOV copy lost media or metadata samples");
 }
 
+void WriteEbmlPackets(MediaMuxer& output, std::span<const MediaTrack> tracks,
+                      const std::vector<std::vector<ContainerPacket>>& packets) {
+  std::vector<std::size_t> cursor(tracks.size());
+  std::size_t track = 0;
+  for (std::size_t attempts = 0; track < tracks.size();) {
+    Check(++attempts < 1000, "Matroska or WebM mux did not make progress");
+    const auto need = Take(output.TryWrite(packets[track][cursor[track]]));
+    if (need) {
+      Check(*need > 0 && *need <= tracks.size() && cursor[*need - 1] < packets[*need - 1].size(),
+            "Matroska mux requested a completed track");
+      track = *need - 1;
+    } else if (++cursor[track] == packets[track].size()) {
+      Take(output.EndTrack(tracks[track].id));
+      track = 0;
+      while (track < tracks.size() && cursor[track] == packets[track].size()) ++track;
+    }
+  }
+  Take(output.Finish());
+}
+
 void EbmlRoundTrip(const fs::path& destination, std::string_view fixture, ContainerFormat format,
                    CodecId video_codec = CodecId::Unknown) {
   namespace ebml = huxerui::media::detail::ebml;
   const auto source = Path(fs::path(MEDIA_FIXTURES) / "container" / fixture);
   auto input = Take(MediaDemuxer::Open(Take(source.OpenRandomAccess()), format));
   std::vector<MediaTrack> tracks(input.Tracks().begin(), input.Tracks().end());
+  const MediaMuxerOptions options{.ebml_timestamp_scale = input.EbmlTimestampScale()};
   const bool audio_only = video_codec == CodecId::Unknown;
   const bool webm = format == ContainerFormat::WebM;
   Check(input.Format() == format && tracks.size() == (audio_only ? 1u : 2u), "Wrong Matroska or WebM track count");
@@ -1230,44 +1251,30 @@ void EbmlRoundTrip(const fs::path& destination, std::string_view fixture, Contai
 
   Check(Take(MediaMuxer::ValidateOutput(format, tracks)) == MediaMuxer::OutputRequirement::SequentialWrite,
         "Matroska or WebM unexpectedly requires backpatching");
-  auto output = Take(MediaMuxer::Open(Take(Path(destination).OpenWrite()), format, tracks));
+  auto output = Take(MediaMuxer::Open(Take(Path(destination).OpenWrite()), format, tracks, options));
   if (audio_only) {
+    auto legacy = Take(MediaMuxer::Open(Take(Path(destination.string() + ".coarse").OpenWrite()), format, tracks));
     auto short_packet = packets.front().front();
     short_packet.duration = MediaTimestamp{10, 1000};
     short_packet.discard_padding = MediaTimestamp{15, 1000};
-    auto rejected = output.TryWrite(short_packet);
+    auto rejected = legacy.TryWrite(short_packet);
     Check(!rejected.Succeeded() && rejected.Error().code == ContainerErrorCode::InvalidArgument,
           "WebM accepted trim exceeding an explicit packet duration");
     short_packet.duration = MediaTimestamp{104, 10000};
     short_packet.discard_padding = MediaTimestamp{102, 10000};
-    rejected = output.TryWrite(short_packet);
+    rejected = legacy.TryWrite(short_packet);
     Check(!rejected.Succeeded() && rejected.Error().code == ContainerErrorCode::Unsupported,
           "WebM accepted trim exceeding the serialized BlockDuration");
     packets.front().front().discard_padding = MediaTimestamp{0, 1};
   }
-  std::vector<std::size_t> cursor(tracks.size());
-  std::size_t track = 0;
-  for (std::size_t attempts = 0; track < tracks.size();) {
-    Check(++attempts < 1000, "Matroska or WebM mux did not make progress");
-    const auto need = Take(output.TryWrite(packets[track][cursor[track]]));
-    if (need) {
-      Check(*need > 0 && *need <= tracks.size() && cursor[*need - 1] < packets[*need - 1].size(),
-            "Matroska mux requested a completed track");
-      track = *need - 1;
-    } else if (++cursor[track] == packets[track].size()) {
-      Take(output.EndTrack(tracks[track].id));
-      track = 0;
-      while (track < tracks.size() && cursor[track] == packets[track].size()) ++track;
-    }
-  }
-  Take(output.Finish());
+  WriteEbmlPackets(output, tracks, packets);
 
   auto readback = Take(MediaDemuxer::Open(Take(Path(destination).OpenRead()), format));
   Check(readback.Tracks().size() == tracks.size() &&
         readback.Tracks().front().descriptions.front().codec == tracks.front().descriptions.front().codec &&
         readback.Tracks().front().descriptions.front().initialization_data == tracks.front().descriptions.front().initialization_data,
         "Matroska or WebM output lost a track or changed its codec mapping");
-  std::fill(cursor.begin(), cursor.end(), 0);
+  std::vector<std::size_t> cursor(tracks.size());
   while (auto item = ReadPacket(readback)) {
     const auto& packet = *item;
     const auto index = packet.track_id - 1;
@@ -1293,11 +1300,10 @@ void EbmlRoundTrip(const fs::path& destination, std::string_view fixture, Contai
   Check(ReadPacket(seekable)->pts == expected, "Matroska Seek landed at the wrong Block");
 }
 
-void WebmWithoutCues() {
-  const auto file = Path(fs::path(MEDIA_FIXTURES) / "container" / "preview-vp9-opus-no-cues.webm");
+void EbmlWithoutCues(const File& file) {
   const auto bytes = Take(file.ReadBytes());
   constexpr std::array cues{std::byte{0x1c}, std::byte{0x53}, std::byte{0xbb}, std::byte{0x6b}};
-  Check(std::ranges::search(bytes, cues).empty(), "The WebM scan fixture contains Cues");
+  Check(std::ranges::search(bytes, cues).empty(), "The scan fixture contains Cues");
   auto sequential = Take(MediaDemuxer::Open(Take(file.OpenRead())));
   const auto tracks = sequential.Tracks();
   const auto video = tracks[0].id, audio = tracks[1].id;
@@ -1366,7 +1372,170 @@ void WebmWithoutCues() {
   }
 }
 
-void WebmCuePreroll(const fs::path& path) {
+void PreciseVpxCopy(const fs::path& directory, std::string_view codec) {
+  using namespace huxerui::media::detail::ebml;
+  const auto name = std::string(codec) + "-opus";
+  const auto fixture = Path(fs::path(MEDIA_FIXTURES) / "container" / ("webm-" + name + ".webm"));
+  auto source = Take(MediaDemuxer::Open(Take(fixture.OpenRead())));
+  std::vector<MediaTrack> tracks(source.Tracks().begin(), source.Tracks().end());
+  MediaMuxerOptions options{.ebml_timestamp_scale = std::chrono::nanoseconds{1}};
+  std::vector<std::vector<ContainerPacket>> packets(tracks.size());
+  while (auto packet = ReadPacket(source)) {
+    packet->pts = MediaTimestamp{ToNs(*packet->pts) + 123457, Nanoseconds};
+    packets.at(packet->track_id - 1).push_back(std::move(*packet));
+  }
+  auto& first_video = packets.front().front();
+  first_video.duration = MediaTimestamp{23456789, Nanoseconds};
+  for (const auto [format, suffix] : {std::pair{ContainerFormat::WebM, ".precise.webm"},
+                                    {ContainerFormat::Matroska, ".precise.mkv"},
+                                    {ContainerFormat::WebM, ".copied.webm"}}) {
+    const auto file = Path(directory / (name + suffix));
+    auto writer = Take(MediaMuxer::Open(Take(file.OpenWrite()), format, tracks, options));
+    WriteEbmlPackets(writer, tracks, packets);
+    auto reopened = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess()), format));
+    tracks.assign(reopened.Tracks().begin(), reopened.Tracks().end());
+    Check(reopened.EbmlTimestampScale() == options.ebml_timestamp_scale &&
+          !tracks.front().timescale && !tracks.back().timescale, "EBML readback confused the Segment and track clocks");
+    options.ebml_timestamp_scale = reopened.EbmlTimestampScale();
+    const auto anchor = Take(reopened.FindSeekPoint(first_video.track_id, *first_video.pts));
+    Check(anchor && anchor->presentation_time == first_video.pts, "Cues rounded the precise sync time");
+    std::vector<std::size_t> cursor(tracks.size());
+    while (auto packet = ReadPacket(reopened)) {
+      const auto track = packet->track_id - 1;
+      const auto& original = packets.at(track).at(cursor.at(track)++);
+      Compare(*packet, original);
+      Check(packet->discard_padding == original.discard_padding, "EBML copy changed packet trim on the precise clock");
+    }
+    for (std::size_t i = 0; i < cursor.size(); ++i)
+      Check(cursor[i] == packets[i].size(), "EBML copy lost packets on the precise clock");
+  }
+}
+
+void MatroskaClockSeparation(const fs::path& directory) {
+  using huxerui::media::detail::ebml::Nanoseconds;
+  auto video = Fixture(false, false);
+  video.track.default_duration = MediaTimestamp{33333333, Nanoseconds};
+  for (const auto tick : {1000000, 1001}) {
+    const auto name = std::to_string(tick);
+    const auto path = directory / ("negative-" + name + ".mkv");
+    auto sample = video.packets.front();
+    sample.pts = MediaTimestamp{-2 * tick, Nanoseconds};
+    sample.dts.reset();
+    sample.duration = video.track.default_duration;
+    auto writer = Take(MediaMuxer::Open(Output(path), ContainerFormat::Matroska, std::span(&video.track, 1),
+                                      {.ebml_timestamp_scale = std::chrono::nanoseconds{tick}}));
+    Check(!Take(writer.TryWrite(sample)), "Matroska rejected a single video packet");
+    Take(writer.Finish());
+    auto reader = Take(MediaDemuxer::Open(Take(Path(path).OpenRandomAccess())));
+    const auto scale = reader.EbmlTimestampScale();
+    Check(scale == std::chrono::nanoseconds{tick} && !reader.Tracks().front().timescale &&
+          reader.Tracks().front().default_duration == sample.duration, "Matroska mixed packet duration and Segment ticks");
+    const auto packet = ReadPacket(reader).value();
+    Compare(packet, sample);
+    const auto copied_path = directory / ("negative-copy-" + name + ".mkv");
+    auto copy = Take(MediaMuxer::Open(Output(copied_path), ContainerFormat::Matroska, reader.Tracks(),
+                                    {.ebml_timestamp_scale = scale}));
+    Check(!Take(copy.TryWrite(packet)), "Matroska could not copy its negative packet PTS");
+    Take(copy.Finish());
+    auto reopened = Take(MediaDemuxer::Open(Take(Path(copied_path).OpenRead())));
+    Check(reopened.EbmlTimestampScale() == scale, "Matroska copy changed the Segment scale");
+    Compare(ReadPacket(reopened).value(), sample);
+  }
+
+  auto audio = Fixture(true, false);
+  audio.track.id = 1;
+  auto sample = audio.packets.front();
+  sample.track_id = audio.track.id;
+  sample.pts = MediaTimestamp{0, 1};
+  sample.dts.reset();
+  sample.duration = MediaTimestamp{1024, 48000};
+  const auto source = directory / "sample-clock.mka";
+  auto writer = Take(MediaMuxer::Open(Output(source), ContainerFormat::Matroska, std::span(&audio.track, 1)));
+  Check(!Take(writer.TryWrite(sample)), "Matroska rejected a single AAC packet");
+  Take(writer.Finish());
+  auto reader = Take(MediaDemuxer::Open(Take(Path(source).OpenRead())));
+  Check(reader.EbmlTimestampScale() == std::chrono::milliseconds{1} && !reader.Tracks().front().timescale,
+        "Matroska exposed a Segment tick as the AAC media clock");
+  const auto packet = ReadPacket(reader).value();
+  Compare(packet, sample);
+  const auto target = directory / "sample-clock.m4a";
+  const auto invalid = MediaMuxer::ValidateOutput(ContainerFormat::Mp4, reader.Tracks(),
+                                                  {.ebml_timestamp_scale = reader.EbmlTimestampScale()});
+  Check(!invalid.Succeeded() && invalid.Error().code == ContainerErrorCode::Unsupported,
+        "MP4 accepted an EBML Segment clock");
+  const auto zero_tick = MediaMuxer::ValidateOutput(ContainerFormat::Matroska, reader.Tracks(),
+                                                    {.ebml_timestamp_scale = std::chrono::nanoseconds{0}});
+  Check(!zero_tick.Succeeded() && zero_tick.Error().code == ContainerErrorCode::InvalidArgument,
+        "Matroska accepted a zero Segment tick");
+  auto m4a = Take(MediaMuxer::Open(Output(target), ContainerFormat::Mp4, reader.Tracks()));
+  Check(!Take(m4a.TryWrite(packet)), "M4A could not copy AAC on its sample clock");
+  Take(m4a.Finish());
+  auto copied = Take(MediaDemuxer::Open(Take(Path(target).OpenRandomAccess())));
+  Check(!copied.EbmlTimestampScale() && copied.Tracks().front().timescale == 48000,
+        "M4A did not select the AAC sample clock");
+  sample.dts = sample.pts;
+  Compare(ReadPacket(copied).value(), sample);
+}
+
+File MatroskaWithoutCues(const File& source, const fs::path& destination) {
+  using namespace huxerui::media::detail;
+  using namespace ebml;
+  const auto bytes = Take(source.ReadBytes());
+  ByteView data(bytes);
+  const auto header = ReadField(data);
+  Check(header.id == Header, "The no-Cues fixture has no EBML header");
+  Bytes output;
+  Master(output, Header, [&](Bytes& fields) {
+    auto entries = header.data;
+    while (!entries.empty()) {
+      const auto entry = ReadField(entries);
+      if (entry.id == 0x4282) PutText(fields, entry.id, "matroska");
+      else PutElement(fields, entry.id, entry.data);
+    }
+  });
+  Append(output, data);
+  const auto file = Path(destination);
+  Check(file.WriteBytes(output), "Could not write the Matroska no-Cues fixture");
+  return file;
+}
+
+void ReorderedMatroskaAnchors(const fs::path& path) {
+  using namespace huxerui::media::detail;
+  using namespace ebml;
+  Bytes bytes;
+  Master(bytes, Header, [](Bytes& header) { PutText(header, 0x4282, "matroska"); });
+  PutId(bytes, Segment);
+  Put<std::uint8_t>(bytes, 0xff);
+  Master(bytes, Info, [](Bytes& info) { PutUInt(info, 0x2ad7b1, 250000); });
+  Master(bytes, Tracks, [](Bytes& entries) {
+    Master(entries, 0xae, [](Bytes& track) {
+      PutUInt(track, 0xd7, 1);
+      PutUInt(track, 0x83, 1);
+      PutText(track, 0x86, "V_VP9");
+      Master(track, 0xe0, [](Bytes& video) {
+        PutUInt(video, 0xb0, 64);
+        PutUInt(video, 0xba, 48);
+      });
+    });
+  });
+  for (const auto ticks : {3000, 1000, 2000}) {
+    Master(bytes, Cluster, [&](Bytes& cluster) {
+      PutUInt(cluster, Timestamp, ticks);
+      const Bytes sync{std::byte{0x81}, {}, {}, std::byte{0x80}, std::byte{0x82}};
+      PutElement(cluster, SimpleBlock, sync);
+    });
+  }
+  const auto file = Path(path);
+  Check(file.WriteBytes(bytes), "Could not write reordered Matroska anchors");
+  auto reader = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+  const auto forward = Take(reader.FindSeekPoint(1, {600, 1000}, SeekDirection::AtOrAfter));
+  Check(forward && forward->presentation_time == MediaTimestamp{3, 4}, "Forward seek missed the reordered sync Block");
+  const auto before = Take(reader.Seek(1, {600, 1000}));
+  Check(before && before->presentation_time == MediaTimestamp{1, 2} && ReadPacket(reader)->pts == before->decode_start_pts,
+        "Reverse seek missed the nearest reordered sync Block");
+}
+
+void WebmCuePreroll(const fs::path& path, bool late_audio) {
   using namespace media::detail;
   using namespace media::detail::ebml;
   const auto source = Path(fs::path(MEDIA_FIXTURES) / "container" / "preview-vp9-opus-no-cues.webm");
@@ -1407,15 +1576,19 @@ void WebmCuePreroll(const fs::path& path) {
       });
     });
   });
-  Master(segment, Cluster, [&](Bytes& cluster) {
-    PutUInt(cluster, Timestamp, 0);
-    block(cluster, audio, 0);
-    block(cluster, video, 0);
-  });
-  Master(segment, Cluster, [](Bytes& cluster) {
-    PutUInt(cluster, Timestamp, 100);
+  const auto long_cluster = [](Bytes& cluster) {
     // A prefix scan would hit the Cluster element budget before reaching the indexed media.
     for (int i = 0; i < 65536; ++i) PutElement(cluster, Void, {});
+  };
+  Master(segment, Cluster, [&](Bytes& cluster) {
+    PutUInt(cluster, Timestamp, 0);
+    if (!late_audio) block(cluster, audio, 0);
+    block(cluster, video, 0);
+    if (late_audio) long_cluster(cluster);
+  });
+  if (!late_audio) Master(segment, Cluster, [&](Bytes& cluster) {
+    PutUInt(cluster, Timestamp, 100);
+    long_cluster(cluster);
   });
   const auto previous = segment.size();
   Master(segment, Cluster, [&](Bytes& cluster) {
@@ -1463,11 +1636,19 @@ void WebmCuePreroll(const fs::path& path) {
   const auto file = Path(path);
   Check(file.WriteBytes(bytes), "Could not write the WebM Cue fixture");
   auto indexed = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+  if (!late_audio) Check(ReadPacket(indexed)->track_id == 2, "The initial Opus packet was not read");
   const auto point = Take(indexed.Seek(1, {1, 1}));
   Check(point && point->presentation_time == MediaTimestamp{1, 1}, "WebM seek missed the video Cue");
   const auto audio_start = std::get<TrackDecodeStart>(*Take(indexed.Read()));
-  Check(audio_start.track_id == 2 && audio_start.first_audible_pts == MediaTimestamp{0, 1} &&
+  Check(audio_start.track_id == 2 && audio_start.first_audible_pts ==
+        (late_audio ? std::nullopt : std::optional{MediaTimestamp{0, 1}}) &&
         ReadPacket(indexed)->pts == MediaTimestamp{913500000, Nanoseconds}, "WebM seek missed Opus preroll near the Cue");
+  if (late_audio) {
+    const auto first = Take(indexed.Seek(1, {800, 1000}));
+    Check(first && first->presentation_time == MediaTimestamp{800, 1000} &&
+          ReadPacket(indexed)->track_id == 1 && ReadPacket(indexed)->pts == MediaTimestamp{813500000, Nanoseconds},
+          "Late Opus prevented seeking to the first video Cue");
+  }
   const auto picture = Take(indexed.FindSeekPoint(2, {970, 1000}));
   Check(picture && picture->presentation_time == MediaTimestamp{953500000, Nanoseconds} &&
         picture->decode_start_pts == MediaTimestamp{873500000, Nanoseconds}, "WebM audio reference seek missed the nearby Cue");
@@ -1563,8 +1744,8 @@ void MatroskaLacing(const fs::path& path, bool corrupt) {
   Check(!Take(input.Read()), "Matroska did not end after its last unknown-sized Cluster");
   auto random = Take(MediaDemuxer::Open(Take(Path(path).OpenRandomAccess())));
   const auto point = random.FindSeekPoint(1, {0, 1});
-  Check(!point.Succeeded() && point.Error().code == ContainerErrorCode::IndexUnavailable,
-        "Matroska reported an index for a file with no Cues");
+  Check(point.Succeeded() && point.Value() && point.Value()->presentation_time == MediaTimestamp{0, 1},
+        "Matroska scan missed the laced track's first Block");
 }
 } // namespace
 
@@ -1595,8 +1776,15 @@ int main(int argc, char** argv) {
     EbmlRoundTrip(path / names[15], "mkv-avc-aac.mkv", ContainerFormat::Matroska, CodecId::H264);
     EbmlRoundTrip(path / names[16], "webm-vp8-opus.webm", ContainerFormat::WebM, CodecId::Vp8);
     Mp4(path / names[17], ContainerLayout::FastStart);
-    WebmWithoutCues();
-    WebmCuePreroll(path / "webm-cue-preroll.webm");
+    const auto no_cues = Path(fs::path(MEDIA_FIXTURES) / "container" / "preview-vp9-opus-no-cues.webm");
+    EbmlWithoutCues(no_cues);
+    EbmlWithoutCues(MatroskaWithoutCues(no_cues, path / "vp9-opus-no-cues.mkv"));
+    ReorderedMatroskaAnchors(path / "reordered-anchors.mkv");
+    PreciseVpxCopy(path, "vp8");
+    PreciseVpxCopy(path, "vp9");
+    MatroskaClockSeparation(path);
+    WebmCuePreroll(path / "webm-cue-preroll.webm", false);
+    WebmCuePreroll(path / "webm-cue-late-opus.webm", true);
     AudioFormats(path);
     M4a(path);
     EmptyM4aMetadata(path);

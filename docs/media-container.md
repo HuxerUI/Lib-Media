@@ -16,7 +16,7 @@ Pass the description selected by a packet to the corresponding decoder for a sup
 | Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC or ALAC, and length-prefixed AVC or HEVC | Random access, or sequential when movie metadata precedes samples | Random write; fast-start requires random read/write |
 | Fragmented MP4 | AAC, AVC, and HEVC | Sequential from initialization. Sized random-access input supports incremental seek, including growing files. | Sequential or random write |
 | QuickTime MOV | AAC, AVC, HEVC, ProRes, packed interleaved PCM, timecode, and boxed timed metadata | Random access, or sequential when movie metadata precedes samples | Random write |
-| Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, raw AAC-LC, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
+| Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, VP8, VP9, raw AAC-LC, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
 | WebM | VP8, VP9, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
 | RIFF WAVE and RF64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
 | MPEG-4 ADTS | One raw mono/stereo AAC-LC access unit per frame | Sequential or random access | Sequential or random write |
@@ -157,7 +157,7 @@ track. For AAC in MP4 or MOV, the reader resolves the edit first and includes th
 unit when it shares the configuration. For Opus, the presentation anchor respects the known audible start
 while decode start retains codec delay or link pre-skip. Other selected tracks can start at different media
 times. For AVC and HEVC, an independent point has verified IDR syntax. VP9 seeking uses the container sync
-flag and the decoder checks the first frame header.
+flag and the decoder checks the first frame header. VP8 uses the same contract.
 
 Fixed fMP4 can be read from the start one fragment batch at a time. On sized random-access inputs, a batch can
 include several fragments that share media data. Their sample ranges are checked against complete `mdat` boxes.
@@ -179,20 +179,24 @@ Matroska and WebM share the EBML reader. The document type selects the mapping. 
 known- and unknown-sized Segments and Clusters, `SimpleBlock`, `BlockGroup`, and Xiph, fixed, and EBML
 lacing. Laced frames are delivered separately in their stored order. Select mapped tracks before reading
 when `Tracks()` contains an unknown codec. A sequential input requires Info and Tracks before media.
-AVC carries the AVCDecoderConfigurationRecord in CodecPrivate. VP8 uses complete codec packets
-without CodecPrivate. Use container sync marks when submitting VP8 or VP9 for indexed output.
+AVC and HEVC carry a decoder configuration record in CodecPrivate and use length-prefixed packets. VP8 uses complete codec packets
+without CodecPrivate. VP9 retains any CodecPrivate payload through packet copy. Use container sync marks
+when submitting VP8 or VP9 for indexed output.
 
 The reader converts stored Block time to media PTS using the track's CodecDelay and leaves DTS absent.
 BlockDuration, DefaultDuration, and known codec frame durations supply timing where available. Opus
 retains OpusHead, the track's `seek_preroll`, and signed `discard_padding`. When a writer records the
 audible duration of a trimmed Opus Block, the reader can recover its coded duration from the packet.
 
-Random Matroska uses Cues, including discoverable tail Cues. Fixed, sized random-access WebM uses
-advertised Cues or scans Cluster headers and Block prefixes as needed. When only video has Cues, the
-reader searches nearby Clusters for Opus anchors and preroll. A scan from the beginning provides fallback
-coverage and retains its per-track anchors for later seeks. Video starts at a sync Block. Sequential
-input cannot seek. Matroska with no usable Cues reports `IndexUnavailable`.
-[Matroska timing and indexing](https://www.rfc-editor.org/rfc/rfc9559.html)
+Random Matroska uses Cues, including discoverable tail Cues. Sized random-access Matroska and WebM can scan
+Cluster headers and Block prefixes when a track lacks Cues. After resolving a video Cue, the reader looks near
+that Cue for the selected Opus track's preroll. Late audio can start after the video anchor. If an optional
+audio search reaches its scan limit, the video Cue still determines the seek. `first_audible_pts` can be absent
+until the audio track's start is known. Without Cues for the reference track, the fallback scans from the first Cluster and retains
+per-track anchors for later seeks. WebM and audio tracks extend that index as needed on ordered timelines. Matroska video
+without Cues completes the bounded scan on the first index query so sync timestamps can be sorted independently
+of packet order. The reader opens without scanning media Clusters and video seeks start at a sync Block.
+Sequential inputs report `IndexUnavailable` for seeking. [Matroska timing and indexing](https://www.rfc-editor.org/rfc/rfc9559.html)
 
 ## Write and finish
 
@@ -203,17 +207,30 @@ places the movie box before media data at `Finish()`, using bounded copying on t
 Readers report this as a regular MP4 layout. The actual
 open and subsequent I/O can still report SDK errors, including permissions or insufficient space.
 
-Choose an exact output clock using the track's `timescale`. MP4 defaults to the audio sample rate or
+For MP4 and MOV, choose an exact output clock using the track's `timescale`. MP4 defaults to the audio sample rate or
 90 kHz for video. Supply PTS and duration, and explicit DTS for AVC and HEVC. AAC and ProRes decode
 time can use PTS. An omitted AAC duration is one 1024-sample access unit. Each track's decode times
 must follow a contiguous grid. Presentation times may move backwards across successive packets with
 B pictures. WAVE, ADTS, and MOV PCM can derive timing from sample counts and validate any supplied
 values against that grid.
 
-Matroska and WebM use a 1 ms output timestamp grid. The writer keeps the supplied decode order per track
-and rounds absolute packet times and duration boundaries. WebM additionally requires nondecreasing
-stored Block times. Output uses a single Segment, bounded Clusters, and one packet per Block. Finish
-writes available video sync Cues or audio Cues for audio-only output. The initial output header omits duration.
+Matroska and WebM use a shared Segment tick, independent of `MediaTrack::timescale`. Set
+`MediaMuxerOptions::ebml_timestamp_scale` to the desired nanoseconds per tick. The default is 1 ms.
+For packet copy, pass `MediaDemuxer::EbmlTimestampScale()` to that option and retain each track's
+`default_duration`. This preserves Block times on the source grid and implicit durations even when those
+durations are not whole ticks. When separating laced packets, choose a finer tick if their derived starts
+fall between the source ticks. Times between ticks round to the nearest tick, with ties away from zero.
+Explicit BlockDuration values round their absolute endpoints. Cues and Blocks share the Segment tick.
+Audio keeps its codec sample clock, for example when copying compatible AAC to M4A.
+[Matroska timestamp ticks](https://www.rfc-editor.org/rfc/rfc9559.html#section-11.1)
+
+The writer preserves decode order per track. WebM also requires nondecreasing stored Block times. A fine grid
+can require more Clusters because relative Block timestamps are signed 16-bit values. Output uses a single
+Segment and one packet per Block. `Finish()` writes video sync Cues or Cues for audio-only output.
+
+To copy VP8 or VP9 with Opus between WebM and MKV, pass the tracks, packet timing, sync marks, and signed trim
+to the destination muxer. `ValidateOutput()` checks the requested mapping. The Frames example reopens
+the output. The [preview integration tests](../tests/container_preview.cpp) compare packets per track in both directions.
 
 `priming_samples` and OpusHead must describe the initial delay before opening the writer.
 Supply packet trim through `discard_padding` before submitting the affected packet. Positive values

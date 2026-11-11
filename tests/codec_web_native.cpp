@@ -29,6 +29,98 @@ std::vector<EncodedPacket> Packets(const std::string& name) {
   }
   return packets;
 }
+
+void Report(std::string message) {
+  EM_ASM({ document.body.textContent = UTF8ToString($0); }, message.c_str());
+  std::cout << message << '\n';
+  emscripten_cancel_main_loop();
+}
+
+struct QueueTest {
+  enum class Phase { Starting, KeyQueued, Refilling, ReferencesQueued, Draining, Closing };
+  std::optional<VideoDecoder> decoder;
+  Phase phase = Phase::Starting;
+  bool cleaned = false;
+  std::string failure;
+  double deadline = emscripten_get_now() + 15000;
+
+  void Start() {
+    EM_ASM({
+      globalThis.VideoDecoder = class {
+        static async isConfigSupported() { return {supported: true}; }
+        configure() { globalThis.stalledDecoder = this; this.decodeQueueSize = 0; }
+        decode() { ++this.decodeQueueSize; }
+        async flush() { this.decodeQueueSize = 0; }
+        close() { this.decodeQueueSize = 0; }
+      };
+    });
+    VideoDecoderConfig config{.width = 64, .height = 48, .codec = CodecId::Vp9};
+    config.limits.input_items = 2;
+    config.limits.input_bytes = 6;
+    config.cleanup_completed = [this](CodecResult<void> result) {
+      if (!result.Succeeded()) failure = result.Error().message;
+      cleaned = true;
+    };
+    auto created = VideoDecoder::Create(config);
+    if (!created.Succeeded()) throw std::runtime_error(created.Error().message);
+    decoder.emplace(std::move(created).Value());
+  }
+
+  SubmitStatus Submit(Bytes bytes, bool key = false) {
+    const auto data = std::make_shared<Bytes>(std::move(bytes));
+    const auto result = decoder->TrySubmit({BufferReference(*data, data), {0, 1}, {}, {}, key});
+    if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
+    return result.Value();
+  }
+
+  void Tick() {
+    try {
+      if (emscripten_get_now() > deadline) throw std::runtime_error("Web decoder input did not make progress");
+      const auto pending = EM_ASM_INT({ return globalThis.stalledDecoder?.decodeQueueSize ?? 0; });
+      switch (phase) {
+        case Phase::Starting:
+          if (Submit({std::byte{0x80}, std::byte{0x49}, std::byte{0x83}, std::byte{0x42}}, true) == SubmitStatus::Accepted)
+            phase = Phase::KeyQueued;
+          break;
+        case Phase::KeyQueued:
+          if (pending != 1) break;
+          if (Submit({std::byte{0x84}, {}, {}}) != SubmitStatus::WouldBlock)
+            throw std::runtime_error("A queued reference packet did not retain its input byte credit");
+          EM_ASM({ globalThis.stalledDecoder.decodeQueueSize = 0; });
+          phase = Phase::Refilling;
+          break;
+        case Phase::Refilling:
+          if (Submit({std::byte{0x84}, {}, {}}) == SubmitStatus::WouldBlock) break;
+          if (Submit({std::byte{0x84}}) != SubmitStatus::Accepted)
+            throw std::runtime_error("Web decoder did not release the dequeued packet's credit");
+          phase = Phase::ReferencesQueued;
+          break;
+        case Phase::ReferencesQueued:
+          if (pending != 2) break;
+          if (Submit({std::byte{0x84}}) != SubmitStatus::WouldBlock)
+            throw std::runtime_error("Queued reference packets did not retain their input item credits");
+          if (const auto result = decoder->Finish(); !result.Succeeded()) throw std::runtime_error(result.Error().message);
+          phase = Phase::Draining;
+          break;
+        case Phase::Draining:
+          if (auto result = decoder->TryRead(); !result.Succeeded()) throw std::runtime_error(result.Error().message);
+          else if (result.Value()) {
+            if (!std::holds_alternative<EndOfStream>(*result.Value())) throw std::runtime_error("Reference packets produced output");
+            decoder->Close();
+            phase = Phase::Closing;
+          }
+          break;
+        case Phase::Closing:
+          if (cleaned) Report(failure.empty() ? "PASS: Web reference packet backpressure, dequeue, and drain" : "FAIL: " + failure);
+          break;
+      }
+    } catch (const std::exception& error) {
+      decoder->Close();
+      Report(std::string("FAIL: ") + error.what());
+    }
+  }
+};
+
 struct Test : std::enable_shared_from_this<Test> {
   std::optional<AudioDecoder> audio;
   std::optional<VideoDecoder> video;
@@ -148,19 +240,22 @@ struct Test : std::enable_shared_from_this<Test> {
         }
         held_texture.reset();
       }
-      const auto message = failure.empty() ? std::string("PASS: C++ WASM AAC/AVC sessions, ") +
-          (platform ? "platform texture without pixel readback" : "CPU output") + ", EOS, reset and cleanup" : "FAIL: " + failure;
-      EM_ASM({ document.body.textContent = UTF8ToString($0); }, message.c_str());
-      std::cout << message << '\n';
-      emscripten_cancel_main_loop();
+      Report(failure.empty() ? std::string("PASS: C++ WASM AAC/AVC sessions, ") +
+          (platform ? "platform texture without pixel readback" : "CPU output") + ", EOS, reset and cleanup" : "FAIL: " + failure);
     }
   }
   void Close() { if (!closing) { closing = true; audio->Close(); video->Close(); } }
 };
 std::shared_ptr<Test> test;
+QueueTest queue_test;
 } // namespace
 int main() {
   try {
+    if (EM_ASM_INT({ return new URLSearchParams(location.search).has('backpressure'); })) {
+      queue_test.Start();
+      emscripten_set_main_loop([] { queue_test.Tick(); }, 0, false);
+      return 0;
+    }
     test = std::make_shared<Test>(); test->Start();
     emscripten_set_main_loop([] { test->Tick(); }, 0, false);
   } catch (const std::exception& error) {

@@ -76,15 +76,17 @@ public:
       const auto* audio = std::get_if<AudioDecoderConfig>(&config_);
       const auto* video = std::get_if<VideoDecoderConfig>(&config_);
       const bool hevc = video && video->codec == CodecId::Hevc;
-      const GUID subtype = audio ? AudioSubtype(audio->codec) : hevc ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+      const bool vpx = video && (video->codec == CodecId::Vp8 || video->codec == CodecId::Vp9);
+      const GUID subtype = audio ? AudioSubtype(audio->codec) : hevc ? MFVideoFormat_HEVC :
+          vpx ? (video->codec == CodecId::Vp8 ? MFVideoFormat_VP80 : MFVideoFormat_VP90) : MFVideoFormat_H264;
       if (audio && audio->codec != CodecId::Aac) {
         const MFT_REGISTER_TYPE_INFO type{MFMediaType_Audio, subtype};
         Require(OpenSynchronousTransform(MFT_CATEGORY_AUDIO_DECODER, &type, nullptr, decoder_),
             "No synchronous Media Foundation audio decoder for this codec", CodecErrorCode::Unsupported);
-      } else if (hevc) {
+      } else if (hevc || vpx) {
         const MFT_REGISTER_TYPE_INFO type{MFMediaType_Video, subtype};
         Require(OpenSynchronousTransform(MFT_CATEGORY_VIDEO_DECODER, &type, nullptr, decoder_),
-            "No synchronous Media Foundation HEVC decoder", CodecErrorCode::Unsupported);
+            "No synchronous Media Foundation decoder for this video codec", CodecErrorCode::Unsupported);
       } else {
         Require(CoCreateInstance(audio ? CLSID_CMSAACDecMFT : CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER,
             IID_PPV_ARGS(&decoder_)), "System AAC/AVC decoder is unavailable");
@@ -102,9 +104,11 @@ public:
         ConfigureAudioInput(*input.Get(), *audio);
         if (audio->codec == CodecId::Flac) parameters_ = AudioDecoderHeader(*audio);
       } else {
-        ComPtr<IMFAttributes> attributes;
-        Require(decoder_->GetAttributes(&attributes), "Cannot configure video buffering");
-        Require(attributes->SetUINT32(MF_LOW_LATENCY, TRUE), "Cannot bound video startup buffering");
+        if (!vpx) {
+          ComPtr<IMFAttributes> attributes;
+          Require(decoder_->GetAttributes(&attributes), "Cannot configure video buffering");
+          Require(attributes->SetUINT32(MF_LOW_LATENCY, TRUE), "Cannot bound video startup buffering");
+        }
         Require(MFSetAttributeSize(input.Get(), MF_MT_FRAME_SIZE, video->width, video->height), "Cannot set video dimensions");
         if (hevc) {
           length_size_ = ParseHevcConfiguration(video->initialization_data, true, false).length;
@@ -113,7 +117,7 @@ public:
               eAVEncH265VProfile_Main_420_10 : eAVEncH265VProfile_Main_420_8), "Cannot set HEVC profile");
           Require(input->SetBlob(MF_MT_MPEG_SEQUENCE_HEADER, reinterpret_cast<const UINT8*>(parameters_.data()),
               static_cast<UINT32>(parameters_.size())), "Cannot set HEVC initialization data");
-        } else {
+        } else if (!vpx) {
           const auto avc = ParseAvc(video->initialization_data).Value();
           length_size_ = avc.length_size;
           for (const auto& parameter : avc.parameters) {
@@ -141,7 +145,7 @@ public:
         audio_samples = count.Value();
       }
       Bytes formatted;
-      if (!audio) {
+      if (length_size_) {
         auto converted = AnnexB(packet, length_size_);
         if (!converted.Succeeded()) throw MfFailure{converted.Error()};
         formatted = std::move(converted).Value();
@@ -430,7 +434,7 @@ private:
   Bytes mp3_drain_frame_;
   LONGLONG mp3_last_pts_ = 0;
   AudioSampleFormat audio_sample_format_ = AudioSampleFormat::S16;
-  unsigned length_size_ = 4;
+  unsigned length_size_ = 0;
   bool com_ = false, mf_ = false, first_ = true, finished_ = false, eos_ = false;
 };
 } // namespace

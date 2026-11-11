@@ -178,6 +178,7 @@ public:
   virtual std::optional<ContainerPacket> Read() = 0;
   virtual std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp time, SeekDirection direction, bool seek);
   virtual std::optional<MediaPresentationRange> PresentationRange(std::size_t) const { return {}; }
+  virtual std::optional<std::chrono::nanoseconds> EbmlTimestampScale() const { return {}; }
 
   std::uint32_t RegisterAudioDescription(MediaTrack& track, MediaSampleDescription description);
 
@@ -237,7 +238,7 @@ std::unique_ptr<ContainerWriter> OpenMp4Writer(ContainerOutput output, Container
 void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, const MediaMuxerOptions& options);
 std::unique_ptr<ContainerReader> OpenMatroskaReader(ContainerInput input, std::optional<ContainerFormat> hint);
 std::unique_ptr<ContainerWriter> OpenMatroskaWriter(ContainerOutput output, ContainerFormat format,
-                                                    std::span<const MediaTrack> tracks);
+                                                    std::span<const MediaTrack> tracks, const MediaMuxerOptions& options);
 void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks);
 
 } // namespace huxerui::media::detail

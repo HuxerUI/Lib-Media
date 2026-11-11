@@ -113,6 +113,7 @@ public:
     }
     const auto& video = std::get<VideoDecoderConfig>(config_);
     OSStatus status;
+    NSDictionary* specification = nil;
     std::vector<const std::uint8_t*> parameters;
     std::vector<std::size_t> sizes;
     const auto add_parameters = [&](const auto& entries) {
@@ -121,7 +122,21 @@ public:
         sizes.push_back(entry.size());
       }
     };
-    if (video.codec == CodecId::Hevc) {
+    if (video.codec == CodecId::Vp9) {
+#if __IPHONE_OS_VERSION_MAX_ALLOWED >= 260200
+      if (@available(iOS 26.2, *)) VTRegisterSupplementalVideoDecoderIfAvailable(kCMVideoCodecType_VP9);
+#endif
+      if (!VTIsHardwareDecodeSupported(kCMVideoCodecType_VP9))
+        return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "VP9 hardware decoding is unavailable"));
+      // VideoToolbox needs a vpcC record for VP9 profile 0 packets from Matroska and WebM.
+      constexpr std::uint8_t vpcc[]{1, 0, 0, 0, 0, 0, 0x82, 2, 2, 2, 0, 0};
+      NSDictionary* extensions = @{(__bridge NSString*)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms:
+          @{@"vpcC": [NSData dataWithBytes:vpcc length:sizeof(vpcc)]}};
+      status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_VP9, video.width, video.height,
+          (__bridge CFDictionaryRef)extensions, &description_);
+      if (@available(iOS 17.0, *))
+        specification = @{(__bridge NSString*)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @YES};
+    } else if (video.codec == CodecId::Hevc) {
       const auto hevc = ParseHevcConfiguration(video.initialization_data, true, true);
       add_parameters(hevc.parameters);
       status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(kCFAllocatorDefault, parameters.size(),
@@ -132,7 +147,7 @@ public:
       status = CMVideoFormatDescriptionCreateFromH264ParameterSets(kCFAllocatorDefault, parameters.size(),
           parameters.data(), sizes.data(), avc.length_size, &description_);
     }
-    if (status) return CodecResult<void>::Failure(AppleError(status, "Video parameter sets were rejected"));
+    if (status) return CodecResult<void>::Failure(AppleError(status, "Video format description was rejected"));
     const auto dimensions = CMVideoFormatDescriptionGetDimensions(description_);
     if (dimensions.width <= 0 || dimensions.height <= 0 || dimensions.width > video.width || dimensions.height > video.height)
       return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidArgument, "Video dimensions exceed configured bounds"));
@@ -144,7 +159,8 @@ public:
       (__bridge NSString*)kCVPixelBufferIOSurfacePropertiesKey: @{}
     } : @{(id)kCVPixelBufferPixelFormatTypeKey: @(pixel_type)};
     VTDecompressionOutputCallbackRecord callback{Output, this};
-    status = VTDecompressionSessionCreate(kCFAllocatorDefault, description_, nullptr, (__bridge CFDictionaryRef)attributes, &callback, &video_);
+    status = VTDecompressionSessionCreate(kCFAllocatorDefault, description_, (__bridge CFDictionaryRef)specification,
+        (__bridge CFDictionaryRef)attributes, &callback, &video_);
     if (status) return CodecResult<void>::Failure(AppleError(status, "VTDecompressionSessionCreate failed"));
     return CodecResult<void>::Success();
   }
@@ -174,10 +190,13 @@ public:
     CFRelease(block);
     if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "Cannot create compressed video sample"));
     VTDecodeInfoFlags flags = 0;
-    status = VTDecompressionSessionDecodeFrame(video_, sample, 0, nullptr, &flags);
+    const auto& video = std::get<VideoDecoderConfig>(config_);
+    const bool hidden = video.codec == CodecId::Vp9 && !Vp9PacketDisplays(bytes).Value();
+    status = VTDecompressionSessionDecodeFrame(video_, sample, hidden ? kVTDecodeFrame_DoNotOutputFrame : 0,
+        hidden ? this : nullptr, &flags);
     CFRelease(sample);
     if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "VideoToolbox decoding failed"));
-    if (flags & kVTDecodeInfo_FrameDropped)
+    if (!hidden && (flags & kVTDecodeInfo_FrameDropped))
       return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::InvalidData, "VideoToolbox dropped a frame"));
     return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
   }
@@ -294,11 +313,12 @@ private:
     }
     return R::Success(std::nullopt);
   }
-  static void Output(void* context, void*, OSStatus status, VTDecodeInfoFlags flags, CVImageBufferRef image,
+  static void Output(void* context, void* hidden, OSStatus status, VTDecodeInfoFlags flags, CVImageBufferRef image,
       CMTime pts, CMTime duration) {
     auto& self = *static_cast<IOSDecoder*>(context);
     std::lock_guard lock(self.output_mutex_);
     if (self.failure_) return;
+    if (hidden && !status) return;
     if (status || !image || (flags & kVTDecodeInfo_FrameDropped)) {
       self.failure_ = AppleError(status, "VideoToolbox returned a failed/dropped frame"); return;
     }

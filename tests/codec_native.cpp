@@ -1,10 +1,8 @@
 #include <huxerui/media_codec.h>
 
-#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
 #include <huxerui/file.h>
 #include <huxerui/media_container.h>
 #include <future>
-#endif
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #include "codec/decoder/backend.h"
@@ -213,6 +211,52 @@ void Decode(Config config, const std::vector<EncodedPacket>& packets, std::size_
   Check(held && held->Validate(), "Retained frame invalid after cleanup");
 }
 
+template<class Decoder, class Config>
+bool ProbeFixture(const Config& config) {
+  auto probe = std::make_shared<std::promise<CodecResult<void>>>();
+  auto ready = probe->get_future();
+  Decoder::Probe(config, [probe](auto result) { probe->set_value(std::move(result)); });
+  Check(ready.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "Codec fixture probe timed out");
+  const auto support = ready.get();
+  if (support.Succeeded()) return true;
+  const auto& error = support.Error();
+  if (error.code != CodecErrorCode::Unsupported)
+    throw std::runtime_error(error.message + " (" + error.platform_code + ")");
+  std::cout << error.message << '\n';
+  return false;
+}
+
+int DecodeVideoFixture(const std::filesystem::path& path) {
+  auto opened = File(path.u8string()).OpenRandomAccess();
+  Check(opened.Succeeded(), "Cannot open video fixture");
+  auto input = MediaDemuxer::Open(std::move(opened).Value());
+  Check(input.Succeeded(), "Cannot demux video fixture");
+  auto reader = std::move(input).Value();
+  const auto track = std::ranges::find(reader.Tracks(), TrackKind::Video, &MediaTrack::kind);
+  Check(track != reader.Tracks().end(), "Expected a video track");
+  const auto& description = track->descriptions.front();
+  Check(description.coded_width && description.coded_height, "Video fixture has no dimensions");
+  VideoDecoderConfig config{.initialization_data = description.initialization_data,
+      .width = *description.coded_width, .height = *description.coded_height, .codec = description.codec};
+  if (!ProbeFixture<VideoDecoder>(config)) return 77;
+  Check(reader.SelectTracks(std::span(&track->id, 1)).Succeeded(), "Cannot select the video track");
+  std::vector<EncodedPacket> packets;
+  for (;;) {
+    auto read = reader.Read();
+    Check(read.Succeeded(), "Cannot read video fixture");
+    auto item = std::move(read).Value();
+    if (!item) break;
+    if (const auto* packet = std::get_if<ContainerPacket>(&*item)) {
+      Check(packet->pts.has_value(), "Video fixture has no PTS");
+      packets.push_back({packet->data, *packet->pts, packet->dts, packet->duration, packet->sync_sample.value_or(false)});
+    }
+  }
+  Check(!packets.empty(), "Video fixture has no packets");
+  Decode<VideoDecoder, VideoDecoderConfig, VideoFrame>(config, packets, packets.size());
+  std::cout << path.filename().string() << " decoded " << packets.size() << " pictures with exact timestamps and reset\n";
+  return 0;
+}
+
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
 int DecodeAudioFixture(const std::filesystem::path& path) {
   auto opened = File(path.u8string()).OpenRandomAccess();
@@ -220,26 +264,16 @@ int DecodeAudioFixture(const std::filesystem::path& path) {
   auto input = MediaDemuxer::Open(std::move(opened).Value());
   Check(input.Succeeded(), "Cannot demux audio fixture");
   auto reader = std::move(input).Value();
-  Check(reader.Tracks().size() == 1, "Expected one audio track");
-  const auto& track = reader.Tracks().front();
+  const auto tracks = reader.Tracks();
+  Check(tracks.size() == 1, "Expected one audio track");
+  const auto& track = tracks.front().descriptions.front();
   Check(track.sample_rate && track.channel_count && (*track.channel_count == 1 || *track.channel_count == 2),
         "Audio fixture has an invalid rate or channel layout");
   AudioDecoderConfig config{.initialization_data = track.initialization_data,
       .output = {*track.sample_rate, AudioSampleFormat::S16, AudioPacking::Interleaved,
                  *track.channel_count == 1 ? AudioChannelLayout::Mono : AudioChannelLayout::Stereo},
       .codec = track.codec};
-  auto probe = std::make_shared<std::promise<CodecResult<void>>>();
-  auto ready = probe->get_future();
-  AudioDecoder::Probe(config, [probe](auto result) { probe->set_value(std::move(result)); });
-  Check(ready.wait_for(std::chrono::seconds(10)) == std::future_status::ready, "Audio fixture probe timed out");
-  const auto support = ready.get();
-  if (!support.Succeeded()) {
-    const auto& error = support.Error();
-    if (error.code != CodecErrorCode::Unsupported)
-      throw std::runtime_error(error.message + " (" + error.platform_code + ")");
-    std::cout << error.message << '\n';
-    return 77;
-  }
+  if (!ProbeFixture<AudioDecoder>(config)) return 77;
   std::vector<EncodedPacket> packets;
   std::size_t samples = 0;
   for (;;) {
@@ -247,7 +281,9 @@ int DecodeAudioFixture(const std::filesystem::path& path) {
     Check(result.Succeeded(), "Cannot read audio fixture packet");
     auto item = std::move(result).Value();
     if (!item) break;
-    const auto& packet = std::get<ContainerPacket>(*item);
+    const auto* value = std::get_if<ContainerPacket>(&*item);
+    if (!value) continue;
+    const auto& packet = *value;
     Check(packet.pts && packet.duration, "Audio fixture has incomplete timing");
     const auto duration = packet.duration->Rescale(config.output.sample_rate);
     Check(duration && duration->ticks > 0, "Audio fixture has an invalid packet duration");
@@ -264,6 +300,7 @@ int DecodeAudioFixture(const std::filesystem::path& path) {
 } // namespace
 int main(int argc, char** argv) {
   try {
+    if (argc == 3 && std::string_view(argv[1]) == "--video") return DecodeVideoFixture(argv[2]);
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
     if (argc == 3 && std::string_view(argv[1]) == "--audio") return DecodeAudioFixture(argv[2]);
 #endif

@@ -107,7 +107,7 @@ template<class Output> CodecResult<SubmitStatus> DecoderState<Output>::Submit(co
     auto copy = packet;
     copy.data = BufferReference(owner->bytes, owner);
     ScheduleLocked();
-    input_.push_back(std::move(copy));
+    input_.push_back({std::move(copy), valid.Value()});
     credit->notify = true;
     needs_key_ = false;
     return R::Success(SubmitStatus::Accepted);
@@ -269,7 +269,9 @@ template<class Output> void DecoderState<Output>::Run(bool credit_available) {
   {
     std::lock_guard lock(mutex_);
     terminal = phase_ == Phase::Closed || phase_ == Phase::Failed;
-    if (!terminal && ((!input_.empty() && !waiting_credit_) || !inflight_.empty() || (phase_ == Phase::Draining && input_.empty() && !eos_queued_))) ScheduleLocked(2);
+    if (!terminal && ((!input_.empty() && !waiting_credit_) || !inflight_.empty() ||
+                      (backend_ && backend_->HasPendingInput()) || (phase_ == Phase::Draining && input_.empty() && !eos_queued_)))
+      ScheduleLocked(2);
   }
   if (terminal) Cleanup();
 }
@@ -378,9 +380,10 @@ template<class Output> void DecoderState<Output>::Process(std::uint64_t generati
       std::lock_guard lock(mutex_);
       if (generation != generation_ || (phase_ != Phase::Running && phase_ != Phase::Draining)) return;
       if (!input_.empty()) {
-        credit = Reserve();
-        waiting_credit_ = !credit;
-        if (credit) packet = input_.front();
+        const auto& next = input_.front();
+        if (next.displays) credit = Reserve();
+        waiting_credit_ = next.displays && !credit;
+        if (!waiting_credit_) packet = next.packet;
       } else finish = phase_ == Phase::Draining && !finish_sent_ && !eos_queued_;
     }
     if (packet) {
@@ -389,9 +392,11 @@ template<class Output> void DecoderState<Output>::Process(std::uint64_t generati
       if (result.Value() == SubmitStatus::WouldBlock) return;
       std::lock_guard lock(mutex_);
       if (generation != generation_) return;
-      auto timing = std::move(input_.front());
-      timing.data = {};
-      inflight_.push_back({std::move(timing), std::move(credit)});
+      if (credit) {
+        auto timing = std::move(input_.front().packet);
+        timing.data = {};
+        inflight_.push_back({std::move(timing), std::move(credit)});
+      }
       input_.pop_front();
     } else if (finish) {
       auto result = backend_->Finish();

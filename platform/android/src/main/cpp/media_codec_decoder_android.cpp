@@ -91,6 +91,10 @@ public:
         case CodecId::Mp3: mime = "audio/mpeg"; break;
         default: return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Unsupported Android audio codec"));
       }
+    } else if (video->codec == CodecId::Vp8) {
+      mime = "video/x-vnd.on2.vp8";
+    } else if (video->codec == CodecId::Vp9) {
+      mime = "video/x-vnd.on2.vp9";
     }
     codec_ = AMediaCodec_createDecoderByType(mime);
     if (!codec_) return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "No Android decoder for this MIME type"));
@@ -122,7 +126,7 @@ public:
         length_size_ = ParseHevcConfiguration(video->initialization_data, true, false).length;
         const auto header = HevcAnnexBConfiguration(video->initialization_data);
         AMediaFormat_setBuffer(format, "csd-0", header.data(), header.size());
-      } else {
+      } else if (video->codec == CodecId::H264) {
         auto avc = ParseAvc(video->initialization_data).Value();
         length_size_ = avc.length_size;
         Bytes sps, pps;
@@ -160,7 +164,7 @@ public:
   CodecResult<SubmitStatus> Submit(const EncodedPacket& packet) override {
     Bytes converted;
     auto bytes = packet.data.AsBytes();
-    if (std::holds_alternative<VideoDecoderConfig>(config_)) {
+    if (length_size_) {
       auto result = AnnexB(packet, length_size_);
       if (!result.Succeeded()) return CodecResult<SubmitStatus>::Failure(result.Error());
       converted = std::move(result).Value(); bytes = converted;
@@ -371,7 +375,7 @@ private:
   std::optional<MediaTimestamp> surface_pts_;
   unsigned audio_sample_limit_ = 0;
   std::optional<PcmPackets> mp3_;
-  unsigned length_size_ = 4;
+  unsigned length_size_ = 0;
   bool started_ = false, eos_ = false, pending_eos_ = false;
 };
 } // namespace

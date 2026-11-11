@@ -13,6 +13,8 @@ public:
   virtual CodecResult<void> Open(const DecoderConfig& config) = 0;
   virtual CodecResult<bool> Ready() { return CodecResult<bool>::Success(true); }
   virtual CodecResult<SubmitStatus> Submit(const EncodedPacket& packet) = 0;
+  // Input retained by the backend can need polling even when no frame is expected.
+  virtual bool HasPendingInput() const noexcept { return false; }
   virtual CodecResult<std::optional<BackendOutput>> Poll() = 0;
   // Match input and output PTS in this timescale before restoring the original packet timestamp.
   virtual std::uint32_t PresentationTimescale() const noexcept { return 1000000; }

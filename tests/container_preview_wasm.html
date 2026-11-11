@@ -1,12 +1,19 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>Lib-Media Web preview regressions</title>
-<pre id="out">Running preview export and audio packet copy…</pre>
+<button id="run" disabled>Run preview checks</button>
+<pre id="out"></pre>
 <script type="module">
 import create from './media_container_preview_tests.js';
-const output = document.querySelector('pre');
+const button = document.getElementById('run');
+const output = document.getElementById('out');
 const log = line => { output.textContent += '\n' + line; };
-try {
-  await create({print: log, printErr: log, huxeruiStorageKey: 'org.huxerui.media.container-preview.test'});
-} catch (error) { log('FAIL: ' + error.message); }
+button.addEventListener('click', async () => {
+  button.disabled = true;
+  output.textContent = 'Running preview checks…';
+  try {
+    await create({print: log, printErr: log, huxeruiStorageKey: 'org.huxerui.media.container-preview.test'});
+  } catch (error) { log('FAIL: ' + error.message); }
+}, {once: true});
+button.disabled = false;
 </script>

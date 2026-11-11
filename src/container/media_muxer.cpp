@@ -9,6 +9,12 @@ using Requirement = MediaMuxer::OutputRequirement;
 Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks, const MediaMuxerOptions& options) {
   const auto layout = options.layout;
   const bool mp4 = format == ContainerFormat::Mp4 || format == ContainerFormat::Mov;
+  if (options.ebml_timestamp_scale) {
+    if (format != ContainerFormat::Matroska && format != ContainerFormat::WebM)
+      Fail(ContainerErrorCode::Unsupported, "The EBML timestamp scale requires Matroska or WebM output");
+    if (options.ebml_timestamp_scale->count() <= 0)
+      Fail(ContainerErrorCode::InvalidArgument, "EBML timestamp scale must be positive");
+  }
   if (tracks.empty()) Fail(ContainerErrorCode::InvalidArgument, "A container needs at least one track");
   if (tracks.size() > MaxContainerTracks) Fail(ContainerErrorCode::LimitExceeded, "Too many output tracks");
   for (auto it = tracks.begin(); it != tracks.end(); ++it) {
@@ -92,7 +98,7 @@ std::unique_ptr<ContainerWriter> OpenWriter(ContainerOutput output, ContainerFor
     case ContainerFormat::Mp4:
     case ContainerFormat::Mov: return OpenMp4Writer(std::move(output), format, tracks, options);
     case ContainerFormat::Matroska:
-    case ContainerFormat::WebM: return OpenMatroskaWriter(std::move(output), format, tracks);
+    case ContainerFormat::WebM: return OpenMatroskaWriter(std::move(output), format, tracks, options);
     case ContainerFormat::Flac: return OpenFlacWriter(std::move(output), tracks, options.audio_metadata);
     case ContainerFormat::Mp3: return OpenMp3Writer(std::move(output), tracks, options.audio_metadata);
   }

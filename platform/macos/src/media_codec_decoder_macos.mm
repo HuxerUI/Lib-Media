@@ -188,10 +188,13 @@ public:
     CFRelease(block);
     if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "Cannot create compressed video sample"));
     VTDecodeInfoFlags flags = 0;
-    status = VTDecompressionSessionDecodeFrame(video_, sample, 0, nullptr, &flags);
+    const auto& video = std::get<VideoDecoderConfig>(config_);
+    const bool hidden = video.codec == CodecId::Vp9 && !Vp9PacketDisplays(bytes).Value();
+    status = VTDecompressionSessionDecodeFrame(video_, sample, hidden ? kVTDecodeFrame_DoNotOutputFrame : 0,
+        hidden ? this : nullptr, &flags);
     CFRelease(sample);
     if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "VideoToolbox decoding failed"));
-    if (flags & kVTDecodeInfo_FrameDropped)
+    if (!hidden && (flags & kVTDecodeInfo_FrameDropped))
       return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::InvalidData, "VideoToolbox dropped a frame"));
     return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
   }
@@ -308,11 +311,12 @@ private:
     }
     return R::Success(std::nullopt);
   }
-  static void Output(void* context, void*, OSStatus status, VTDecodeInfoFlags flags, CVImageBufferRef image,
+  static void Output(void* context, void* hidden, OSStatus status, VTDecodeInfoFlags flags, CVImageBufferRef image,
       CMTime pts, CMTime duration) {
     auto& self = *static_cast<MacOSDecoder*>(context);
     std::lock_guard lock(self.output_mutex_);
     if (self.failure_) return;
+    if (hidden && !status) return;
     if (status || !image || (flags & kVTDecodeInfo_FrameDropped)) {
       self.failure_ = AppleError(status, "VideoToolbox returned a failed/dropped frame"); return;
     }

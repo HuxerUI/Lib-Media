@@ -3,6 +3,7 @@
 #include "codec/hevc.h"
 #include "media_video_web.h"
 #include <algorithm>
+#include <deque>
 #include <emscripten/threading.h>
 #include <emscripten/val.h>
 
@@ -18,6 +19,24 @@ BufferReference Buffer(const val& array) {
   val(emscripten::typed_memory_view(bytes.size(), reinterpret_cast<unsigned char*>(bytes.data()))).call<void>("set", array);
   return Own(std::move(bytes));
 }
+
+std::optional<std::string> Vp9CodecString(const VideoDecoderConfig& video) {
+  struct Level { unsigned id, samples, dimension; };
+  // The configuration has coded bounds. The stream determines its actual sample rate and bitrate.
+  constexpr Level levels[]{
+    {10, 36864, 512}, {11, 73728, 768}, {20, 122880, 960}, {21, 245760, 1344},
+    {30, 552960, 2048}, {31, 983040, 2752}, {40, 2228224, 4160},
+    {50, 8912896, 8384}, {60, 35651584, 16832},
+  };
+  const auto samples = std::uint64_t(video.width) * video.height;
+  const auto dimension = std::max(video.width, video.height);
+  const auto level = std::ranges::find_if(levels, [&](const Level& candidate) {
+    return samples <= candidate.samples && dimension <= candidate.dimension;
+  });
+  if (level == std::end(levels)) return {};
+  return "vp09.00." + std::to_string(std::max(level->id, Vp9Level(video.initialization_data).Value())) + ".08";
+}
+
 class WebDecoder final : public DecoderBackend {
 public:
   bool PresentationOrdered() const noexcept override {
@@ -59,10 +78,19 @@ public:
       if (platform && !emscripten_is_main_browser_thread())
         return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Web platform video requires the browser main thread"));
       options.set("audio", false); options.set("width", video.width); options.set("height", video.height);
-      if (video.codec == CodecId::Hevc) options.set("codec", HevcCodecString(video.initialization_data));
+      if (video.codec == CodecId::Hevc) {
+        options.set("codec", HevcCodecString(video.initialization_data));
+      } else if (video.codec == CodecId::Vp8) {
+        options.set("codec", std::string("vp8"));
+      } else if (video.codec == CodecId::Vp9) {
+        const auto codec = Vp9CodecString(video);
+        if (!codec) return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "VP9 coded bounds exceed WebCodecs levels"));
+        options.set("codec", *codec);
+      }
       options.set("platform", platform);
       options.set("tenBit", video.output == VideoPixelFormat::P010);
-      options.set("description", Uint8(video.initialization_data));
+      const bool nal = video.codec == CodecId::H264 || video.codec == CodecId::Hevc;
+      options.set("description", Uint8(nal ? std::span<const std::byte>(video.initialization_data) : std::span<const std::byte>{}));
     }
     id_ = bridge_.call<unsigned>("open", options);
     return CodecResult<void>::Success();
@@ -76,6 +104,8 @@ public:
     const auto pts = packet.pts.Rescale(1000000).value().ticks;
     const auto duration = packet.duration ? val(double(packet.duration->Rescale(1000000).value().ticks)) : val::null();
     const auto bytes = packet.data.AsBytes();
+    // Retain the session's input credit until WebCodecs dequeues the decode request.
+    queued_input_.push_back(packet.data);
     bridge_.call<void>("submit", id_, Uint8(bytes), double(pts), duration, packet.key_frame);
     const auto error = ErrorText();
     if (!error.empty()) return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::InvalidData, error, "WebCodecs"));
@@ -88,10 +118,16 @@ public:
     }
     return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
   }
+  bool HasPendingInput() const noexcept override { return !queued_input_.empty(); }
+
   CodecResult<std::optional<BackendOutput>> Poll() override {
     using R = CodecResult<std::optional<BackendOutput>>;
     const auto error = ErrorText();
     if (!error.empty()) return R::Failure(Error(CodecErrorCode::PlatformFailure, error, "WebCodecs"));
+    if (!queued_input_.empty()) {
+      const auto queued = bridge_.call<unsigned>("queued", id_);
+      while (queued_input_.size() > queued) queued_input_.pop_front();
+    }
     if (mp3_) {
       if (auto frame = mp3_->Read()) return R::Success(BackendOutput{DecodedFrame{std::move(*frame)}});
     }
@@ -154,6 +190,7 @@ public:
   }
   CodecResult<SubmitStatus> Finish() override {
     if (!mp3_drain_frame_.empty()) {
+      if (HasPendingInput()) return CodecResult<SubmitStatus>::Success(SubmitStatus::WouldBlock);
       bridge_.call<void>("submit", id_, Uint8(mp3_drain_frame_), 0.0, val::null(), true);
       const auto error = ErrorText();
       if (!error.empty()) return CodecResult<SubmitStatus>::Failure(Error(CodecErrorCode::InvalidData, error, "WebCodecs"));
@@ -165,6 +202,7 @@ public:
   CodecResult<void> Close() override {
     if (!id_) return CodecResult<void>::Success();
     const auto error = bridge_.call<std::string>("close", id_); id_ = 0;
+    queued_input_.clear();
     if (!error.empty()) return CodecResult<void>::Failure(Error(CodecErrorCode::PlatformFailure, error, "WebCodecs.close"));
     return CodecResult<void>::Success();
   }
@@ -172,6 +210,7 @@ private:
   std::string ErrorText() { return bridge_.call<std::string>("error", id_); }
   val bridge_ = val::global("HuxerMediaCodec");
   DecoderConfig config_;
+  std::deque<BufferReference> queued_input_;
   std::optional<PcmPackets> mp3_;
   Bytes mp3_drain_frame_;
   unsigned id_ = 0;

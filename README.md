@@ -1,7 +1,7 @@
 # Lib-Media
 
 Lib-Media is the media library for [HuxerUI](https://github.com/HuxerUI/HuxerUI). It brings media playback, platform
-image/video selection, saving to the system photo library, headless AAC-LC/H.264 encoding and decoding, container I/O,
+image/video selection, saving to the system photo library, headless audio/video encoding and decoding, container I/O,
 and decoded PCM output into one C++ library.
 
 Link **`HuxerUI::Media`** and use APIs in **`huxerui::media`**. Register the **`Install`** application hook
@@ -30,7 +30,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`media_player.h`](include/huxerui/media_player.h) |
 | Platform image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
-| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, HEVC, and macOS VP9 profile 0. Opus, FLAC, and MP3 also pass native decoding on Windows and Linux. See [decoder validation](#media-decoding). | `AudioDecoder`, `VideoDecoder`, exact timestamps and CPU frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
+| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, HEVC, and VP8/VP9 profile 0 where available. See the [VP8/VP9 platform matrix](docs/media-codec.md#vp8-and-vp9) and [decoder validation](#media-decoding). | `AudioDecoder`, `VideoDecoder`, exact timestamps and decoded frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
 | HEVC encoding and decoding | Main and Main10 adapters for all six platforms. Linux Main/Main10 CPU round trips and preview export passed under WSL. See the [HEVC matrix](docs/media-codec.md#hevc) for device and runtime coverage. | `CodecId::Hevc`, `VideoEncoder`, `VideoDecoder`, and `VideoPixelFormat::P010` |
 | GPU video | SDR H.264 and HEVC Main platform frames and SDK texture input on macOS, Android, iOS, Windows, and supported Web browsers. Windows x64 passed H.264 GPU transcode and SDK texture encoding for H.264 and HEVC Main. See [GPU video](docs/gpu-video.md) for platform coverage. | `VideoStorage::Platform`, `MakeExternalTexture()`, and `MakeVideoFrame()` |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
@@ -447,21 +447,23 @@ The Library tab disables multi-select when the maximum is below two; otherwise i
 the platform limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
 FilePicker explicitly to obtain a source. Switching tabs unmounts the previous session and cancels its pending work.
 
-The Frames tab uses `MediaDemuxer` and `DecodedPlayback` to preview and seek MP4, MOV, and supported WebM
-files. It switches decoders at sample-description boundaries and applies track edits to decoded pictures and PCM.
-The bundled H.264/AAC sample has reordered pictures, uneven frame intervals, and AAC priming. On supported
-macOS hardware, CPU preview also plays VP9 profile 0 with Opus in WebM without Cues.
+The Frames tab uses `MediaDemuxer` and `DecodedPlayback` to preview and seek MP4, MOV, WebM, and MKV files
+with supported codecs. It switches decoders at sample-description boundaries and applies track edits to decoded
+pictures and PCM. The bundled H.264/AAC sample has reordered pictures, uneven frame intervals, and AAC priming.
+VP8/VP9 with Opus can use a bounded seek index when Cues are absent. The preview accepts length-prefixed MKV
+HEVC with a separate codec configuration. [Container seek](docs/media-container.md#read-and-seek)
 
 Switch **CPU video** to **GPU video** for supported SDR platform frames. Android can preview directly to
 `SurfaceStreamTexture`. See the [frame storage contract and GPU performance comparison](docs/gpu-video.md).
 
 **Open audio** plays supported Ogg Opus, WebM/MKA, FLAC, MP3, and AAC M4A sources. **Copy Audio** keeps
 compatible FLAC, MP3, and AAC/ALAC M4A packets, supported tags, and artwork. **Copy Movie** keeps compatible
-MP4, MOV, or WebM access units, sample descriptions, timing, and supported metadata. The copy is reopened
-before the save action becomes available. Browser input is staged in memory and limited to 128 MiB.
+MP4, MOV, WebM, or MKV access units, sample descriptions, timing, and supported metadata. The copy is reopened
+before the save action becomes available. EBML copies reuse the source Segment tick. Browser input is staged in
+memory and limited to 128 MiB.
 
 The [preview integration test](tests/container_preview.cpp) covers repeated seeks, presentation edits,
-configuration changes, packet copy, encoded MP4 readback, and WAV sample counts including authored silence.
+configuration changes, packet-by-packet copy checks, encoded MP4 readback, and WAV sample counts including authored silence.
 The encoding and WAV export entry points are built into the test target. Hardware cases use
 `Probe()` for the concrete configuration. The [roadmap](docs/media-roadmap.md) tracks remaining device acceptance.
 

@@ -4,9 +4,6 @@
 #include "format/platform_video_storage.h"
 
 #include <array>
-#if defined(__APPLE__)
-#include <TargetConditionals.h>
-#endif
 
 namespace huxerui::media::detail {
 namespace {
@@ -184,25 +181,98 @@ CodecResult<Bytes> AnnexB(const EncodedPacket& packet, unsigned length_size) {
   }
   return CodecResult<Bytes>::Success(std::move(result));
 }
-CodecResult<void> ValidatePacket(const EncodedPacket& packet, const DecoderConfig& config, bool needs_key) {
-  auto invalid = [](const char* text) { return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidData, text)); };
+CodecResult<unsigned> Vp9Level(std::span<const std::byte> bytes) {
+  using R = CodecResult<unsigned>;
+  unsigned level = 0, seen = 0;
+  while (!bytes.empty()) {
+    if (bytes.size() < 2)
+      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Truncated VP9 codec feature header"));
+    const auto id = std::to_integer<unsigned>(bytes[0]), size = std::to_integer<unsigned>(bytes[1]);
+    bytes = bytes.subspan(2);
+    if (size > bytes.size())
+      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Truncated VP9 codec feature payload"));
+    if (id >= 1 && id <= 4) {
+      if (size != 1 || (seen & (1u << id)))
+        return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid or duplicate VP9 codec feature"));
+      seen |= 1u << id;
+      const auto value = std::to_integer<unsigned>(bytes.front());
+      if ((id == 1 && value != 0) || (id == 3 && value != 8) || (id == 4 && value > 1))
+        return R::Failure(Error(CodecErrorCode::Unsupported, "VP9 requires profile 0, eight-bit 4:2:0"));
+      if (id == 2) {
+        constexpr unsigned levels[]{10, 11, 20, 21, 30, 31, 40, 41, 50, 51, 52, 60, 61, 62};
+        if (std::ranges::find(levels, value) == std::end(levels))
+          return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid VP9 codec level"));
+        level = value;
+      }
+    }
+    bytes = bytes.subspan(size);
+  }
+  return R::Success(level);
+}
+
+CodecResult<bool> Vp9PacketDisplays(std::span<const std::byte> bytes) {
+  using R = CodecResult<bool>;
+  const auto displays = [](std::span<const std::byte> frame) {
+    if (frame.empty() || (std::to_integer<unsigned>(frame.front()) & 0xf0) != 0x80)
+      return R::Failure(Error(CodecErrorCode::InvalidData, "VP9 requires a profile 0 frame header"));
+    // show_existing_frame and show_frame both produce a picture for presentation.
+    return R::Success((std::to_integer<unsigned>(frame.front()) & 0x0a) != 0);
+  };
+  if (bytes.empty()) return displays(bytes);
+  const auto marker = std::to_integer<unsigned>(bytes.back());
+  if ((marker & 0xe0) != 0xc0) return displays(bytes);
+  const auto count = (marker & 7) + 1, width = ((marker >> 3) & 3) + 1;
+  const auto index_size = 2 + count * width;
+  if (bytes.size() < index_size || bytes[bytes.size() - index_size] != bytes.back()) return displays(bytes);
+  const auto index = bytes.last(index_size);
+  auto frames = bytes.first(bytes.size() - index_size);
+  bool visible = false;
+  for (unsigned i = 0; i < count; ++i) {
+    std::uint32_t size = 0;
+    for (unsigned j = 0; j < width; ++j)
+      size |= std::to_integer<std::uint32_t>(index[1 + i * width + j]) << (8 * j);
+    if (!size || size > frames.size())
+      return R::Failure(Error(CodecErrorCode::InvalidData, "VP9 superframe index exceeds its packet"));
+    auto frame = displays(frames.first(size));
+    if (!frame.Succeeded()) return frame;
+    if (frame.Value() && visible)
+      return R::Failure(Error(CodecErrorCode::Unsupported, "VP9 packets may contain at most one visible frame"));
+    visible |= frame.Value();
+    frames = frames.subspan(size);
+  }
+  if (!frames.empty())
+    return R::Failure(Error(CodecErrorCode::InvalidData, "VP9 superframe sizes do not cover its packet"));
+  return R::Success(visible);
+}
+
+CodecResult<bool> ValidatePacket(const EncodedPacket& packet, const DecoderConfig& config, bool needs_key) {
+  using R = CodecResult<bool>;
+  auto invalid = [](const char* text) { return R::Failure(Error(CodecErrorCode::InvalidData, text)); };
   if (packet.data.AsBytes().empty() || !packet.pts.Rescale(1000000)
       || (packet.dts && !packet.dts->Rescale(1000000))
       || (packet.duration && (!packet.duration->Rescale(1000000) || packet.duration->ticks < 0)))
     return invalid("Empty packet or invalid/unrepresentable timing");
   if (const auto* audio = std::get_if<AudioDecoderConfig>(&config); audio && audio->codec != CodecId::Aac) {
     const auto samples = AudioPacketSamples(*audio, packet.data.AsBytes());
-    if (!samples.Succeeded()) return CodecResult<void>::Failure(samples.Error());
+    if (!samples.Succeeded()) return R::Failure(samples.Error());
   }
   if (const auto* video = std::get_if<VideoDecoderConfig>(&config)) {
+    if (video->codec == CodecId::Vp8) {
+      const auto bytes = packet.data.AsBytes();
+      const auto tag = std::to_integer<unsigned>(bytes.front());
+      if (bytes.size() < 3 || (tag & 0x0e) > 6) return invalid("Invalid VP8 frame tag");
+      if (needs_key && (!packet.key_frame || (tag & 1) || bytes.size() < 10 ||
+                        bytes[3] != std::byte{0x9d} || bytes[4] != std::byte{0x01} || bytes[5] != std::byte{0x2a}))
+        return invalid("VP8 requires a key frame after creation/reset");
+      return R::Success((tag & 0x10) != 0);
+    }
     if (video->codec == CodecId::Vp9) {
       const auto bytes = packet.data.AsBytes();
       const auto header = std::to_integer<unsigned>(bytes.front());
-      if ((header & 0xf0) != 0x80) return invalid("VP9 requires a profile 0 frame header");
       if (needs_key && (!packet.key_frame || (header & 0x0c) || bytes.size() < 4 ||
                         bytes[1] != std::byte{0x49} || bytes[2] != std::byte{0x83} || bytes[3] != std::byte{0x42}))
         return invalid("VP9 requires a key frame after creation/reset");
-      return CodecResult<void>::Success();
+      return Vp9PacketDisplays(bytes);
     }
     if (video->codec == CodecId::Hevc) {
       const auto length = (std::to_integer<unsigned>(video->initialization_data[21]) & 3u) + 1;
@@ -213,7 +283,7 @@ CodecResult<void> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
       } catch (const std::invalid_argument& error) {
         return invalid(error.what());
       }
-      return CodecResult<void>::Success();
+      return R::Success(true);
     }
     const auto parsed = ParseAvc(video->initialization_data);
     const auto length = parsed.Value().length_size;
@@ -230,7 +300,7 @@ CodecResult<void> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
       if (type == 7) {
         AvcConfig update{length, {Bytes(bytes.begin() + i, bytes.begin() + i + size)}};
         const auto supported = ValidateSps(update, video->width, video->height);
-        if (!supported.Succeeded()) return supported;
+        if (!supported.Succeeded()) return R::Failure(supported.Error());
       }
       if (!type || type > 12 || (std::to_integer<unsigned>(bytes[i]) & 128)) return invalid("Unsupported AVC NAL type");
       i += size;
@@ -238,7 +308,7 @@ CodecResult<void> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
     if (!picture) return invalid("AVC access unit contains no picture");
     if (needs_key && (!packet.key_frame || !idr)) return invalid("AVC requires an IDR access unit after creation/reset");
   }
-  return CodecResult<void>::Success();
+  return R::Success(true);
 }
 CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
   using R = CodecResult<std::size_t>;
@@ -273,15 +343,27 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
       } catch (const std::invalid_argument& error) {
         return R::Failure(Error(CodecErrorCode::InvalidArgument, error.what()));
       }
-    } else if (video.codec == CodecId::Vp9) {
-#if defined(__APPLE__) && TARGET_OS_OSX
-      if (platform_storage || !eight_bit || !video.initialization_data.empty())
-        return R::Failure(Error(CodecErrorCode::Unsupported, "VP9 profile 0 requires CPU output and empty initialization data"));
-#else
-      return R::Failure(Error(CodecErrorCode::Unsupported, "VP9 decoding is unavailable on this platform"));
+    } else if (video.codec == CodecId::Vp8 || video.codec == CodecId::Vp9) {
+      if (!eight_bit)
+        return R::Failure(Error(CodecErrorCode::Unsupported, "VP8 and VP9 profile 0 require eight-bit output"));
+      if (video.codec == CodecId::Vp8 && !video.initialization_data.empty())
+        return R::Failure(Error(CodecErrorCode::InvalidArgument, "VP8 does not use initialization data"));
+      if (video.codec == CodecId::Vp9) {
+        if (video.initialization_data.size() > 65536)
+          return R::Failure(Error(CodecErrorCode::InvalidArgument, "VP9 initialization data exceeds 64 KiB"));
+        const auto level = Vp9Level(video.initialization_data);
+        if (!level.Succeeded()) return R::Failure(level.Error());
+      }
+#if defined(__APPLE__)
+      if (video.codec == CodecId::Vp8)
+        return R::Failure(Error(CodecErrorCode::Unsupported, "VP8 decoding is unavailable on this platform"));
+#endif
+#if defined(__APPLE__) || defined(_WIN32)
+      if (platform_storage)
+        return R::Failure(Error(CodecErrorCode::Unsupported, "This VP8/VP9 adapter provides CPU output"));
 #endif
     } else {
-      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video decoding requires H.264, HEVC, or VP9"));
+      return R::Failure(Error(CodecErrorCode::InvalidArgument, "Video decoding requires H.264, HEVC, VP8, or VP9"));
     }
     frame_bytes = VideoImageBytes(video.width, video.height, video.output);
     minimum = 34;

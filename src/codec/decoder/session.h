@@ -30,8 +30,9 @@ private:
     ~Credit();
   };
   struct Input { EncodedPacket packet; std::shared_ptr<Credit> credit; };
+  struct PendingInput { EncodedPacket packet; bool displays; };
   struct RetiredQueues {
-    std::deque<EncodedPacket> input;
+    std::deque<PendingInput> input;
     std::deque<Input> inflight;
     std::deque<Output> output;
     std::vector<DecodedFrame> reordered;
@@ -68,7 +69,7 @@ private:
   bool wake_pending_ = false, cleaned_ = false, finish_sent_ = false, eos_queued_ = false, needs_key_ = true;
   std::optional<CodecError> failure_, cleanup_failure_;
   std::unique_ptr<DecoderBackend> backend_;
-  std::deque<EncodedPacket> input_;
+  std::deque<PendingInput> input_;
   std::deque<Input> inflight_;
   std::deque<Output> output_;
   std::vector<DecodedFrame> reordered_;

@@ -142,8 +142,9 @@ enum class CodecId {
 
 /// @brief A complete compressed access unit with timing on the source's media timeline.
 ///
-/// Supply one raw AAC access unit or one complete length-prefixed AVC or HEVC picture access unit per packet. Keep data
-/// address-stable and unchanged throughout TrySubmit(). BufferReference retains the backing owner, which may still
+/// Supply one complete codec packet, such as a raw AAC access unit, a length-prefixed AVC or HEVC access unit,
+/// a VP8 frame, or a VP9 frame or superframe. Keep data address-stable and unchanged throughout TrySubmit().
+/// BufferReference retains the backing owner, which may still
 /// be mutable. Accepted packets are copied before TrySubmit() returns, so the caller can then reuse the source bytes.
 /// Keep a packet available for retry when submission returns SubmitStatus::WouldBlock.
 /// Supplied timing must fit in signed 64-bit microseconds after rescaling. A platform adapter may impose a smaller range.
@@ -163,7 +164,8 @@ struct EncodedPacket {
   std::optional<MediaTimestamp> dts;
   /// Optional nonnegative duration with a positive timescale. An absent duration and a zero duration are distinct.
   std::optional<MediaTimestamp> duration;
-  /// Marks a random-access unit. The first video packet after Create() or Reset() must contain an IDR and set this flag.
+  /// Marks a random-access unit. The first video packet after Create() or Reset() must begin with an IDR or VP8/VP9 key frame
+  /// and set this flag.
   /// AudioEncoder output always sets this flag; VideoEncoder derives it from actual IDR syntax.
   bool key_frame = false;
 };

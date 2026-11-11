@@ -9,7 +9,6 @@ namespace huxerui::media::detail {
 namespace {
 using namespace ebml;
 
-constexpr std::uint32_t TickRate = Nanoseconds / DefaultTimestampScale;
 constexpr std::size_t ClusterTarget = 4 * 1024 * 1024;
 
 std::string_view CodecName(ContainerFormat format, const MediaTrack& track) {
@@ -17,8 +16,8 @@ std::string_view CodecName(ContainerFormat format, const MediaTrack& track) {
   if (track.kind == TrackKind::Video) {
     if (format == ContainerFormat::Matroska && description.codec == CodecId::H264) return "V_MPEG4/ISO/AVC";
     if (format == ContainerFormat::Matroska && description.codec == CodecId::Hevc) return "V_MPEGH/ISO/HEVC";
-    if (format == ContainerFormat::WebM && description.codec == CodecId::Vp8) return "V_VP8";
-    if (format == ContainerFormat::WebM && description.codec == CodecId::Vp9) return "V_VP9";
+    if (description.codec == CodecId::Vp8) return "V_VP8";
+    if (description.codec == CodecId::Vp9) return "V_VP9";
   }
   if (track.kind == TrackKind::Audio) {
     if (description.codec == CodecId::Opus) return "A_OPUS";
@@ -36,10 +35,6 @@ std::int64_t Delay(const MediaTrack& track) {
   return ToNs({static_cast<std::int64_t>(*track.priming_samples), *description.sample_rate});
 }
 
-std::int64_t OutputTicks(std::int64_t ns) {
-  return MediaTimestamp{ns, Nanoseconds}.Rescale(TickRate)->ticks;
-}
-
 void WriteTrack(Bytes& entries, ContainerFormat format, const MediaTrack& track) {
   const auto& description = track.descriptions.front();
   Master(entries, 0xae, [&](Bytes& entry) {
@@ -49,6 +44,7 @@ void WriteTrack(Bytes& entries, ContainerFormat format, const MediaTrack& track)
     PutUInt(entry, 0x9c, 0);
     PutText(entry, 0x86, CodecName(format, track));
     if (!description.initialization_data.empty()) PutElement(entry, 0x63a2, description.initialization_data);
+    if (track.default_duration) PutUInt(entry, 0x23e383, ToNs(*track.default_duration));
     if (track.kind == TrackKind::Video) {
       Master(entry, 0xe0, [&](Bytes& video) {
         PutUInt(video, 0xb0, *description.coded_width);
@@ -108,8 +104,9 @@ struct WrittenCue {
 
 class MatroskaWriter final : public ContainerWriter {
 public:
-  MatroskaWriter(ContainerOutput stream, ContainerFormat format, std::span<const MediaTrack> tracks)
-      : ContainerWriter(std::move(stream), tracks), webm_(format == ContainerFormat::WebM), states_(tracks.size()) {
+  MatroskaWriter(ContainerOutput stream, ContainerFormat format, std::span<const MediaTrack> tracks, std::int64_t scale)
+      : ContainerWriter(std::move(stream), tracks), webm_(format == ContainerFormat::WebM),
+        scale_(scale), states_(tracks.size()) {
     for (std::size_t i = 0; i < tracks.size(); ++i) {
       states_[i].delay = Delay(tracks[i]);
       const auto& description = tracks[i].descriptions.front();
@@ -136,7 +133,7 @@ public:
     segment_data_ = output.Position();
     header.clear();
     Master(header, Info, [&](Bytes& info) {
-      PutUInt(info, 0x2ad7b1, DefaultTimestampScale);
+      PutUInt(info, 0x2ad7b1, scale_);
       PutText(info, 0x4d80, "Lib-Media");
       PutText(info, 0x5741, "Lib-Media");
     });
@@ -176,14 +173,15 @@ public:
         Fail(BadArgument, "Matroska discard padding exceeds its audio packet");
     }
     std::optional<std::uint64_t> duration;
-    if (packet.duration && packet.duration != intrinsic) {
+    const auto implied_duration = intrinsic ? intrinsic : track.default_duration;
+    if (packet.duration && packet.duration != implied_duration) {
       // Round absolute packet endpoints so a fractional audio clock cannot accumulate duration error.
       const auto ticks = SubTime(OutputTicks(AddTime(stored, ToNs(*packet.duration))), time);
       if (ticks < 0 || (packet.duration->ticks > 0 && !ticks))
         Fail(Unsupported, "Packet duration is below the Matroska output time grid");
-      // The reader applies trim to the serialized BlockDuration after the millisecond conversion.
+      // The reader applies trim to the serialized BlockDuration on the output grid.
       if (discard) {
-        const auto length = ScaleTime(ticks, DefaultTimestampScale);
+        const auto length = ScaleTime(ticks, scale_);
         if (*discard > length || *discard < -length)
           Fail(Unsupported, "Packet discard padding exceeds its duration on the Matroska output grid");
       }
@@ -232,6 +230,16 @@ public:
   }
 
 private:
+  std::int64_t OutputTicks(std::int64_t ns) const {
+    auto ticks = ns / scale_;
+    const auto remainder = ns % scale_;
+    const auto half = scale_ / 2 + scale_ % 2;
+    if (remainder >= half) ++ticks;
+    if (remainder <= -half) --ticks;
+    ScaleTime(ticks, scale_);
+    return ticks;
+  }
+
   void RequireWritable() const {
     if (failed_) Fail(ContainerErrorCode::InvalidState, "Matroska output failed while draining accepted packets");
   }
@@ -265,13 +273,14 @@ private:
   void Emit(std::size_t index, const PendingBlock& packet) {
     const auto& track = tracks[index];
     const bool video_sync = track.kind == TrackKind::Video && packet.sync;
-    auto relative = packet.time - cluster_time_;
+    auto relative = SubTime(packet.time, cluster_time_);
+    const auto maximum = std::min<std::int64_t>(2000000000 / scale_, std::numeric_limits<std::int16_t>::max());
     if (!cluster_.empty() &&
-        (relative < std::numeric_limits<std::int16_t>::min() || relative > 2000 ||
+        (relative < std::numeric_limits<std::int16_t>::min() || relative > maximum ||
          cluster_.size() + packet.bytes.size() > ClusterTarget || (video_sync && relative > 0))) Flush();
     if (cluster_.empty()) {
-      cluster_time_ = std::max(cluster_time_, packet.time);
-      relative = packet.time - cluster_time_;
+      cluster_time_ = std::max<std::int64_t>(0, packet.time);
+      relative = SubTime(packet.time, cluster_time_);
       if (relative < std::numeric_limits<std::int16_t>::min())
         Fail(Unsupported, "Matroska timestamp is too far behind the current Cluster");
       PutUInt(cluster_, Timestamp, cluster_time_);
@@ -324,6 +333,7 @@ private:
   }
 
   bool webm_;
+  std::int64_t scale_;
   bool has_video_ = false;
   bool failed_ = false;
   std::uint64_t segment_data_ = 0;
@@ -339,6 +349,11 @@ void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks
   for (const auto& track : tracks) {
     CodecName(format, track);
     const auto& description = track.descriptions.front();
+    if (track.default_duration) {
+      const auto ns = track.default_duration->Rescale(Nanoseconds);
+      if (!ns || ns->ticks <= 0 || *ns != *track.default_duration)
+        Fail(BadArgument, "Matroska default duration must be a positive whole number of nanoseconds");
+    }
     if (track.padding_samples.value_or(0))
       Fail(Unsupported, "Matroska tail trim must be supplied in the last packet");
     if (track.rotation != VideoRotation::None)
@@ -362,9 +377,9 @@ void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks
           HevcNalLength(description.initialization_data, false, BadArgument);
         }
       } else if (description.framing != PacketFraming::CodecPacket) {
-        Fail(Unsupported, "WebM VP8 and VP9 require complete codec packets");
+        Fail(Unsupported, "Matroska VP8 and VP9 require complete codec packets");
       } else if (description.codec == CodecId::Vp8 && !description.initialization_data.empty()) {
-        Fail(BadArgument, "WebM VP8 has no codec private data");
+        Fail(BadArgument, "VP8 has no Matroska codec private data");
       }
     } else {
       if (description.framing != PacketFraming::CodecPacket)
@@ -386,7 +401,8 @@ void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks
 }
 
 std::unique_ptr<ContainerWriter> OpenMatroskaWriter(ContainerOutput output, ContainerFormat format,
-                                                    std::span<const MediaTrack> tracks) {
-  return std::make_unique<MatroskaWriter>(std::move(output), format, tracks);
+                                                    std::span<const MediaTrack> tracks, const MediaMuxerOptions& options) {
+  const auto scale = options.ebml_timestamp_scale.value_or(std::chrono::nanoseconds{DefaultTimestampScale});
+  return std::make_unique<MatroskaWriter>(std::move(output), format, tracks, scale.count());
 }
 } // namespace huxerui::media::detail

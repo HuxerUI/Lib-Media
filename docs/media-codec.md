@@ -4,7 +4,7 @@
 [codec issue #20](https://github.com/HuxerUI/HuxerUI/issues/20). Link `HuxerUI::Media` with the installed public SDK.
 No `Install()`, View, Runtime, window, or application Task is needed. Existing MediaPlayer and photo-library APIs are unchanged.
 
-This guide covers AAC-LC, Opus, FLAC, and MP3 decoded to CPU PCM, and AVC, HEVC, and supported VP9 decoded to CPU YUV.
+This guide covers AAC-LC, Opus, FLAC, and MP3 decoded to CPU PCM, and AVC, HEVC, VP8, and VP9 decoded to video frames.
 The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264 and HEVC. Codec sessions do not
 demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
@@ -13,10 +13,6 @@ demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns
 They default to H.264 and AAC respectively. When reading from a container, use the codec and initialization
 data from the `MediaSampleDescription` selected by `TrackDecodeStart`. Audio also uses the sample rate and
 channel layout. [Container read and seek](media-container.md#read-and-seek)
-
-VP9 profile 0 accepts complete WebM packets with empty initialization data and CPU NV12 or I420 output
-on supported macOS hardware. Use `VideoDecoder::Probe()` for the source dimensions. Creation and reset
-require a key-marked VP9 key frame.
 
 For HEVC decoding, set `VideoDecoderConfig::codec` to `CodecId::Hevc` and supply an `hvcC` record with complete
 out-of-band VPS, SPS, and PPS for a single-layer stream. Request NV12 or I420 for Main and P010 for Main10.
@@ -110,6 +106,34 @@ existing adapter restrictions. Platform compilation and runtime validation are r
 | Windows | System synchronous Media Foundation AAC/H.264 transforms, COM/MF owned on the codec worker | Windows 11 installed-SDK builds and platform AAC/AVC fixtures, including the longer synchronization fixtures with tight output pools |
 | Linux | GStreamer appsrc/parser/installed decoder/converter/appsink pipeline | Headless installed-SDK tests on Ubuntu 24.04 under WSL with GStreamer 1.24.2, including the longer AAC/AVC synchronization fixtures and appsrc backpressure |
 | Web | WebCodecs on the owning JS event loop | Full WASM build and real Chrome C++ decoder/bridge fixture tests; simulated late probe/copy/flush retirement tests |
+
+### VP8 and VP9
+
+Submit complete VP8 frames or VP9 profile 0 frames or superframes from WebM or Matroska. VP8 leaves
+`initialization_data` empty. VP9 accepts the optional codec feature metadata from the sample description.
+Creation and reset require a key-marked packet beginning with a key frame. Reference-only packets update the
+decoder without reserving an output frame. On Web, queued decode requests hold their input item and byte credits
+until WebCodecs dequeues them, including requests that produce no picture. Each VP9 superframe can present up to one picture.
+[VP9 codec feature metadata](https://www.webmproject.org/docs/container/#vp9-codec-feature-metadata-codecprivate)
+
+Use NV12 or I420 for eight-bit CPU output. Probe the concrete codec, coded dimensions, and storage with
+`VideoDecoder::Probe()`. WebCodecs requests a level that covers the coded dimensions and any declared VP9
+level. The browser and the installed decoder determine which configurations can run.
+[VP8 WebCodecs registration](https://www.w3.org/TR/webcodecs-vp8-codec-registration/) ·
+[VP9 WebCodecs registration](https://www.w3.org/TR/webcodecs-vp9-codec-registration/)
+
+| Platform | VP8 | VP9 profile 0 | Validation |
+| --- | --- | --- | --- |
+| Android | MediaCodec VP8 | MediaCodec VP9 | Android 12 hardware passed CPU decode, exact PTS after reset, synchronized preview, repeated seeks, and WebM/MKV packet-copy readback. |
+| macOS | Unsupported | VideoToolbox hardware, CPU output | Apple Silicon passed CPU decode, reset, and VP9/Opus preview and seek without Cues at 320×240. VideoToolbox rejected the 64×48 fixture on the same host. |
+| iOS | Unsupported | VideoToolbox hardware, CPU output | Simulator build and packet copy passed. Its VP9 probe reported unavailable. Physical-device decoding awaits validation. |
+| Windows | Synchronous Media Foundation VP80 transform | Synchronous Media Foundation VP90 transform | Decoder and test sources cross-compiled for x64 and ARM64. Runtime validation requires an installed decoder that negotiates NV12 output. |
+| Linux | Installed GStreamer VP8 decoder | Installed GStreamer VP9 decoder | CPU output through `videoconvert`. Linux runtime validation pending. |
+| Web | WebCodecs `vp8` | WebCodecs `vp09` | Chrome WASM preview, repeated seeks, WebM/MKV packet-copy readback, and stalled reference packet backpressure. |
+
+Android and Web can also request platform frame storage for compatible decoder configurations.
+Matroska/WebM packet copy and seek use the shared C++ container implementation on all six platforms.
+[Container format mappings](media-container.md#supported-combinations)
 
 ### Opus, FLAC, and MP3
 
@@ -450,13 +474,19 @@ On Windows and Linux, `media_codec_native_mp3`, `media_codec_native_flac`, and `
 complete audio fixtures and compare decoded packet counts, exact PTS, and PCM sample totals across a reset and second
 drain. The cases report a skip when the configuration is unsupported by the installed media components.
 
+The VP8 and VP9 native cases run `media_codec_native_tests --video <fixture>` and check frame counts, exact PTS,
+drain, reset, and retained output. For device runs, stage the files from `tests/fixtures/container` and run
+`media_container_preview_tests --vpx <fixture-directory>` for preview, repeated seeks, and WebM/MKV copy.
+Build with `HUXERUI_MEDIA_BUILD_TESTS=ON` and the SDK's testing component.
+
 For the browser bridge, serve the repository over localhost and open
 [tests/codec_web_native.html](../tests/codec_web_native.html). It decodes the same AAC/AVC fixtures through WebCodecs,
 checks CPU copies/counts/EOS, and releases the codecs. With Web tests enabled, build `media_codec_web_native` and serve
 its generated `tests/codec_wasm.html` beside the JS/WASM/data files. That test invokes the C++ AudioDecoder and
 VideoDecoder APIs, decodes both fixtures, resets both sessions, and observes cleanup while retaining CPU output.
 Open `tests/codec_wasm.html?storage=platform` to disable browser pixel reads and verify the SDK texture after reset
-and cleanup. The separate Node test checks platform frame ownership and injects late support, flush, and copy
+and cleanup. Open `tests/codec_wasm.html?backpressure=1` to stall the WebCodecs queue and check reference packets against
+both input limits, then resume and drain. The separate Node test checks platform frame ownership and injects late support, flush, and copy
 completions after retirement. Controlled worker shutdown
 still needs dedicated validation. Physical iOS devices, Linux hardware/plugin diversity, stress/RSS, and release-failure injection
 in platform APIs remain validation work; shared fake-backend failure tests do not replace those checks.
@@ -464,10 +494,12 @@ in platform APIs remain validation work; shared fake-backend failure tests do no
 On macOS, Windows, and Linux with `HuxerUI::testing` available, `media_container_preview` verifies repeated seeks,
 PCM across a zero-pre-skip Ogg link, WAV sample counts, and movie export and readback. Windows and Linux check that the
 MP3 waveform begins at the start of the trimmed WAV. The Linux run also verifies Main and rotated Main10 preview export.
+The Matroska HEVC case verifies packet copy and repeated preview seeks where the decoder is available.
 For Web, build `media_container_preview_tests` and serve the generated `tests/container_preview_wasm.html` with its
-JS/WASM/data files. The test checks that an application callback runs during audio packet copy, that regular and fragmented
-AAC retain their packets and timing, and that the Web M4A has its index after the media data. The Web
-and iOS Simulator runs also encode the Main HEVC fixture and compare the exported picture timestamps.
+JS/WASM/data files. Click **Run preview checks** to authorize browser audio. The test exercises VP8 and VP9 with Opus,
+repeated seeks, WebM/MKV packet copy, and audio packet copy with a yielding application callback. Regular and fragmented
+AAC retain their packets and timing. The Web M4A has its index after the media data. The Web and iOS Simulator runs also
+encode the Main HEVC fixture and compare the exported picture timestamps.
 
 A local Apple Silicon Release archive comparison against the pre-codec commit grew from approximately 0.54 MiB to
 1.04 MiB (about 0.50 MiB). These figures exclude system frameworks and vary by toolchain. The existing macOS preview,

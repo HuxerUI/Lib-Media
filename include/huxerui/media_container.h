@@ -7,6 +7,7 @@
 /// Each session owns its stream. Serialize calls on a caller-managed thread. See docs/media-container.md
 /// for the supported format, codec, layout, and stream combinations.
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -205,7 +206,7 @@ struct MediaTrack {
   std::uint32_t id = 0;
   /// Media kind.
   TrackKind kind = TrackKind::Unknown;
-  /// Known media clock or requested output tick rate.
+  /// Known media clock or requested output tick rate. Matroska and WebM expose their Segment clock separately.
   std::optional<std::uint32_t> timescale;
   /// Packet configurations in one-based index order. Output requires at least one entry.
   std::vector<MediaSampleDescription> descriptions;
@@ -224,6 +225,10 @@ struct MediaTrack {
   std::vector<Edit> edits;
   /// Supported MOV track associations. Include their target tracks when copying them to a new movie.
   std::vector<Reference> references;
+  /// Default packet duration declared by Matroska or WebM. Absence means no default was declared.
+  /// Pass it through when copying these tracks. An explicit packet duration takes precedence, followed by
+  /// the codec's intrinsic duration, when known, then this default.
+  std::optional<MediaTimestamp> default_duration;
 };
 
 /// @brief One interval retained when mapping a decoded media interval through a track edit list.
@@ -369,6 +374,9 @@ public:
   [[nodiscard]] ContainerFormat Format() const;
   /// @return The recognized layout. Requires a live session.
   [[nodiscard]] ContainerLayout Layout() const;
+  /// @return The Matroska or WebM Segment tick duration, including the format default when omitted in the file.
+  /// Other formats return std::nullopt. Requires a live session and preserves the read position.
+  std::optional<std::chrono::nanoseconds> EbmlTimestampScale() const;
   /// @return Tracks and their known sample descriptions, borrowed until the next session mutation.
   [[nodiscard]] std::span<const MediaTrack> Tracks() const;
   /// @return File tags and cover art, if recognized. Artwork retains its storage after closing.
@@ -401,8 +409,8 @@ public:
 
   /// @brief Queries a covered point while preserving the read position.
   /// Random-access fragmented MP4 extends its bounded index as needed. Full coverage establishes the sample bounds.
-  /// A validated embedded index can identify a fragment directly. Sized random-access WebM can scan Blocks
-  /// when the reference track has no advertised Cues.
+  /// A validated embedded index can identify a fragment directly. Sized random-access Matroska and WebM
+  /// can scan Cluster headers and Block prefixes when the reference track has no usable Cues.
   /// @param track_id Reference track.
   /// @param time Target presentation time.
   /// @param direction Inclusive search direction.
@@ -429,12 +437,15 @@ private:
   std::unique_ptr<detail::ContainerReader> reader_;
 };
 
-/// @brief Output layout and optional file-level audio tags.
+/// @brief Output layout, optional file-level audio tags, and container timing.
 struct MediaMuxerOptions {
   /// Requested output layout for the chosen container.
   ContainerLayout layout = ContainerLayout::Default;
   /// Tags and cover art for native FLAC, MP3, or regular single-audio MP4.
   std::optional<MediaAudioMetadata> audio_metadata;
+  /// Positive nanoseconds per Matroska or WebM Segment tick. The default is one millisecond.
+  /// To copy the source clock, pass MediaDemuxer::EbmlTimestampScale(). Other output formats require absence.
+  std::optional<std::chrono::nanoseconds> ebml_timestamp_scale;
 };
 
 /// @brief Owns a synchronous, move-only container writing session.
@@ -460,7 +471,7 @@ public:
   /// @brief Validates a container and track combination without opening or writing a destination.
   /// @param format Target container format.
   /// @param tracks One entry per track ID, with the descriptions referenced by its packets.
-  /// @param options Target layout and file tags.
+  /// @param options Target layout, file tags, and container timing.
   /// @return The minimum required I/O ability or the configuration error.
   static ContainerResult<OutputRequirement> ValidateOutput(
       ContainerFormat format, std::span<const MediaTrack> tracks, const MediaMuxerOptions& options = {});
@@ -469,7 +480,7 @@ public:
   /// @param output Stream transferred to the operation, including on failure.
   /// @param format Target container format.
   /// @param tracks Track descriptions copied by the session.
-  /// @param options Target layout and file tags.
+  /// @param options Target layout, file tags, and container timing.
   /// @return A session or an error. Layouts requiring backpatching report NeedRandomAccess.
   static ContainerResult<MediaMuxer> Open(
       OutputStream output, ContainerFormat format, std::span<const MediaTrack> tracks,
@@ -479,7 +490,7 @@ public:
   /// @param output Stream transferred to the operation, including on failure.
   /// @param format Target container format.
   /// @param tracks Track descriptions copied by the session.
-  /// @param options Target layout and file tags.
+  /// @param options Target layout, file tags, and container timing.
   /// @return A session or an error. FastStart requires an SDK stream opened in ReadWrite mode.
   static ContainerResult<MediaMuxer> Open(
       RandomAccessStream output, ContainerFormat format, std::span<const MediaTrack> tracks,

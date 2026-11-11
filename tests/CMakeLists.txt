@@ -9,11 +9,11 @@ if (IOS)
     set_source_files_properties("${IOS_PREVIEW_SOURCE}" PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 endif ()
 
-if ((APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND HuxerUI_DIR AND NOT TARGET HuxerUI::testing)
+if ((ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND HuxerUI_DIR AND NOT TARGET HuxerUI::testing)
     find_package(HuxerUI CONFIG QUIET COMPONENTS static testing)
 endif ()
 
-if ((APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND TARGET HuxerUI::testing)
+if ((ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND TARGET HuxerUI::testing)
     set(MEDIA_PREVIEW_SOURCE_DIR "${PROJECT_SOURCE_DIR}/examples/preview/src")
     set(MEDIA_PREVIEW_FIXTURES "${CMAKE_CURRENT_BINARY_DIR}/preview-fixtures")
     configure_file(fixtures/container/preview-avc-aac.mp4
@@ -35,12 +35,17 @@ if ((APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND TAR
     elseif (WIN32)
         target_compile_definitions(media_container_preview_tests PRIVATE NOMINMAX)
         target_include_directories(media_container_preview_tests PRIVATE "${PROJECT_SOURCE_DIR}/platform/windows/src")
+    elseif (ANDROID)
+        target_include_directories(media_container_preview_tests PRIVATE "${PROJECT_SOURCE_DIR}/platform/android/src/main/cpp")
+        target_link_options(media_container_preview_tests PRIVATE
+                "LINKER:--wrap=AMediaCodec_createDecoderByType" "LINKER:--wrap=AMediaCodec_delete")
     endif ()
     huxerui_add_resources(media_container_preview_tests ROOT "${MEDIA_PREVIEW_FIXTURES}" NAMESPACE fixture)
     if (EMSCRIPTEN)
         target_include_directories(media_container_preview_tests PRIVATE "${PROJECT_SOURCE_DIR}/platform/web/src")
         target_compile_definitions(media_container_preview_tests PRIVATE MEDIA_FIXTURES="/fixtures/container")
-        foreach (fixture IN ITEMS tagged-mp3.mp3 tagged-aac.m4a fragmented-aac.m4a preview-hevc-main.mp4)
+        foreach (fixture IN ITEMS tagged-mp3.mp3 tagged-aac.m4a fragmented-aac.m4a preview-hevc-main.mp4
+                webm-vp8-opus.webm preview-vp9-opus-no-cues.webm mkv-hevc-aac.mkv)
             target_link_options(media_container_preview_tests PRIVATE
                     "SHELL:--preload-file \"${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container/${fixture}@/fixtures/container/${fixture}\"")
         endforeach ()
@@ -50,7 +55,7 @@ if ((APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux") AND TAR
         configure_file(container_preview_wasm.html "${CMAKE_CURRENT_BINARY_DIR}/container_preview_wasm.html" COPYONLY)
     else ()
         target_compile_definitions(media_container_preview_tests PRIVATE MEDIA_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container")
-        if (NOT IOS)
+        if (NOT IOS AND NOT ANDROID)
             add_test(NAME media_container_preview COMMAND media_container_preview_tests)
             set_tests_properties(media_container_preview PROPERTIES TIMEOUT 180)
         endif ()
@@ -170,6 +175,11 @@ if (NOT EMSCRIPTEN AND (APPLE OR ANDROID OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL 
     endif ()
     add_test(NAME media_codec_native COMMAND media_codec_native_tests)
     set_tests_properties(media_codec_native PROPERTIES TIMEOUT 90)
+    add_test(NAME media_codec_native_vp8 COMMAND media_codec_native_tests --video
+            "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container/webm-vp8-opus.webm")
+    add_test(NAME media_codec_native_vp9 COMMAND media_codec_native_tests --video
+            "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container/preview-vp9-opus-no-cues.webm")
+    set_tests_properties(media_codec_native_vp8 media_codec_native_vp9 PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     if (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
         foreach (sample IN ITEMS tagged-mp3.mp3 tagged-flac.flac preview-opus.ogg)
             get_filename_component(codec "${sample}" LAST_EXT)

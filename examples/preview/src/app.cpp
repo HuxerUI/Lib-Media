@@ -479,7 +479,7 @@ View FramesPage() {
         if (!sample) {
           const auto filter = audio ? FilePickerFilter{.name = "Audio", .extensions = {"m4a", "ogg", "opus", "flac", "mp3", "webm", "mka"},
                                                        .content_types = {"audio/*", "application/ogg", "video/webm", "video/x-matroska"}}
-                                    : FilePickerFilter{.name = "Movies", .extensions = {"mp4", "m4v", "mov", "webm"},
+                                    : FilePickerFilter{.name = "Movies", .extensions = {"mp4", "m4v", "mov", "webm", "mkv"},
                                                        .content_types = {"video/*"}};
           chosen = co_await picker->OpenFileAsync(filter);
         }

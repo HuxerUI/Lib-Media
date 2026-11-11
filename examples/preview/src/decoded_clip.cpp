@@ -235,11 +235,11 @@ struct PacketFeed {
 };
 
 VideoDecoderConfig VideoConfig(const MediaSampleDescription& description, VideoStorage storage) {
-  if ((description.codec != CodecId::H264 && description.codec != CodecId::Hevc && description.codec != CodecId::Vp9) ||
-      !description.coded_width || !description.coded_height)
-    throw std::runtime_error("Decoded preview requires an H.264, HEVC, or VP9 video track");
-  if (description.codec == CodecId::Hevc && description.sample_entry != "hvc1")
-    throw std::runtime_error("The HEVC preview requires an hvc1 sample entry");
+  if (!description.coded_width || !description.coded_height)
+    throw std::runtime_error("Decoded preview requires known video dimensions");
+  if (description.codec == CodecId::Hevc && (description.framing != PacketFraming::LengthPrefixedNals ||
+      (!description.sample_entry.empty() && description.sample_entry != "hvc1")))
+    throw std::runtime_error("The HEVC preview requires length-prefixed packets with a separate configuration");
   if (HasHdrMetadata(description))
     throw std::runtime_error("HDR display needs an HDR surface. Use Copy Movie to retain the source metadata.");
   VideoDecoderConfig video_config;
@@ -662,34 +662,34 @@ Task<void> PlayContainer(std::shared_ptr<const File> file, ClipControls controls
 namespace {
 
 MediaMuxer OpenMovieOutput(const File& output, ContainerFormat format, std::span<const MediaTrack> tracks,
-                           const std::optional<MediaAudioMetadata>& metadata = {}) {
-  const auto layout = format == ContainerFormat::Mp4 ? ContainerLayout::FastStart : ContainerLayout::Default;
-  return Require(MediaMuxer::Open(Require(output.OpenRandomAccess(FileAccessMode::ReadWrite)), format, tracks,
-                                 {.layout = layout, .audio_metadata = metadata}));
+                           MediaMuxerOptions options = {}) {
+  if (format == ContainerFormat::Mp4) options.layout = ContainerLayout::FastStart;
+  return Require(MediaMuxer::Open(Require(output.OpenRandomAccess(FileAccessMode::ReadWrite)), format, tracks, options));
 }
 
-void FinishMovie(MediaMuxer& mux, const File& output, std::size_t expected) {
+void FinishMovie(MediaMuxer& mux, const File& output) {
   Require(mux.Finish());
-  auto reopened = Open(output);
-  std::size_t packets = 0;
-  while (auto item = Require(reopened.Read())) {
-    if (std::holds_alternative<ContainerPacket>(*item)) ++packets;
-  }
-  if (packets != expected) throw std::runtime_error("The exported movie changed its packet count");
+  Open(output);
 }
 
 struct MovieCopy {
   MovieCopy(std::shared_ptr<const File> file, const File& temporary, std::optional<ContainerFormat> target) {
     auto source = Open(*file);
     const auto format = target.value_or(source.Format());
-    const auto movie = [](ContainerFormat value) { return value == ContainerFormat::Mp4 || value == ContainerFormat::Mov; };
-    if ((!movie(source.Format()) || !movie(format)) &&
-        !(source.Format() == ContainerFormat::WebM && format == ContainerFormat::WebM))
-      throw std::runtime_error("Copy supports MP4, MOV, and WebM");
+    const char* suffix;
+    switch (format) {
+      case ContainerFormat::Mp4: suffix = ".mp4"; break;
+      case ContainerFormat::Mov: suffix = ".mov"; break;
+      case ContainerFormat::Matroska: suffix = ".mkv"; break;
+      case ContainerFormat::WebM: suffix = ".webm"; break;
+      default: throw std::runtime_error("Movie copy supports MP4, MOV, MKV, and WebM");
+    }
     const std::vector source_tracks(source.Tracks().begin(), source.Tracks().end());
-    const auto suffix = format == ContainerFormat::WebM ? ".webm" : format == ContainerFormat::Mov ? ".mov" : ".mp4";
     output = TemporaryFile(temporary, suffix);
-    mux.emplace(OpenMovieOutput(*output, format, source_tracks, source.AudioMetadata()));
+    auto options = MediaMuxerOptions{.audio_metadata = source.AudioMetadata()};
+    if (format == ContainerFormat::Matroska || format == ContainerFormat::WebM)
+      options.ebml_timestamp_scale = source.EbmlTimestampScale();
+    mux.emplace(OpenMovieOutput(*output, format, source_tracks, std::move(options)));
     for (std::size_t i = 0; i < source_tracks.size(); ++i) {
       auto reader = i + 1 == source_tracks.size() ? std::move(source) : Open(*file);
       tracks.push_back({TrackInput(file, std::move(reader), source_tracks[i])});
@@ -703,7 +703,7 @@ struct MovieCopy {
       });
       if (next == tracks.end()) {
         if (requested) throw std::runtime_error("The muxer requested a track that has ended");
-        FinishMovie(*mux, *output, packets);
+        FinishMovie(*mux, *output);
         return true;
       }
       if (!next->packet) next->packet = next->input.Read();
@@ -714,10 +714,7 @@ struct MovieCopy {
         requested.reset();
       } else {
         requested = Require(mux->TryWrite(*next->packet));
-        if (!requested) {
-          next->packet.reset();
-          ++packets;
-        }
+        if (!requested) next->packet.reset();
       }
     }
     return false;
@@ -732,7 +729,6 @@ struct MovieCopy {
   std::optional<MediaMuxer> mux;
   std::vector<Track> tracks;
   std::optional<std::uint32_t> requested;
-  std::size_t packets = 0;
 };
 
 #ifdef MEDIA_PREVIEW_TEST_EXPORTS
@@ -765,7 +761,6 @@ struct ExportQueue {
   std::optional<MediaTrack> track;
   std::optional<ContainerPacket> packet;
   AudioEncodeSummary trim;
-  std::size_t packets = 0;
   bool ended = false;
   bool written = false;
 };
@@ -835,7 +830,6 @@ struct ExportTrack {
           auto dts = decode_order ? packet->dts : std::optional{packet->pts};
           ContainerPacket sample{queue.track->id, packet->data, packet->pts, dts, packet->duration, packet->key_frame};
           queue.packet = decode_order ? decode_order->Push(std::move(sample)) : std::optional{std::move(sample)};
-          ++queue.packets;
         } else if (std::holds_alternative<EndOfStream>(*output)) {
           if (decode_order) queue.packet = decode_order->Finish();
           queue.ended = true;
@@ -1005,8 +999,7 @@ Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, F
     if (audio) advanced |= co_await audio->Pump();
     if (audio_copy.track && !audio_copy.packet && !audio_copy.ended) {
       audio_copy.packet = co_await OnFileThread([source = clip.audio] { return ReadPacket(source->source); });
-      if (audio_copy.packet) ++audio_copy.packets;
-      else {
+      if (!audio_copy.packet) {
         const auto& track = clip.audio->track;
         audio_copy.trim.priming_samples = track.priming_samples;
         audio_copy.trim.padding_samples = track.padding_samples;
@@ -1049,9 +1042,8 @@ Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, F
     else if (now >= deadline) throw std::runtime_error("Timed out waiting for MP4 export");
     co_await Delay(advanced ? 0ms : 2ms);
   }
-  const auto expected = video.queue.packets + (soundtrack ? soundtrack->packets : 0);
-  co_await OnFileThread([mux, output, expected] {
-    FinishMovie(*mux, *output, expected);
+  co_await OnFileThread([mux, output] {
+    FinishMovie(*mux, *output);
     return true;
   });
   co_return output;

@@ -426,13 +426,43 @@ void Values() {
   auto malformed = ParseAvc(Bytes{std::byte{1}});
   Check(!malformed.Succeeded(), "Malformed avcC accepted");
 }
+
+void VpxPackets() {
+  const auto validate = [](CodecId codec, Bytes bytes, bool needs_key = false, bool key = false) {
+    const EncodedPacket packet{Own(std::move(bytes)), {0, 1}, {}, {}, key};
+    return ValidatePacket(packet, VideoDecoderConfig{.codec = codec}, needs_key);
+  };
+  const Bytes vp8_key{std::byte{0x10}, {}, {}, std::byte{0x9d}, std::byte{1}, std::byte{0x2a},
+                     std::byte{64}, {}, std::byte{48}, {}};
+  Check(validate(CodecId::Vp8, vp8_key, true, true).Value() &&
+        !validate(CodecId::Vp8, vp8_key, true).Succeeded(), "VP8 startup did not require a marked key frame");
+  Check(!validate(CodecId::Vp8, {std::byte{1}, {}, {}}).Value() &&
+        !validate(CodecId::Vp8, {std::byte{1}, {}, {}}, true, true).Succeeded(),
+        "VP8 reference-only frames requested output or were accepted as a key frame");
+  const Bytes vp9_key{std::byte{0x82}, std::byte{0x49}, std::byte{0x83}, std::byte{0x42}};
+  Check(validate(CodecId::Vp9, vp9_key, true, true).Value() &&
+        !validate(CodecId::Vp9, vp9_key, true).Succeeded(), "VP9 startup did not require a marked key frame");
+  Check(!validate(CodecId::Vp9, {std::byte{0x84}}).Value() &&
+        validate(CodecId::Vp9, {std::byte{0x88}}).Value(),
+        "VP9 reference-only and show-existing frames reported the wrong output count");
+  const auto marker = std::byte{0xc1};
+  Bytes superframe{std::byte{0x84}, std::byte{0x86}, marker, std::byte{1}, std::byte{1}, marker};
+  Check(validate(CodecId::Vp9, superframe).Value(), "VP9 superframe lost its visible frame");
+  superframe[0] = std::byte{0x86};
+  Check(!validate(CodecId::Vp9, superframe).Succeeded(), "VP9 superframe accepted two visible frames");
+  superframe[4] = std::byte{4};
+  Check(!validate(CodecId::Vp9, superframe).Succeeded(), "VP9 superframe accepted an out-of-range index");
+  const Bytes features{std::byte{1}, std::byte{1}, {}, std::byte{2}, std::byte{1}, std::byte{31}};
+  Check(Vp9Level(features).Value() == 31 && !Vp9Level(std::span(features).first(5)).Succeeded(),
+        "VP9 codec feature validation lost the level or accepted truncation");
+}
 } // namespace
 int main() {
   try {
 #ifdef _WIN32
     WindowsVideoColor();
 #endif
-    Values(); AllocationFailureReturnsCredit(); PlatformTimestampRounding();
+    Values(); VpxPackets(); AllocationFailureReturnsCredit(); PlatformTimestampRounding();
 #ifndef __EMSCRIPTEN__
     IndependentWorkerCleanup();
 #endif
