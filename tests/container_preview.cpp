@@ -270,9 +270,17 @@ void CheckCopy(const File& source, const File& output, ContainerFormat format) {
           found->initialization_data == track.initialization_data && found->visible == track.visible &&
           found->rotation == track.rotation && found->pixel_aspect_ratio == track.pixel_aspect_ratio &&
           found->video_extensions == track.video_extensions && found->presentation_edit == track.presentation_edit &&
+          found->edits == track.edits && found->references == track.references &&
           copy.PresentationRange(track.id) == original.PresentationRange(track.id) &&
           found->priming_samples == track.priming_samples && found->padding_samples == track.padding_samples,
           "Packet copy changed the track description or presentation metadata");
+    const auto descriptions = original.SampleDescriptions(track.id);
+    const auto copied = copy.SampleDescriptions(track.id);
+    Check(descriptions.size() == copied.size(), "Packet copy lost a sample description");
+    for (std::size_t i = 0; i < descriptions.size(); ++i)
+      Check(descriptions[i].initialization_data == copied[i].initialization_data &&
+            descriptions[i].coded_width == copied[i].coded_width && descriptions[i].coded_height == copied[i].coded_height,
+            "Packet copy changed a sample description");
     auto before = open(source), after = open(output);
     Require(before.SelectTracks(std::span(&track.id, 1)));
     Require(after.SelectTracks(std::span(&track.id, 1)));
@@ -281,6 +289,7 @@ void CheckCopy(const File& source, const File& output, ContainerFormat format) {
       Check(actual && actual->track_id == expected->track_id && actual->pts == expected->pts &&
             actual->dts == expected->dts && actual->duration == expected->duration &&
             actual->sync_sample == expected->sync_sample &&
+            actual->sample_description_index == expected->sample_description_index &&
             std::ranges::equal(actual->data.AsBytes(), expected->data.AsBytes()), "Packet copy changed access units or timing");
     }
     Check(!ReadPacket(after), "Packet copy added access units");
@@ -292,7 +301,7 @@ void CheckAudioCopy(const TaskScope& tasks, testing::UiTest& ui, const File& tem
   auto source = media_preview::Open(*input);
   if (source.Layout() == ContainerLayout::Fragmented) {
     Check(!source.PresentationRange(source.Tracks().front().id), "Fragment fixture already has an index");
-    Require(source.FindSeekPoint(source.Tracks().front().id, {0, 1}));
+    Require(source.FindSeekPoint(source.Tracks().front().id, {INT64_MAX, 1}));
   }
   const auto& original = source.Tracks().front();
   const auto expected_range = source.PresentationRange(original.id);
@@ -336,6 +345,155 @@ void CheckAudioCopy(const TaskScope& tasks, testing::UiTest& ui, const File& tem
 #endif
   }
 }
+
+void CheckFragmentedTrim(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+  for (const bool edited : {false, true}) {
+    auto source = media_preview::Open(*Fixture("fragmented-aac.m4a"));
+    auto track = source.Tracks().front();
+    const auto scale = *track.sample_rate;
+    constexpr std::int64_t head = 128, tail = 173, original = 22624;
+    std::int64_t samples = original - head - tail;
+    if (edited) {
+      track.edits = {{{1024, scale}, MediaTimestamp{head, scale}}, {{256, scale}, {}},
+                     {{1024, scale}, MediaTimestamp{8192, scale}}};
+      samples = 2304;
+    } else {
+      track.presentation_edit = MediaPresentationRange{{head, scale}, {original - tail, scale}};
+      track.priming_samples = head;
+      track.padding_samples = tail;
+    }
+    const auto input = media_preview::TemporaryFile(temporary, ".m4a");
+    auto mux = Require(MediaMuxer::Open(Require(input->OpenWrite()), ContainerFormat::Mp4, std::span(&track, 1),
+                                       ContainerLayout::Fragmented));
+    while (auto packet = ReadPacket(source)) Check(!Require(mux.TryWrite(*packet)), "Fragmented AAC write blocked");
+    Require(mux.Finish());
+    std::shared_ptr<const File> output;
+    std::exception_ptr failure;
+    const auto exporting = tasks.Launch([&]() -> Task<void> {
+      try { output = co_await media_preview::ExportWave(input, temporary); }
+      catch (...) { failure = std::current_exception(); }
+    });
+    Until(ui, failure, [&] { return bool(output); }, "Fragmented AAC could not export a trimmed WAV");
+    const auto wave = media_preview::Open(*output);
+    Check(wave.Duration() == MediaTimestamp{samples, scale}, "Fragmented AAC WAV has the wrong sample count");
+    if (edited) {
+      auto seek = media_preview::Open(*output);
+      Check(Require(seek.Seek(seek.Tracks().front().id, {1024, scale})).has_value(), "Cannot locate the empty audio edit");
+      const auto packet = ReadPacket(seek);
+      Check(packet && packet->data.AsBytes().size() >= 256 * 4 &&
+            std::ranges::all_of(packet->data.AsBytes().first(256 * 4), [](std::byte value) {
+        return value == std::byte{0};
+      }), "The empty audio edit did not produce silence");
+    }
+    exporting.Cancel();
+  }
+}
+
+void CheckFragmentedAudioStartup(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+  auto bytes = Require(Fixture("fragmented-aac.m4a")->ReadBytes());
+  bytes.pop_back();
+  const auto input = media_preview::TemporaryFile(temporary, ".m4a");
+  Check(input->WriteBytes(bytes), "Could not stage a fragmented audio file with an incomplete tail");
+  bool started = false;
+  std::exception_ptr failure;
+  const auto playing = tasks.Launch([&]() -> Task<void> {
+    try {
+      co_await media_preview::PlayAudio(input, {
+          .paused = [] { return true; }, .take_seek = [] { return std::optional<float>{}; },
+          .position = [](float, float) {}, .audio_info = [&](bool, const auto&) { started = true; },
+      });
+    } catch (...) { failure = std::current_exception(); }
+  });
+  Until(ui, failure, [&] { return started; }, "Audio preview read the entire fragment index before starting");
+  playing.Cancel();
+  ui.Pump();
+}
+
+#if !defined(__EMSCRIPTEN__) && !(defined(__APPLE__) && TARGET_OS_IOS)
+void CheckDescriptionPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+  auto large = media_preview::Open(*Fixture("preview-avc-aac.mp4"));
+  auto small = media_preview::Open(*Fixture("mkv-avc-aac.mkv"));
+  auto read_idr = [](MediaDemuxer& source) {
+    const auto track = std::ranges::find(source.Tracks(), TrackKind::Video, &MediaTrack::kind);
+    Check(track != source.Tracks().end(), "Missing AVC fixture");
+    auto description = *track;
+    Require(source.SelectTracks(std::span(&description.id, 1)));
+    while (auto packet = ReadPacket(source)) {
+      if (packet->sync_sample == true) return std::pair{std::move(description), std::move(*packet)};
+    }
+    throw std::runtime_error("No IDR in the AVC fixture");
+  };
+  auto [first, first_packet] = read_idr(large);
+  auto [second, second_packet] = read_idr(small);
+  first.id = second.id = 1;
+  first.timescale = second.timescale = 8;
+  first.presentation_edit = second.presentation_edit = {};
+  first.edits = second.edits = {{{4, 8}, MediaTimestamp{2, 8}}, {{1, 8}, {}}, {{4, 8}, MediaTimestamp{8, 8}}};
+  second.sample_description_index = 2;
+  const std::array descriptions{first, second};
+  const auto clip = media_preview::TemporaryFile(temporary, ".mp4");
+  auto mux = Require(MediaMuxer::Open(Require(clip->OpenRandomAccess(FileAccessMode::ReadWrite)),
+                                     ContainerFormat::Mp4, descriptions));
+  for (int i = 0; i < 16; ++i) {
+    auto packet = i < 8 ? first_packet : second_packet;
+    packet.track_id = first.id;
+    packet.pts = packet.dts = MediaTimestamp{i, 8};
+    packet.duration = MediaTimestamp{1, 8};
+    packet.sample_description_index = i < 8 ? 1 : 2;
+    Check(!Require(mux.TryWrite(packet)), "Description fixture write blocked");
+  }
+  Require(mux.Finish());
+
+  Observations seen;
+  std::exception_ptr failure;
+  const auto preview = Play(tasks, clip, seen, failure);
+  Until(ui, failure, [&] { return seen.format && seen.format->width == *first.coded_width; },
+        "Preview missed the first AVC configuration");
+  Check(seen.first_frame == MediaTimestamp{0, 8}, "Preview did not project the first edit to its presentation start");
+  Until(ui, failure, [&] { return seen.format && seen.format->width == *second.coded_width; },
+        "Preview did not drain and switch AVC configuration");
+  Check(seen.first_frame && seen.first_frame->Compare({5, 8}) >= 0,
+        "Preview presented the new configuration before the second edit");
+  seen.paused = true;
+  for (const auto [target, width] : {std::pair{0.125F, *first.coded_width}, {0.75F, *second.coded_width}}) {
+    const auto epoch = seen.epoch;
+    seen.seek = target;
+    Until(ui, failure, [&] { return seen.epoch > epoch && seen.first_frame && seen.format && seen.format->width == width; },
+          "Seek crossed a description or edit boundary with the wrong decoder");
+  }
+  preview.Cancel();
+  ui.Pump();
+  const auto copy = RunMovieExport(tasks, ui, temporary, clip, ContainerFormat::Mov);
+  CheckCopy(*clip, *copy, ContainerFormat::Mov);
+
+  // An unused trex default can describe HDR even when the actual first sample is SDR.
+  first.edits.clear();
+  second.edits.clear();
+  std::erase_if(first.video_extensions, [](const auto& extension) { return extension.type == "colr"; });
+  first.video_extensions.push_back({"colr", {std::byte{'n'}, std::byte{'c'}, std::byte{'l'}, std::byte{'x'},
+      std::byte{0}, std::byte{9}, std::byte{0}, std::byte{16}, std::byte{0}, std::byte{9}, std::byte{0}}});
+  const std::array fragment_descriptions{first, second};
+  const auto fragmented = media_preview::TemporaryFile(temporary, ".mp4");
+  auto fragments = Require(MediaMuxer::Open(Require(fragmented->OpenWrite()), ContainerFormat::Mp4,
+                                           fragment_descriptions, ContainerLayout::Fragmented));
+  second_packet.track_id = second.id;
+  second_packet.pts = second_packet.dts = MediaTimestamp{0, 8};
+  second_packet.duration = MediaTimestamp{1, 8};
+  second_packet.sample_description_index = 2;
+  Check(!Require(fragments.TryWrite(second_packet)), "Fragmented description fixture write blocked");
+  Require(fragments.Finish());
+  auto reader = media_preview::Open(*fragmented);
+  Check(reader.Tracks().front().sample_description_index == 1 &&
+        std::get<MediaTrack>(*Require(reader.Read())).sample_description_index == 2,
+        "The fragmented fixture did not override its default description");
+  seen = {};
+  const auto sdr_preview = Play(tasks, fragmented, seen, failure);
+  Until(ui, failure, [&] { return seen.format && seen.format->width == *second.coded_width && seen.duration == 0.125F; },
+        "Preview did not use the first packet's SDR configuration and discovered duration");
+  sdr_preview.Cancel();
+  ui.Pump();
+}
+#endif
 
 template<class Config, class Probe>
 bool CodecAvailable(testing::UiTest& ui, const Config& config, Probe probe, const char* name) {
@@ -543,10 +701,13 @@ int main(int argc, char** argv) {
     CheckAudioCopy(tasks, ui, temporary, "tagged-mp3.mp3");
     CheckAudioCopy(tasks, ui, temporary, "tagged-aac.m4a");
     CheckAudioCopy(tasks, ui, temporary, "fragmented-aac.m4a");
+    CheckFragmentedTrim(tasks, ui, temporary);
+    CheckFragmentedAudioStartup(tasks, ui, temporary);
     CheckHevcMainExport(tasks, ui, temporary);
 #if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && TARGET_OS_IOS)
     std::cout << "PASS: Preview export and audio packet copy contracts\n";
 #else
+    CheckDescriptionPreview(tasks, ui, temporary);
     const auto mp4 = Fixture("preview-avc-aac.mp4");
     std::exception_ptr failure;
     Observations seen;

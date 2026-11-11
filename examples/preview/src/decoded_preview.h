@@ -1,5 +1,6 @@
 #pragma once
 
+#include <deque>
 #include <functional>
 #include <stdexcept>
 #include <type_traits>
@@ -91,6 +92,26 @@ float Seconds(huxerui::media::MediaTimestamp time);
 huxerui::media::MediaTimestamp TimeAt(float seconds);
 bool TrimAudio(huxerui::media::AudioFrame& frame, huxerui::media::MediaTimestamp target,
                std::optional<huxerui::media::MediaTimestamp> end);
+
+struct EditMapping {
+  huxerui::media::MediaPresentationRange media;
+  std::int64_t shift;
+};
+
+class AudioEditQueue {
+public:
+  explicit AudioEditQueue(const huxerui::media::MediaTrack& track);
+  void Reset();
+  void Push(const huxerui::media::AudioFrame& frame);
+  std::optional<huxerui::media::AudioFrame> Read(huxerui::media::MediaTimestamp start,
+      std::optional<huxerui::media::MediaTimestamp> end);
+
+private:
+  std::vector<EditMapping> edits_;
+  std::deque<huxerui::media::AudioFrame> ready_;
+  std::optional<std::int64_t> next_;
+};
+
 std::shared_ptr<const huxerui::File> TemporaryFile(const huxerui::File& directory, std::string_view suffix);
 
 // Staged inputs and completed exports are removed when their last owner releases them.

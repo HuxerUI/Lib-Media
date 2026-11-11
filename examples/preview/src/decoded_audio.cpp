@@ -20,6 +20,15 @@ struct AudioInput {
     if (track == source.Tracks().end()) throw std::runtime_error("The file has no audio track");
     description = *track;
     Require(source.SelectTracks(std::span(&description.id, 1)));
+    if (source.Layout() == ContainerLayout::Fragmented) {
+      while (auto item = Require(source.Read())) {
+        if (std::holds_alternative<ContainerPacket>(*item)) {
+          first_packet = std::move(item);
+          description = *std::ranges::find(source.Tracks(), description.id, &MediaTrack::id);
+          break;
+        }
+      }
+    }
     ReadTimeline();
     if (!range && description.padding_samples.value_or(0)) {
       FindDuration();
@@ -28,7 +37,7 @@ struct AudioInput {
   }
 
   void FindDuration() {
-    if (source.Duration()) return;
+    if (source.Layout() == ContainerLayout::Fragmented || source.Duration()) return;
     auto point = source.FindSeekPoint(description.id, {0, 1});
     if (!point.Succeeded() && point.Error().code != ContainerErrorCode::IndexUnavailable)
       Require(std::move(point));
@@ -36,10 +45,21 @@ struct AudioInput {
   }
 
   void ReadTimeline() {
-    range = source.PresentationRange(description.id);
-    origin = range ? range->start : source.StartTime().value_or(MediaTimestamp{0, 1});
+    const auto coverage = source.PresentationRange(description.id);
+    range = source.Layout() == ContainerLayout::Fragmented ? description.presentation_edit : coverage;
+    origin = range ? range->start : coverage ? coverage->start : source.StartTime().value_or(MediaTimestamp{0, 1});
     if (range) duration = Seconds(range->end) - Seconds(range->start);
-    else if (const auto time = source.Duration()) duration = Seconds(*time);
+    else if (const auto time = source.Duration())
+      duration = Seconds(*time) - (source.Layout() == ContainerLayout::Fragmented ? Seconds(origin) : 0.0F);
+  }
+
+  std::optional<DemuxItem> Read() {
+    if (first_packet) return std::exchange(first_packet, std::nullopt);
+    auto item = Require(source.Read());
+    if (!item && source.Layout() == ContainerLayout::Fragmented) {
+      if (const auto time = source.Duration(); time && !range) duration = Seconds(*time) - Seconds(origin);
+    }
+    return item;
   }
 
   std::optional<MediaTrack> Seek(MediaTimestamp target) {
@@ -47,6 +67,7 @@ struct AudioInput {
     if (point.Succeeded() && !point.Value()) point = source.Seek(description.id, target, SeekDirection::AtOrAfter);
     if (!point.Succeeded() && point.Error().code == ContainerErrorCode::IndexUnavailable) return {};
     if (!Require(std::move(point))) return {};
+    first_packet.reset();
     auto item = Require(source.Read());
     if (!item || !std::holds_alternative<MediaTrack>(*item))
       throw std::runtime_error("Audio seek did not return its track description");
@@ -56,6 +77,7 @@ struct AudioInput {
   std::shared_ptr<const File> file;
   MediaDemuxer source;
   MediaTrack description;
+  std::optional<DemuxItem> first_packet;
   std::optional<MediaPresentationRange> range;
   MediaTimestamp origin;
   float duration = 0;
@@ -71,6 +93,7 @@ class AudioDecode {
 public:
   explicit AudioDecode(std::shared_ptr<AudioInput> input)
       : input_(std::move(input)), target_(input_->origin) {
+    if (!input_->description.edits.empty()) edits_.emplace(input_->description);
     Configure(input_->description);
   }
 
@@ -82,6 +105,7 @@ public:
     pending_.reset();
     frame.reset();
     windows_.clear();
+    if (edits_) edits_->Reset();
     ended = false;
     Configure(*track);
     head_ = false;
@@ -90,12 +114,19 @@ public:
 
   Task<bool> Pump() {
     if (ended || frame) co_return false;
+    if (edits_) {
+      frame = edits_->Read(target_, input_->range ? std::optional(input_->range->end) : std::nullopt);
+      if (frame) co_return true;
+    }
     if (auto item = Require(decoder_->TryRead())) {
       if (auto* pcm = std::get_if<AudioFrame>(&*item)) {
         if (windows_.empty()) throw std::runtime_error("Decoded PCM has no packet interval");
         const auto window = windows_.front();
         windows_.pop_front();
-        if (TrimAudio(*pcm, window.start, window.end)) frame = std::move(*pcm);
+        if (TrimAudio(*pcm, window.start, window.end)) {
+          if (edits_) edits_->Push(*pcm);
+          else frame = std::move(*pcm);
+        }
       } else if (std::holds_alternative<EndOfStream>(*item)) {
         if (pending_track_) {
           Configure(*pending_track_);
@@ -106,9 +137,16 @@ public:
     }
     if (sealed_) co_return false;
     if (!pending_) {
-      auto item = co_await OnFileThread([input = input_] { return Require(input->source.Read()); });
+      auto item = co_await OnFileThread([input = input_] { return input->Read(); });
       if (!item || std::holds_alternative<MediaTrack>(*item)) {
-        if (item) pending_track_ = std::get<MediaTrack>(std::move(*item));
+        if (item) {
+          auto description = std::get<MediaTrack>(std::move(*item));
+          if (!next_pts_) {
+            Configure(description);
+            co_return true;
+          }
+          pending_track_ = std::move(description);
+        }
         Require(decoder_->Finish());
         sealed_ = true;
         co_return true;
@@ -132,13 +170,16 @@ public:
     if (Require(decoder_->TrySubmit({packet.data, {pts, rate}, {}, packet.duration, true})) == SubmitStatus::WouldBlock)
       co_return false;
 
-    if (std::exchange(head_, false)) {
+    if (!edits_ && std::exchange(head_, false)) {
       const auto begin = MediaTimestamp{AddSamples(pts, track_.priming_samples.value_or(0)), rate};
       if (begin.Compare(target_) > 0) target_ = begin;
     }
-    const auto start = std::max(CeilTicks(target_, rate), AddSamples(pts, discard < 0 ? -discard : 0));
+    auto start = AddSamples(pts, discard < 0 ? -discard : 0);
     auto stop = end - std::max<std::int64_t>(0, discard);
-    if (input_->range) stop = std::min(stop, CeilTicks(input_->range->end, rate));
+    if (!edits_) {
+      start = std::max(start, CeilTicks(target_, rate));
+      if (input_->range) stop = std::min(stop, CeilTicks(input_->range->end, rate));
+    }
     windows_.push_back({{start, rate}, {stop, rate}});
     next_pts_ = end;
     pending_.reset();
@@ -157,8 +198,8 @@ private:
         track.channel_count == 1 ? AudioChannelLayout::Mono : AudioChannelLayout::Stereo};
     decoder_.emplace(Require(AudioDecoder::Create({
         .initialization_data = track.initialization_data, .output = format_, .codec = track.codec})));
+    head_ = !next_pts_ || input_->source.Format() != ContainerFormat::Mp4;
     next_pts_.reset();
-    head_ = true;
     sealed_ = false;
   }
 
@@ -171,6 +212,7 @@ private:
   std::optional<ContainerPacket> pending_;
   std::optional<std::int64_t> next_pts_;
   std::deque<MediaPresentationRange> windows_;
+  std::optional<AudioEditQueue> edits_;
   bool head_ = true;
   bool sealed_ = false;
 };
@@ -190,7 +232,7 @@ std::string_view AudioCopySuffix(const MediaDemuxer& reader) {
 
 struct AudioCopy {
   AudioCopy(std::shared_ptr<const File> input, const File& temporary)
-      : file(std::move(input)), reader(Open(*file)), fragmented(reader.Layout() == ContainerLayout::Fragmented) {
+      : file(std::move(input)), reader(Open(*file)) {
     const auto format = reader.Format();
     const auto suffix = AudioCopySuffix(reader);
     if (suffix.empty()) throw std::runtime_error("Audio packet copy requires FLAC, MP3, or a single AAC/ALAC MP4 track");
@@ -201,44 +243,28 @@ struct AudioCopy {
     const auto layout = format == ContainerFormat::Mp4 ? ContainerLayout::FastStart : ContainerLayout::Default;
 #endif
     mux.emplace(Require(MediaMuxer::Open(
-        Require(output->OpenRandomAccess(FileAccessMode::ReadWrite)), format, reader.Tracks(), layout)));
-  }
-
-  void ExtendRange(const ContainerPacket& packet) {
-    if (!packet.pts || !packet.duration) throw std::runtime_error("Fragmented audio packet is missing presentation timing");
-    const auto start = *packet.pts;
-    const auto duration = Ticks(*packet.duration, start.timescale);
-    if (duration <= 0 || start.ticks > INT64_MAX - duration)
-      throw std::runtime_error("Fragmented audio packet has an invalid presentation interval");
-    const MediaTimestamp end{start.ticks + duration, start.timescale};
-    if (!range) range = MediaPresentationRange{start, end};
-    else {
-      if (start.Compare(range->start) < 0) range->start = start;
-      if (end.Compare(range->end) > 0) range->end = end;
-    }
+        Require(output->OpenRandomAccess(FileAccessMode::ReadWrite)), format,
+        reader.SampleDescriptions(reader.Tracks().front().id), layout)));
   }
 
   bool Pump() {
     const auto deadline = std::chrono::steady_clock::now() + 8ms;
     for (unsigned i = 0; i < 32; ++i) {
       auto item = Require(reader.Read());
+      if (item && std::holds_alternative<MediaTrack>(*item)) continue;
       if (item && mux) {
         const auto& packet = std::get<ContainerPacket>(*item);
         if (Require(mux->TryWrite(packet)))
           throw std::runtime_error("Audio copy requested another track");
-        if (fragmented) ExtendRange(packet);
         ++remaining;
       } else if (item) {
         if (!remaining) throw std::runtime_error("Audio copy added packets");
         --remaining;
       } else if (mux) {
         const auto& track = reader.Tracks().front();
-        if (const auto indexed = reader.PresentationRange(track.id)) range = indexed;
-        else if (range && track.presentation_edit) {
-          const auto earlier = [](MediaTimestamp a, MediaTimestamp b) { return a.Compare(b) < 0; };
-          range->start = std::max(range->start, track.presentation_edit->start, earlier);
-          range->end = std::max(range->start, std::min(range->end, track.presentation_edit->end, earlier), earlier);
-        }
+        range = reader.PresentationRange(track.id);
+        if (reader.Format() == ContainerFormat::Mp4)
+          Require(mux->EndTrack(track.id, track.priming_samples, track.padding_samples));
         Require(mux->Finish());
         mux.reset();
         reader = Open(*output);
@@ -255,7 +281,6 @@ struct AudioCopy {
   std::shared_ptr<const File> file;
   std::shared_ptr<const File> output;
   MediaDemuxer reader;
-  const bool fragmented;
   std::optional<MediaMuxer> mux;
   std::optional<MediaPresentationRange> range;
   std::size_t remaining = 0;
@@ -289,13 +314,21 @@ Task<void> PlayAudio(std::shared_ptr<const File> file, ClipControls controls) {
   PlaybackEpoch epoch;
   bool playing = false, sealed = false;
   const auto origin = Seconds(input->origin);
-  controls.position(0, input->duration);
+  const bool fragmented = input->source.Layout() == ContainerLayout::Fragmented;
+  float observed_duration = 0.0F;
+  const auto report_position = [&](float position) {
+    observed_duration = std::max(observed_duration, position);
+    if (input->duration > 0.0F) controls.position(std::min(position, input->duration), input->duration);
+    else controls.position(position, fragmented ? observed_duration : 0.0F);
+  };
+  report_position(0);
   for (;;) {
-    if (const auto seek = controls.take_seek(); seek && input->duration > 0) {
-      const auto target = std::clamp(*seek, 0.0F, input->duration);
+    if (const auto seek = controls.take_seek(); seek && (fragmented || input->duration > 0.0F)) {
+      const auto end = input->duration > 0.0F ? input->duration : std::max(0.0F, *seek);
+      const auto target = std::clamp(*seek, 0.0F, end);
       if (co_await decode.Seek(TimeAt(origin + target))) {
         playback.reset();
-        controls.position(target, input->duration);
+        report_position(target);
       }
     }
     const bool wanted = !controls.paused();
@@ -334,7 +367,7 @@ Task<void> PlayAudio(std::shared_ptr<const File> file, ClipControls controls) {
       if (snapshot.error) throw std::runtime_error(snapshot.error->message);
       if (snapshot.position) {
         const auto current = std::max(0.0F, Seconds(*snapshot.position) - origin);
-        controls.position(input->duration > 0 ? std::min(current, input->duration) : current, input->duration);
+        report_position(current);
       }
     }
     if (!advanced) co_await Delay(8ms);

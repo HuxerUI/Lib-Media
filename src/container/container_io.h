@@ -49,6 +49,7 @@ public:
 
   bool Random() const { return std::holds_alternative<RandomAccessStream>(stream_); }
   std::optional<std::uint64_t> Size() const { return size_; }
+  void RefreshSize();
   std::uint64_t Position() const { return position_; }
   std::span<const std::byte> Peek(std::size_t count);
   bool ReadExact(std::span<std::byte> bytes);
@@ -155,6 +156,7 @@ public:
   ContainerReader(ContainerInput input, ContainerFormat format) : input(std::move(input)), format(format) {}
   virtual ~ContainerReader() = default;
   virtual std::optional<DemuxItem> Read() = 0;
+  virtual std::span<const MediaTrack> SampleDescriptions(std::size_t track) const { return {&tracks[track], 1}; }
   virtual std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp time, SeekDirection direction, bool seek);
   virtual std::optional<MediaPresentationRange> PresentationRange(std::size_t) const { return {}; }
 
@@ -178,6 +180,7 @@ public:
   virtual std::optional<std::uint32_t> Write(std::uint32_t track, const ContainerPacket& packet) = 0;
   virtual void TrackEnded(std::uint32_t) {}
   virtual bool SupportsTrim() const { return false; }
+  virtual bool SupportsSampleDescriptions() const { return false; }
   virtual bool SupportsPacketTrim() const { return false; }
   virtual void Finish() = 0;
 
@@ -203,7 +206,8 @@ void ValidateOgg(std::span<const MediaTrack> tracks);
 std::unique_ptr<ContainerReader> OpenFlacReader(ContainerInput input);
 std::unique_ptr<ContainerReader> OpenMp3Reader(ContainerInput input);
 bool LooksLikeMp3(ByteView bytes);
-std::unique_ptr<ContainerReader> OpenMp4Reader(ContainerInput input, std::optional<ContainerFormat> hint);
+std::unique_ptr<ContainerReader> OpenMp4Reader(ContainerInput input, std::optional<ContainerFormat> hint,
+                                               ContainerInputMode mode);
 std::unique_ptr<ContainerWriter> OpenMp4Writer(ContainerOutput output, ContainerFormat format,
                                                std::span<const MediaTrack> tracks, ContainerLayout layout);
 void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout);

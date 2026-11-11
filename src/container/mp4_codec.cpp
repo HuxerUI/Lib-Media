@@ -3,6 +3,29 @@
 
 namespace huxerui::media::detail {
 
+Mp4EditTimeline Mp4Edits(std::span<const MediaTrack::Edit> edits, std::uint32_t movie_scale,
+                         std::uint32_t media_scale, ContainerErrorCode error) {
+  if (edits.size() > MaxMp4Edits) Fail(ContainerErrorCode::LimitExceeded, "MP4 edit list exceeds its limit");
+  Mp4EditTimeline timeline{CommonScale(movie_scale, media_scale), {}};
+  std::int64_t previous_media_end = 0;
+  for (const auto& edit : edits) {
+    const auto length = ExactTicks(edit.duration, movie_scale);
+    if (length <= 0) Fail(error, "MP4 edit duration must be positive");
+    const auto duration = ExactTicks(edit.duration, timeline.scale);
+    const auto end = AddTime(timeline.duration, duration);
+    if (edit.media_start) {
+      ExactTicks(*edit.media_start, media_scale);
+      const auto start = ExactTicks(*edit.media_start, timeline.scale);
+      if (start < previous_media_end) Fail(error, "MP4 media edits must be forward and nonoverlapping");
+      timeline.segments.push_back({timeline.duration, end, start});
+      previous_media_end = AddTime(start, duration);
+    }
+    timeline.duration = end;
+  }
+  if (timeline.segments.empty()) Fail(error, "MP4 edit list has no media interval");
+  return timeline;
+}
+
 AlacConfig ParseAlac(ByteView config, ContainerErrorCode error) {
   if (config.size() != 24 || Number<std::uint8_t>(config, 4) != 0)
     Fail(error, "Invalid ALACSpecificConfig");
@@ -67,6 +90,30 @@ bool ProResEntry(std::uint32_t tag) {
     case Tag("ap4h"):
     case Tag("ap4x"): return true;
     default: return false;
+  }
+}
+
+void ValidateMovDataDescription(std::string_view entry, ByteView data, ContainerErrorCode error) {
+  if (data.size() > 65536)
+    Fail(ContainerErrorCode::LimitExceeded, "QuickTime data description exceeds 64 KiB");
+  if (entry == "tmcd") {
+    if (data.size() < 18 || !Number<std::uint32_t>(data, 8) || !Number<std::uint32_t>(data, 12) ||
+        !Number<std::uint8_t>(data, 16))
+      Fail(error, "Invalid QuickTime timecode description");
+  } else {
+    if (entry != "mebx") Fail(error, "Unsupported QuickTime data sample entry");
+    bool keys = false;
+    while (!data.empty()) {
+      if (data.size() < 8) Fail(error, "Truncated QuickTime timed metadata description");
+      const auto size = Number<std::uint32_t>(data);
+      if (size < 8 || size > data.size()) Fail(error, "Invalid QuickTime timed metadata description size");
+      if (Number<std::uint32_t>(data, 4) == Tag("keys")) {
+        if (keys || size == 8) Fail(error, "Invalid QuickTime timed metadata keys");
+        keys = true;
+      }
+      data = data.subspan(size);
+    }
+    if (!keys) Fail(error, "QuickTime timed metadata is missing its key table");
   }
 }
 

@@ -4,6 +4,9 @@
 
 namespace huxerui::media::detail {
 
+inline constexpr std::uint32_t MaxMp4Descriptions = 32;
+inline constexpr std::size_t MaxMp4Edits = 256;
+
 struct Mp4Sample {
   std::uint64_t offset;
   std::uint32_t size;
@@ -11,6 +14,7 @@ struct Mp4Sample {
   std::int64_t dts;
   std::uint32_t duration;
   bool sync;
+  std::uint32_t description = 1;
 };
 
 inline void SetU32(Bytes& bytes, std::size_t position, std::uint32_t value) {
@@ -31,6 +35,19 @@ template<class Body> void FullBox(Bytes& bytes, std::string_view tag, std::uint3
 }
 
 std::uint32_t Mp4Scale(const MediaTrack& track);
+
+struct Mp4EditSegment {
+  std::int64_t begin, end, media;
+};
+
+struct Mp4EditTimeline {
+  std::uint32_t scale;
+  std::vector<Mp4EditSegment> segments;
+  std::int64_t duration = 0;
+};
+
+Mp4EditTimeline Mp4Edits(std::span<const MediaTrack::Edit> edits, std::uint32_t movie_scale,
+                         std::uint32_t media_scale, ContainerErrorCode error);
 
 struct AlacConfig {
   std::uint32_t frame_length, sample_rate;
@@ -55,6 +72,7 @@ bool AvcIdr(ByteView bytes, unsigned length_size, ContainerErrorCode error);
 unsigned HevcNalLength(ByteView config, bool hvc1, ContainerErrorCode error);
 bool HevcIdr(ByteView bytes, unsigned length_size, bool hvc1, ContainerErrorCode error);
 bool ProResEntry(std::uint32_t tag);
+void ValidateMovDataDescription(std::string_view entry, ByteView data, ContainerErrorCode error);
 unsigned MovPcmBits(CodecId codec);
 bool MovPcmBigEndian(CodecId codec);
 

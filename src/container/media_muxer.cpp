@@ -1,4 +1,4 @@
-#include "container_io.h"
+#include "mp4.h"
 
 namespace huxerui::media {
 namespace {
@@ -6,11 +6,19 @@ using namespace detail;
 using Requirement = MediaMuxer::OutputRequirement;
 
 Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks, ContainerLayout layout) {
+  const bool mp4 = format == ContainerFormat::Mp4 || format == ContainerFormat::Mov;
   if (tracks.empty()) Fail(ContainerErrorCode::InvalidArgument, "A container needs at least one track");
-  if (tracks.size() > MaxContainerTracks) Fail(ContainerErrorCode::LimitExceeded, "Too many output tracks");
+  const auto track_count = static_cast<std::size_t>(std::ranges::count(tracks, 1u, &MediaTrack::sample_description_index));
+  if (tracks.size() > MaxContainerTracks * (mp4 ? MaxMp4Descriptions : 1) || track_count > MaxContainerTracks)
+    Fail(ContainerErrorCode::LimitExceeded, "Too many output tracks or descriptions");
   for (auto it = tracks.begin(); it != tracks.end(); ++it) {
-    if (!it->id || std::ranges::find(tracks.begin(), it, it->id, &MediaTrack::id) != it)
-      Fail(ContainerErrorCode::InvalidArgument, "Output track IDs must be nonzero and unique");
+    if (!it->id || !it->sample_description_index ||
+        std::ranges::any_of(std::ranges::subrange(tracks.begin(), it), [&](const auto& before) {
+          return before.id == it->id && before.sample_description_index == it->sample_description_index;
+        }))
+      Fail(ContainerErrorCode::InvalidArgument, "Output track IDs and description indices must identify unique descriptions");
+    if (!mp4 && it->sample_description_index != 1)
+      Fail(ContainerErrorCode::Unsupported, "Output format requires a single sample description per track");
     if (it->timescale == 0) Fail(ContainerErrorCode::InvalidArgument, "Zero output track timescale");
     if (it->seek_preroll && (!it->seek_preroll->timescale || it->seek_preroll->ticks < 0))
       Fail(ContainerErrorCode::InvalidArgument, "Invalid track seek preroll");
@@ -19,17 +27,21 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain track seek preroll");
     if (it->initialization_data.size() > 65536)
       Fail(ContainerErrorCode::LimitExceeded, "Output track configuration exceeds 64 KiB");
-    if (it->presentation_edit && it->presentation_edit->start.Compare(it->presentation_edit->end) != -1)
+    if (it->presentation_edit && (!it->edits.empty() ||
+        it->presentation_edit->start.Compare(it->presentation_edit->end) != -1))
       Fail(ContainerErrorCode::InvalidArgument, "Invalid track presentation edit");
-    if ((it->presentation_edit || it->pixel_aspect_ratio || !it->video_extensions.empty()) &&
-        format != ContainerFormat::Mp4 && format != ContainerFormat::Mov)
+    if ((it->presentation_edit || !it->edits.empty() || it->pixel_aspect_ratio || !it->video_extensions.empty()) && !mp4)
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied presentation metadata");
+    if (!it->references.empty() && format != ContainerFormat::Mov)
+      Fail(ContainerErrorCode::Unsupported, "Output format cannot retain QuickTime track references");
     if (it->kind != TrackKind::Video && (it->pixel_aspect_ratio || !it->video_extensions.empty()))
       Fail(ContainerErrorCode::InvalidArgument, "Visual metadata requires a video track");
     if (it->audio_metadata && format != ContainerFormat::Flac && format != ContainerFormat::Mp3 &&
-        (format != ContainerFormat::Mp4 || tracks.size() != 1 || it->kind != TrackKind::Audio ||
+        (format != ContainerFormat::Mp4 || track_count != 1 || it->kind != TrackKind::Audio ||
          layout == ContainerLayout::Fragmented))
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied audio tags");
+    if (it->audio_metadata && it->sample_description_index != 1)
+      Fail(ContainerErrorCode::InvalidArgument, "Audio tags belong to the first sample description");
   }
   if (layout != ContainerLayout::Default && (format != ContainerFormat::Mp4 ||
       (layout != ContainerLayout::Fragmented && layout != ContainerLayout::FastStart)))
@@ -118,10 +130,12 @@ ContainerResult<std::optional<std::uint32_t>> MediaMuxer::TryWrite(const Contain
     const auto size = packet.data.AsBytes().size();
     if (!size) Fail(ContainerErrorCode::InvalidArgument, "Empty container packet");
     if (size > MaxContainerPacket) Fail(ContainerErrorCode::LimitExceeded, "Container packet exceeds 16 MiB");
-    if ((packet.pts && !packet.pts->timescale) || (packet.dts && !packet.dts->timescale) ||
+    if (!packet.sample_description_index || (packet.pts && !packet.pts->timescale) || (packet.dts && !packet.dts->timescale) ||
         (packet.duration && (!packet.duration->timescale || packet.duration->ticks < 0)) ||
         (packet.discard_padding && !packet.discard_padding->timescale))
       Fail(ContainerErrorCode::InvalidArgument, "Invalid container packet timing");
+    if (packet.sample_description_index != 1 && !writer_->SupportsSampleDescriptions())
+      Fail(ContainerErrorCode::Unsupported, "Output format requires a single sample description per track");
     if (packet.discard_padding && packet.discard_padding->ticks && !writer_->SupportsPacketTrim())
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain packet discard padding");
     return writer_->Write(index, packet);
@@ -140,7 +154,9 @@ ContainerResult<void> MediaMuxer::EndTrack(std::uint32_t track_id, std::optional
     auto& track = writer_->tracks[index];
     if ((priming || padding) && track.kind != TrackKind::Audio)
       Fail(ContainerErrorCode::InvalidArgument, "Audio trim requires an audio track");
-    if ((priming.value_or(0) || padding.value_or(0)) && !writer_->SupportsTrim())
+    if (!writer_->SupportsTrim() &&
+        ((priming.value_or(0) && priming != track.priming_samples) ||
+         (padding.value_or(0) && padding != track.padding_samples)))
       Fail(ContainerErrorCode::Unsupported, "The output layout cannot store audio trim");
     if ((priming && track.priming_samples && priming != track.priming_samples) ||
         (padding && track.padding_samples && padding != track.padding_samples))

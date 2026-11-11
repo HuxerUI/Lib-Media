@@ -4,9 +4,11 @@ namespace huxerui::media {
 namespace {
 using namespace detail;
 
-std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<ContainerFormat> hint) {
+std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<ContainerFormat> hint,
+                                             ContainerInputMode mode = ContainerInputMode::Fixed) {
   const auto prefix = input.Peek(12);
   if (prefix.size() >= 4 && Number<std::uint32_t>(prefix) == 0x1a45dfa3u) {
+    if (mode == ContainerInputMode::Growing) Fail(ContainerErrorCode::Unsupported, "Growing input requires fragmented MP4");
     if (hint && *hint != ContainerFormat::Matroska && *hint != ContainerFormat::WebM)
       Fail(ContainerErrorCode::UnrecognizedFormat, "EBML input does not match the format hint");
     return OpenMatroskaReader(std::move(input), hint);
@@ -31,6 +33,8 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
   if (!recognized || (hint && *recognized != *hint &&
       !(*recognized == ContainerFormat::Mp4 && *hint == ContainerFormat::Mov)))
     Fail(ContainerErrorCode::UnrecognizedFormat, "Input bytes do not identify the requested or a supported container");
+  if (mode == ContainerInputMode::Growing && *recognized != ContainerFormat::Mp4)
+    Fail(ContainerErrorCode::Unsupported, "Growing input requires fragmented MP4");
   switch (*recognized) {
     case ContainerFormat::Wave:
     case ContainerFormat::Rf64: return OpenWaveReader(std::move(input), *recognized);
@@ -39,7 +43,7 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
     case ContainerFormat::Flac: return OpenFlacReader(std::move(input));
     case ContainerFormat::Mp3: return OpenMp3Reader(std::move(input));
     case ContainerFormat::Mp4:
-    case ContainerFormat::Mov: return OpenMp4Reader(std::move(input), hint);
+    case ContainerFormat::Mov: return OpenMp4Reader(std::move(input), hint, mode);
     case ContainerFormat::Matroska:
     case ContainerFormat::WebM: break;
   }
@@ -67,7 +71,16 @@ ContainerResult<MediaDemuxer> MediaDemuxer::Open(InputStream input, std::optiona
 }
 
 ContainerResult<MediaDemuxer> MediaDemuxer::Open(RandomAccessStream input, std::optional<ContainerFormat> hint) {
-  return ContainerCall<MediaDemuxer>([&] { return MediaDemuxer(OpenReader(ContainerInput(std::move(input)), hint)); });
+  return Open(std::move(input), hint, ContainerInputMode::Fixed);
+}
+
+ContainerResult<MediaDemuxer> MediaDemuxer::Open(RandomAccessStream input, std::optional<ContainerFormat> hint,
+                                                ContainerInputMode mode) {
+  return ContainerCall<MediaDemuxer>([&] {
+    if (mode != ContainerInputMode::Fixed && mode != ContainerInputMode::Growing)
+      Fail(ContainerErrorCode::InvalidArgument, "Invalid container input mode");
+    return MediaDemuxer(OpenReader(ContainerInput(std::move(input)), hint, mode));
+  });
 }
 
 ContainerReader& MediaDemuxer::Require() const {
@@ -78,6 +91,12 @@ ContainerReader& MediaDemuxer::Require() const {
 ContainerFormat MediaDemuxer::Format() const { return Require().format; }
 ContainerLayout MediaDemuxer::Layout() const { return Require().layout; }
 std::span<const MediaTrack> MediaDemuxer::Tracks() const { return Require().tracks; }
+std::span<const MediaTrack> MediaDemuxer::SampleDescriptions(std::uint32_t track_id) const {
+  const auto& reader = Require();
+  const auto track = std::ranges::find(reader.tracks, track_id, &MediaTrack::id);
+  if (track == reader.tracks.end()) return {};
+  return reader.SampleDescriptions(static_cast<std::size_t>(track - reader.tracks.begin()));
+}
 std::optional<MediaTimestamp> MediaDemuxer::StartTime() const { return Require().start; }
 std::optional<MediaTimestamp> MediaDemuxer::Duration() const { return Require().duration; }
 

@@ -5,7 +5,8 @@ import Foundation
 import VideoToolbox
 
 let file = URL(fileURLWithPath: CommandLine.arguments[1])
-let hlg = CommandLine.arguments.dropFirst(2).first == "hlg"
+let mode = CommandLine.arguments.dropFirst(2).first
+let hlg = mode == "hlg"
 let writer = try AVAssetWriter(outputURL: file, fileType: .mov)
 let width = 128, height = 96
 var settings: [String: Any] = [
@@ -35,9 +36,40 @@ let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sour
     kCVPixelBufferWidthKey as String: width, kCVPixelBufferHeightKey as String: height,
 ])
 writer.add(input)
+let frameCount = 18
+let timedMetadata: AVAssetWriterInputMetadataAdaptor?
+let orientationKey = "mdta/com.apple.quicktime.video-orientation"
+if mode == "metadata" {
+    var format: CMMetadataFormatDescription?
+    let status = CMMetadataFormatDescriptionCreateWithMetadataSpecifications(
+        allocator: kCFAllocatorDefault, metadataType: kCMMetadataFormatType_Boxed,
+        metadataSpecifications: [[
+            kCMMetadataFormatDescriptionMetadataSpecificationKey_Identifier: orientationKey,
+            kCMMetadataFormatDescriptionMetadataSpecificationKey_DataType: kCMMetadataBaseDataType_SInt16,
+        ]] as CFArray, formatDescriptionOut: &format
+    )
+    guard status == noErr else { fatalError("Cannot create the orientation metadata description") }
+    let metadata = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil, sourceFormatHint: format)
+    writer.add(metadata)
+    metadata.addTrackAssociation(withTrackOf: input, type: AVAssetTrack.AssociationType.metadataReferent.rawValue)
+    timedMetadata = AVAssetWriterInputMetadataAdaptor(assetWriterInput: metadata)
+} else {
+    timedMetadata = nil
+}
 guard writer.startWriting() else { fatalError(String(describing: writer.error)) }
 writer.startSession(atSourceTime: .zero)
-for index in 0..<18 {
+if let timedMetadata {
+    let orientation = AVMutableMetadataItem()
+    orientation.identifier = AVMetadataIdentifier(rawValue: orientationKey)
+    orientation.dataType = kCMMetadataBaseDataType_SInt16 as String
+    orientation.value = NSNumber(value: 6)
+    let time = CMTimeRange(start: .zero, duration: CMTime(value: Int64(frameCount), timescale: 12))
+    guard timedMetadata.append(AVTimedMetadataGroup(items: [orientation], timeRange: time)) else {
+        fatalError(String(describing: writer.error))
+    }
+    timedMetadata.assetWriterInput.markAsFinished()
+}
+for index in 0..<frameCount {
     while !input.isReadyForMoreMediaData {
         guard writer.status == .writing else { fatalError(String(describing: writer.error)) }
         Thread.sleep(forTimeInterval: 0.001)

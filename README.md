@@ -447,8 +447,11 @@ FilePicker explicitly to obtain a source. Switching tabs unmounts the previous s
 
 The Frames tab decodes files through `MediaDemuxer` and `DecodedPlayback`. Local MP4, MOV, and fragmented MP4
 can use a seek index to restart the decoders and replace the texture for each playback epoch. Effective track ranges
-limit visible pictures and PCM to the intersection of sample coverage and edits. The bundled file has reordered H.264
-pictures, uneven frame intervals, and AAC priming. The Frames preview can also present rotated SDR HEVC when the selected decoder exposes CPU I420, NV12, or P010.
+limit visible pictures and PCM to the intersection of sample coverage and edits. The preview drains and switches
+decoder configurations at sample-description boundaries and maps rate-one edits onto the playback clock. Fragmented
+MP4 playback starts from the first packet's configuration and updates its duration as packets are read. The bundled
+file has reordered H.264 pictures, uneven frame intervals, and AAC priming. The Frames preview can also present
+rotated SDR HEVC when the selected decoder exposes CPU I420, NV12, or P010.
 
 Switch **CPU video** to **GPU video** to preview supported SDR platform frames. Android can send the selected picture
 directly to `SurfaceStreamTexture`. macOS, Android, iOS, and supported Windows setups can export a half-size MP4 with
@@ -464,8 +467,9 @@ copy fragmented AAC into a regular M4A. AAC-LC M4A supports PCM preview and WAV 
 fast-start. Web copies yield between packet batches and leave the M4A index after the media data. Use “Save Audio”
 to save the prepared file.
 
-“Copy Movie” rewrites up to two compatible tracks into MP4 or MOV with the original access units, timing,
-authored edits, and supported visual metadata. This includes HLG and Dolby Vision configuration on the
+“Copy Movie” rewrites compatible tracks into MP4 or MOV with the original access units, timing, sample descriptions,
+authored edits, and supported visual metadata. MOV copies also retain timecode, boxed timed metadata, and their track
+associations. This includes HLG and Dolby Vision configuration on the
 HEVC packet-copy path. “Encode MP4” encodes SDR H.264 or HEVC using the source codec and writes fast-start MP4. macOS allows B pictures
 and uses explicit encoder DTS, as does HEVC on the iOS Simulator. Web HEVC uses automatic B-picture selection and
 can export when encoder output has strictly increasing presentation timestamps. The zero-B-picture H.264 path

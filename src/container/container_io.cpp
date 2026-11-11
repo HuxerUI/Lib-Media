@@ -89,6 +89,13 @@ ContainerInput::ContainerInput(RandomAccessStream input) : stream_(std::move(inp
   size_ = UnwrapIo(std::get<RandomAccessStream>(stream_).Size());
 }
 
+void ContainerInput::RefreshSize() {
+  const auto size = UnwrapIo(std::get<RandomAccessStream>(stream_).Size());
+  if (!size || (size_ && *size < *size_))
+    Fail(ContainerErrorCode::InvalidData, "Growing input lost its size or was truncated");
+  size_ = size;
+}
+
 std::size_t ContainerInput::Pull(std::uint64_t offset, std::span<std::byte> bytes) {
   if (auto* input = std::get_if<RandomAccessStream>(&stream_)) return UnwrapIo(input->ReadAt(offset, bytes));
   return UnwrapIo(std::get<InputStream>(stream_).Read(bytes));

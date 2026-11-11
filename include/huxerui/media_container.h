@@ -47,6 +47,12 @@ enum class ContainerLayout {
   FastStart,  ///< Regular MP4 output with its movie metadata before the media data.
 };
 
+/// @brief Expected extent of a random-access input.
+enum class ContainerInputMode {
+  Fixed,   ///< A complete input. Truncated boxes are errors.
+  Growing, ///< A fragmented MP4 whose provider exposes appended bytes through Size() and ReadAt().
+};
+
 /// @brief Media carried by a track.
 enum class TrackKind {
   Audio,    ///< Audio samples or compressed audio access units.
@@ -114,8 +120,8 @@ struct MediaAudioMetadata {
 
 /// @brief Track description shared by the demuxer and muxer.
 ///
-/// A track ID is nonzero and unique in its session. Callers may reuse an input track ID in an output session.
-/// A description returned by Read() applies to subsequent packets with the same ID until replaced.
+/// A track ID is nonzero and identifies one track in its session. An MP4 or MOV track can have several indexed
+/// sample descriptions. A description returned by Read() applies to subsequent packets with the same ID until replaced.
 struct MediaTrack {
   /// @brief Width-to-height ratio of one coded pixel, before presentation rotation.
   struct PixelAspectRatio {
@@ -139,6 +145,30 @@ struct MediaTrack {
     bool operator==(const VideoExtension&) const = default;
   };
 
+  /// @brief One rate-one edit on the track's presentation timeline.
+  ///
+  /// Entries are laid out in order from movie time zero. A missing media start represents an empty edit.
+  struct Edit {
+    /// Positive length on the presentation timeline.
+    MediaTimestamp duration;
+    /// Start on the packet timeline. Media intervals are forward and nonoverlapping.
+    std::optional<MediaTimestamp> media_start;
+
+    /// Compares the edit length and source position as rational times.
+    bool operator==(const Edit&) const = default;
+  };
+
+  /// @brief A supported QuickTime track association.
+  struct Reference {
+    /// Four-character reference type, such as tmcd or cdsc.
+    std::string type;
+    /// ID of another track in the same movie.
+    std::uint32_t track_id = 0;
+
+    /// Compares the reference type and target.
+    bool operator==(const Reference&) const = default;
+  };
+
   /// Session-local track identity.
   std::uint32_t id = 0;
   /// Media kind.
@@ -148,7 +178,8 @@ struct MediaTrack {
   /// Representation of packet bytes.
   PacketFraming framing = PacketFraming::CodecPacket;
   /// Codec configuration in the representation specified by the mapping, such as the payload of an hvcC box.
-  /// ALAC uses the 24-byte ALACSpecificConfig without the MP4 box header or version and flags.
+  /// ALAC uses the 24-byte ALACSpecificConfig without the MP4 box header or version and flags. MOV timecode
+  /// and timed metadata use the sample-entry payload after the reserved fields and data-reference index.
   Bytes initialization_data;
   /// Known track clock or requested output tick rate.
   std::optional<std::uint32_t> timescale;
@@ -171,15 +202,16 @@ struct MediaTrack {
   /// Clockwise presentation rotation of the visible image. Packet bytes keep their coded orientation.
   VideoRotation rotation = VideoRotation::None;
   /// Four-character ISO BMFF or QuickTime sample entry for mappings that distinguish variants.
-  /// HEVC retains hvc1 or hev1. ProRes retains its profile entry, such as apch.
+  /// HEVC retains hvc1 or hev1. ProRes retains its profile entry, such as apch. MOV data tracks use tmcd or mebx.
   /// Empty selects hvc1 for HEVC. ProRes output requires an explicit profile entry.
   std::string sample_entry;
   /// Known nonnegative duration of data to decode before using the output after seeking.
   /// Absence leaves the preroll unspecified. Matroska and WebM can retain this value in the track header.
   std::optional<MediaTimestamp> seek_preroll = {};
   /// Finite, authored presentation window from a supported MP4 or MOV edit list.
-  /// Pass it with the original packet timing to retain the edit in regular MP4 or MOV output. The start must
-  /// precede the end. Any supplied audio trim must agree with the edit on the packet timeline.
+  /// Pass it with the original packet timing to retain the edit. The start must precede the end.
+  /// Fragmented MP4 writes this interval in its initialization movie and requires nonnegative packet DTS.
+  /// Any supplied audio trim must agree with the edit on the packet timeline.
   /// Use MediaDemuxer::PresentationRange() for the effective window covered by media samples.
   std::optional<MediaPresentationRange> presentation_edit = {};
   /// Explicit pixel spacing from a video sample entry. Absence leaves the source's aspect unspecified.
@@ -188,7 +220,15 @@ struct MediaTrack {
   /// compressed samples. Supply metadata for the new bitstream when encoding different pictures.
   std::vector<VideoExtension> video_extensions = {};
   /// Supported file tags for the single audio track of FLAC, MP3, or M4A. Retained when copying to the same mapping.
+  /// Supply M4A tags on the first sample description when opening a writer.
   std::optional<MediaAudioMetadata> audio_metadata = {};
+  /// One-based sample description index. MP4 and MOV output accepts consecutive descriptions for the same track.
+  std::uint32_t sample_description_index = 1;
+  /// Ordered MP4 or MOV presentation edits. With these edits, packet timing stays on the source media timeline.
+  /// Supply either these edits or presentation_edit. Empty edits leave gaps in the presentation.
+  std::vector<Edit> edits = {};
+  /// Supported MOV track associations. Include their target tracks when copying the associations to a new movie.
+  std::vector<Reference> references = {};
 };
 
 /// @brief A packet on a container session's common timeline.
@@ -211,6 +251,8 @@ struct ContainerPacket {
   /// Optional audio trim within this packet. A negative value trims the beginning, a positive value trims the end.
   /// This duration does not shift PTS and is separate from trim declared on the track.
   std::optional<MediaTimestamp> discard_padding = {};
+  /// One-based description index for the packet. Must match a supplied description when writing MP4 or MOV.
+  std::uint32_t sample_description_index = 1;
 };
 
 /// @brief A covered index candidate or actual seek anchor on a reference track.
@@ -286,8 +328,17 @@ public:
   /// @brief Probes a readable random-access input starting at offset zero.
   /// @param input Stream transferred to the operation, including on failure.
   /// @param hint Optional expected container syntax.
-  /// @return A session or the probe or open error.
+  /// @return A session for a fixed input, or the probe or open error.
   static ContainerResult<MediaDemuxer> Open(RandomAccessStream input, std::optional<ContainerFormat> hint = {});
+
+  /// @brief Probes a readable random-access input with an explicit extent policy.
+  /// @param input Stream transferred to the operation, including on failure.
+  /// @param hint Optional expected container syntax.
+  /// @param mode Growing exposes only complete fragments. A successful empty Read() can be retried after an append.
+  /// The provider must report a current size and the existing prefix must stay unchanged.
+  /// @return A session or the probe or open error.
+  static ContainerResult<MediaDemuxer> Open(RandomAccessStream input, std::optional<ContainerFormat> hint,
+                                           ContainerInputMode mode);
 
   /// @return The recognized container format. Requires a live session.
   [[nodiscard]] ContainerFormat Format() const;
@@ -295,16 +346,24 @@ public:
   [[nodiscard]] ContainerLayout Layout() const;
   /// @return Current descriptions, borrowed until the next session mutation. Requires a live session.
   [[nodiscard]] std::span<const MediaTrack> Tracks() const;
+  /// @brief Returns the available sample descriptions in one-based index order.
+  /// @param track_id Track identity in this session.
+  /// @return A view borrowed until the next session mutation, or an empty view for an unknown track.
+  /// For formats with in-stream configuration changes, the view contains the current description.
+  /// In M4A the first description in this view carries the file tags. Current descriptions retain the tags across changes.
+  std::span<const MediaTrack> SampleDescriptions(std::uint32_t track_id) const;
   /// @return Known presentation start on the session timeline. Requires a live session.
   [[nodiscard]] std::optional<MediaTimestamp> StartTime() const;
   /// @return Known presentation duration. Requires a live session.
+  /// MP4 and MOV include declared empty edits at the end of the timeline.
   [[nodiscard]] std::optional<MediaTimestamp> Duration() const;
 
-  /// @brief Returns the sample coverage of a track intersected with its supported presentation edit.
+  /// @brief Returns the bounds of the samples presented by the track's supported edits.
   /// @param track_id Track identity in this session.
   /// @return A half-open interval, or std::nullopt for an unknown track or unavailable sample timing.
   /// Equal endpoints mean no samples intersect the edit. Requires a live session and does not move the read
-  /// position or build an index. MP4 and MOV supply these bounds from sample tables or a built fragment index.
+  /// position or build an index. MP4 and MOV supply these bounds from sample tables or verified fragments.
+  /// The bounds can span gaps in a multi-segment edit list. Fragmented input can initially report partial coverage.
   /// Native FLAC and MP3 supply them when the total sample count and any available gapless trim are known.
   std::optional<MediaPresentationRange> PresentationRange(std::uint32_t track_id) const;
 
@@ -319,7 +378,8 @@ public:
   ContainerResult<std::optional<DemuxItem>> Read();
 
   /// @brief Queries a covered point while preserving the read position.
-  /// A random-access fragmented MP4 can build its bounded sample index and establish track presentation ranges and audio trim.
+  /// A random-access fragmented MP4 extends its bounded index as needed. Full coverage establishes the duration and
+  /// any trailing audio trim. A validated embedded index can identify a fragment directly.
   /// @param track_id Reference track.
   /// @param time Target presentation time.
   /// @param direction Inclusive search direction.
@@ -368,7 +428,8 @@ public:
 
   /// @brief Validates a container and track combination without opening or writing a destination.
   /// @param format Target container format.
-  /// @param tracks Track descriptions with unique IDs.
+  /// @param tracks Track descriptions. MP4 and MOV accept consecutive, one-based sample description indices
+  /// for one ID. Other formats accept one description per ID.
   /// @param layout Target layout.
   /// @return The minimum required I/O ability or the configuration error.
   static ContainerResult<OutputRequirement> ValidateOutput(

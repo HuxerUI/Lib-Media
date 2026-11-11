@@ -92,6 +92,7 @@ TrackFixture Fixture(bool audio, bool fragmented) {
 void Compare(const ContainerPacket& actual, const ContainerPacket& expected) {
   Check(actual.track_id == expected.track_id && actual.pts == expected.pts && actual.dts == expected.dts &&
         actual.duration == expected.duration && actual.sync_sample == expected.sync_sample &&
+        actual.sample_description_index == expected.sample_description_index &&
         std::ranges::equal(actual.data.AsBytes(), expected.data.AsBytes()), "Container packet differs after round trip");
 }
 
@@ -214,6 +215,7 @@ void Mp4(const fs::path& path, ContainerLayout layout) {
     Check(future && future->time == *second_idr.pts && future->kind == SeekPoint::Kind::Independent,
           "Fragment index did not find the next independent sample");
     Compare(std::get<ContainerPacket>(*Take(indexed.Read())), video.packets[1]);
+    Take(indexed.FindSeekPoint(video.track.id, {INT64_MAX, 1}));
     const auto video_range = indexed.PresentationRange(video.track.id);
     Check(indexed.Duration() && video_range && indexed.PresentationRange(audio.track.id) &&
           !indexed.PresentationRange(0),
@@ -223,9 +225,8 @@ void Mp4(const fs::path& path, ContainerLayout layout) {
           "Building an index made unedited tracks incompatible with fragmented output");
     auto edited = indexed.Tracks()[0];
     edited.presentation_edit = video_range;
-    const auto unsupported = MediaMuxer::ValidateOutput(ContainerFormat::Mp4, std::span(&edited, 1), layout);
-    Check(!unsupported.Succeeded() && unsupported.Error().code == ContainerErrorCode::Unsupported,
-          "Fragmented output accepted an authored edit");
+    Check(Take(MediaMuxer::ValidateOutput(ContainerFormat::Mp4, std::span(&edited, 1), layout)) == requirement,
+          "Fragmented output rejected a known presentation edit");
     for (const auto* expected : {&second_idr, &video.packets[0], &second_idr}) {
       const auto point = Take(indexed.Seek(video.track.id, *expected->pts));
       Check(point && point->time == *expected->pts && point->kind == SeekPoint::Kind::Independent,
@@ -260,12 +261,276 @@ void Mp4(const fs::path& path, ContainerLayout layout) {
     Check(!result.Succeeded() && result.Error().code == ContainerErrorCode::InvalidData,
           "Truncated fragment was treated as EOF");
     auto damaged_index = Take(MediaDemuxer::Open(Take(Path(shortened).OpenRandomAccess())));
-    const auto failed = damaged_index.FindSeekPoint(video.track.id, {1, 1});
+    const auto failed = damaged_index.FindSeekPoint(video.track.id, {INT64_MAX, 1});
     Check(!failed.Succeeded() && failed.Error().code == ContainerErrorCode::InvalidData,
           "Truncated fragments produced a seek index");
     Take(damaged_index.SelectTracks(selected));
     Compare(std::get<ContainerPacket>(*Take(damaged_index.Read())), video.packets.front());
   }
+}
+
+void WriteMp4(const File& file, std::span<const MediaTrack> descriptions, std::span<const ContainerPacket> packets,
+              ContainerLayout layout) {
+  auto mux = layout == ContainerLayout::Fragmented
+      ? Take(MediaMuxer::Open(Take(file.OpenWrite()), ContainerFormat::Mp4, descriptions, layout))
+      : Take(MediaMuxer::Open(Take(file.OpenRandomAccess(FileAccessMode::ReadWrite, FileOpenMode::CreateNew)),
+                              ContainerFormat::Mp4, descriptions, layout));
+  for (const auto& packet : packets) Check(!Take(mux.TryWrite(packet)), "Single-track MP4 write blocked");
+  Take(mux.Finish());
+}
+
+void DescriptionsAndEdits(const fs::path& path, ContainerLayout layout) {
+  using media::detail::Number;
+  using media::detail::Put;
+  auto video = Fixture(false, true);
+  const auto group = video.packets.size() / 2;
+  const auto scale = *video.track.timescale;
+  const auto origin = video.packets.front().dts->ticks;
+  for (auto& packet : video.packets) {
+    packet.dts->ticks -= origin;
+    packet.pts->ticks -= origin;
+  }
+  const auto first = *video.packets.front().pts;
+  const auto second = *video.packets[group].pts;
+  const auto length = video.packets.front().duration->ticks;
+  video.track.edits = {{{length, scale}, {}}, {{length, scale}, first},
+                       {{length, scale}, {}}, {{2 * length, scale}, second}, {{2 * length, scale}, {}}};
+  auto alternate = video.track;
+  alternate.sample_description_index = 2;
+  alternate.visible = VideoRectangle{4, 2, 56, 44};
+  alternate.initialization_data[4] = (alternate.initialization_data[4] & std::byte{0xfc}) | std::byte{1};
+  for (auto& packet : std::span(video.packets).subspan(group)) {
+    packet.sample_description_index = 2;
+    auto nals = packet.data.AsBytes();
+    Bytes bytes;
+    while (!nals.empty()) {
+      const auto size = Number<std::uint32_t>(nals);
+      Check(size && size <= UINT16_MAX && size <= nals.size() - 4, "Invalid AVC test packet");
+      Put(bytes, static_cast<std::uint16_t>(size));
+      media::detail::Append(bytes, nals.subspan(4, size));
+      nals = nals.subspan(4 + size);
+    }
+    packet.data = BytesRef(std::move(bytes));
+  }
+  const std::array descriptions{video.track, alternate};
+  const auto file = Path(path);
+  WriteMp4(file, descriptions, video.packets, layout);
+  auto reader = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+  const auto known = reader.SampleDescriptions(video.track.id);
+  Check(known.size() == 2 && known[0].edits == video.track.edits && known[1].visible == alternate.visible &&
+        known[1].initialization_data == alternate.initialization_data, "MP4 changed its sample descriptions or edits");
+  const auto later = Take(reader.Seek(video.track.id, {3 * length, scale}));
+  Check(later && later->time == MediaTimestamp{3 * length, scale} && later->kind == SeekPoint::Kind::Independent,
+        "Seek did not map the second edit to its independent sample");
+  Check(std::get<MediaTrack>(*Take(reader.Read())).sample_description_index == 2,
+        "Seek did not replay the new description");
+  Compare(std::get<ContainerPacket>(*Take(reader.Read())), video.packets[group]);
+  const auto previous = Take(reader.Seek(video.track.id, {length, scale}));
+  Check(previous && previous->time == MediaTimestamp{length, scale}, "Seek did not map the first edit");
+  Check(std::get<MediaTrack>(*Take(reader.Read())).sample_description_index == 1,
+        "Backward seek did not restore the original description");
+  for (std::size_t i = 0; i < video.packets.size(); ++i) {
+    if (i == group) {
+      const auto updated = std::get<MediaTrack>(*Take(reader.Read()));
+      Check(updated.sample_description_index == 2 && updated.initialization_data == alternate.initialization_data,
+            "MP4 omitted the description event before the new packets");
+    }
+    Compare(std::get<ContainerPacket>(*Take(reader.Read())), video.packets[i]);
+  }
+  Check(!Take(reader.Read()), "MP4 returned extra packets across the edits");
+  Check(reader.Duration() == MediaTimestamp{7 * length, scale} &&
+        reader.PresentationRange(video.track.id) == MediaPresentationRange{{length, scale}, {5 * length, scale}},
+        "The trailing empty edit changed the sample bounds or disappeared from the movie duration");
+  if (layout == ContainerLayout::Fragmented) {
+    auto streamed = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+    while (Take(streamed.Read())) {}
+    Check(streamed.Duration() == reader.Duration() &&
+          streamed.PresentationRange(video.track.id) == reader.PresentationRange(video.track.id),
+          "Streaming and indexed reads disagree about the trailing edit");
+  }
+}
+
+void FragmentedAacTrim(const fs::path& path) {
+  auto audio = Fixture(true, true);
+  const auto scale = *audio.track.sample_rate;
+  audio.track.priming_samples = 128;
+  audio.track.padding_samples = 173;
+  const auto start = audio.packets.front().pts->ticks + 128;
+  const auto end = audio.packets.back().pts->ticks + audio.packets.back().duration->ticks - 173;
+  audio.track.presentation_edit = MediaPresentationRange{{start, scale}, {end, scale}};
+  const auto file = Path(path);
+  WriteMp4(file, std::span(&audio.track, 1), audio.packets, ContainerLayout::Fragmented);
+  auto reader = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+  const auto id = audio.track.id;
+  Take(reader.FindSeekPoint(id, {INT64_MAX, 1}));
+  Check(reader.PresentationRange(id) == audio.track.presentation_edit &&
+        reader.Tracks().front().priming_samples == audio.track.priming_samples &&
+        reader.Tracks().front().padding_samples == audio.track.padding_samples,
+        "Fragmented AAC lost its exact priming or tail trim");
+  for (const auto& expected : audio.packets) Compare(std::get<ContainerPacket>(*Take(reader.Read())), expected);
+  const auto copy = Path(path.parent_path() / "trim-readback.m4a");
+  WriteMp4(copy, reader.Tracks(), audio.packets, ContainerLayout::Default);
+  auto readback = Take(MediaDemuxer::Open(Take(copy.OpenRandomAccess())));
+  Check(readback.PresentationRange(id) == audio.track.presentation_edit &&
+        readback.Tracks().front().padding_samples == audio.track.padding_samples,
+        "M4A copy lost the fragmented edit");
+}
+
+void AppendFile(const fs::path& path, std::span<const std::byte> data) {
+  std::ofstream file(path, std::ios::binary | std::ios::app);
+  file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  Check(bool(file), "Could not append a fragment test file");
+}
+
+void FragmentSeekAndSharedMedia(const fs::path& path) {
+  using namespace media::detail;
+  auto fixture = Fixture(false, false);
+  fixture.track.timescale = 1;
+  const auto id = fixture.track.id;
+  constexpr std::array order{2, 0, 1};
+  std::array<ContainerPacket, order.size()> packets;
+  for (std::size_t i = 0; i < order.size(); ++i) {
+    packets[i] = fixture.packets.front();
+    packets[i].pts = MediaTimestamp{order[i], 1};
+    packets[i].dts = MediaTimestamp{static_cast<std::int64_t>(i), 1};
+    packets[i].duration = MediaTimestamp{1, 1};
+  }
+  const auto file = Path(path / "reordered-fragments.mp4");
+  WriteMp4(file, std::span(&fixture.track, 1), packets, ContainerLayout::Fragmented);
+  for (const auto direction : {SeekDirection::AtOrBefore, SeekDirection::AtOrAfter}) {
+    auto reader = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+    const auto target = *packets.back().pts;
+    const auto point = Take(reader.FindSeekPoint(id, target, direction));
+    Check(point && point->time == target, "A later fragment's reordered sync picture was skipped");
+    const auto anchor = Take(reader.Seek(id, target, direction));
+    Check(anchor && anchor->byte_offset == point->byte_offset &&
+          std::holds_alternative<MediaTrack>(*Take(reader.Read())), "The seek lost its reordered sync picture");
+    Compare(std::get<ContainerPacket>(*Take(reader.Read())), packets.back());
+  }
+
+  // Place two consecutive moofs before a single mdat and adjust their relative run offsets.
+  const auto bytes = Take(file.ReadBytes());
+  const ByteView data(bytes);
+  const auto skip = [&](std::size_t at) { return at + Number<std::uint32_t>(data, at); };
+  const auto first = skip(skip(0)), first_media = skip(first), second = skip(first_media);
+  const auto second_media = skip(second), third = skip(second_media);
+  const auto patch_run = [](Bytes& moof, std::uint32_t offset) {
+    const auto tag = std::as_bytes(std::span("trun", 4));
+    const auto run = std::ranges::search(moof, tag);
+    Check(!run.empty(), "Missing shared-media test run");
+    SetU32(moof, static_cast<std::size_t>(run.begin() - moof.begin()) + 12, offset);
+  };
+  Bytes first_moof(data.begin() + first, data.begin() + first_media);
+  Bytes second_moof(data.begin() + second, data.begin() + second_media);
+  const auto first_bytes = data.subspan(first_media + 8, second - first_media - 8);
+  const auto second_bytes = data.subspan(second_media + 8, third - second_media - 8);
+  patch_run(first_moof, static_cast<std::uint32_t>(first_moof.size() + second_moof.size() + 8));
+  patch_run(second_moof, static_cast<std::uint32_t>(second_moof.size() + first_bytes.size() + 8));
+  Bytes shared(data.begin(), data.begin() + first);
+  Append(shared, first_moof);
+  Append(shared, second_moof);
+  Box(shared, "mdat", [&] {
+    Append(shared, first_bytes);
+    Append(shared, second_bytes);
+  });
+  const auto complete = shared.size();
+  Append(shared, data.subspan(third));
+
+  const auto combined = Path(path / "shared-mdat.mp4");
+  Check(combined.WriteBytes(shared), "Could not stage shared media data");
+  auto reader = Take(MediaDemuxer::Open(Take(combined.OpenRandomAccess())));
+  for (const auto& packet : packets) Compare(std::get<ContainerPacket>(*Take(reader.Read())), packet);
+  Check(!Take(reader.Read()), "Reading shared media produced extra packets");
+  const auto point = Take(reader.Seek(id, *packets[1].pts));
+  Check(point && point->time == *packets[1].pts && std::holds_alternative<MediaTrack>(*Take(reader.Read())),
+        "The fragment index did not include the second run in shared media");
+  Compare(std::get<ContainerPacket>(*Take(reader.Read())), packets[1]);
+
+  const auto growing = path / "shared-mdat-growing.mp4";
+  AppendFile(growing, ByteView(shared).first(complete - 1));
+  auto live = Take(MediaDemuxer::Open(Take(Path(growing).OpenRandomAccess()), {}, ContainerInputMode::Growing));
+  Check(!Take(live.Read()), "A partial shared mdat exposed packets");
+  AppendFile(growing, ByteView(shared).subspan(complete - 1));
+  for (const auto& packet : packets) Compare(std::get<ContainerPacket>(*Take(live.Read())), packet);
+}
+
+void GrowingAndIndexedMp4(const fs::path& path) {
+  using namespace media::detail;
+  auto fixture = Fixture(false, false);
+  const auto scale = *fixture.track.timescale;
+  const auto id = fixture.track.id;
+  auto first = fixture.packets.front();
+  first.pts = first.dts = MediaTimestamp{0, scale};
+  auto second = first;
+  second.pts = second.dts = *first.duration;
+  const std::array packets{first, second};
+  const auto file = Path(path / "index-source.mp4");
+  WriteMp4(file, std::span(&fixture.track, 1), packets, ContainerLayout::Fragmented);
+  const auto bytes = Take(file.ReadBytes());
+  const ByteView data(bytes);
+  const auto skip = [&](std::size_t at) { return at + Number<std::uint32_t>(data, at); };
+  const auto init = skip(skip(0)), boundary = skip(skip(init));
+  const auto growing = path / "growing.mp4";
+  AppendFile(growing, data.first(boundary + 3));
+  auto reader = Take(MediaDemuxer::Open(Take(Path(growing).OpenRandomAccess()), {}, ContainerInputMode::Growing));
+  Compare(std::get<ContainerPacket>(*Take(reader.Read())), first);
+  Check(!Take(reader.Read()) && !Take(reader.FindSeekPoint(id, *second.pts, SeekDirection::AtOrAfter)),
+        "A partial fragment became visible");
+  AppendFile(growing, data.subspan(boundary + 3, data.size() - boundary - 4));
+  Check(!Take(reader.Read()), "A fragment with a partial mdat became visible");
+  AppendFile(growing, data.last(1));
+  Check(Take(reader.FindSeekPoint(id, *second.pts, SeekDirection::AtOrAfter))->time == *second.pts,
+        "The index did not extend after append");
+  Compare(std::get<ContainerPacket>(*Take(reader.Read())), second);
+  Check(Take(reader.Seek(id, *first.pts))->time == *first.pts, "Growing input lost its earlier index");
+  Check(std::holds_alternative<MediaTrack>(*Take(reader.Read())), "Growing seek did not replay the description");
+  Compare(std::get<ContainerPacket>(*Take(reader.Read())), first);
+
+  Bytes index;
+  FullBox(index, "sidx", 0, [&] {
+    Put(index, id);
+    Put(index, scale);
+    Put(index, 0u);
+    Put(index, 0u);
+    Put<std::uint16_t>(index, 0);
+    Put<std::uint16_t>(index, 2);
+    for (auto size : {boundary - init, data.size() - boundary}) {
+      Put(index, static_cast<std::uint32_t>(size));
+      Put(index, static_cast<std::uint32_t>(first.duration->ticks));
+      Put(index, 0x90000000u);
+    }
+  });
+  const auto embedded = path / "embedded-index.mp4";
+  AppendFile(embedded, data.first(init));
+  AppendFile(embedded, index);
+  auto broken = Bytes(data.begin() + init, data.begin() + boundary);
+  const auto tfhd = std::ranges::search(broken, std::array{std::byte{'t'}, std::byte{'f'}, std::byte{'h'}, std::byte{'d'}});
+  Check(!tfhd.empty(), "Missing test fragment header");
+  SetU32(broken, static_cast<std::size_t>(tfhd.begin() - broken.begin()) + 8, 999);
+  AppendFile(embedded, broken);
+  AppendFile(embedded, data.subspan(boundary));
+  auto direct = Take(MediaDemuxer::Open(Take(Path(embedded).OpenRandomAccess())));
+  Check(Take(direct.Seek(id, *second.pts))->time == *second.pts, "Valid embedded index did not jump to its fragment");
+  Check(std::holds_alternative<MediaTrack>(*Take(direct.Read())), "Embedded seek did not replay the description");
+  Compare(std::get<ContainerPacket>(*Take(direct.Read())), second);
+
+#if !defined(_WIN32)
+  const auto large = path / "sparse.mp4";
+  AppendFile(large, data.first(init));
+  constexpr std::uint64_t free_size = 0x100000000ull;
+  Bytes free_header;
+  Put(free_header, 1u);
+  Put(free_header, Tag("free"));
+  Put(free_header, free_size);
+  AppendFile(large, free_header);
+  fs::resize_file(large, init + free_size);
+  AppendFile(large, data.subspan(init));
+  auto sparse = Take(MediaDemuxer::Open(Take(Path(large).OpenRandomAccess())));
+  const auto point = Take(sparse.Seek(id, *second.pts));
+  Check(point && point->byte_offset && *point->byte_offset > UINT32_MAX, "Sparse MP4 lost its 64-bit seek offset");
+  Check(std::holds_alternative<MediaTrack>(*Take(sparse.Read())), "Sparse seek did not replay the description");
+  Compare(std::get<ContainerPacket>(*Take(sparse.Read())), second);
+#endif
 }
 
 void Wave(const fs::path& path, ContainerFormat format) {
@@ -576,6 +841,27 @@ void M4a(const fs::path& directory) {
       const auto packet = std::get<ContainerPacket>(*Take(random.Read()));
       Check(packet.pts == point->decode_start.value_or(point->time), "M4A seek landed at the wrong packet");
     }
+    if (aac) {
+      auto alternate = track;
+      alternate.sample_description_index = 2;
+      alternate.audio_metadata.reset();
+      for (auto& packet : std::span(packets).subspan(1)) packet.sample_description_index = 2;
+      const auto switched = Path(directory / "tagged-descriptions.m4a");
+      const std::array descriptions{track, alternate};
+      WriteMp4(switched, descriptions, packets, ContainerLayout::FastStart);
+      auto tagged = Take(MediaDemuxer::Open(Take(switched.OpenRandomAccess())));
+      const auto entries = tagged.SampleDescriptions(track.id);
+      Check(entries.size() == 2 && entries[0].audio_metadata && !entries[1].audio_metadata,
+            "M4A did not expose one copy of the file tags for the track");
+      Compare(std::get<ContainerPacket>(*Take(tagged.Read())), packets.front());
+      const auto event = std::get<MediaTrack>(*Take(tagged.Read()));
+      Check(event.sample_description_index == 2 && event.audio_metadata && event.audio_metadata->title == tags->title &&
+            event.audio_metadata->cover && std::ranges::equal(event.audio_metadata->cover->data.AsBytes(),
+                                                            tags->cover->data.AsBytes()),
+            "M4A dropped the file tags or cover when the description changed");
+      for (const auto& packet : std::span(packets).subspan(1))
+        Compare(std::get<ContainerPacket>(*Take(tagged.Read())), packet);
+    }
   }
 }
 
@@ -588,7 +874,7 @@ void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in
   Check(!wrong_hint.Succeeded() && wrong_hint.Error().code == ContainerErrorCode::UnrecognizedFormat,
         "A QuickTime brand matched an MP4 hint");
   auto input = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess()), ContainerFormat::Mov));
-  Check(input.Format() == ContainerFormat::Mov && input.Tracks().size() == 2, "QuickTime brand or track count differs");
+  Check(input.Format() == ContainerFormat::Mov && input.Tracks().size() == (hevc ? 2 : 3), "QuickTime brand or track count differs");
 
   std::vector<MediaTrack> tracks(input.Tracks().begin(), input.Tracks().end());
   Check(tracks[0].codec == (hevc ? CodecId::Hevc : CodecId::ProRes) &&
@@ -596,14 +882,19 @@ void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in
         tracks[0].rotation == (hevc ? VideoRotation::Clockwise90 : VideoRotation::None),
         "QuickTime video description differs");
   Check(tracks[1].codec == (hevc ? CodecId::Aac : CodecId::PcmS24Le), "QuickTime audio coding differs");
+  if (!hevc) {
+    Check(tracks[2].kind == TrackKind::Data && tracks[2].sample_entry == "tmcd" &&
+          tracks[0].references == std::vector<MediaTrack::Reference>{{"tmcd", tracks[2].id}},
+          "QuickTime timecode or its association is missing");
+  }
   const auto seek = Take(input.FindSeekPoint(tracks[0].id, {0, 1}));
   Check(seek && seek->kind == SeekPoint::Kind::Independent && seek->time == MediaTimestamp{0, 1},
         "QuickTime video did not expose an independent first frame");
-  std::array<std::vector<ContainerPacket>, 2> packets;
+  std::vector<std::vector<ContainerPacket>> packets(tracks.size());
   std::size_t pcm_bytes = 0;
   while (auto item = Take(input.Read())) {
     auto packet = std::get<ContainerPacket>(std::move(*item));
-    const auto track = packet.track_id == tracks[0].id ? 0u : 1u;
+    const auto track = media::detail::PacketTrack(tracks, packet.track_id);
     if (!hevc && track == 1) {
       const auto size = packet.data.AsBytes().size();
       Check(size % 6 == 0 && size > 6 && size <= 16384, "QuickTime PCM did not group aligned frames");
@@ -612,8 +903,12 @@ void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in
     packets[track].push_back(std::move(packet));
   }
   Check(packets[0].size() == (hevc ? 6 : 4) && !packets[1].empty(), "Wrong QuickTime fixture packet count");
-  if (!hevc) Check(pcm_bytes == 4000 * 6, "QuickTime PCM lost sample frames");
-  const std::array source_ranges{input.PresentationRange(tracks[0].id), input.PresentationRange(tracks[1].id)};
+  if (!hevc) {
+    Check(pcm_bytes == 4000 * 6, "QuickTime PCM lost sample frames");
+    Check(packets[2].size() == 1 && packets[2][0].data.AsBytes().size() == 4, "Wrong QuickTime timecode sample");
+  }
+  std::vector<std::optional<MediaPresentationRange>> source_ranges;
+  for (const auto& track : tracks) source_ranges.push_back(input.PresentationRange(track.id));
   Take(input.Close());
 
   if (in_band) {
@@ -673,17 +968,24 @@ void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in
     Check(!rejected.Succeeded() && rejected.Error().code == ContainerErrorCode::InvalidArgument,
           "Mux accepted two HEVC pictures as one sample");
   }
-  std::array<std::size_t, 2> cursor{};
-  std::size_t track = 0, attempts = 0;
-  while (cursor[0] < packets[0].size() || cursor[1] < packets[1].size()) {
-    Check(++attempts <= 2 * (packets[0].size() + packets[1].size()), "QuickTime remux did not make progress");
+  std::vector<std::size_t> cursor(tracks.size());
+  std::size_t total = 0;
+  for (const auto& group : packets) total += group.size();
+  std::size_t track = 0;
+  for (std::size_t remaining = total, attempts = 0; remaining;) {
+    Check(++attempts <= 2 * total, "QuickTime remux did not make progress");
     const auto need = Take(output.TryWrite(packets[track][cursor[track]]));
     if (need) {
-      Check(*need == tracks[1 - track].id, "QuickTime remux requested the wrong track");
-      track = 1 - track;
-    } else if (++cursor[track] == packets[track].size()) {
-      Take(output.EndTrack(tracks[track].id));
-      track = 1 - track;
+      track = media::detail::PacketTrack(tracks, *need);
+      Check(cursor[track] < packets[track].size(), "QuickTime remux requested an ended track");
+    } else {
+      --remaining;
+      if (++cursor[track] == packets[track].size()) {
+        Take(output.EndTrack(tracks[track].id));
+        if (remaining) {
+          do { track = (track + 1) % tracks.size(); } while (cursor[track] == packets[track].size());
+        }
+      }
     }
   }
   Take(output.Finish());
@@ -702,18 +1004,21 @@ void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in
   if (!fragmented) {
     for (std::size_t i = 0; i < tracks.size(); ++i) {
       Check(result.Tracks()[i].presentation_edit == tracks[i].presentation_edit &&
+            result.Tracks()[i].references == tracks[i].references &&
+            result.Tracks()[i].initialization_data == tracks[i].initialization_data &&
             result.PresentationRange(tracks[i].id) == source_ranges[i],
             "QuickTime remux changed the track edit or effective presentation range");
     }
   }
-  cursor = {};
+  std::ranges::fill(cursor, 0);
   while (auto item = Take(result.Read())) {
     const auto& packet = std::get<ContainerPacket>(*item);
-    const auto index = packet.track_id == tracks[0].id ? 0u : 1u;
+    const auto index = media::detail::PacketTrack(tracks, packet.track_id);
     Check(cursor[index] < packets[index].size(), "Unexpected remuxed packet");
     Compare(packet, packets[index][cursor[index]++]);
   }
-  Check(cursor[0] == packets[0].size() && cursor[1] == packets[1].size(), "QuickTime remux lost packets");
+  for (std::size_t i = 0; i < tracks.size(); ++i)
+    Check(cursor[i] == packets[i].size(), "QuickTime remux lost packets");
   if (fragmented) return;
   const auto point = Take(result.Seek(tracks[0].id, {0, 1}));
   Check(point && point->kind == (in_band ? SeekPoint::Kind::SyncMarked : SeekPoint::Kind::Independent),
@@ -721,6 +1026,53 @@ void Mov(const fs::path& destination, bool hevc, ContainerFormat format, bool in
   Check(std::get<MediaTrack>(*Take(result.Read())).rotation == tracks[0].rotation,
         "Seek did not deliver the remuxed rotation");
   Compare(std::get<ContainerPacket>(*Take(result.Read())), packets[0].front());
+}
+
+void QuickTimeMetadata(const fs::path& path) {
+  const auto fixture = Path(fs::path(MEDIA_FIXTURES) / "container" / "preview-hevc-metadata.mov");
+  auto source = Take(MediaDemuxer::Open(Take(fixture.OpenRandomAccess()), ContainerFormat::Mov));
+  const std::vector tracks(source.Tracks().begin(), source.Tracks().end());
+  Check(tracks.size() == 2 && tracks[0].codec == CodecId::Hevc && tracks[0].rotation == VideoRotation::Clockwise90 &&
+        tracks[1].kind == TrackKind::Data && tracks[1].sample_entry == "mebx" &&
+        tracks[1].references == std::vector<MediaTrack::Reference>{{"cdsc", tracks[0].id}},
+        "AVAssetWriter timed metadata description differs");
+  const auto unsupported = MediaMuxer::ValidateOutput(ContainerFormat::Mp4, tracks);
+  Check(!unsupported.Succeeded() && unsupported.Error().code == ContainerErrorCode::Unsupported,
+        "MP4 output silently dropped a QuickTime track association");
+  Take(source.SelectTracks(std::span(&tracks[1].id, 1)));
+  const auto metadata = std::get<ContainerPacket>(*Take(source.Read()));
+  Check(!Take(source.Read()) && metadata.data.AsBytes().size() == 10, "Unexpected timed metadata packet");
+
+  auto mux = Take(MediaMuxer::Open(Output(path), ContainerFormat::Mov, tracks));
+  Check(!Take(mux.TryWrite(metadata)), "Timed metadata write did not accept the sample");
+  Take(mux.EndTrack(tracks[1].id));
+  auto video = Take(MediaDemuxer::Open(Take(fixture.OpenRandomAccess())));
+  Take(video.SelectTracks(std::span(&tracks[0].id, 1)));
+  std::vector<ContainerPacket> expected;
+  while (auto item = Take(video.Read())) {
+    if (const auto* packet = std::get_if<ContainerPacket>(&*item)) {
+      Check(!Take(mux.TryWrite(*packet)), "QuickTime video write blocked");
+      expected.push_back(*packet);
+    }
+  }
+  Take(mux.Finish());
+  auto copied = Take(MediaDemuxer::Open(Take(Path(path).OpenRandomAccess())));
+  Check(copied.Tracks().size() == 2 && copied.Tracks()[0].rotation == tracks[0].rotation &&
+        copied.Tracks()[0].video_extensions == tracks[0].video_extensions &&
+        copied.Tracks()[1].references == tracks[1].references &&
+        copied.Tracks()[1].initialization_data == tracks[1].initialization_data,
+        "MOV copy changed timed metadata or the video description");
+  std::size_t pictures = 0, metadata_samples = 0;
+  while (auto item = Take(copied.Read())) {
+    const auto& packet = std::get<ContainerPacket>(*item);
+    if (packet.track_id == tracks[1].id) {
+      Compare(packet, metadata);
+      ++metadata_samples;
+    } else {
+      Compare(packet, expected.at(pictures++));
+    }
+  }
+  Check(pictures == expected.size() && metadata_samples == 1, "MOV copy lost media or metadata samples");
 }
 
 void EbmlRoundTrip(const fs::path& destination, std::string_view fixture, ContainerFormat format,
@@ -969,22 +1321,13 @@ int main(int argc, char** argv) {
     AudioFormats(path);
     M4a(path);
     EmptyM4aMetadata(path);
-    if (argc != 2) {
-      for (auto name : names) fs::remove(path / name);
-      fs::remove(path / "open-ended.mp4");
-      fs::remove(path / "truncated.mp4");
-      fs::remove(path / "remux.ogg");
-      fs::remove(path / "remux.webm");
-      fs::remove(path / "chained.ogg");
-      fs::remove(path / "copy.flac");
-      fs::remove(path / "copy.mp3");
-      fs::remove(path / "copy-aac.m4a");
-      fs::remove(path / "copy-alac.m4a");
-      fs::remove(path / "empty-udta.m4a");
-      fs::remove(path / "empty-ilst.m4a");
-      fs::remove(path / "truncated-audio");
-      fs::remove(path);
-    }
+    DescriptionsAndEdits(path / "descriptions.mp4", ContainerLayout::Default);
+    DescriptionsAndEdits(path / "descriptions-fragmented.mp4", ContainerLayout::Fragmented);
+    FragmentedAacTrim(path / "trim-fragmented.mp4");
+    FragmentSeekAndSharedMedia(path);
+    GrowingAndIndexedMp4(path);
+    QuickTimeMetadata(path / "timed-metadata-copy.mov");
+    if (argc != 2) fs::remove_all(path);
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     return 1;
