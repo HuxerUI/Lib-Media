@@ -24,6 +24,7 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
     if (type == Tag("RIFF")) recognized = ContainerFormat::Wave;
     if (type == Tag("RF64")) recognized = ContainerFormat::Rf64;
   }
+  if (!recognized && LooksLikeWave64(prefix)) recognized = ContainerFormat::Wave64;
   if (!recognized && prefix.size() >= 8) {
     const auto box = Number<std::uint32_t>(prefix, 4);
     if (box == Tag("ftyp") || box == Tag("moov") || box == Tag("mdat") || box == Tag("free") || box == Tag("wide"))
@@ -40,6 +41,7 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
     Fail(ContainerErrorCode::Unsupported, "Growing input requires fragmented MP4");
   switch (*recognized) {
     case ContainerFormat::Wave:
+    case ContainerFormat::Wave64:
     case ContainerFormat::Rf64: return OpenWaveReader(std::move(input), *recognized);
     case ContainerFormat::Aiff: return OpenAiffReader(std::move(input));
     case ContainerFormat::Caf: return OpenCafReader(std::move(input));

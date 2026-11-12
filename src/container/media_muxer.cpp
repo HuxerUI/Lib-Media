@@ -58,6 +58,7 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
     Fail(ContainerErrorCode::Unsupported, "Unsupported output layout");
   switch (format) {
     case ContainerFormat::Wave:
+    case ContainerFormat::Wave64:
     case ContainerFormat::Rf64:
       ValidateWave(tracks);
       return Requirement::RandomWrite;
@@ -100,6 +101,7 @@ std::unique_ptr<ContainerWriter> OpenWriter(ContainerOutput output, ContainerFor
   if (requirement == Requirement::RandomReadWrite) output.RequireReadable();
   switch (format) {
     case ContainerFormat::Wave:
+    case ContainerFormat::Wave64:
     case ContainerFormat::Rf64: return OpenWaveWriter(std::move(output), format, tracks);
     case ContainerFormat::Aiff: return OpenAiffWriter(std::move(output), tracks);
     case ContainerFormat::Caf: return OpenCafWriter(std::move(output), tracks);

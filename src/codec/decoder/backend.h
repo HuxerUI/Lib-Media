@@ -25,6 +25,7 @@ public:
   virtual CodecResult<void> Close() = 0;
 };
 std::unique_ptr<DecoderBackend> MakeDecoderBackend();
+std::unique_ptr<DecoderBackend> MakeVorbisDecoderBackend();
 using BackendFactory = std::function<std::unique_ptr<DecoderBackend>()>;
 
 struct VideoDecoderAccess {

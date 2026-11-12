@@ -16,13 +16,13 @@ Pass the description selected by a packet to the corresponding decoder for a sup
 | Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC or ALAC, length-prefixed AVC or HEVC, and AV1 temporal units | Random access, or sequential when movie metadata precedes samples | Random write; fast-start requires random read/write |
 | Fragmented MP4 | AAC, AVC, and HEVC | Sequential from initialization. Sized random-access input supports incremental seek, including growing files. | Sequential or random write |
 | QuickTime MOV | AAC, AVC, HEVC, ProRes, packed interleaved PCM, timecode, and boxed timed metadata | Random access, or sequential when movie metadata precedes samples | Random write |
-| Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, VP8, VP9, AV1, raw AAC-LC, mapping-family-zero Opus, and opaque subtitle samples | Sequential or random access | Sequential or random write |
-| WebM | VP8, VP9, AV1, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
-| RIFF WAVE and RF64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
+| Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, VP8, VP9, AV1, raw AAC-LC, mapping-family-zero Opus, mono/stereo Vorbis, and opaque subtitle samples | Sequential or random access | Sequential or random write |
+| WebM | VP8, VP9, AV1, mapping-family-zero Opus, and mono/stereo Vorbis | Sequential or random access | Sequential or random write |
+| RIFF WAVE, RF64, and Wave64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
 | AIFF | Mono/stereo packed interleaved S16BE, S24BE, or S32BE | Random access, or sequential when `COMM` precedes `SSND` | Random write |
 | CAF | Mono/stereo packed interleaved S16, S24, S32, or F32 in either byte order, or ALAC | Sized random access | Random write |
 | MPEG-4 ADTS | One raw mono/stereo AAC-LC access unit per frame | Sequential or random access | Sequential or random write |
-| Ogg | Mapping-family-zero Opus, including chained logical streams on input | Sequential or random access | Sequential or random write for one logical stream |
+| Ogg | Mapping-family-zero Opus, including chained logical streams on input, or mono/stereo Vorbis | Sequential or random access | Sequential or random write for one logical stream |
 | Native FLAC | Complete FLAC frames with STREAMINFO | Sequential or random access, with native seek table support | Random write for whole-frame packet copy |
 | MP3 | MPEG Layer III frames, including variable bitrate | Sequential or random access | Random write for whole-track packet copy |
 
@@ -153,8 +153,13 @@ The macOS integration test opens the encoded MOV with AVFoundation and verifies 
 unchanged LPCM bytes. [ProRes encoding](media-codec.md#prores-422-and-alac)
 
 For WAVE, an extensible track carries the 22-byte format suffix in `initialization_data`. It preserves
-the subtype, valid bits, and speaker mask when passed to a WAVE or RF64 writer. WAVE packets are
-frame-aligned blocks. ADTS strips transport headers on read and supplies them on write. It provides a
+the subtype, valid bits, and speaker mask when passed to a WAVE, RF64, or Wave64 writer. The shared PCM
+reader emits frame-aligned blocks and seeks on the sample clock. `ContainerFormat::Wave64` writes GUID
+chunks with 64-bit lengths and a 64-bit sample count. On input, the Wave64 `fact` count identifies the valid
+samples when a writer includes alignment bytes in the data chunk length.
+[Sony Wave64 format specification](https://mab.greyserv.net/f/sony_wave64.pdf)
+
+ADTS strips transport headers on read and supplies them on write. It provides a
 sample-count timeline starting at zero and emits a decode start if the AAC configuration changes.
 
 The container API covers the track and packet fields declared in the header. Tag and cover support includes
@@ -170,6 +175,26 @@ and page index on the first seek query. The 80 ms Opus preroll stays within the 
 The writer emits one packet per page for a single logical stream and accepts up to 1 ms of timestamp
 rounding for WebM interoperability. Supported streams use mapping family zero.
 [Ogg Opus mapping and seeking](https://www.rfc-editor.org/rfc/rfc7845.html#section-4.6)
+
+### Vorbis
+
+Use `CodecId::Vorbis` with the three Xiph-laced `A_VORBIS` header packets in `initialization_data`.
+Ogg uses those same packets as identification, comment, and setup headers. The first coded packet
+primes the overlap window and has zero duration on a fresh stream. Subsequent durations come from the
+previous and current block sizes. Seek returns a decode start before the requested audio so a fresh
+decoder can rebuild its overlap window. Pass the priming packet to the decoder before presenting PCM.
+[Vorbis I specification](https://www.xiph.org/vorbis/doc/Vorbis_I_spec.html) · [Matroska mapping](https://www.matroska.org/technical/codec_specs.html#A_VORBIS) · [WebM mapping](https://www.webmproject.org/docs/container/)
+
+Single-stream Ogg and audio-only WebM/MKA can copy the original Vorbis packets and headers in either
+direction on a continuous sample clock. Carry initial trim in `priming_samples` and packet trim in
+`ContainerPacket::discard_padding`. When copying to Ogg, leading `DiscardPadding` on the first
+packet with a nonzero overlap is folded into the initial audio granule. The final page granule
+preserves the tail trim. Ogg output with leading trim requires both packets in the first overlap
+to fit on its first audio page, followed by at least one more packet. An audio-only Vorbis writer
+uses a one-microsecond Segment tick by default and records the audible end on random-access output.
+On a coarser input clock, Vorbis packet times within one Segment tick of the next expected sample
+boundary are snapped to the sample clock. Random seeks restore that clock from cached Cluster
+positions and scan up to the decode anchor as needed.
 
 Native FLAC validates frame geometry, position, and checksums. Random input uses checked `SEEKTABLE`
 entries when present, with a bounded frame index as a fallback. The writer retains the compressed frames,

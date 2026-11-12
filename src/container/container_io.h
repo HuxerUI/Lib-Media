@@ -223,6 +223,7 @@ public:
 };
 
 std::unique_ptr<ContainerReader> OpenWaveReader(ContainerInput input, ContainerFormat format);
+bool LooksLikeWave64(ByteView prefix);
 void ValidateFlac(std::span<const MediaTrack> tracks);
 void ValidateMp3(std::span<const MediaTrack> tracks);
 std::unique_ptr<ContainerWriter> OpenFlacWriter(ContainerOutput output, std::span<const MediaTrack> tracks,

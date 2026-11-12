@@ -183,7 +183,8 @@ Task<bool> AudioDecode::Pump() {
   const auto rate = format_.sample_rate;
   auto pts = Ticks(*packet.pts, rate);
   const auto duration = Ticks(*packet.duration, rate);
-  if (duration <= 0) throw std::runtime_error("Audio packets require positive duration");
+  if (duration < 0 || (!duration && !vorbis_priming_))
+    throw std::runtime_error("Audio packets require positive duration after decoder priming");
   const auto container = input_->source.Format();
   if (next_pts_ && (container == ContainerFormat::Matroska || container == ContainerFormat::WebM)) {
     const auto distance = std::uint64_t(std::max(pts, *next_pts_)) - std::uint64_t(std::min(pts, *next_pts_));
@@ -203,7 +204,7 @@ Task<bool> AudioDecode::Pump() {
   if (decoder_) {
     if (Require(decoder_->TrySubmit({packet.data, {pts, rate}, {}, packet.duration, true})) == SubmitStatus::WouldBlock)
       co_return false;
-    windows_.push_back(window);
+    if (!std::exchange(vorbis_priming_, false)) windows_.push_back(window);
   } else {
     Publish(UnpackPcm(packet, *pcm_codec_, format_, pts, duration), window);
   }
@@ -225,6 +226,7 @@ void AudioDecode::Configure(const AudioDecodeStart& start) {
         .initialization_data = description.initialization_data, .output = format_, .codec = description.codec})));
   }
   first_audible_pts_ = start.first_audible_pts;
+  vorbis_priming_ = description.codec == CodecId::Vorbis;
   next_pts_.reset();
   windows_.clear();
   sealed_ = false;
@@ -244,6 +246,15 @@ std::string_view AudioCopySuffix(const MediaDemuxer& reader) {
   switch (reader.Format()) {
     case ContainerFormat::Aiff: return ".aiff";
     case ContainerFormat::Caf: return ".caf";
+    case ContainerFormat::Wave64: return ".w64";
+    case ContainerFormat::Ogg:
+    case ContainerFormat::Matroska:
+    case ContainerFormat::WebM:
+      if (tracks.front().descriptions.size() == 1 && tracks.front().descriptions.front().codec == CodecId::Vorbis) {
+        if (reader.Format() == ContainerFormat::Ogg) return ".ogg";
+        return reader.Format() == ContainerFormat::Matroska ? ".mka" : ".webm";
+      }
+      return {};
     case ContainerFormat::Flac: return ".flac";
     case ContainerFormat::Mp3: return ".mp3";
     case ContainerFormat::Mp4:
@@ -411,7 +422,7 @@ Task<std::shared_ptr<const File>> CopyAudioClip(std::shared_ptr<const File> file
 Task<std::shared_ptr<const File>> ExportWave(std::shared_ptr<const File> file, File temporary) {
   auto input = co_await OnFileThread([file] { return std::make_shared<AudioInput>(file); });
   const auto codec = input->track.descriptions.front().codec;
-  const bool floating = codec == CodecId::Alac || media::detail::DescribePackedPcm(codec).bits;
+  const bool floating = codec == CodecId::Alac || codec == CodecId::Vorbis || media::detail::DescribePackedPcm(codec).bits;
   AudioDecode decode(input, floating ? AudioSampleFormat::F32 : AudioSampleFormat::S16);
   auto result = co_await OnFileThread([temporary] { return TemporaryFile(temporary, ".wav"); });
   std::shared_ptr<MediaMuxer> mux;

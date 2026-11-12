@@ -124,10 +124,12 @@ enum class CodecId {
   ProRes,   ///< Apple ProRes coded pictures. The sample entry identifies the profile.
 
   Aac,      ///< Advanced Audio Coding.
-  Alac,     ///< Apple Lossless Audio Codec.
-  Opus,     ///< Opus coded audio. Trim uses the 48 kHz decoded sample grid.
-  Flac,     ///< Complete native FLAC frames.
   Mp3,      ///< Complete MPEG Layer III frames.
+  Opus,     ///< Opus coded audio. Trim uses the 48 kHz decoded sample grid.
+  Vorbis,   ///< Vorbis I audio. The first packet after opening or seeking primes the overlap window.
+
+  Alac,     ///< Apple Lossless Audio Codec.
+  Flac,     ///< Complete native FLAC frames.
 
   PcmU8,    ///< Unsigned eight-bit PCM.
   PcmS16Le, ///< Signed 16-bit little-endian PCM.

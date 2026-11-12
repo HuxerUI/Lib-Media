@@ -161,6 +161,7 @@ private:
   std::optional<huxerui::media::MediaTimestamp> first_audible_pts_;
   std::optional<std::int64_t> next_pts_;
   std::deque<huxerui::media::MediaPresentationRange> windows_;
+  bool vorbis_priming_ = false;
   std::optional<AudioEditQueue> edits_;
   bool sealed_ = false;
   bool drained_ = false;

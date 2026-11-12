@@ -96,6 +96,11 @@ ffmpeg -f lavfi -i sine=sample_rate=48000:duration=5.15 \
   Both M4A fixtures carry the same text tags and PNG cover and exercise fast-start copy and seek.
 - `preview-pcm.aiff` carries 8821 mono S24BE frames at 44.1 kHz and has an odd-length sound payload.
   `preview-pcm.caf` carries 9600 stereo F32BE frames at 48 kHz. Core Audio wrote both files.
+- `preview-pcm.w64` has 8821 mono F32LE frames at 44.1 kHz. FFmpeg writes four alignment bytes in its
+  declared data length and supplies the exact count in `fact`.
+- `preview-vorbis.ogg` carries 97593 stereo PCM samples at 44.1 kHz after Vorbis synthesis and final granule
+  trim. It uses short and long blocks across two audio pages. The preview regression verifies PCM after
+  backward and forward seeks and checks original packets through WebM and MKA round trips.
 - `trimmed-alac.caf` carries stereo ALAC at 96 kHz in packets of 4096, 4096, and 2368 coded samples.
   Its valid interval retains 10540 samples after 7 samples of priming and 13 of tail trim. The fixed-frame
   table includes the 1728 uncoded samples of the last nominal packet in its remainder.
@@ -152,6 +157,11 @@ afconvert -f AIFF -d BEI24 aiff-source.wav preview-pcm.aiff
 ffmpeg -f lavfi -i 'aevalsrc=0.2*sin(2*PI*440*t)|0.15*sin(2*PI*660*t):s=48000:d=0.2' -c:a pcm_f32le caf-source.wav
 afconvert -f caff -d BEF32 caf-source.wav preview-pcm.caf
 afconvert -f caff -d alac tagged-alac.m4a trimmed-alac.caf
+```
+
+```sh
+ffmpeg -f lavfi -i 'sine=sample_rate=44100:duration=0.25' -af atrim=end_sample=8821 -c:a pcm_f32le -f w64 preview-pcm.w64
+ffmpeg -f lavfi -i 'sine=sample_rate=44100:duration=2.213' -ac 2 -c:a libvorbis preview-vorbis.ogg
 ```
 
 For `trimmed-alac.caf`, set the `pakt` header's big-endian packet count, valid frames, priming, and remainder

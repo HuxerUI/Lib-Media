@@ -19,7 +19,7 @@ public:
 
 protected:
   PcmReader(ContainerInput input, ContainerFormat format) : ContainerReader(std::move(input), format) {}
-  void Begin(MediaTrack track, std::uint64_t bytes, unsigned alignment, bool padding = false);
+  void Begin(MediaTrack track, std::uint64_t bytes, unsigned alignment, unsigned padding = 0);
 
 private:
   unsigned alignment_ = 0;
@@ -27,7 +27,7 @@ private:
   std::uint64_t offset_ = 0;
   std::int64_t frames_ = 0;
   std::int64_t cursor_ = 0;
-  bool padding_ = false;
+  unsigned padding_ = 0;
 };
 
 } // namespace huxerui::media::detail

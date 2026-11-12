@@ -35,13 +35,15 @@ enum class ContainerFormat {
 
   Wave,     ///< RIFF WAVE with 32-bit chunk sizes.
   Rf64,     ///< RF64 WAVE with a 64-bit size table.
+  Wave64,   ///< Sony Wave64 PCM with GUID chunk identifiers and 64-bit lengths.
 
-  Adts,     ///< AAC with an ADTS header on each access unit.
-  Ogg,      ///< Mapping-family-zero Opus, with chained logical streams supported on input.
-  Flac,     ///< Native FLAC frames following a STREAMINFO metadata block.
-  Mp3,      ///< MPEG Layer III audio frames with optional ID3 and Xing information.
   Aiff,     ///< AIFF with packed big-endian signed integer PCM.
   Caf,      ///< Core Audio Format with packed LPCM or mono/stereo ALAC.
+
+  Adts,     ///< AAC with an ADTS header on each access unit.
+  Ogg,      ///< Mapping-family-zero Opus or Vorbis. Opus input can contain chained logical streams.
+  Flac,     ///< Native FLAC frames following a STREAMINFO metadata block.
+  Mp3,      ///< MPEG Layer III audio frames with optional ID3 and Xing information.
 };
 
 /// @brief File organization within a container format.
@@ -170,6 +172,7 @@ struct MediaSampleDescription {
   /// Codec configuration in the representation specified by the mapping, such as the payload of an hvcC or av1C box.
   /// ALAC uses the 24-byte ALACSpecificConfig without the MP4 box header or version and flags. MOV timecode
   /// and timed metadata use the sample-entry payload after the reserved fields and data-reference index.
+  /// Vorbis uses the three header packets in the Matroska `A_VORBIS` CodecPrivate layout.
   Bytes initialization_data;
   /// Audio samples per channel per second.
   std::optional<std::uint32_t> sample_rate;
@@ -492,7 +495,7 @@ struct MediaMuxerOptions {
   ContainerLayout layout = ContainerLayout::Default;
   /// Tags and cover art for native FLAC, MP3, or regular single-audio MP4.
   std::optional<MediaAudioMetadata> audio_metadata;
-  /// Positive nanoseconds per Matroska or WebM Segment tick. The default is one millisecond.
+  /// Positive nanoseconds per Matroska or WebM Segment tick. Defaults to one millisecond, or one microsecond for audio-only Vorbis.
   /// To copy the source clock, pass MediaDemuxer::EbmlTimestampScale(). Other output formats require absence.
   std::optional<std::chrono::nanoseconds> ebml_timestamp_scale;
   /// Metadata for Matroska output. Pass the original track attributes to preserve UID targets.

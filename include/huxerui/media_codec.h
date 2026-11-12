@@ -103,7 +103,7 @@ struct QueueLimits {
 /// @see AudioDecoder::Create(), AudioDecoder::Probe()
 struct AudioDecoderConfig {
   /// Two-byte AudioSpecificConfig for AAC-LC, 24-byte ALACSpecificConfig for ALAC, OpusHead for Opus,
-  /// or the 34-byte STREAMINFO payload for FLAC.
+  /// the 34-byte STREAMINFO payload for FLAC, or the Xiph-laced Matroska `A_VORBIS` headers for Vorbis.
   /// Leave empty for MPEG Layer III, whose complete frames carry their own configuration.
   Bytes initialization_data;
   /// Requested PCM format. Set the sample rate and channel layout to match the compressed stream.
@@ -123,7 +123,8 @@ struct AudioDecoderConfig {
   /// any decoding error. Platform work that cannot safely be retired leaves it pending.
   /// Retained CPU frames remain readable and do not delay completion. The callback must return promptly and not throw.
   std::function<void(CodecResult<void>)> cleanup_completed;
-  /// Coding of the configuration and access units. Use Aac, Alac, Opus, Flac, or Mp3.
+  /// Coding of the configuration and access units. Use Aac, Alac, Opus, Flac, Mp3, or Vorbis.
+  /// A fresh or reset Vorbis decoder consumes one packet to prime synthesis before producing PCM.
   /// Mono and stereo ALAC decoding is available on macOS and iOS. Probe() checks the concrete configuration.
   CodecId codec = CodecId::Aac;
 };

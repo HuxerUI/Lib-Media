@@ -48,7 +48,7 @@ PcmReader::PcmReader(ContainerInput input, ContainerFormat format, MediaTrack tr
   Begin(std::move(track), bytes, alignment);
 }
 
-void PcmReader::Begin(MediaTrack track, std::uint64_t bytes, unsigned alignment, bool padding) {
+void PcmReader::Begin(MediaTrack track, std::uint64_t bytes, unsigned alignment, unsigned padding) {
   if (!alignment || bytes % alignment || bytes / alignment > INT64_MAX)
     Fail(ContainerErrorCode::InvalidData, "PCM data ends inside a sample frame or exceeds its sample clock");
   alignment_ = alignment;
@@ -64,8 +64,8 @@ void PcmReader::Begin(MediaTrack track, std::uint64_t bytes, unsigned alignment,
 std::optional<ContainerPacket> PcmReader::Read() {
   if (cursor_ == frames_) {
     if (padding_) {
-      input.Skip(1);
-      padding_ = false;
+      input.Skip(padding_);
+      padding_ = 0;
     }
     return {};
   }

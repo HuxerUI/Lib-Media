@@ -50,7 +50,8 @@ if ((ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linu
         foreach (fixture IN ITEMS tagged-mp3.mp3 tagged-aac.m4a fragmented-aac.m4a preview-hevc-main.mp4
                 webm-vp8-opus.webm preview-vp9-opus-no-cues.webm mkv-hevc-aac.mkv
                 preview-av1.webm preview-av1.mkv preview-av1.mp4
-                preview-pcm.aiff preview-pcm.caf tagged-alac.m4a trimmed-alac.caf alac-edit-8821.m4a alac-edit-8813.m4a)
+                preview-pcm.aiff preview-pcm.caf tagged-alac.m4a trimmed-alac.caf alac-edit-8821.m4a alac-edit-8813.m4a
+                preview-pcm.w64 preview-vorbis.ogg)
             target_link_options(media_container_preview_tests PRIVATE
                     "SHELL:--preload-file \"${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container/${fixture}@/fixtures/container/${fixture}\"")
         endforeach ()

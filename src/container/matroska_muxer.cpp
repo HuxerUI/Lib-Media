@@ -1,6 +1,7 @@
 #include "ebml.h"
 
 #include "codec/common.h"
+#include "codec/vorbis.h"
 #include "mp4.h"
 
 #include <array>
@@ -26,6 +27,7 @@ std::string_view CodecName(ContainerFormat format, const MediaTrack& track) {
   }
   if (track.kind == TrackKind::Audio) {
     if (description.codec == CodecId::Opus) return "A_OPUS";
+    if (description.codec == CodecId::Vorbis) return "A_VORBIS";
     if (format == ContainerFormat::Matroska && description.codec == CodecId::Aac) return "A_AAC";
   }
   if (format == ContainerFormat::Matroska && track.kind == TrackKind::Subtitle &&
@@ -102,6 +104,8 @@ struct PendingBlock {
 struct WriteTrackState {
   std::int64_t delay = 0;
   unsigned nal_length = 0;
+  std::unique_ptr<VorbisHeaders> vorbis;
+  unsigned vorbis_block = 0;
   std::optional<std::int64_t> last_time;
   std::optional<PendingBlock> pending;
 };
@@ -118,7 +122,8 @@ public:
   MatroskaWriter(ContainerOutput stream, ContainerFormat format, std::span<const MediaTrack> tracks,
                  const MediaMuxerOptions& options)
       : ContainerWriter(std::move(stream), tracks), webm_(format == ContainerFormat::WebM),
-        scale_(options.ebml_timestamp_scale.value_or(std::chrono::nanoseconds{DefaultTimestampScale}).count()),
+        scale_(options.ebml_timestamp_scale.value_or(std::chrono::nanoseconds{
+            tracks.size() == 1 && tracks.front().descriptions.front().codec == CodecId::Vorbis ? 1000 : DefaultTimestampScale}).count()),
         states_(tracks.size()) {
     const auto& metadata = options.matroska_metadata;
     for (std::size_t i = 0; i < tracks.size(); ++i) {
@@ -128,6 +133,8 @@ public:
         states_[i].nal_length = HevcNalLength(description.initialization_data, false, BadArgument);
       if (description.codec == CodecId::H264)
         states_[i].nal_length = ParseAvc(description.initialization_data).Value().length_size;
+      if (description.codec == CodecId::Vorbis)
+        states_[i].vorbis = std::make_unique<VorbisHeaders>(description.initialization_data, BadArgument);
       has_video_ |= tracks[i].kind == TrackKind::Video;
     }
     Bytes header;
@@ -146,6 +153,7 @@ public:
     output.Write(header);
     segment_data_ = output.Position();
     header.clear();
+    const bool write_duration = output.Random() && states_.size() == 1 && states_.front().vorbis;
     Master(header, Info, [&](Bytes& info) {
       PutUInt(info, 0x2ad7b1, scale_);
       PutText(info, 0x4d80, "Lib-Media");
@@ -154,7 +162,9 @@ public:
         if (metadata->segment_uid) PutElement(info, 0x73a4, *metadata->segment_uid);
         if (!metadata->title.empty()) PutText(info, 0x7ba9, metadata->title);
       }
+      if (write_duration) PutFloat(info, 0x4489, 0);
     });
+    if (write_duration) duration_offset_ = AddOffset(segment_data_, header.size() - 8);
     Master(header, Tracks, [&](Bytes& entries) {
       for (const auto& track : tracks) WriteTrack(entries, format, track);
     });
@@ -191,7 +201,14 @@ public:
       Fail(ContainerErrorCode::LimitExceeded, "Matroska Block and its additions exceed the packet limit");
     for (auto fields = additions; !fields.empty();) ReadField(fields);
     const auto& description = track.descriptions.front();
-    const auto intrinsic = CodecDuration(description, data, BadArgument);
+    auto intrinsic = CodecDuration(description, data, BadArgument);
+    unsigned vorbis_block = 0;
+    if (state.vorbis) {
+      vorbis_block = state.vorbis->BlockSize(data, BadArgument);
+      intrinsic = MediaTimestamp{VorbisOverlap(state.vorbis_block, vorbis_block), state.vorbis->Rate()};
+      if (packet.duration && packet.duration != intrinsic)
+        Fail(BadArgument, "Matroska Vorbis duration differs from its overlap window");
+    }
     const auto discard = packet.discard_padding ? std::optional{ToNs(*packet.discard_padding)} : std::nullopt;
     if (discard) {
       if (track.kind != TrackKind::Audio || !intrinsic)
@@ -216,7 +233,7 @@ public:
       }
       duration = static_cast<std::uint64_t>(ticks);
     }
-    bool independent = track.kind != TrackKind::Video;
+    bool independent = track.kind != TrackKind::Video && !state.vorbis;
     // VPx uses the caller's sync flag. AVC, HEVC, and AV1 can derive it from the packet.
     if (description.codec == CodecId::H264) independent = AvcIdr(data, state.nal_length, BadArgument);
     if (description.codec == CodecId::Hevc) independent = HevcIdr(data, state.nal_length, false, BadArgument);
@@ -224,11 +241,15 @@ public:
       independent = Av1Sync(data, BadArgument);
       if (packet.sync_sample == true && !independent) Fail(BadArgument, "AV1 sync Block has no random-access key frame");
     }
+    const auto presented_end = duration_offset_ && intrinsic && intrinsic->ticks > 0
+        ? SubTime(AddTime(ToNs(*packet.pts), ToNs(*intrinsic)), std::max<std::int64_t>(0, discard.value_or(0))) : 0;
     state.pending = PendingBlock{Bytes(data.begin(), data.end()), Bytes(additions.begin(), additions.end()), time,
                                  webm_ ? time : (packet.dts ? ToNs(*packet.dts) : stored),
                                  duration, discard, packet.sync_sample.value_or(independent),
                                  packet.matroska && packet.matroska->invisible};
     state.last_time = time;
+    state.vorbis_block = vorbis_block;
+    duration_ns_ = std::max(duration_ns_, presented_end);
     Drain();
     return {};
   }
@@ -240,6 +261,11 @@ public:
     std::fill(ended.begin(), ended.end(), true);
     Drain();
     Flush();
+    if (duration_offset_) {
+      Bytes duration;
+      Put(duration, std::bit_cast<std::uint64_t>(double(duration_ns_) / scale_));
+      output.Patch(*duration_offset_, duration);
+    }
     if (!cues_.empty()) {
       std::stable_sort(cues_.begin(), cues_.end(), [](const auto& a, const auto& b) { return a.time < b.time; });
       Bytes bytes;
@@ -384,6 +410,8 @@ private:
   bool has_video_ = false;
   bool failed_ = false;
   std::uint64_t segment_data_ = 0;
+  std::optional<std::uint64_t> duration_offset_;
+  std::int64_t duration_ns_ = 0;
   std::int64_t cluster_time_ = 0;
   std::array<bool, MaxContainerTracks> audio_cued_{};
   std::vector<WriteTrackState> states_;
@@ -468,6 +496,11 @@ void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks
         if (description.sample_rate != 48000 || description.channel_count != opus.channels ||
             (track.priming_samples && track.priming_samples != opus.pre_skip))
           Fail(BadArgument, "Opus track does not match its 48 kHz timeline, channels, or pre-skip");
+      } else if (description.codec == CodecId::Vorbis) {
+        const VorbisHeaders vorbis(description.initialization_data, BadArgument);
+        if (description.sample_rate != vorbis.Rate() || description.channel_count != vorbis.Channels() ||
+            track.priming_samples.value_or(0) > vorbis.MaxSamples())
+          Fail(BadArgument, "Matroska Vorbis track does not match its headers or sample clock");
       } else {
         const auto aac = ParseAac(description.initialization_data);
         if (!aac.Succeeded()) Fail(Unsupported, aac.Error().message);

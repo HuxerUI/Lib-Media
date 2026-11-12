@@ -1,6 +1,7 @@
 #include "ebml.h"
 
 #include "codec/common.h"
+#include "codec/vorbis.h"
 #include "mp4.h"
 
 #include <cmath>
@@ -15,9 +16,23 @@ bool IsRetainedMetadata(std::uint64_t id) {
   return id == Chapters || id == Tags || id == Attachments;
 }
 
+struct VorbisClock {
+  unsigned block = 0;
+  std::optional<std::int64_t> next;
+};
+
+struct VorbisCheckpoint {
+  std::uint64_t offset;
+  VorbisClock clock;
+};
+
 struct TrackState {
   std::uint64_t number = 0;
   std::int64_t delay = 0;
+  std::unique_ptr<VorbisHeaders> vorbis;
+  VorbisClock vorbis_clock;
+  std::vector<VorbisCheckpoint> vorbis_checkpoints;
+  std::optional<MediaPresentationRange> vorbis_range;
 };
 
 struct BlockFields {
@@ -255,7 +270,11 @@ public:
       lace_.clear();
       lace_cursor_ = 0;
       auto element = Next();
-      if (!element) return {};
+      if (!element) {
+        if (!duration && states_.size() == 1 && states_.front().vorbis_range)
+          duration = states_.front().vorbis_range->end;
+        return {};
+      }
       if (!in_cluster_) {
         if (element->id == Cluster) {
           in_cluster_ = true;
@@ -287,6 +306,10 @@ public:
     }
   }
 
+  std::optional<MediaPresentationRange> PresentationRange(std::size_t track) const override {
+    return states_[track].vorbis_range;
+  }
+
   std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp time, SeekDirection direction, bool seek) override {
     if (!input.Random()) return ContainerReader::Find(id, time, direction, seek);
     const auto track = PacketTrack(tracks, id);
@@ -297,6 +320,7 @@ public:
     std::optional<SeekPoint> point;
     std::optional<Anchor> first;
     std::array<std::optional<std::uint64_t>, MaxContainerTracks> floors;
+    std::array<VorbisClock, MaxContainerTracks> clocks{};
     try {
       LoadCues();
       if (const auto anchor = FindAnchor(track, time, direction)) {
@@ -306,9 +330,14 @@ public:
             Fail(ContainerErrorCode::IndexUnavailable, "Matroska index does not cover the required preroll");
           decode = *preroll;
         }
+        MediaTimestamp decode_time{decode.time, Nanoseconds};
+        if (const auto& vorbis = states_[track].vorbis) {
+          clocks[track] = VorbisClockAt(track, decode);
+          decode_time = VorbisPts(*vorbis, clocks[track], decode.time, true);
+        }
         point = SeekPoint{id, AnchorTime(track, anchor->time, true),
-            decode.block < anchor->block ? SeekPoint::Kind::NeedsPreroll : SeekPoint::Kind::SyncMarked,
-            anchor->block, {decode.time, Nanoseconds}};
+            decode.block < anchor->block || states_[track].vorbis ? SeekPoint::Kind::NeedsPreroll : SeekPoint::Kind::SyncMarked,
+            anchor->block, decode_time};
         if (seek) {
           first = decode;
           floors[track] = decode.block;
@@ -324,6 +353,7 @@ public:
               }
               if (!start) continue;
               floors[i] = start->block;
+              if (states_[i].vorbis) clocks[i] = VorbisClockAt(i, *start);
               if (start->block < first->block) first = *start;
             }
           }
@@ -346,6 +376,7 @@ public:
     cluster_end_.reset();
     lace_.clear();
     lace_cursor_ = 0;
+    for (std::size_t i = 0; i < states_.size(); ++i) states_[i].vorbis_clock = clocks[i];
     return point;
   }
 
@@ -579,11 +610,11 @@ private:
       if (attributes.uid || !attributes.fields.empty() || !attributes.subtitle_codec.empty())
         track.matroska = std::move(attributes);
       tracks.push_back(std::move(track));
-      states_.push_back(state);
+      states_.push_back(std::move(state));
     }
   }
 
-  void ReadCodec(MediaTrack& track, const TrackState& state, std::string_view codec, ByteView audio, ByteView video) {
+  void ReadCodec(MediaTrack& track, TrackState& state, std::string_view codec, ByteView audio, ByteView video) {
     auto& description = track.descriptions.front();
     if (track.kind == TrackKind::Video) {
       if (codec == "V_MPEGH/ISO/HEVC" && format == ContainerFormat::Matroska) {
@@ -617,6 +648,21 @@ private:
       description.codec = CodecId::Opus;
       description.sample_rate = 48000;
       track.priming_samples = opus.pre_skip;
+    } else if (track.kind == TrackKind::Audio && codec == "A_VORBIS") {
+      auto vorbis = std::make_unique<VorbisHeaders>(description.initialization_data, BadData);
+      ReadAudio(audio, description);
+      if (description.sample_rate != vorbis->Rate() || description.channel_count != vorbis->Channels())
+        Fail(BadData, "Matroska Vorbis metadata does not match its headers");
+      description.codec = CodecId::Vorbis;
+      const MediaTimestamp overlap{vorbis->MaxSamples(), vorbis->Rate()};
+      if (!track.seek_preroll || track.seek_preroll->Compare(overlap) < 0) track.seek_preroll = overlap;
+      if (state.delay) {
+        const auto trim = MediaTimestamp{state.delay, Nanoseconds}.Rescale(vorbis->Rate());
+        if (!trim || trim->ticks > vorbis->MaxSamples() || std::abs(SubTime(ToNs(*trim), state.delay)) > 1)
+          Fail(Unsupported, "Matroska Vorbis delay does not align to the initial overlap");
+        track.priming_samples = static_cast<std::uint64_t>(trim->ticks);
+      }
+      state.vorbis = std::move(vorbis);
     } else if (track.kind == TrackKind::Audio && codec == "A_AAC" && format == ContainerFormat::Matroska) {
       const auto config = AacLcInitialization(description.initialization_data);
       const auto aac = ParseAac(config);
@@ -633,6 +679,30 @@ private:
         track.priming_samples = static_cast<std::uint64_t>(trim->ticks);
       }
     }
+  }
+
+  MediaTimestamp VorbisPts(const VorbisHeaders& vorbis, const VorbisClock& clock,
+                          std::int64_t nanos, bool first_in_block) const {
+    const auto rate = vorbis.Rate();
+    const auto signaled = MediaTimestamp{nanos, Nanoseconds}.Rescale(rate);
+    if (!signaled) Fail(BadData, "Matroska Vorbis timestamp exceeds its sample clock");
+    if (!clock.next) return *signaled;
+    if (first_in_block) {
+      const auto expected = ToNs({*clock.next, rate});
+      const auto gap = std::uint64_t(std::max(nanos, expected)) - std::uint64_t(std::min(nanos, expected));
+      // The first block's quantization can shift the sample clock by up to one Segment tick.
+      if (gap > scale_) return *signaled;
+    }
+    return {*clock.next, rate};
+  }
+
+  std::pair<MediaTimestamp, MediaTimestamp> AdvanceVorbis(const VorbisHeaders& vorbis, VorbisClock& clock,
+      ByteView frame, std::int64_t nanos, bool first_in_block) const {
+    const auto block = vorbis.BlockSize(frame, BadData);
+    const auto pts = VorbisPts(vorbis, clock, nanos, first_in_block);
+    const auto length = VorbisOverlap(clock.block, block);
+    clock = {block, AddTime(pts.ticks, length)};
+    return {pts, {length, pts.timescale}};
   }
 
   std::optional<Element> Next() {
@@ -657,11 +727,16 @@ private:
     const auto header = ReadBlockHeader(payload);
     const auto index = TrackIndex(header.track);
     const auto& track = tracks[index];
+    auto& state = states_[index];
     const auto& description = track.descriptions.front();
     const auto ticks = AddTime(cluster_ticks, header.relative_time);
     const auto pts = Time(ticks, index);
     if (at_start_) RecordAudioStart(index, pts);
-    if (!Selected(index) || (track_floors_[index] && element.position < *track_floors_[index])) return;
+    if (track_floors_[index] && element.position < *track_floors_[index]) return;
+    if (!Selected(index)) {
+      state.vorbis_clock = {};
+      return;
+    }
     const bool subtitle = track.matroska && !track.matroska->subtitle_codec.empty();
     if ((description.codec == CodecId::Unknown && !subtitle) || block.codec_state)
       Fail(Unsupported, "Unsupported Matroska track or changing codec state");
@@ -670,14 +745,19 @@ private:
     const bool invisible = format == ContainerFormat::Matroska && (header.flags & BlockInvisible);
     if (additions && sizes.size() != 1) Fail(Unsupported, "Cannot separate BlockAdditions from a Matroska lace");
     const auto total = block.duration ? std::optional{ScaleTime(SignedTime(*block.duration), scale_)} : std::nullopt;
-    const bool sync = simple ? (header.flags & 128) != 0 : !block.reference;
+    const bool sync = !state.vorbis && (simple ? (header.flags & 128) != 0 : !block.reference);
     std::optional<std::int64_t> elapsed{0};
     for (std::size_t i = 0; i < sizes.size(); ++i) {
       const auto frame = Slice(payload, 0, sizes[i]);
       if ((!subtitle && frame.empty()) || frame.size() > MaxContainerPacket) Fail(BadData, "Invalid Matroska packet size");
       auto length = CodecDuration(description, frame, BadData);
       if (!length) length = track.default_duration;
-      if (total && elapsed && i + 1 == sizes.size()) {
+      std::optional<MediaTimestamp> presentation;
+      if (state.vorbis) {
+        const auto [start, duration] = AdvanceVorbis(*state.vorbis, state.vorbis_clock, frame, pts, i == 0);
+        presentation = start;
+        length = duration;
+      } else if (total && elapsed && i + 1 == sizes.size()) {
         if (*elapsed > *total) Fail(BadData, "Matroska BlockDuration is shorter than its lace");
         auto frame_duration = *total - *elapsed;
         if (description.codec == CodecId::Opus && sizes.size() == 1 && length && block.discard && *block.discard > 0) {
@@ -699,8 +779,22 @@ private:
           Fail(Unsupported, "Matroska discard padding exceeds its audio packet");
         discard = MediaTimestamp{padding, Nanoseconds};
       }
-      std::optional<MediaTimestamp> presentation;
-      if (elapsed) presentation = MediaTimestamp{AddTime(pts, *elapsed), Nanoseconds};
+      if (state.vorbis) {
+        if (at_start_ && length->ticks > 0) {
+          const auto rate = presentation->timescale;
+          const auto trim = discard ? discard->Rescale(rate) : std::optional<MediaTimestamp>{};
+          const auto samples = trim ? trim->ticks : 0;
+          const auto first = AddTime(presentation->ticks, std::max<std::int64_t>(0, -samples));
+          const auto last = SubTime(*state.vorbis_clock.next, std::max<std::int64_t>(0, samples));
+          const auto audible = first_audible_pts[index]->Rescale(rate);
+          if (!audible) Fail(BadData, "Matroska Vorbis start exceeds its sample clock");
+          const auto begin = std::max(first, audible->ticks);
+          if (begin < last) {
+            if (!state.vorbis_range) state.vorbis_range = MediaPresentationRange{{begin, rate}, {last, rate}};
+            else state.vorbis_range->end = {last, rate};
+          }
+        }
+      } else if (elapsed) presentation = MediaTimestamp{AddTime(pts, *elapsed), Nanoseconds};
       const auto offset = static_cast<std::size_t>(frame.data() - bytes.data());
       lace_.push_back({track.id, owner.Slice(offset, frame.size()), presentation, {}, length, sync, discard});
       if (invisible || additions) {
@@ -883,7 +977,7 @@ private:
         if (!timestamp) Fail(BadData, "Matroska Cluster has no timestamp before its Blocks");
         const auto block = ReadIndexedBlock(*element);
         const auto ticks = AddTime(*timestamp, block.header.relative_time);
-        if (!visit(element->position, ticks, block)) return;
+        if (!visit(*element, ticks, block)) return;
       } else {
         SkipElement(input, *element);
       }
@@ -898,7 +992,8 @@ private:
     const auto expected = block ? std::optional{AddOffset(parent.data, *block)} : std::nullopt;
     if (expected && end && *expected >= *end) Fail(BadData, "Matroska Cue block offset exceeds its Cluster");
     std::optional<Anchor> anchor;
-    VisitCluster(parent, [&](auto position, auto ticks, const IndexedBlock& entry) {
+    VisitCluster(parent, [&](const Element& element, auto ticks, const IndexedBlock& entry) {
+      const auto position = element.position;
       if (expected && position > *expected) return false;
       if ((!expected || position == *expected) && entry.header.track == states_[track].number &&
           (!time || ticks == *time) && !entry.codec_state) {
@@ -917,6 +1012,51 @@ private:
       SkipElement(input, *element);
     }
     Fail(ContainerErrorCode::LimitExceeded, "Too many elements between Matroska Clusters");
+  }
+
+  VorbisClock VorbisClockAt(std::size_t track, const Anchor& anchor) {
+    if (!first_cluster_ || anchor.cluster < *first_cluster_)
+      Fail(BadData, "Matroska Vorbis anchor precedes the first Cluster");
+    auto& state = states_[track];
+    auto& checkpoints = state.vorbis_checkpoints;
+    if (checkpoints.empty()) checkpoints.push_back({*first_cluster_, {}});
+    const auto checkpoint = std::ranges::upper_bound(checkpoints, anchor.cluster, {}, &VorbisCheckpoint::offset);
+    auto clock = std::prev(checkpoint)->clock;
+    input.Seek(std::prev(checkpoint)->offset);
+    std::size_t visited = 0;
+    // Recover the sample clock from earlier overlap windows. A Cluster timestamp alone can round away samples.
+    for (auto cluster = NextCluster(); cluster && cluster->position <= anchor.cluster; cluster = NextCluster()) {
+      if (++visited > MaxContainerSamples)
+        Fail(ContainerErrorCode::LimitExceeded, "Matroska Vorbis seek scan exceeds its element budget");
+      if (cluster->position > checkpoints.back().offset && checkpoints.size() < MaxContainerSamples)
+        checkpoints.push_back({cluster->position, clock});
+      bool found = false;
+      VisitCluster(*cluster, [&](const Element& element, auto ticks, const IndexedBlock& block) {
+        if (++visited > MaxContainerSamples)
+          Fail(ContainerErrorCode::LimitExceeded, "Matroska Vorbis seek scan exceeds its element budget");
+        if (cluster->position == anchor.cluster && element.position >= anchor.block) {
+          found = element.position == anchor.block;
+          return false;
+        }
+        if (block.header.track != state.number) return true;
+        if (block.codec_state) Fail(Unsupported, "Changing Matroska Vorbis codec state");
+        const auto end = input.Position();
+        input.Seek(element.data);
+        const auto bytes = ReadBody(input, element, MaxContainerPacket + 4096);
+        input.Seek(end);
+        auto payload = element.id == SimpleBlock ? ByteView(bytes) : Group(bytes).data;
+        const auto header = ReadBlockHeader(payload);
+        const auto sizes = LaceSizes(payload, (header.flags >> 1) & 3);
+        const auto time = Time(ticks, track);
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+          AdvanceVorbis(*state.vorbis, clock, Slice(payload, 0, sizes[i]), time, i == 0);
+          payload = payload.subspan(sizes[i]);
+        }
+        return true;
+      });
+      if (found) return clock;
+    }
+    Fail(ContainerErrorCode::IndexUnavailable, "Matroska Vorbis seek anchor is unavailable");
   }
 
   bool CanAnchor(std::size_t track, const IndexedBlock& block) const {
@@ -944,7 +1084,7 @@ private:
       if (!scanned_[i].empty()) last[i] = scanned_[i].back().time;
     auto count = scan_count_;
     std::vector<std::pair<std::size_t, Anchor>> found;
-    VisitCluster(*cluster, [&](auto position, auto ticks, const IndexedBlock& block) {
+    VisitCluster(*cluster, [&](const Element& element, auto ticks, const IndexedBlock& block) {
       if (++count > MaxContainerSamples) Fail(ContainerErrorCode::LimitExceeded, "Matroska seek scan exceeds its Block limit");
       const auto track = TrackIndex(block.header.track);
       if (!CanAnchor(track, block)) return true;
@@ -952,7 +1092,7 @@ private:
       if (OrderedAnchors(track) && last[track] && time < *last[track])
         Fail(Unsupported, "Matroska seek anchors must be ordered within this track");
       last[track] = time;
-      found.emplace_back(track, Anchor{cluster->position, position, time, block.sync});
+      found.emplace_back(track, Anchor{cluster->position, element.position, time, block.sync});
       return true;
     });
     if (count == scan_count_ && ++count > MaxContainerSamples)
@@ -984,10 +1124,10 @@ private:
     for (std::optional cluster = IndexedElement(first, Cluster); cluster; cluster = NextCluster()) {
       if (last && cluster->position > *last) break;
       const auto previous = blocks;
-      VisitCluster(*cluster, [&](auto position, auto ticks, const IndexedBlock& block) {
+      VisitCluster(*cluster, [&](const Element& element, auto ticks, const IndexedBlock& block) {
         if (++blocks > MaxContainerSamples) Fail(ContainerErrorCode::LimitExceeded, "Matroska seek scan exceeds its Block limit");
         if (block.header.track != states_[track].number || !CanAnchor(track, block)) return true;
-        const Anchor anchor{cluster->position, position, Time(ticks, track), block.sync};
+        const Anchor anchor{cluster->position, element.position, Time(ticks, track), block.sync};
         if (from_start) RecordAudioStart(track, anchor.time);
         if (result.before && anchor.time < result.before->time)
           Fail(Unsupported, "Matroska seek anchors must be ordered within this track");

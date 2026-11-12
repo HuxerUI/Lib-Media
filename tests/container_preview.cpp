@@ -928,9 +928,158 @@ std::shared_ptr<const File> CopyAudioContainer(const File& source, const File& t
         point->decode_start_pts == last_pts : point->presentation_time == final_sample),
         "Audio copy could not seek to its final sample or packet");
 #if defined(__APPLE__) && TARGET_OS_OSX
-  CheckAudioReadback(source, *output, expected, channels);
+  if (target != ContainerFormat::Wave64) CheckAudioReadback(source, *output, expected, channels);
 #endif
   return output;
+}
+
+std::shared_ptr<const File> CopyVorbis(const File& source, const File& temporary, ContainerFormat target,
+    std::string_view suffix, MediaTimestamp expected, MediaMuxerOptions options = {}, std::int64_t leading_discard = 0) {
+  auto input = media_preview::Open(source);
+  const auto track = input.Tracks().front();
+  const auto& description = track.descriptions.front();
+  Check(description.codec == CodecId::Vorbis, "Wrong codec in Vorbis copy fixture");
+  auto output = media_preview::TemporaryFile(temporary, suffix);
+  auto mux = Require(MediaMuxer::Open(Require(output->OpenRandomAccess(FileAccessMode::ReadWrite)),
+      target, std::span(&track, 1), options));
+  while (const auto packet = ReadPacket(input))
+    Check(!Require(mux.TryWrite(*packet)), "Vorbis audio copy requested another track");
+  Require(mux.Finish());
+
+  input = media_preview::Open(source);
+  auto copy = media_preview::Open(*output);
+  Check(copy.Format() == target && copy.Tracks().front().descriptions.front().initialization_data == description.initialization_data,
+        "Vorbis copy changed its header packets");
+  const auto padding = [rate = expected.timescale](const ContainerPacket& packet) {
+    return packet.discard_padding ? packet.discard_padding->Rescale(rate)->ticks : 0;
+  };
+  std::int64_t samples = 0;
+  std::size_t index = 0;
+  bool trimmed = false;
+  std::int64_t discarded = 0;
+  while (const auto packet = ReadPacket(input)) {
+    const auto next = ReadPacket(copy);
+    auto pts = packet->pts;
+    if (pts) pts->ticks -= leading_discard;
+    const auto trim = padding(*packet);
+    discarded -= std::min<std::int64_t>(0, trim);
+    Check(next && next->duration && pts == next->pts && packet->duration == next->duration &&
+          std::max<std::int64_t>(0, trim) == padding(*next) &&
+          std::ranges::equal(packet->data.AsBytes(), next->data.AsBytes()), "Vorbis copy changed a packet or its sample clock");
+    const auto count = next->duration->Rescale(expected.timescale)->ticks;
+    Check((count == 0) == (index++ == 0), "Vorbis priming must consume one packet without advancing its clock");
+    trimmed |= padding(*next) != 0;
+    samples += count - padding(*next);
+  }
+  const auto priming = static_cast<std::int64_t>(copy.Tracks().front().priming_samples.value_or(0));
+  Check(!ReadPacket(copy) && trimmed && discarded == leading_discard &&
+        priming == static_cast<std::int64_t>(track.priming_samples.value_or(0)) + leading_discard &&
+        MediaTimestamp{samples - priming, expected.timescale} == expected &&
+        copy.PresentationRange(copy.Tracks().front().id) == MediaPresentationRange{{0, expected.timescale}, expected},
+        "Vorbis copy lost valid samples or trim");
+  return output;
+}
+
+void CheckVorbisSeekSamples(const TaskScope& tasks, testing::UiTest& ui, const std::shared_ptr<const File>& source,
+    const File& reference) {
+  auto input = std::make_shared<media_preview::AudioInput>(source);
+  auto pcm = media_preview::Open(reference);
+  constexpr MediaTimestamp targets[]{{83000, 44100}, {12531, 44100}, {92000, 44100}};
+  for (const auto target : targets) {
+    const auto point = Require(pcm.Seek(pcm.Tracks().front().id, target));
+    const auto expected = ReadPacket(pcm);
+    Check(point && expected && expected->pts == target, "Vorbis seek reference missed its exact sample");
+    std::exception_ptr failure;
+    std::optional<AudioFrame> first;
+    const auto seek = tasks.Launch([&]() -> Task<void> {
+      try {
+        media_preview::AudioDecode decode(input, AudioSampleFormat::F32);
+        Check(co_await decode.Seek(target), "Vorbis seek returned no decode anchor");
+        while (!decode.frame && !decode.ended) {
+          if (!co_await decode.Pump()) co_await Delay(1ms);
+        }
+        first = std::move(decode.frame);
+      } catch (...) { failure = std::current_exception(); }
+    });
+    Until(ui, failure, [&] { return first.has_value(); }, "Vorbis seek returned no audible samples");
+    seek.Cancel();
+    const auto bytes = first->planes.front().AsBytes();
+    const auto baseline = expected->data.AsBytes();
+    const auto common = std::min(bytes.size(), baseline.size());
+    Check(first->pts == target && common && std::ranges::equal(bytes.first(common), baseline.first(common)),
+          "Vorbis seek changed the first audible samples");
+  }
+}
+
+void CheckWave64AndVorbis(const TaskScope& tasks, testing::UiTest& ui, const File& temporary, const File& fixtures) {
+  const auto wave64 = CopyAudioContainer(fixtures.Child("preview-pcm.w64"), temporary, ContainerFormat::Wave64, ".w64", {8821, 44100}, 1);
+  CheckAudioPreviewSample(tasks, ui, temporary, {wave64, {8821, 44100}, CodecId::PcmF32Le});
+  constexpr MediaTimestamp samples{97593, 44100};
+  const auto ogg = std::make_shared<const File>(fixtures.Child("preview-vorbis.ogg"));
+  const auto reference = CheckAudioPreviewSample(tasks, ui, temporary, {ogg, samples, CodecId::PcmF32Le});
+  CheckVorbisSeekSamples(tasks, ui, ogg, *reference);
+  for (const auto [container, suffix] : {std::pair{ContainerFormat::WebM, ".webm"}, std::pair{ContainerFormat::Matroska, ".mka"}}) {
+    const auto ebml = CopyVorbis(*ogg, temporary, container, suffix, samples);
+    CopyVorbis(*ebml, temporary, ContainerFormat::Ogg, ".ogg", samples);
+    const auto decoded = CheckAudioPreviewSample(tasks, ui, temporary, {ebml, samples, CodecId::PcmF32Le});
+    Check(Require(decoded->ReadBytes()) == Require(reference->ReadBytes()), "Vorbis copy changed decoded PCM");
+    CheckVorbisSeekSamples(tasks, ui, ebml, *reference);
+  }
+  const auto coarse = CopyVorbis(*ogg, temporary, ContainerFormat::WebM, ".webm", samples, {.ebml_timestamp_scale = 1ms});
+  CheckVorbisSeekSamples(tasks, ui, coarse, *reference);
+
+  constexpr std::int64_t priming = 37;
+  auto input = media_preview::Open(*ogg);
+  auto track = input.Tracks().front();
+  track.priming_samples = priming;
+  const auto trimmed = media_preview::TemporaryFile(temporary, ".ogg");
+  auto mux = Require(MediaMuxer::Open(Require(trimmed->OpenRandomAccess(FileAccessMode::ReadWrite)),
+      ContainerFormat::Ogg, std::span(&track, 1)));
+  while (auto packet = ReadPacket(input)) {
+    packet->pts->ticks -= priming;
+    Check(!Require(mux.TryWrite(*packet)), "Vorbis priming trim was not accepted");
+  }
+  Require(mux.Finish());
+  constexpr MediaTimestamp audible{samples.ticks - priming, samples.timescale};
+  const auto mka = CopyVorbis(*trimmed, temporary, ContainerFormat::Matroska, ".mka", audible);
+  CopyVorbis(*mka, temporary, ContainerFormat::Ogg, ".ogg", audible);
+
+  input = media_preview::Open(*ogg);
+  const auto padded = media_preview::TemporaryFile(temporary, ".mka");
+  mux = Require(MediaMuxer::Open(Require(padded->OpenRandomAccess(FileAccessMode::ReadWrite)),
+      ContainerFormat::Matroska, input.Tracks()));
+  bool discarded = false;
+  while (auto packet = ReadPacket(input)) {
+    if (!discarded && packet->duration && packet->duration->ticks > 0) {
+      packet->discard_padding = MediaTimestamp{-priming, samples.timescale};
+      discarded = true;
+    }
+    Check(!Require(mux.TryWrite(*packet)), "Vorbis leading discard was not accepted");
+  }
+  Require(mux.Finish());
+  const auto remuxed = CopyVorbis(*padded, temporary, ContainerFormat::Ogg, ".ogg", audible, {}, priming);
+  const auto bytes = Require(remuxed->ReadBytes());
+  auto pages = std::span(bytes);
+  std::size_t headers = 0;
+  for (;;) {
+    Check(pages.size() >= 27, "Missing Ogg Vorbis audio page");
+    const auto segments = std::to_integer<std::size_t>(pages[26]);
+    Check(pages.size() >= 27 + segments, "Truncated Ogg Vorbis lacing table");
+    const auto laces = pages.subspan(27, segments);
+    const auto completed = std::ranges::count_if(laces, [](auto lace) { return lace != std::byte{255}; });
+    if (headers == 3) {
+      Check(completed == 2, "Ogg Vorbis leading trim requires both overlap packets on the first audio page");
+      break;
+    }
+    headers += completed;
+    std::size_t size = 27 + segments;
+    for (const auto lace : laces) size += std::to_integer<std::size_t>(lace);
+    Check(headers <= 3 && pages.size() >= size, "Invalid Ogg Vorbis header page");
+    pages = pages.subspan(size);
+  }
+  const auto trimmed_pcm = CheckAudioPreviewSample(tasks, ui, temporary, {trimmed, audible, CodecId::PcmF32Le});
+  const auto remuxed_pcm = CheckAudioPreviewSample(tasks, ui, temporary, {remuxed, audible, CodecId::PcmF32Le});
+  Check(Require(remuxed_pcm->ReadBytes()) == Require(trimmed_pcm->ReadBytes()), "MKA leading discard changed decoded Vorbis PCM");
 }
 
 void CheckAudioContainers(const TaskScope& tasks, testing::UiTest& ui, const File& temporary, const File& fixtures) {
@@ -952,7 +1101,8 @@ void CheckAudioContainers(const TaskScope& tasks, testing::UiTest& ui, const Fil
   const auto second = CheckAudioPreviewSample(tasks, ui, temporary, {alac_m4a, {10540, 96000}, CodecId::PcmF32Le});
   Check(Require(first->ReadBytes()) == Require(second->ReadBytes()), "CAF and M4A decoded different trimmed ALAC samples");
 #endif
-  std::cout << "PASS: AIFF/CAF PCM preview and seek, and CAF/M4A ALAC packet copy\n";
+  CheckWave64AndVorbis(tasks, ui, temporary, fixtures);
+  std::cout << "PASS: PCM and Vorbis container preview, seek, and audio packet copy\n";
 }
 
 #if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)

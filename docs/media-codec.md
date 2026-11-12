@@ -196,6 +196,15 @@ also passes repeated seeks on the LPCM clock. The iOS 26.5 Simulator returned `U
 creation. ProRes preview from an iPhone camera file requires device acceptance. macOS and the iOS Simulator cover
 ALAC playback, repeated seeks, and F32 WAV readback for M4A and CAF with a short final packet and CAF trim.
 
+### Vorbis
+
+The shared software decoder uses the bundled Xiph Vorbis synthesis library on all six targets. Use
+`CodecId::Vorbis`, the three Xiph-laced headers from the sample description, and the source sample
+rate and mono or stereo layout. `Probe()` validates the actual configuration. The first accepted packet
+after opening or resetting initializes the overlap and emits no PCM. Each following packet emits at most
+one PCM block with its submitted PTS. Pass the decode-start packet returned by the demuxer after a seek.
+[Vorbis container mapping](media-container.md#vorbis) · [Bundled sources](../third_party/README.md)
+
 ### Opus, FLAC, and MP3
 
 | Platform | Opus | FLAC | MP3 | Validation for this batch |

@@ -30,7 +30,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`media_player.h`](include/huxerui/media_player.h) |
 | Platform image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
-| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, HEVC, VP8, VP9 profile 0, and [8-bit SDR AV1](docs/media-codec.md#av1) where available. macOS and iOS also support [mono/stereo ALAC](docs/media-codec.md#prores-422-and-alac). | `AudioDecoder`, `VideoDecoder`, exact timestamps and decoded frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
+| Audio and video decoding | AAC-LC, Opus, Vorbis, FLAC, MP3, H.264, HEVC, VP8, VP9 profile 0, and [8-bit SDR AV1](docs/media-codec.md#av1) where available. macOS and iOS also support [mono/stereo ALAC](docs/media-codec.md#prores-422-and-alac). | `AudioDecoder`, `VideoDecoder`, exact timestamps and decoded frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
 | HEVC encoding and decoding | Main and Main10 adapters for all six platforms. Linux Main/Main10 CPU round trips and preview export passed under WSL. See the [HEVC matrix](docs/media-codec.md#hevc) for device and runtime coverage. | `CodecId::Hevc`, `VideoEncoder`, `VideoDecoder`, and `VideoPixelFormat::P010` |
 | ProRes 422 encoding and decoding | macOS decodes progressive 422 Proxy, LT, 422, and HQ and encodes standard 422. The MOV round trip retains ten-bit 4:2:2 chroma and LPCM timing. Compatible iOS devices can decode standard 422. | `CodecId::ProRes`, `VideoPixelFormat::P210`, [`MediaMuxer`](docs/media-container.md) |
 | GPU video | SDR H.264 and HEVC Main platform frames and SDK texture input on macOS, Android, iOS, Windows, and supported Web browsers. Windows x64 passed H.264 GPU transcode and SDK texture encoding for H.264 and HEVC Main. See [GPU video](docs/gpu-video.md) for platform coverage. | `VideoStorage::Platform`, `MakeExternalTexture()`, and `MakeVideoFrame()` |
@@ -38,7 +38,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; macOS native tests passed; iOS validation pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; macOS native tests passed; iOS validation pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | Codec capability discovery | Typed AAC-LC and H.264 snapshots, plus per-codec audio decoder queries for Opus, FLAC, and MP3. Support and reported limits depend on the adapter. | `QueryCapabilities()` on the four codec classes and `AudioDecoder::QueryCapabilities(CodecId, ...)` in [`media_codec.h`](include/huxerui/media_codec.h) |
-| Container demuxing and muxing | MP4/M4A/fMP4, QuickTime MOV, Matroska, WebM, WAVE/RF64, AIFF and CAF LPCM, CAF ALAC, ADTS, Ogg Opus with chained input, and native FLAC/MP3 with tag and cover copy | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
+| Container demuxing and muxing | MP4/M4A/fMP4, QuickTime MOV, Matroska, WebM, WAVE/RF64/Wave64, AIFF and CAF LPCM, CAF ALAC, ADTS, Ogg Opus or Vorbis, and native FLAC/MP3 with tag and cover copy | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
 
 Platform selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
 SDK `FileReference` values, which can be retained for reading, imported to local files, or passed to `MediaSource` for
@@ -299,7 +299,7 @@ See the [media library guide](docs/media-library.md) and [`media_library.h`](inc
 ## Media decoding
 
 `AudioDecoder` and `VideoDecoder` are move-only sessions with bounded queues. Supply complete access units from a source
-or demuxer. The audio decoder produces mono/stereo S16 or F32 PCM from AAC-LC, Opus, FLAC, or MP3. The video decoder
+or demuxer. The audio decoder produces mono/stereo S16 or F32 PCM from AAC-LC, Opus, Vorbis, FLAC, or MP3. The video decoder
 produces CPU YUV by default from length-prefixed H.264 or HEVC. macOS, Android, iOS, and Windows can also return
 [retained platform images](docs/gpu-video.md) for SDR video. Returned frames remain valid after reset and close.
 
@@ -464,9 +464,10 @@ stereo LPCM. Compatible iOS devices preview standard 422. **Open from Photos** o
 Switch **CPU video** to **GPU video** for supported SDR platform frames. Android can preview directly to
 `SurfaceStreamTexture`. See the [frame storage contract and GPU performance comparison](docs/gpu-video.md).
 
-**Open audio** plays supported AIFF/CAF LPCM, Ogg Opus, WebM/MKA, FLAC, MP3, and AAC M4A sources. On macOS and
-iOS it also previews and seeks mono/stereo ALAC in M4A and CAF. **Copy Audio** keeps compatible AIFF and CAF audio
-in its source container, and retains supported packets, tags, and artwork for FLAC, MP3, and AAC/ALAC M4A.
+**Open audio** plays supported AIFF/CAF/Wave64 LPCM, Ogg Opus and Vorbis, WebM/MKA, FLAC, MP3, and AAC M4A sources.
+On macOS and iOS it also previews and seeks mono/stereo ALAC in M4A and CAF. **Copy Audio** keeps compatible AIFF,
+CAF, Wave64, and Vorbis audio in its source container, and retains supported packets, tags, and artwork for FLAC,
+MP3, and AAC/ALAC M4A.
 **Copy Movie** keeps compatible MP4, MOV, WebM, or MKV access units, sample descriptions, timing, and supported metadata.
 The copy is reopened before the save action becomes available. EBML copies reuse the source Segment tick. Browser input is staged in
 memory and limited to 128 MiB. MKV copies retain supported subtitle tracks, chapters, tags, and attachments.

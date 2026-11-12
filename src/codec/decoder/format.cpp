@@ -1,6 +1,7 @@
 #include "format.h"
 #include "../av1.h"
 #include "../hevc.h"
+#include "../vorbis.h"
 #include "container/container_io.h"
 #include "format/platform_video_storage.h"
 
@@ -124,6 +125,10 @@ CodecResult<unsigned> AudioSampleLimit(const AudioDecoderConfig& config) {
       case CodecId::Opus: {
         const auto info = ParseOpus(config.initialization_data, ContainerErrorCode::Unsupported);
         return matches(48000, info.channels, 5760);
+      }
+      case CodecId::Vorbis: {
+        const VorbisHeaders info(config.initialization_data, ContainerErrorCode::InvalidArgument);
+        return matches(info.Rate(), info.Channels(), info.MaxSamples());
       }
       case CodecId::Flac: {
         const auto info = ParseFlacStreamInfo(config.initialization_data, ContainerErrorCode::InvalidArgument);
@@ -272,6 +277,7 @@ CodecResult<bool> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
       || (packet.duration && (!packet.duration->Rescale(1000000) || packet.duration->ticks < 0)))
     return invalid("Empty packet or invalid/unrepresentable timing");
   if (const auto* audio = std::get_if<AudioDecoderConfig>(&config); audio && audio->codec != CodecId::Aac) {
+    if (audio->codec == CodecId::Vorbis) return R::Success(!needs_key);
     const auto samples = AudioPacketSamples(*audio, packet.data.AsBytes());
     if (!samples.Succeeded()) return R::Failure(samples.Error());
   }

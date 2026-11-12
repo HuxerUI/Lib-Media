@@ -493,7 +493,7 @@ View FramesPage() {
           if (!selected.empty()) chosen = std::move(selected.front());
         } else if (!sample) {
           const auto filter = audio ? FilePickerFilter{.name = "Audio",
-                                                       .extensions = {"m4a", "aif", "aiff", "caf", "ogg", "opus", "flac", "mp3", "webm", "mka"},
+                                                       .extensions = {"m4a", "aif", "aiff", "caf", "w64", "ogg", "oga", "opus", "flac", "mp3", "webm", "mka"},
                                                        .content_types = {"audio/*", "application/ogg", "video/webm", "video/x-matroska"}}
                                     : FilePickerFilter{.name = "Movies", .extensions = {"mp4", "m4v", "mov", "webm", "mkv"},
                                                        .content_types = {"video/*"}};

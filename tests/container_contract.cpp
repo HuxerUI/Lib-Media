@@ -633,6 +633,40 @@ void Wave(const fs::path& path, ContainerFormat format) {
         std::ranges::equal(packet.data.AsBytes(), std::span(bytes).last(frame_bytes)), "WAVE seek payload differs");
 }
 
+#if !defined(_WIN32)
+void SparseWave64(const fs::path& directory) {
+  const auto ordinary = directory / "small.w64";
+  Wave(ordinary, ContainerFormat::Wave64);
+  auto bytes = Take(Path(ordinary).ReadBytes());
+  const auto find = [&](std::string_view name) {
+    const auto tag = std::as_bytes(std::span(name.data(), name.size()));
+    const auto match = std::ranges::search(bytes, tag);
+    Check(!match.empty(), "Wave64 fixture is missing a chunk");
+    return static_cast<std::size_t>(match.begin() - bytes.begin());
+  };
+  const auto data = find("data"), fact = find("fact"), payload = data + 24;
+  constexpr std::uint64_t frames = 0x100000003ull;
+  const auto patch = [&](std::size_t offset, std::uint64_t value) {
+    for (unsigned byte = 0; byte < 8; ++byte) bytes[offset + byte] = std::byte((value >> (byte * 8)) & 255);
+  };
+  patch(16, payload + frames + 5);
+  patch(data + 16, frames + 24);
+  patch(fact + 24, frames);
+  const auto large = directory / "sparse.w64";
+  AppendFile(large, std::span(bytes).first(payload));
+  fs::resize_file(large, payload + frames - 1);
+  constexpr std::array tail{std::byte{0x71}, std::byte{}, std::byte{}, std::byte{}, std::byte{}, std::byte{}};
+  AppendFile(large, tail);
+  auto reader = Take(MediaDemuxer::Open(Take(Path(large).OpenRandomAccess())));
+  Check(reader.Duration() == MediaTimestamp{frames, 48000}, "Wave64 lost its 64-bit sample count");
+  const auto point = Take(reader.Seek(1, {frames - 1, 48000}));
+  const auto packet = ReadPacket(reader);
+  Check(point && point->byte_offset == payload + frames - 1 && packet && packet->duration == MediaTimestamp{1, 48000} &&
+        std::ranges::equal(packet->data.AsBytes(), std::span(tail).first(1)), "Wave64 seek did not reach the sample beyond 4 GiB");
+  Check(!ReadPacket(reader), "Wave64 returned alignment padding as PCM");
+}
+#endif
+
 void PcmContainers(const fs::path& directory) {
   struct Mapping { ContainerFormat container; CodecId codec; };
   constexpr Mapping mappings[]{
@@ -1949,6 +1983,10 @@ int main(int argc, char** argv) {
     Mp4(path / names[1], ContainerLayout::Fragmented);
     Wave(path / names[2], ContainerFormat::Wave);
     Wave(path / names[3], ContainerFormat::Rf64);
+    Wave(path / "wave64.w64", ContainerFormat::Wave64);
+#if !defined(_WIN32)
+    SparseWave64(path);
+#endif
     PcmContainers(path);
     CafPacketDurations(path);
     Adts(path / names[4]);

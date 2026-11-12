@@ -86,6 +86,18 @@ target_include_directories(huxerui_media PUBLIC
 )
 target_include_directories(huxerui_media PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+enable_language(C)
+file(GLOB VORBIS_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/vorbis/lib/*.c")
+target_sources(huxerui_media PRIVATE ${VORBIS_SOURCES} third_party/ogg/bitwise.c)
+target_include_directories(huxerui_media PRIVATE third_party/vorbis/include third_party/ogg/include)
+target_compile_features(huxerui_media PRIVATE c_std_99)
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(${VORBIS_SOURCES} third_party/ogg/bitwise.c PROPERTIES COMPILE_OPTIONS "-fvisibility=hidden")
+endif ()
+if (UNIX AND NOT APPLE AND NOT EMSCRIPTEN)
+    target_link_libraries(huxerui_media PRIVATE m)
+endif ()
+
 if (ANDROID)
     target_link_libraries(huxerui_media PRIVATE mediandk android dl EGL GLESv3)
 endif ()

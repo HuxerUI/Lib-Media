@@ -5,6 +5,17 @@
 namespace huxerui::media::detail {
 namespace {
 
+constexpr std::array<std::uint8_t, 12> Wave64RiffTail{0x2e, 0x91, 0xcf, 0x11, 0xa5, 0xd6, 0x28, 0xdb, 4, 0xc1, 0, 0};
+constexpr std::array<std::uint8_t, 12> Wave64ChunkTail{0xf3, 0xac, 0xd3, 0x11, 0x8c, 0xd1, 0, 0xc0, 0x4f, 0x8e, 0xdb, 0x8a};
+constexpr std::uint64_t Wave64HeaderBytes = 24;
+
+void PutWave64Guid(Bytes& bytes, std::uint32_t tag, bool riff = false) {
+  Put(bytes, tag);
+  Append(bytes, std::as_bytes(std::span(riff ? Wave64RiffTail : Wave64ChunkTail)));
+}
+
+std::uint64_t Wave64Padding(std::uint64_t size) { return (8 - size % 8) % 8; }
+
 unsigned Bits(CodecId codec) {
   switch (codec) {
     case CodecId::PcmU8: return 8;
@@ -71,6 +82,10 @@ void ReadFormat(ByteView bytes, MediaTrack& track, unsigned& alignment) {
 class WaveReader final : public PcmReader {
 public:
   WaveReader(ContainerInput input, ContainerFormat format) : PcmReader(std::move(input), format) {
+    if (format == ContainerFormat::Wave64) {
+      ReadWave64();
+      return;
+    }
     const auto header = this->input.ReadBytes(12);
     const bool rf64 = format == ContainerFormat::Rf64;
     auto end = AddOffset(8, Number<std::uint32_t>(header, 4, true));
@@ -111,7 +126,7 @@ public:
         ReadFormat(this->input.ReadBytes(static_cast<std::size_t>(size)), track, alignment);
         this->input.Skip(size & 1);
       } else if (type == Tag("data")) {
-        Begin(std::move(track), size, alignment, (size & 1) != 0);
+        Begin(std::move(track), size, alignment, static_cast<unsigned>(size & 1));
         return;
       } else {
         if ((!this->input.Random() || !this->input.Size()) && padded > MaxContainerMetadata)
@@ -122,12 +137,67 @@ public:
     Fail(ContainerErrorCode::InvalidData, "Missing WAVE data chunk");
   }
 
+private:
+  void ReadWave64() {
+    constexpr auto invalid = ContainerErrorCode::InvalidData;
+    const auto header = input.ReadBytes(40);
+    const auto riff = std::as_bytes(std::span(Wave64RiffTail));
+    const auto tail = std::as_bytes(std::span(Wave64ChunkTail));
+    const auto end = Number<std::uint64_t>(header, 16, true);
+    if (Number<std::uint32_t>(header) != Tag("riff") || !std::ranges::equal(Slice(header, 4, 12), riff) ||
+        Number<std::uint32_t>(header, 24) != Tag("wave") || !std::ranges::equal(Slice(header, 28, 12), tail) ||
+        end < header.size() || (input.Size() && end > *input.Size()))
+      Fail(invalid, "Invalid Wave64 RIFF header");
+
+    MediaTrack track{.descriptions = {{}}};
+    std::optional<std::uint64_t> fact;
+    unsigned alignment = 0;
+    std::size_t chunks = 0;
+    while (end - input.Position() >= Wave64HeaderBytes) {
+      if (++chunks > 4096 || (!input.Random() && input.Position() > MaxContainerMetadata))
+        Fail(ContainerErrorCode::LimitExceeded, "Wave64 chunk discovery exceeds its budget");
+      const auto chunk = input.ReadBytes(Wave64HeaderBytes);
+      const auto size = Number<std::uint64_t>(chunk, 16, true);
+      const auto padded = AddOffset(size, Wave64Padding(size));
+      if (size < Wave64HeaderBytes || padded - Wave64HeaderBytes > end - input.Position())
+        Fail(invalid, "Wave64 chunk exceeds the RIFF bounds");
+      const auto payload = size - Wave64HeaderBytes;
+      const auto type = std::ranges::equal(Slice(chunk, 4, 12), tail) ? Number<std::uint32_t>(chunk) : 0;
+      if (type == Tag("fmt ")) {
+        if (alignment || payload < 16 || payload > 65536) Fail(invalid, "Invalid Wave64 format chunk");
+        ReadFormat(input.ReadBytes(static_cast<std::size_t>(payload)), track, alignment);
+        input.Skip(padded - size);
+      } else if (type == Tag("fact")) {
+        if (fact || payload < 8 || payload > 65536) Fail(invalid, "Invalid Wave64 fact chunk");
+        fact = Number<std::uint64_t>(input.ReadBytes(8), 0, true);
+        input.Skip(padded - Wave64HeaderBytes - 8);
+      } else if (type == Tag("data")) {
+        if (!alignment) Fail(invalid, "Wave64 data precedes its format");
+        auto bytes = payload;
+        if (fact && *fact) {
+          if (*fact > payload / alignment || payload - *fact * alignment > 7)
+            Fail(invalid, "Wave64 sample count differs from its data length");
+          bytes = *fact * alignment;
+        } else if (payload % 8 == 0 && payload % alignment <= 7) {
+          // Some writers include alignment bytes in the declared chunk size.
+          bytes -= payload % alignment;
+        }
+        Begin(std::move(track), bytes, alignment, static_cast<unsigned>(padded - Wave64HeaderBytes - bytes));
+        return;
+      } else {
+        if ((!input.Random() || !input.Size()) && padded - Wave64HeaderBytes > MaxContainerMetadata)
+          Fail(ContainerErrorCode::LimitExceeded, "Wave64 header skip exceeds its budget");
+        input.Skip(padded - Wave64HeaderBytes);
+      }
+    }
+    Fail(invalid, "Missing Wave64 data chunk");
+  }
 };
 
 class WaveWriter final : public ContainerWriter {
 public:
   WaveWriter(ContainerOutput output, ContainerFormat format, std::span<const MediaTrack> tracks)
-      : ContainerWriter(std::move(output), tracks), rf64_(format == ContainerFormat::Rf64) {
+      : ContainerWriter(std::move(output), tracks), rf64_(format == ContainerFormat::Rf64), wave64_(format == ContainerFormat::Wave64) {
     const auto& track = tracks[0];
     const auto& description = track.descriptions.front();
     const auto bits = Bits(description.codec);
@@ -137,16 +207,22 @@ public:
     const std::uint16_t coding = description.codec == CodecId::PcmF32Le ? 3 : 1;
     const bool extensible = channels > 2 || !description.initialization_data.empty();
     Bytes header;
-    Put(header, Tag(rf64_ ? "RF64" : "RIFF"));
-    Put(header, rf64_ ? 0xffffffffu : 0u, true);
-    Put(header, Tag("WAVE"));
+    if (wave64_) {
+      PutWave64Guid(header, Tag("riff"), true);
+      Put<std::uint64_t>(header, 0, true);
+      PutWave64Guid(header, Tag("wave"));
+    } else {
+      Put(header, Tag(rf64_ ? "RF64" : "RIFF"));
+      Put(header, rf64_ ? 0xffffffffu : 0u, true);
+      Put(header, Tag("WAVE"));
+    }
     if (rf64_) {
       Put(header, Tag("ds64"));
       Put(header, 28u, true);
       header.resize(header.size() + 28);
     }
-    Put(header, Tag("fmt "));
-    Put(header, extensible ? 40u : (coding == 3 ? 18u : 16u), true);
+    const auto format_bytes = extensible ? 40u : (coding == 3 ? 18u : 16u);
+    PutChunk(header, Tag("fmt "), format_bytes);
     Put<std::uint16_t>(header, extensible ? 0xfffe : coding, true);
     Put<std::uint16_t>(header, static_cast<std::uint16_t>(channels), true);
     Put(header, rate, true);
@@ -166,15 +242,15 @@ public:
     } else if (coding == 3) {
       Put<std::uint16_t>(header, 0, true);
     }
-    if (coding == 3) {
-      Put(header, Tag("fact"));
-      Put(header, 4u, true);
+    if (wave64_) header.resize(header.size() + Wave64Padding(format_bytes));
+    if (wave64_ || coding == 3) {
+      const auto fact_bytes = wave64_ ? 8u : 4u;
+      PutChunk(header, Tag("fact"), fact_bytes);
       fact_offset_ = header.size();
-      Put(header, 0u, true);
+      header.resize(header.size() + fact_bytes);
     }
-    Put(header, Tag("data"));
-    size_offset_ = header.size();
-    Put(header, rf64_ ? 0xffffffffu : 0u, true);
+    PutChunk(header, Tag("data"), rf64_ ? 0xffffffffu : 0u);
+    size_offset_ = header.size() - (wave64_ ? 8u : 4u);
     this->output.Write(header);
   }
 
@@ -188,8 +264,8 @@ public:
         (packet.duration && *packet.duration != length))
       Fail(ContainerErrorCode::InvalidArgument, "WAVE packet timing does not match its contiguous sample grid");
     const auto end = AddOffset(output.Position(), bytes.size());
-    if (!rf64_ && AddOffset(end, end & 1) - 8 > 0xffffffffu)
-      Fail(ContainerErrorCode::LimitExceeded, "WAVE file exceeds RIFF size limits; use RF64");
+    if (!rf64_ && !wave64_ && AddOffset(end, end & 1) - 8 > 0xffffffffu)
+      Fail(ContainerErrorCode::LimitExceeded, "WAVE file exceeds RIFF size limits; use RF64 or Wave64");
     const auto next = AddTime(frames_, frames);
     output.Write(bytes);
     frames_ = next;
@@ -198,10 +274,9 @@ public:
   }
 
   void Finish() override {
-    if (data_bytes_ & 1) {
-      constexpr std::array padding{std::byte{0}};
-      output.Write(padding);
-    }
+    constexpr std::array<std::byte, 7> padding{};
+    const auto count = wave64_ ? Wave64Padding(data_bytes_) : data_bytes_ & 1;
+    if (count) output.Write(ByteView(padding).first(static_cast<std::size_t>(count)));
     // The RF64 table carries real lengths; the RIFF and data size fields keep their sentinels.
     if (rf64_) {
       Bytes sizes;
@@ -209,21 +284,35 @@ public:
       Put(sizes, data_bytes_, true);
       Put(sizes, frames_, true);
       output.Patch(20, sizes);
+    } else if (wave64_) {
+      Patch(16, output.Position());
+      Patch(size_offset_, AddOffset(data_bytes_, Wave64HeaderBytes));
+      Patch(fact_offset_, static_cast<std::uint64_t>(frames_));
     } else {
-      Patch32(4, static_cast<std::uint32_t>(output.Position() - 8));
-      Patch32(size_offset_, static_cast<std::uint32_t>(data_bytes_));
+      Patch(4, static_cast<std::uint32_t>(output.Position() - 8));
+      Patch(size_offset_, static_cast<std::uint32_t>(data_bytes_));
     }
-    if (fact_offset_) Patch32(fact_offset_, static_cast<std::uint32_t>(std::min<std::int64_t>(frames_, 0xffffffffu)));
+    if (fact_offset_ && !wave64_) Patch(fact_offset_, static_cast<std::uint32_t>(std::min<std::int64_t>(frames_, 0xffffffffu)));
   }
 
 private:
-  void Patch32(std::uint64_t offset, std::uint32_t value) {
+  void PutChunk(Bytes& header, std::uint32_t type, std::uint32_t size) const {
+    if (wave64_) {
+      PutWave64Guid(header, type);
+      Put(header, Wave64HeaderBytes + size, true);
+    } else {
+      Put(header, type);
+      Put(header, size, true);
+    }
+  }
+
+  template<class T> void Patch(std::uint64_t offset, T value) {
     Bytes bytes;
     Put(bytes, value, true);
     output.Patch(offset, bytes);
   }
 
-  bool rf64_;
+  bool rf64_, wave64_;
   unsigned alignment_;
   std::uint64_t size_offset_;
   std::uint64_t fact_offset_ = 0;
@@ -231,6 +320,12 @@ private:
   std::int64_t frames_ = 0;
 };
 } // namespace
+
+bool LooksLikeWave64(ByteView prefix) {
+  const auto riff = std::as_bytes(std::span(Wave64RiffTail));
+  return prefix.size() >= 12 && Number<std::uint32_t>(prefix) == Tag("riff") &&
+      std::ranges::equal(prefix.subspan(4, 8), riff.first(8));
+}
 
 void ValidateWave(std::span<const MediaTrack> tracks) {
   if (tracks.size() != 1 || tracks[0].kind != TrackKind::Audio ||
