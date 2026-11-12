@@ -127,7 +127,7 @@ std::string_view VideoEntry(const MediaSampleDescription& track) {
 }
 
 std::uint32_t PcmFrameSize(const MediaSampleDescription& track) {
-  return (MovPcmBits(track.codec) / 8) * track.channel_count.value_or(0);
+  return (DescribePackedPcm(track.codec).bits / 8) * track.channel_count.value_or(0);
 }
 
 void PcmDescription(Bytes& bytes, const MediaSampleDescription& track) {
@@ -142,14 +142,13 @@ void PcmDescription(Bytes& bytes, const MediaSampleDescription& track) {
     Put<std::uint16_t>(bytes, 0);
     Put(bytes, 0x10000u);
     // The version-two fields describe one packed, interleaved PCM frame per QuickTime sample.
-    const auto bits = MovPcmBits(track.codec);
-    const bool floating = track.codec == CodecId::PcmF32Le || track.codec == CodecId::PcmF32Be;
-    const auto flags = 8u | (floating ? 1u : (bits > 8 ? 4u : 0u)) | (MovPcmBigEndian(track.codec) ? 2u : 0u);
+    const auto pcm = DescribePackedPcm(track.codec);
+    const auto flags = 8u | (pcm.floating_point ? 1u : (pcm.bits > 8 ? 4u : 0u)) | (pcm.big_endian ? 2u : 0u);
     Put(bytes, 72u);
     Put(bytes, std::bit_cast<std::uint64_t>(static_cast<double>(*track.sample_rate)));
     Put(bytes, *track.channel_count);
     Put(bytes, 0x7f000000u);
-    Put(bytes, bits);
+    Put(bytes, pcm.bits);
     Put(bytes, flags);
     Put(bytes, PcmFrameSize(track));
     Put(bytes, 1u);
@@ -819,7 +818,7 @@ void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, con
           Fail(WriteError, "MP4 ALAC track metadata does not match ALACSpecificConfig");
         if (options.layout == ContainerLayout::Fragmented)
           Fail(ContainerErrorCode::Unsupported, "ALAC output requires regular or fast-start MP4");
-      } else if (track.kind == TrackKind::Audio && format == ContainerFormat::Mov && MovPcmBits(description.codec)) {
+      } else if (track.kind == TrackKind::Audio && format == ContainerFormat::Mov && DescribePackedPcm(description.codec).bits) {
         const auto rate = description.sample_rate.value_or(0), channels = description.channel_count.value_or(0);
         if (!rate || !channels || channels > 64 || Mp4Scale(track) % rate ||
             description.framing != PacketFraming::CodecPacket || !description.initialization_data.empty() ||

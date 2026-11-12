@@ -101,7 +101,8 @@ struct QueueLimits {
 /// decoded timeline. Use Probe() to check the selected codec and stream configuration on the current platform.
 /// @see AudioDecoder::Create(), AudioDecoder::Probe()
 struct AudioDecoderConfig {
-  /// Two-byte AudioSpecificConfig for AAC-LC, OpusHead for Opus, or the 34-byte STREAMINFO payload for FLAC.
+  /// Two-byte AudioSpecificConfig for AAC-LC, 24-byte ALACSpecificConfig for ALAC, OpusHead for Opus,
+  /// or the 34-byte STREAMINFO payload for FLAC.
   /// Leave empty for MPEG Layer III, whose complete frames carry their own configuration.
   Bytes initialization_data;
   /// Requested PCM format. Set the sample rate and channel layout to match the compressed stream.
@@ -121,7 +122,8 @@ struct AudioDecoderConfig {
   /// any decoding error. Platform work that cannot safely be retired leaves it pending.
   /// Retained CPU frames remain readable and do not delay completion. The callback must return promptly and not throw.
   std::function<void(CodecResult<void>)> cleanup_completed;
-  /// Coding of the configuration and access units. Use Aac, Opus, Flac, or Mp3.
+  /// Coding of the configuration and access units. Use Aac, Alac, Opus, Flac, or Mp3.
+  /// Mono and stereo ALAC decoding is available on macOS and iOS. Probe() checks the concrete configuration.
   CodecId codec = CodecId::Aac;
 };
 
@@ -129,18 +131,21 @@ struct AudioDecoderConfig {
 ///
 /// AVC supports Baseline, Main, and High profiles with at most 16 reference pictures and continuous frame
 /// numbering. HEVC supports single-layer Main and Main10 4:2:0. VP8 and VP9 profile 0 produce eight-bit 4:2:0.
-/// AV1 supports single-spatial-layer Main, eight-bit SDR 4:2:0, with CPU output.
+/// AV1 supports single-spatial-layer Main, eight-bit SDR 4:2:0, with CPU output. Progressive ProRes 422 decodes to
+/// CPU 4:2:0 on macOS and on iOS devices with a compatible decoder. P010 preserves ten-bit precision.
 /// Probe the concrete configuration for platform support, storage, and pixel layout. A fresh or reset session
-/// requires a key-marked AVC/HEVC IDR or VP8, VP9, or AV1 key frame.
+/// requires a marked random-access packet, such as an AVC/HEVC IDR or an independently decodable ProRes frame.
 /// @see VideoDecoder::Create(), VideoDecoder::Probe()
 struct VideoDecoderConfig {
   /// Decoder configuration of at most 64 KiB. Supply avcC with SPS/PPS for AVC or hvcC with complete VPS/SPS/PPS for HEVC.
   /// AVC and HEVC pictures use the configuration's NAL length field size of 1, 2, or 4 bytes.
   /// VP8 leaves this empty. VP9 profile 0 accepts an empty configuration or Matroska/WebM codec feature metadata.
   /// For AV1, supply the AV1CodecConfigurationRecord from av1C or Matroska/WebM CodecPrivate.
+  /// Leave empty for ProRes. Each packet carries its own frame header.
   Bytes initialization_data;
   /// Maximum coded luma width in pixels, in [1, 8192]. The backend can impose smaller limits.
   /// Together with height, configures the codec and sizes output reservations. Use a new session for larger bounds.
+  /// For ProRes, provide the exact coded width and height.
   std::uint32_t width = 0;
   /// Maximum coded luma height in pixels, in [1, 8192], subject to the platform limit described for width.
   std::uint32_t height = 0;
@@ -154,7 +159,7 @@ struct VideoDecoderConfig {
   /// Optional teardown callback with the resource and lifetime contract of AudioDecoderConfig::cleanup_completed.
   /// Returned platform frames may retain their retired image pool independently of this callback.
   std::function<void(CodecResult<void>)> cleanup_completed;
-  /// Coding of the supplied configuration and packets. Supports H264, Hevc, Vp8, Vp9, and Av1.
+  /// Coding of the supplied configuration and packets. Supports H264, Hevc, Vp8, Vp9, Av1, and ProRes.
   /// QueryCapabilities() describes H.264. Use Probe() to check other concrete configurations.
   CodecId codec = CodecId::H264;
   /// Selects the returned frame storage. Platform storage requires a compatible codec on macOS, iOS, Android,
@@ -538,7 +543,7 @@ using AudioEncodeOutput = std::variant<AudioEncodeFormat, EncodedPacket, AudioEn
 /// @see VideoEncoder::TryRead(), VideoEncodeFormat
 using VideoEncodeOutput = std::variant<VideoEncodeFormat, EncodedPacket, EndOfStream>;
 
-/// @brief Move-only AAC-LC, Opus, FLAC, or MP3 decoder with bounded queues and independently retained PCM output.
+/// @brief Move-only AAC-LC, ALAC, Opus, FLAC, or MP3 decoder with bounded queues and retained PCM output.
 ///
 /// The returned handle owns the session. On desktop and mobile platforms, queue and control calls may run concurrently on a live
 /// handle. On Web, use the JavaScript event loop that created the session. Move or destroy a handle only after its
@@ -708,6 +713,7 @@ public:
   /// VP8 and VP9 packets may carry reference-only frames. VP9 superframes can contain up to one visible picture.
   /// AV1 uses one temporal unit per packet with at most one visible picture. An AV1 key packet carries an
   /// in-band sequence header before its first frame, a displayed key frame.
+  /// ProRes uses one complete frame, including the frame header, per packet.
   /// The first packet after creation or reset must be a random-access packet and set key_frame.
   /// Keep bytes unchanged until return.
   /// @return Accepted after copying the packet. WouldBlock leaves it unconsumed while startup or reset is pending

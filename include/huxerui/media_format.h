@@ -124,7 +124,7 @@ enum class CodecId {
   ProRes,   ///< Apple ProRes coded pictures. The sample entry identifies the profile.
 
   Aac,      ///< Advanced Audio Coding.
-  Alac,     ///< Apple Lossless Audio Codec. The container API supports packet copy.
+  Alac,     ///< Apple Lossless Audio Codec.
   Opus,     ///< Opus coded audio. Trim uses the 48 kHz decoded sample grid.
   Flac,     ///< Complete native FLAC frames.
   Mp3,      ///< Complete MPEG Layer III frames.

@@ -1,10 +1,13 @@
 #include "decoded_preview.h"
+#include "packed_pcm.h"
 
 #include <huxerui/media_codec.h>
 #include <huxerui/media_playback.h>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
+#include <cstring>
 #include <deque>
 
 using namespace huxerui;
@@ -18,6 +21,38 @@ std::int64_t AddSamples(std::int64_t start, std::uint64_t samples) {
   if (samples > std::uint64_t(INT64_MAX) || start > INT64_MAX - static_cast<std::int64_t>(samples))
     throw std::runtime_error("Audio sample clock overflow");
   return start + static_cast<std::int64_t>(samples);
+}
+
+AudioFrame UnpackPcm(const ContainerPacket& packet, CodecId codec, AudioFormat format, std::int64_t pts,
+                     std::int64_t duration) {
+  const auto layout = media::detail::DescribePackedPcm(codec);
+  const auto sample_bytes = layout.bits / 8;
+  const auto frame_bytes = sample_bytes * format.ChannelCount();
+  const auto bytes = packet.data.AsBytes();
+  if (!frame_bytes || !std::in_range<std::uint32_t>(duration) || bytes.size() % frame_bytes ||
+      bytes.size() / frame_bytes != static_cast<std::uint32_t>(duration))
+    throw std::runtime_error("PCM packet bytes do not match its sample duration");
+
+  const auto sample_values = bytes.size() / sample_bytes;
+  const auto output_bytes = format.BytesPerSample();
+  auto output = std::make_shared<Bytes>(sample_values * output_bytes);
+  for (std::size_t i = 0; i < sample_values; ++i) {
+    const auto input = bytes.subspan(i * sample_bytes, sample_bytes);
+    std::uint32_t word = 0;
+    for (unsigned b = 0; b < sample_bytes; ++b)
+      word = (word << 8) | std::to_integer<unsigned>(input[layout.big_endian ? b : sample_bytes - 1 - b]);
+    float sample;
+    if (layout.floating_point) sample = std::bit_cast<float>(word);
+    else if (layout.bits == 8) sample = (static_cast<int>(word) - 128) / 128.0f;
+    else sample = std::bit_cast<std::int32_t>(word << (32 - layout.bits)) / 2147483648.0f;
+    auto* destination = output->data() + i * output_bytes;
+    if (format.sample_format == AudioSampleFormat::F32) std::memcpy(destination, &sample, sizeof(sample));
+    else {
+      const auto integer = media::detail::QuantizePcm16(sample);
+      std::memcpy(destination, &integer, sizeof(integer));
+    }
+  }
+  return {format, {pts, format.sample_rate}, static_cast<std::uint32_t>(duration), {BufferReference(*output, output)}};
 }
 
 } // namespace
@@ -76,8 +111,8 @@ AudioFormat PlaybackFormat(const MediaSampleDescription& description) {
       description.channel_count == 1 ? AudioChannelLayout::Mono : AudioChannelLayout::Stereo};
 }
 
-AudioDecode::AudioDecode(std::shared_ptr<AudioInput> input)
-    : input_(std::move(input)), target_(input_->origin) {
+AudioDecode::AudioDecode(std::shared_ptr<AudioInput> input, AudioSampleFormat sample_format)
+    : input_(std::move(input)), target_(input_->origin), sample_format_(sample_format) {
   if (!input_->track.edits.empty()) edits_.emplace(input_->track);
 }
 
@@ -85,6 +120,7 @@ Task<bool> AudioDecode::Seek(MediaTimestamp target) {
   if (!co_await OnFileThread([input = input_, target] { return input->Seek(target); })) co_return false;
   target_ = target;
   decoder_.reset();
+  pcm_codec_.reset();
   pending_start_.reset();
   pending_.reset();
   next_pts_.reset();
@@ -97,7 +133,7 @@ Task<bool> AudioDecode::Seek(MediaTimestamp target) {
 
 Task<bool> AudioDecode::Pump() {
   if (ended || frame) co_return false;
-  if (edits_ && decoder_) {
+  if (edits_ && (decoder_ || pcm_codec_)) {
     frame = edits_->Read(target_, format_, drained_);
     if (frame) co_return true;
   }
@@ -111,10 +147,7 @@ Task<bool> AudioDecode::Pump() {
         if (windows_.empty()) throw std::runtime_error("Decoded PCM has no packet interval");
         const auto window = windows_.front();
         windows_.pop_front();
-        if (TrimAudio(*pcm, window.start, window.end)) {
-          if (edits_) edits_->Push(*pcm);
-          else frame = std::move(*pcm);
-        }
+        Publish(std::move(*pcm), window);
       } else if (std::holds_alternative<EndOfStream>(*item)) {
         if (pending_start_) {
           Configure(*pending_start_);
@@ -139,13 +172,13 @@ Task<bool> AudioDecode::Pump() {
         pending_start_ = std::move(start);
       }
       if (decoder_) Require(decoder_->Finish());
-      else ended = true;
+      else drained_ = true;
       sealed_ = true;
       co_return true;
     }
   }
   auto& packet = *pending_;
-  if (!decoder_ || !packet.pts || !packet.duration)
+  if ((!decoder_ && !pcm_codec_) || !packet.pts || !packet.duration)
     throw std::runtime_error("Audio packet is missing its configuration or timing");
   const auto rate = format_.sample_rate;
   auto pts = Ticks(*packet.pts, rate);
@@ -159,9 +192,6 @@ Task<bool> AudioDecode::Pump() {
   const auto end = AddSamples(pts, duration);
   const auto discard = packet.discard_padding ? Ticks(*packet.discard_padding, rate) : 0;
   if (discard < -duration || discard > duration) throw std::runtime_error("Packet trim exceeds its audio duration");
-  if (Require(decoder_->TrySubmit({packet.data, {pts, rate}, {}, packet.duration, true})) == SubmitStatus::WouldBlock)
-    co_return false;
-
   auto start = AddSamples(pts, discard < 0 ? -discard : 0);
   auto stop = end - std::max<std::int64_t>(0, discard);
   if (first_audible_pts_) start = std::max(start, CeilTicks(*first_audible_pts_, rate));
@@ -169,7 +199,14 @@ Task<bool> AudioDecode::Pump() {
     start = std::max(start, CeilTicks(target_, rate));
     if (input_->range) stop = std::min(stop, CeilTicks(input_->range->end, rate));
   }
-  windows_.push_back({{start, rate}, {stop, rate}});
+  const MediaPresentationRange window{{start, rate}, {stop, rate}};
+  if (decoder_) {
+    if (Require(decoder_->TrySubmit({packet.data, {pts, rate}, {}, packet.duration, true})) == SubmitStatus::WouldBlock)
+      co_return false;
+    windows_.push_back(window);
+  } else {
+    Publish(UnpackPcm(packet, *pcm_codec_, format_, pts, duration), window);
+  }
   next_pts_ = end;
   pending_.reset();
   co_return true;
@@ -178,12 +215,25 @@ Task<bool> AudioDecode::Pump() {
 void AudioDecode::Configure(const AudioDecodeStart& start) {
   const auto& description = start.description;
   format_ = PlaybackFormat(description);
-  decoder_.emplace(Require(AudioDecoder::Create({
-      .initialization_data = description.initialization_data, .output = format_, .codec = description.codec})));
+  format_.sample_format = sample_format_;
+  if (media::detail::DescribePackedPcm(description.codec).bits) {
+    decoder_.reset();
+    pcm_codec_ = description.codec;
+  } else {
+    pcm_codec_.reset();
+    decoder_.emplace(Require(AudioDecoder::Create({
+        .initialization_data = description.initialization_data, .output = format_, .codec = description.codec})));
+  }
   first_audible_pts_ = start.first_audible_pts;
   next_pts_.reset();
   windows_.clear();
   sealed_ = false;
+}
+
+void AudioDecode::Publish(AudioFrame pcm, MediaPresentationRange window) {
+  if (!TrimAudio(pcm, window.start, window.end)) return;
+  if (edits_) edits_->Push(pcm);
+  else frame = std::move(pcm);
 }
 
 namespace {
@@ -358,7 +408,9 @@ Task<std::shared_ptr<const File>> CopyAudioClip(std::shared_ptr<const File> file
 #ifdef MEDIA_PREVIEW_TEST_EXPORTS
 Task<std::shared_ptr<const File>> ExportWave(std::shared_ptr<const File> file, File temporary) {
   auto input = co_await OnFileThread([file] { return std::make_shared<AudioInput>(file); });
-  AudioDecode decode(input);
+  const auto codec = input->track.descriptions.front().codec;
+  const bool floating = codec == CodecId::Alac || media::detail::DescribePackedPcm(codec).bits;
+  AudioDecode decode(input, floating ? AudioSampleFormat::F32 : AudioSampleFormat::S16);
   auto result = co_await OnFileThread([temporary] { return TemporaryFile(temporary, ".wav"); });
   std::shared_ptr<MediaMuxer> mux;
   std::optional<AudioFormat> format;
@@ -372,7 +424,8 @@ Task<std::shared_ptr<const File>> ExportWave(std::shared_ptr<const File> file, F
         format = pcm.format;
         mux = co_await OnFileThread([result, format = *format] {
           const MediaTrack track{.id = 1, .kind = TrackKind::Audio, .descriptions = {{
-              .codec = CodecId::PcmS16Le, .sample_rate = format.sample_rate, .channel_count = format.ChannelCount()}}};
+              .codec = format.sample_format == AudioSampleFormat::F32 ? CodecId::PcmF32Le : CodecId::PcmS16Le,
+              .sample_rate = format.sample_rate, .channel_count = format.ChannelCount()}}};
           return std::make_shared<MediaMuxer>(Require(MediaMuxer::Open(
               Require(result->OpenRandomAccess(FileAccessMode::ReadWrite)), ContainerFormat::Wave, std::span(&track, 1))));
         });

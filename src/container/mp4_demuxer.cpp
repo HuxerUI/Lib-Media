@@ -285,10 +285,10 @@ void ReadPcmDescription(const BoxView& entry, MediaSampleDescription& track) {
       default: Fail(Unsupported, "Unsupported QuickTime audio sample entry");
     }
     if ((entry.tag == Tag("raw ") || entry.tag == Tag("sowt") || entry.tag == Tag("twos")) &&
-        Number<std::uint16_t>(entry.bytes, 18) != MovPcmBits(track.codec))
+        Number<std::uint16_t>(entry.bytes, 18) != DescribePackedPcm(track.codec).bits)
       Fail(Unsupported, "QuickTime PCM sample width does not match its entry");
   }
-  const auto frame_bytes = (MovPcmBits(track.codec) / 8) * channels;
+  const auto frame_bytes = (DescribePackedPcm(track.codec).bits / 8) * channels;
   if (!rate || !channels || channels > 64 || (version && frame_bytes != declared_frame_bytes))
     Fail(Invalid, "Inconsistent QuickTime PCM channels, rate, or frame size");
   track.sample_rate = rate;
@@ -380,7 +380,7 @@ template<class Visit> void VisitChunks(ByteView stbl, std::uint32_t count, std::
 }
 
 void ParsePcmSamples(ByteView stbl, TrackIndex& index, const MediaSampleDescription& track, std::size_t remaining) {
-  const auto frame_bytes = (MovPcmBits(track.codec) / 8) * *track.channel_count;
+  const auto frame_bytes = (DescribePackedPcm(track.codec).bits / 8) * *track.channel_count;
   const auto rate = *track.sample_rate;
   if (index.scale % rate) Fail(Unsupported, "QuickTime PCM track clock is not an integer multiple of its sample rate");
   const auto ticks = index.scale / rate;
@@ -857,7 +857,7 @@ private:
     }
     if (!entries.empty()) Fail(Invalid, "Unexpected bytes after MP4 sample descriptions");
     const auto& primary = descriptions.front();
-    if (MovPcmBits(primary.codec)) {
+    if (DescribePackedPcm(primary.codec).bits) {
       ParsePcmSamples(stbl, index, primary, MaxContainerSamples - count);
     } else {
       ParseSamples(stbl, index, MaxContainerSamples - count);

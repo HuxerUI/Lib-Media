@@ -657,6 +657,37 @@ void CheckMatroskaHevcPreview(const TaskScope& tasks, testing::UiTest& ui, const
   std::cout << "Matroska HEVC passed preview, repeated seek, and packet-copy readback\n";
 }
 
+#if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
+void CheckProResPreview(const TaskScope& tasks, testing::UiTest& ui) {
+  const auto input = Fixture("prores-pcm.mov");
+#if TARGET_OS_IOS
+  const auto source = media_preview::Open(*input);
+  const auto config = VideoFixtureConfig(source.Tracks().front().descriptions.front(), VideoPixelFormat::P010,
+      VideoStorage::Cpu);
+  if (!CodecAvailable(ui, config, VideoDecoder::Probe, "ProRes 422 preview decoder")) return;
+#endif
+  Observations seen;
+  std::exception_ptr failure;
+  const auto playing = Play(tasks, input, seen, failure);
+  Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.06F; },
+        "ProRes MOV did not publish a picture and advance its PCM clock");
+  Check(seen.format->pixel_format == VideoPixelFormat::P010 && seen.size == Size{64, 48} &&
+        seen.first_frame == MediaTimestamp{0, 1} && seen.first_duration == MediaTimestamp{1, 8},
+        "ProRes preview changed the first picture format or timing");
+  for (const auto target : {0.375F, 0.125F, 0.25F}) {
+    const auto epoch = seen.epoch;
+    seen.seek = target;
+    Until(ui, failure, [&] { return seen.epoch > epoch && seen.first_frame && seen.position > target + 0.02F; },
+          "ProRes MOV did not resume synchronized playback after seeking");
+    Check(seen.first_frame == media_preview::TimeAt(target) && seen.first_duration == MediaTimestamp{1, 8},
+          "ProRes MOV seek presented the wrong picture interval");
+  }
+  playing.Cancel();
+  ui.Pump();
+  std::cout << "ProRes MOV passed LPCM preview and repeated seek\n";
+}
+#endif
+
 void CheckAv1Preview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary, const char* name) {
   const auto input = Fixture(name);
   auto source = media_preview::Open(*input);
@@ -797,6 +828,113 @@ void CheckHevcMainExport(const TaskScope& tasks, testing::UiTest& ui, const File
   std::cout << "HEVC Main preview export preserved " << actual_pictures.size() << " picture presentation intervals\n";
 }
 
+struct AudioPreviewSample {
+  std::shared_ptr<const File> file;
+  MediaTimestamp duration;
+  CodecId wave_codec = CodecId::PcmS16Le;
+  bool streaming = false;
+  float play_before_seek = 0.03F;
+};
+
+std::shared_ptr<const File> CheckAudioPreviewSample(const TaskScope& tasks, testing::UiTest& ui,
+    const File& temporary, const AudioPreviewSample& sample) {
+  float position = 0;
+  float duration = 0;
+  std::optional<float> seek;
+  std::optional<float> seek_target;
+  std::exception_ptr failure;
+  const auto playing = tasks.Launch([&]() -> Task<void> {
+    try {
+      co_await media_preview::PlayAudio(sample.file, {
+          .paused = [] { return false; }, .take_seek = [&] { return std::exchange(seek, std::nullopt); },
+          .position = [&](float at, float end) {
+            position = at;
+            duration = end;
+            if (seek_target == at) seek_target.reset();
+          },
+      });
+    } catch (...) { failure = std::current_exception(); }
+  });
+  Until(ui, failure, [&] { return position > sample.play_before_seek; }, "Audio preview did not advance its PCM clock");
+  if (sample.streaming) {
+    Check(duration < 0.2F, "Streaming WebM scanned to discover duration before preview");
+  } else {
+    Check(std::abs(duration - media_preview::Seconds(sample.duration)) < 0.01F, "Wrong audio preview duration");
+    const auto advance = std::min(0.015F, duration * 0.1F);
+    for (float target : {duration * 0.85F, std::min(0.15F, duration * 0.25F), duration * 0.6F}) {
+      seek = seek_target = target;
+      Until(ui, failure, [&] { return !seek_target && position > target + advance && position < target + 0.2F; },
+            "Audio preview did not resume from the requested seek position");
+    }
+  }
+  playing.Cancel();
+  ui.Pump();
+  std::shared_ptr<const File> wave;
+  const auto exporting = tasks.Launch([&]() -> Task<void> {
+    try { wave = co_await media_preview::ExportWave(sample.file, temporary); }
+    catch (...) { failure = std::current_exception(); }
+  });
+  Until(ui, failure, [&] { return bool(wave); }, "Audio preview could not export a WAV");
+  exporting.Cancel();
+  auto output = media_preview::Open(*wave);
+  Check(output.Format() == ContainerFormat::Wave && output.Duration() == sample.duration &&
+        output.Tracks().front().descriptions.front().codec == sample.wave_codec,
+        "Audio WAV readback lost PCM samples or trim");
+  return wave;
+}
+
+#if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
+void CheckAlacPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
+  AudioPreviewSample sample{Fixture("tagged-alac.m4a"), {10560, 96000}, CodecId::PcmF32Le};
+  const auto reference = CheckAudioPreviewSample(tasks, ui, temporary, sample);
+  auto reader = media_preview::Open(*sample.file);
+  sample.file = media_preview::TemporaryFile(temporary, ".m4a");
+  auto mux = Require(MediaMuxer::Open(Require(sample.file->OpenRandomAccess(FileAccessMode::ReadWrite)),
+      ContainerFormat::Mp4, reader.Tracks()));
+  bool prefixed = false;
+  while (auto packet = ReadPacket(reader)) {
+    if (packet->duration == MediaTimestamp{2368, 96000}) {
+      Check(!prefixed, "ALAC fixture has more than one short packet");
+      prefixed = true;
+      auto bytes = std::make_shared<Bytes>();
+      unsigned used = 0;
+      const auto append = [&](unsigned value, unsigned count) {
+        while (count) {
+          if (!used) bytes->push_back(std::byte{});
+          bytes->back() |= static_cast<std::byte>(((value >> --count) & 1u) << (7 - used));
+          used = (used + 1) % 8;
+        }
+      };
+      // An extended fill element leaves the data stream header unaligned.
+      append(6, 3);
+      append(15, 4);
+      append(1, 8);
+      for (unsigned i = 0; i < 15; ++i) append(0, 8);
+      // The data stream element aligns its payload after its extended byte count.
+      append(4, 3);
+      append(0, 4);
+      append(1, 1);
+      append(255, 8);
+      append(1, 8);
+      append(0, (8 - used) % 8);
+      for (unsigned i = 0; i < 256; ++i) append(0, 8);
+      // Another fill element leaves the audio header and partial sample count unaligned.
+      append(6, 3);
+      append(1, 4);
+      append(0, 8);
+      for (const auto byte : packet->data.AsBytes()) append(std::to_integer<unsigned>(byte), 8);
+      packet->data = BufferReference(*bytes, bytes);
+    }
+    Check(!Require(mux.TryWrite(*packet)), "ALAC test muxer requested another track");
+  }
+  Check(prefixed, "ALAC fixture is missing its short final packet");
+  Require(mux.Finish());
+  const auto wave = CheckAudioPreviewSample(tasks, ui, temporary, sample);
+  Check(Require(wave->ReadBytes()) == Require(reference->ReadBytes()), "ALAC auxiliary elements changed decoded PCM");
+  std::cout << "ALAC M4A passed preview, repeated seek, and F32 WAV readback with a prefixed short packet\n";
+}
+#endif
+
 void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
   const auto link = media_preview::TemporaryFile(temporary, ".ogg");
   auto source = media_preview::Open(*Fixture("opus-link.ogg"));
@@ -823,18 +961,18 @@ void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& 
   const auto unavailable = no_index.FindSeekPoint(1, {0, 1});
   Check(!no_index.Duration() && !unavailable.Succeeded() && unavailable.Error().code == ContainerErrorCode::IndexUnavailable,
         "Streaming WebM unexpectedly has a duration or seek index");
-  struct Sample {
-    std::shared_ptr<const File> file;
-    MediaTimestamp duration;
-  };
   const std::array samples{
-      Sample{chain, {107376 + 34344, 48000}},
-      Sample{Fixture("webm-opus.webm"), {247200, 48000}},
-      Sample{streaming, {35880, 48000}},
-      Sample{unindexed_av, {72000, 48000}},
-      Sample{Fixture("tagged-flac.flac"), {50142, 44100}},
-      Sample{mp3, {50142, 44100}},
-      Sample{Fixture("tagged-aac.m4a"), {52800, 48000}}};
+      AudioPreviewSample{.file = chain, .duration = {107376 + 34344, 48000}, .play_before_seek = 2.28F},
+      AudioPreviewSample{Fixture("webm-opus.webm"), {247200, 48000}},
+      AudioPreviewSample{.file = streaming, .duration = {35880, 48000}, .streaming = true},
+      AudioPreviewSample{.file = unindexed_av, .duration = {72000, 48000}, .streaming = true},
+      AudioPreviewSample{Fixture("tagged-flac.flac"), {50142, 44100}},
+      AudioPreviewSample{mp3, {50142, 44100}},
+      AudioPreviewSample{Fixture("tagged-aac.m4a"), {52800, 48000}},
+#if defined(__APPLE__) && TARGET_OS_OSX
+      AudioPreviewSample{Fixture("prores-pcm.mov"), {4000, 8000}, CodecId::PcmF32Le},
+#endif
+  };
   const auto check_signal = [](MediaDemuxer& output, const char* message) {
     const auto packet = ReadPacket(output).value();
     const auto bytes = packet.data.AsBytes();
@@ -849,52 +987,19 @@ void CheckAudioPreview(const TaskScope& tasks, testing::UiTest& ui, const File& 
     Check(peak > 500, message);
   };
   for (const auto& sample : samples) {
-    float position = 0;
-    float duration = 0;
-    std::optional<float> seek;
-    std::exception_ptr failure;
-    const auto playing = tasks.Launch([&]() -> Task<void> {
-      try {
-        co_await media_preview::PlayAudio(sample.file, {
-            .paused = [] { return false; }, .take_seek = [&] { return std::exchange(seek, std::nullopt); },
-            .position = [&](float at, float end) { position = at; duration = end; },
-        });
-      } catch (...) { failure = std::current_exception(); }
-    });
-    Until(ui, failure, [&] { return position > 0.03F; }, "Audio preview did not advance its PCM clock");
-    if (sample.file == streaming || sample.file == unindexed_av) {
-      Check(duration < 0.2F, "Streaming WebM scanned to discover duration before preview");
-    } else {
-      Check(std::abs(duration - media_preview::Seconds(sample.duration)) < 0.01F, "Wrong audio preview duration");
-      if (sample.file == chain)
-        Until(ui, failure, [&] { return position > 2.28F; }, "PCM playback stopped at the zero-pre-skip link");
-      for (float target : {duration * 0.85F, 0.15F, duration * 0.6F}) {
-        seek = target;
-        Until(ui, failure, [&] { return !seek && position > target + 0.015F && position < target + 0.2F; },
-              "Audio preview did not resume from the requested seek position");
-      }
-    }
-    playing.Cancel();
-    ui.Pump();
-    std::shared_ptr<const File> wave;
-    const auto exporting = tasks.Launch([&]() -> Task<void> {
-      try { wave = co_await media_preview::ExportWave(sample.file, temporary); }
-      catch (...) { failure = std::current_exception(); }
-    });
-    Until(ui, failure, [&] { return bool(wave); }, "Audio preview could not export a WAV");
-    auto output = media_preview::Open(*wave);
-    Check(output.Format() == ContainerFormat::Wave && output.Duration() == sample.duration &&
-          output.Tracks().front().descriptions.front().codec == CodecId::PcmS16Le,
-          "Audio WAV readback lost PCM samples or trim");
+    const auto wave = CheckAudioPreviewSample(tasks, ui, temporary, sample);
     if (sample.file == chain) {
+      auto output = media_preview::Open(*wave);
       Check(Require(output.Seek(1, {107376, 48000})).has_value(), "Could not read the second link's first samples");
       Check(std::holds_alternative<TrackDecodeStart>(Require(output.Read()).value()), "WAV seek lost its description");
       check_signal(output, "The first packet of the zero-pre-skip link lost its decoded signal");
     }
 #if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
-    if (sample.file == mp3) check_signal(output, "MP3 WAV starts with synthesis delay");
+    if (sample.file == mp3) {
+      auto output = media_preview::Open(*wave);
+      check_signal(output, "MP3 WAV starts with synthesis delay");
+    }
 #endif
-    exporting.Cancel();
   }
 }
 
@@ -941,6 +1046,10 @@ int main(int argc, char** argv) {
     CheckFragmentedTrim(tasks, ui, temporary);
     CheckFragmentedAudioStartup(tasks, ui, temporary);
     CheckHevcMainExport(tasks, ui, temporary);
+#if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
+    CheckProResPreview(tasks, ui);
+    CheckAlacPreview(tasks, ui, temporary);
+#endif
 #if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && TARGET_OS_IOS)
     std::cout << "PASS: Preview export and audio packet copy contracts\n";
 #else

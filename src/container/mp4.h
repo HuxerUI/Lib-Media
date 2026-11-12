@@ -1,6 +1,7 @@
 #pragma once
 
 #include "container_io.h"
+#include "format/packed_pcm.h"
 
 namespace huxerui::media::detail {
 
@@ -49,12 +50,6 @@ struct Mp4EditTimeline {
 Mp4EditTimeline Mp4Edits(std::span<const MediaTrack::Edit> edits, std::uint32_t movie_scale,
                          std::uint32_t media_scale, ContainerErrorCode error);
 
-struct AlacConfig {
-  std::uint32_t frame_length, sample_rate;
-  unsigned channels, bits;
-};
-AlacConfig ParseAlac(ByteView config, ContainerErrorCode error);
-
 struct Mp4AudioTag {
   std::string_view name;
   std::string MediaAudioMetadata::*field;
@@ -75,7 +70,5 @@ void ValidateAv1Configuration(ByteView config, ContainerErrorCode error);
 bool Av1Sync(ByteView bytes, ContainerErrorCode error);
 bool ProResEntry(std::uint32_t tag);
 void ValidateMovDataDescription(std::string_view entry, ByteView data, ContainerErrorCode error);
-unsigned MovPcmBits(CodecId codec);
-bool MovPcmBigEndian(CodecId codec);
 
 } // namespace huxerui::media::detail

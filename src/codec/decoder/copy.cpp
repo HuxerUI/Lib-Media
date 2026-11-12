@@ -1,4 +1,5 @@
 #include "copy.h"
+#include "format/packed_pcm.h"
 #include "format/platform_video_storage.h"
 
 #include <algorithm>
@@ -66,7 +67,7 @@ CodecResult<AudioFrame> CopyAudio(const AudioFrame& source, AudioFormat requeste
       auto* output = storage[count == 1 ? 0 : channel].data() + (count == 1 ? sample * channels + channel : sample) * bytes;
       if (requested.sample_format == AudioSampleFormat::F32) std::memcpy(output, &value, sizeof(value));
       else {
-        const auto integer = static_cast<std::int16_t>(std::clamp(std::isfinite(value) ? std::round(value * 32768.0f) : 0.0f, -32768.0f, 32767.0f));
+        const auto integer = QuantizePcm16(value);
         std::memcpy(output, &integer, sizeof(integer));
       }
     }

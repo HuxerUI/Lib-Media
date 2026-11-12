@@ -41,7 +41,8 @@ the samples. On Web, the example writes the index after the samples to avoid rel
 
 ALAC uses `CodecId::Alac`, mono or stereo, and the 24-byte `ALACSpecificConfig` in `initialization_data`.
 Write each original packet with its actual duration, including a shorter final packet. The packet-copy path
-retains the lossless bitstream and sample clock.
+retains the lossless bitstream and sample clock. On macOS and iOS, the same packets and configuration can be passed
+to `AudioDecoder` for PCM preview and WAV export. [ALAC decoding](media-codec.md#prores-422-and-alac)
 
 `MediaDemuxer::AudioMetadata()` returns file-level tags and retained cover bytes. Supply them in
 `MediaMuxerOptions::audio_metadata` when copying. Regular and fast-start MP4 with a single AAC-LC or ALAC
@@ -99,6 +100,9 @@ The writer emits packed interleaved LPCM in a version-two sound description. MOV
 `mebx` boxed timed metadata as `TrackKind::Data` with `ContainerSample` framing. The reader retains the description
 payload, timed samples, and supported `tmcd` and `cdsc` track references. Include the associated tracks when copying
 to MOV. `ValidateOutput()` rejects these mappings for MP4. [QuickTime timecode](https://developer.apple.com/documentation/quicktime-file-format/timecode_sample_description)
+
+On macOS and supported iOS devices, the CPU preview decodes progressive SDR ProRes 422 (`apcn`) pictures and plays
+mono or stereo LPCM using the MOV sample clock. [ProRes decoding](media-codec.md#prores-422-and-alac)
 
 For WAVE, an extensible track carries the 22-byte format suffix in `initialization_data`. It preserves
 the subtype, valid bits, and speaker mask when passed to a WAVE or RF64 writer. WAVE packets are

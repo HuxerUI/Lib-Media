@@ -240,6 +240,8 @@ VideoDecoderConfig VideoConfig(const MediaSampleDescription& description, VideoS
   if (description.codec == CodecId::Hevc && (description.framing != PacketFraming::LengthPrefixedNals ||
       (!description.sample_entry.empty() && description.sample_entry != "hvc1")))
     throw std::runtime_error("The HEVC preview requires length-prefixed packets with a separate configuration");
+  if (description.codec == CodecId::ProRes && description.sample_entry != "apcn")
+    throw std::runtime_error("The ProRes preview requires a ProRes 422 sample entry");
   if (HasHdrMetadata(description))
     throw std::runtime_error("HDR display needs an HDR surface. Use Copy Movie to retain the source metadata.");
   VideoDecoderConfig video_config;
@@ -256,6 +258,8 @@ VideoDecoderConfig VideoConfig(const MediaSampleDescription& description, VideoS
     if (video_config.initialization_data.size() >= 23 &&
         (std::to_integer<unsigned>(video_config.initialization_data[17]) & 7) == 2)
       video_config.output = VideoPixelFormat::P010;
+  } else if (description.codec == CodecId::ProRes) {
+    video_config.output = VideoPixelFormat::P010;
   }
   if (video_config.width > 8192 || video_config.height > 8192)
     throw std::runtime_error("The preview supports coded dimensions up to 8192 pixels");
@@ -422,7 +426,17 @@ std::optional<AudioFrame> AudioEditQueue::Read(MediaTimestamp start, const Audio
 }
 
 Task<std::shared_ptr<const File>> StageClip(File temporary, std::optional<FileReference> selected,
-                                          std::shared_ptr<Resources> resources) {
+                                          std::shared_ptr<Resources> resources, bool reuse_local_file) {
+  if (reuse_local_file && selected) {
+    if (auto path = selected->AsFile()) {
+      struct RetainedFile {
+        FileReference reference;
+        File path;
+      };
+      auto owner = std::make_shared<RetainedFile>(RetainedFile{std::move(*selected), std::move(*path)});
+      co_return std::shared_ptr<const File>(owner, &owner->path);
+    }
+  }
   auto file = co_await OnFileThread([temporary] { return TemporaryFile(temporary, ".input"); });
   if (selected) {
 #ifdef __EMSCRIPTEN__

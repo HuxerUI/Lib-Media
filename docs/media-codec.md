@@ -5,6 +5,7 @@
 No `Install()`, View, Runtime, window, or application Task is needed. Existing MediaPlayer and photo-library APIs are unchanged.
 
 This guide covers AAC-LC, Opus, FLAC, and MP3 decoded to CPU PCM, and AVC, HEVC, VP8, VP9, and AV1 decoded to video frames.
+macOS and iOS also support progressive ProRes 422 and mono or stereo ALAC where the platform decoder is available.
 The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264 and HEVC. Codec sessions do not
 demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
@@ -157,6 +158,27 @@ The Android and iOS adapters build with the SDK. The macOS test host reported AV
 container seek and copy checks. Windows and Linux runtime support depends on the installed decoder.
 [AV1 in MP4](https://aomediacodec.github.io/av1-isobmff/) · [WebCodecs AV1 registration](https://www.w3.org/TR/webcodecs-av1-codec-registration/)
 
+### ProRes 422 and ALAC
+
+Set `VideoDecoderConfig::codec` to `CodecId::ProRes` for a progressive ProRes 422 (`apcn`) track. Supply its exact
+coded width and height and leave initialization data empty. Submit one complete ProRes frame per packet. Each frame
+is independently decodable. Mark the first packet after creation or reset. The macOS and iOS adapters support CPU NV12 or
+I420 for eight-bit output, or P010 to keep ten-bit precision with 4:2:0 chroma. The Frames preview uses P010 and feeds
+the MOV's packed mono or stereo LPCM through the existing audio sample clock and presentation edits.
+[ProRes bitstream specification](https://pub.smpte.org/pub/rdd36/rdd36-2022.pdf) · [VideoToolbox codec type](https://developer.apple.com/documentation/coremedia/kcmvideocodectype_appleprores422)
+
+Set `AudioDecoderConfig::codec` to `CodecId::Alac` and pass the sample description's 24-byte `ALACSpecificConfig`.
+Choose S16 or F32 PCM with the source sample rate and mono or stereo layout. The decoder emits the actual sample
+count for each complete access unit, including a shorter final packet with leading data stream or fill elements.
+Apply container edits when presenting PCM.
+The preview uses interleaved S16 playback. WAV export uses F32 for ALAC and packed PCM sources.
+[AudioConverter decoding](https://developer.apple.com/documentation/audiotoolbox/encoding-and-decoding-audio) · [ALAC configuration](https://github.com/macosforge/alac/blob/master/ALACMagicCookieDescription.txt)
+
+Use `Probe()` with the concrete configuration. The macOS integration cases cover repeated seeks in a ProRes 422 MOV
+with LPCM. The iOS 26.5 Simulator returned `Unsupported` for ProRes decoder creation. ProRes preview from an iPhone
+camera file requires device acceptance. macOS and the iOS Simulator cover ALAC playback, repeated seeks, and F32 WAV
+readback with a short final packet.
+
 ### Opus, FLAC, and MP3
 
 | Platform | Opus | FLAC | MP3 | Validation for this batch |
@@ -247,9 +269,9 @@ Oversized packets and impossible configurations fail rather than blocking
 forever. Calls copy bounded data and take short locks; they are not hard-real-time audio callbacks.
 
 Both decoders require at least two copied-input slots. Audio requires at least four output slots and enough output bytes
-for four maximum-size decoded packets. The sample bound is 1024 for AAC, 5760 for Opus, the STREAMINFO maximum block
-size for FLAC, and 1152 for MP3 at MPEG-1 rates or 576 at lower rates. Android MediaCodec can buffer several packets
-before returning its first PCM frame.
+for four maximum-size decoded packets. The sample bound is 1024 for AAC, the configured frame length for ALAC,
+5760 for Opus, the STREAMINFO maximum block size for FLAC, and 1152 for MP3 at MPEG-1 rates or 576 at lower rates.
+Android MediaCodec can buffer several packets before returning its first PCM frame.
 Video conservatively requires 34 output slots and maximum-frame byte reservations: up to 16 platform delayed frames, 16 presentation-order
 slots, and progress headroom. The initial implementation retains a 16-frame presentation window until Finish, even for
 low-delay streams. This is a deliberate conservative bound for the decoding milestone, not a low-latency playback claim.

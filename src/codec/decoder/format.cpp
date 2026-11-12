@@ -6,6 +6,10 @@
 
 #include <array>
 
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
 namespace huxerui::media::detail {
 namespace {
 class Bits {
@@ -87,6 +91,72 @@ CodecResult<void> ValidateSps(const AvcConfig& avc, std::uint32_t maximum_width,
   }
   return CodecResult<void>::Success();
 }
+
+class AlacBits {
+public:
+  explicit AlacBits(ByteView bytes) : bytes_(bytes) {}
+
+  std::uint32_t Read(unsigned count) {
+    const auto bytes = bytes_;
+    const auto offset = offset_;
+    Skip(count);
+    std::uint32_t value = 0;
+    for (unsigned i = 0; i < count; ++i) {
+      const auto bit = offset + i;
+      value = (value << 1) | ((std::to_integer<unsigned>(bytes[bit / 8]) >> (7 - bit % 8)) & 1u);
+    }
+    return value;
+  }
+
+  void Skip(unsigned count) {
+    const auto end = offset_ + count;
+    const auto bytes = end / 8;
+    if (bytes > bytes_.size() || (bytes == bytes_.size() && end % 8))
+      Fail(ContainerErrorCode::InvalidData, "Truncated ALAC packet header");
+    bytes_ = bytes_.subspan(bytes);
+    offset_ = end % 8;
+  }
+
+  void Align() { Skip((8 - offset_) % 8); }
+
+private:
+  ByteView bytes_;
+  unsigned offset_ = 0;
+};
+
+unsigned AlacPacketSamples(ByteView bytes, const AlacConfig& config) {
+  constexpr unsigned data_stream = 4, fill = 6;
+  AlacBits bits(bytes);
+  auto element = bits.Read(3);
+  while (element == data_stream || element == fill) {
+    unsigned length;
+    if (element == data_stream) {
+      bits.Skip(4); // Element instance tag.
+      const bool align = bits.Read(1) != 0;
+      length = bits.Read(8);
+      if (length == 255) length += bits.Read(8);
+      if (align) bits.Align();
+    } else {
+      length = bits.Read(4);
+      if (length == 15) length = 14 + bits.Read(8);
+    }
+    bits.Skip(length * 8);
+    element = bits.Read(3);
+  }
+  if (element != config.channels - 1)
+    Fail(ContainerErrorCode::InvalidData, "Invalid mono or stereo ALAC packet header");
+  bits.Skip(4); // Element instance tag.
+  const auto reserved = bits.Read(12);
+  const bool partial = bits.Read(1) != 0;
+  const auto shifted = bits.Read(2);
+  bits.Skip(1); // Uncompressed flag.
+  if (reserved || shifted == 3)
+    Fail(ContainerErrorCode::InvalidData, "Invalid mono or stereo ALAC packet header");
+  const auto samples = partial ? bits.Read(32) : config.frame_length;
+  if (!samples || samples > config.frame_length)
+    Fail(ContainerErrorCode::InvalidData, "ALAC packet exceeds the configured frame length");
+  return samples;
+}
 } // namespace
 
 CodecResult<unsigned> AudioSampleLimit(const AudioDecoderConfig& config) {
@@ -105,6 +175,16 @@ CodecResult<unsigned> AudioSampleLimit(const AudioDecoderConfig& config) {
         const auto info = ParseAac(config.initialization_data);
         if (!info.Succeeded()) return R::Failure(info.Error());
         return matches(info.Value().sample_rate, info.Value().channels, 1024);
+      }
+      case CodecId::Alac: {
+#if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
+        const auto info = ParseAlac(config.initialization_data, ContainerErrorCode::InvalidArgument);
+        if (info.frame_length > UINT32_MAX / (output.BytesPerSample() * output.ChannelCount()))
+          return R::Failure(Error(CodecErrorCode::Unsupported, "ALAC frames exceed the platform PCM buffer limit"));
+        return matches(info.sample_rate, info.channels, info.frame_length);
+#else
+        return R::Failure(Error(CodecErrorCode::Unsupported, "ALAC decoding is unavailable on this platform"));
+#endif
       }
       case CodecId::Opus: {
         const auto info = ParseOpus(config.initialization_data, ContainerErrorCode::Unsupported);
@@ -133,6 +213,8 @@ CodecResult<unsigned> AudioPacketSamples(const AudioDecoderConfig& config, std::
   try {
     switch (config.codec) {
       case CodecId::Aac: return R::Success(1024);
+      case CodecId::Alac:
+        return R::Success(AlacPacketSamples(bytes, ParseAlac(config.initialization_data, ContainerErrorCode::InvalidData)));
       case CodecId::Opus: return R::Success(OpusPacketSamples(bytes, ContainerErrorCode::InvalidData));
       case CodecId::Flac:
         return R::Success(FlacPacketSamples(bytes, ParseFlacStreamInfo(config.initialization_data, ContainerErrorCode::InvalidData)));
@@ -258,6 +340,22 @@ CodecResult<bool> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
     if (!samples.Succeeded()) return R::Failure(samples.Error());
   }
   if (const auto* video = std::get_if<VideoDecoderConfig>(&config)) {
+    if (video->codec == CodecId::ProRes) {
+      const auto bytes = packet.data.AsBytes();
+      if (bytes.size() < 36 || Number<std::uint32_t>(bytes) != bytes.size() || Number<std::uint32_t>(bytes, 4) != Tag("icpf"))
+        return invalid("Invalid ProRes frame size or identifier");
+      const auto header = Number<std::uint16_t>(bytes, 8);
+      if (header < 20 || header > bytes.size() - 16 || Number<std::uint16_t>(bytes, 16) != video->width ||
+          Number<std::uint16_t>(bytes, 18) != video->height)
+        return invalid("Invalid ProRes frame header or dimensions");
+      const auto flags = Number<std::uint8_t>(bytes, 20);
+      if (Number<std::uint8_t>(bytes, 11) > 1)
+        return R::Failure(Error(CodecErrorCode::Unsupported, "Unsupported ProRes bitstream version"));
+      if (flags >> 6 != 2 || (flags & 0x0c) || (Number<std::uint8_t>(bytes, 25) & 0x0f))
+        return R::Failure(Error(CodecErrorCode::Unsupported, "ProRes requires a progressive 4:2:2 frame without alpha"));
+      if (needs_key && !packet.key_frame) return invalid("ProRes requires a marked frame after creation/reset");
+      return R::Success(true);
+    }
     if (video->codec == CodecId::Vp8) {
       const auto bytes = packet.data.AsBytes();
       const auto tag = std::to_integer<unsigned>(bytes.front());
@@ -367,6 +465,15 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
       } catch (const std::invalid_argument& error) {
         return R::Failure(Error(CodecErrorCode::InvalidArgument, error.what()));
       }
+    } else if (video.codec == CodecId::ProRes) {
+#if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
+      if (!video.initialization_data.empty())
+        return R::Failure(Error(CodecErrorCode::InvalidArgument, "ProRes does not use initialization data"));
+      if (platform_storage || (!eight_bit && video.output != VideoPixelFormat::P010))
+        return R::Failure(Error(CodecErrorCode::Unsupported, "ProRes requires CPU NV12, I420, or P010 output"));
+#else
+      return R::Failure(Error(CodecErrorCode::Unsupported, "ProRes decoding is unavailable on this platform"));
+#endif
     } else if (video.codec == CodecId::Vp8 || video.codec == CodecId::Vp9) {
       if (!eight_bit)
         return R::Failure(Error(CodecErrorCode::Unsupported, "VP8 and VP9 profile 0 require eight-bit output"));

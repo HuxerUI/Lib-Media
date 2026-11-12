@@ -16,6 +16,14 @@ using namespace huxerui::media;
 
 namespace {
 
+#if defined(__APPLE__) && TARGET_OS_IOS
+constexpr bool photos_preview_supported = true;
+#else
+constexpr bool photos_preview_supported = false;
+#endif
+
+enum class PreviewSource { Movie, Audio, Photos, Sample };
+
 std::string TimeLabel(MediaTime time) {
   const auto seconds = static_cast<long long>(std::max(0.0, time.count()));
   std::ostringstream text;
@@ -410,6 +418,7 @@ View LibraryPage() {
 View FramesPage() {
   auto tasks = UseTaskScope();
   auto picker = UseService<FilePicker>();
+  auto photos = UseMediaPicker();
   auto resources = UseService<Resources>();
   const auto temporary = UseApplication().Directories().temporary_directory;
   auto current = UseState(TaskHandle{});
@@ -470,13 +479,19 @@ View FramesPage() {
     });
   };
 
-  auto open = [=](bool sample, bool audio = false) {
+  auto open = [=](PreviewSource input) {
     if (busy) return;
     busy = true;
     tasks.Launch([=]() -> Task<void> {
       try {
+        const bool sample = input == PreviewSource::Sample;
+        const bool audio = input == PreviewSource::Audio;
+        const bool from_photos = input == PreviewSource::Photos;
         std::optional<FileReference> chosen;
-        if (!sample) {
+        if (from_photos) {
+          auto selected = media_preview::Require(co_await photos.PickAsync({.filter = MediaPickerFilter::Videos}));
+          if (!selected.empty()) chosen = std::move(selected.front());
+        } else if (!sample) {
           const auto filter = audio ? FilePickerFilter{.name = "Audio", .extensions = {"m4a", "ogg", "opus", "flac", "mp3", "webm", "mka"},
                                                        .content_types = {"audio/*", "application/ogg", "video/webm", "video/x-matroska"}}
                                     : FilePickerFilter{.name = "Movies", .extensions = {"mp4", "m4v", "mov", "webm", "mkv"},
@@ -484,7 +499,7 @@ View FramesPage() {
           chosen = co_await picker->OpenFileAsync(filter);
         }
         if (sample || chosen) {
-          auto staged = co_await media_preview::StageClip(temporary, std::move(chosen), resources);
+          auto staged = co_await media_preview::StageClip(temporary, std::move(chosen), resources, from_photos);
           notice = sample ? "Bundled H.264/AAC MP4" : audio ? "Selected audio" : "Selected movie";
           play(std::move(staged), audio, video_storage);
         }
@@ -535,10 +550,12 @@ View FramesPage() {
             const std::shared_ptr<const File> input_file = source;
             if (input_file && !audio_mode) play(input_file, false, next);
           }).With(Enabled{!busy && !audio_mode}) : View{}),
-      Button("Open movie").OnClick([open] { open(false); })
+      Button("Open movie").OnClick([open] { open(PreviewSource::Movie); })
           .With(Enabled{media_preview::frame_texture_supported && picker->CanOpenFiles() && !busy}),
-      Button("Open audio").OnClick([open] { open(false, true); }).With(Enabled{picker->CanOpenFiles() && !busy}),
-      Button("Play sample").OnClick([open] { open(true); })
+      (photos_preview_supported ? Button("Open from Photos").OnClick([open] { open(PreviewSource::Photos); })
+          .With(Enabled{!busy}) : View{}),
+      Button("Open audio").OnClick([open] { open(PreviewSource::Audio); }).With(Enabled{picker->CanOpenFiles() && !busy}),
+      Button("Play sample").OnClick([open] { open(PreviewSource::Sample); })
           .With(Enabled{media_preview::frame_texture_supported && !busy}),
       Button(paused ? "Resume" : "Pause").OnClick([paused] { paused = !paused; })
           .With(Enabled{duration > 0 || (audio_mode && position > 0)}),

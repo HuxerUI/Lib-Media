@@ -44,6 +44,18 @@ unsigned OpusPacketSamples(ByteView packet, ContainerErrorCode error) {
   return frames * length;
 }
 
+AlacConfig ParseAlac(ByteView config, ContainerErrorCode error) {
+  if (config.size() != 24 || Number<std::uint8_t>(config, 4) != 0)
+    Fail(error, "Invalid ALACSpecificConfig");
+  const auto frames = Number<std::uint32_t>(config), rate = Number<std::uint32_t>(config, 20);
+  const auto channels = Number<std::uint8_t>(config, 9), bits = Number<std::uint8_t>(config, 5);
+  if (!frames || !rate || (bits != 16 && bits != 20 && bits != 24 && bits != 32))
+    Fail(error, "Invalid ALAC sample geometry");
+  if (channels != 1 && channels != 2)
+    Fail(ContainerErrorCode::Unsupported, "ALAC requires mono or stereo audio");
+  return {frames, rate, channels, bits};
+}
+
 std::uint64_t AddOffset(std::uint64_t offset, std::uint64_t size) {
   if (size > std::numeric_limits<std::uint64_t>::max() - offset)
     Fail(ContainerErrorCode::InvalidData, "Container offset overflows");

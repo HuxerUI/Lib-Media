@@ -23,6 +23,11 @@ CMTime Timestamp(MediaTimestamp time) {
   const auto scaled = time.Rescale(1000000).value();
   return CMTimeMake(scaled.ticks, 1000000);
 }
+UInt32 LosslessSourceFlags(unsigned bits) {
+  return bits <= 16 ? kAppleLosslessFormatFlag_16BitSourceData :
+      bits <= 20 ? kAppleLosslessFormatFlag_20BitSourceData :
+      bits <= 24 ? kAppleLosslessFormatFlag_24BitSourceData : kAppleLosslessFormatFlag_32BitSourceData;
+}
 struct PixelMapping {
   CVPixelBufferRef image;
   std::optional<CodecError>* failure;
@@ -60,6 +65,14 @@ public:
           cookie.assign(bytes.begin(), bytes.end());
           break;
         }
+        case CodecId::Alac: {
+          const auto info = ParseAlac(audio->initialization_data, ContainerErrorCode::InvalidArgument);
+          input.mFormatID = kAudioFormatAppleLossless;
+          input.mFormatFlags = LosslessSourceFlags(info.bits);
+          input.mFramesPerPacket = info.frame_length;
+          cookie = audio->initialization_data;
+          break;
+        }
         case CodecId::Opus:
           input.mFormatID = kAudioFormatOpus;
           audio_gain_ = std::pow(10.0f, Number<std::int16_t>(audio->initialization_data, 16, true) / 5120.0f);
@@ -67,9 +80,7 @@ public:
         case CodecId::Flac: {
           input.mFormatID = kAudioFormatFLAC;
           const auto info = ParseFlacStreamInfo(audio->initialization_data, ContainerErrorCode::InvalidArgument);
-          input.mFormatFlags = info.bits <= 16 ? kAppleLosslessFormatFlag_16BitSourceData :
-              info.bits <= 20 ? kAppleLosslessFormatFlag_20BitSourceData :
-              info.bits <= 24 ? kAppleLosslessFormatFlag_24BitSourceData : kAppleLosslessFormatFlag_32BitSourceData;
+          input.mFormatFlags = LosslessSourceFlags(info.bits);
           input.mFramesPerPacket = info.min_block == info.max_block ? info.max_block : 0;
           Put(cookie, 50u);
           Put(cookie, Tag("dfLa"));
@@ -144,6 +155,9 @@ public:
       status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_AV1, video.width, video.height,
           (__bridge CFDictionaryRef)extensions, &description_);
       specification = @{(__bridge NSString*)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @YES};
+    } else if (video.codec == CodecId::ProRes) {
+      status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_AppleProRes422,
+          video.width, video.height, nullptr, &description_);
     } else if (video.codec == CodecId::Hevc) {
       const auto hevc = ParseHevcConfiguration(video.initialization_data, true, true);
       add_parameters(hevc.parameters);
@@ -231,7 +245,7 @@ public:
     if (video_) {
       auto status = VTDecompressionSessionFinishDelayedFrames(video_);
       if (!status) status = VTDecompressionSessionWaitForAsynchronousFrames(video_);
-      if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "AVC drain failed"));
+      if (status) return CodecResult<SubmitStatus>::Failure(AppleError(status, "VideoToolbox drain failed"));
     }
     return CodecResult<SubmitStatus>::Success(SubmitStatus::Accepted);
   }
@@ -293,8 +307,8 @@ private:
     const auto status = AudioConverterFillComplexBuffer(audio_, Input, this, &samples,
         reinterpret_cast<AudioBufferList*>(&buffers), nullptr);
     if (status && status != NeedInput) return R::Failure(AppleError(status, "AudioConverter decoding failed"));
-    if (config.codec == CodecId::Opus && !audio_times_.empty() && samples != expected)
-      return R::Failure(Error(CodecErrorCode::InvalidData, "AudioConverter changed the Opus packet sample count"));
+    if ((config.codec == CodecId::Alac || config.codec == CodecId::Opus) && !audio_times_.empty() && samples != expected)
+      return R::Failure(Error(CodecErrorCode::InvalidData, "AudioConverter changed the decoded packet sample count"));
     if (samples) {
       if (!mp3_ && audio_times_.empty())
         return R::Failure(Error(CodecErrorCode::InvalidData, "PCM output has no input timing"));

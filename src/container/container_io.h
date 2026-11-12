@@ -130,6 +130,13 @@ OpusHead ParseOpus(ByteView bytes, ContainerErrorCode error);
 
 unsigned OpusPacketSamples(ByteView packet, ContainerErrorCode error);
 
+struct AlacConfig {
+  std::uint32_t frame_length, sample_rate;
+  unsigned channels, bits;
+};
+
+AlacConfig ParseAlac(ByteView config, ContainerErrorCode error);
+
 struct FlacStreamInfo {
   unsigned min_block, max_block, max_frame, rate, channels, bits;
   std::uint64_t total;

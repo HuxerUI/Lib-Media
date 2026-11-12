@@ -138,7 +138,8 @@ huxerui::media::AudioFormat PlaybackFormat(const huxerui::media::MediaSampleDesc
 
 class AudioDecode {
 public:
-  explicit AudioDecode(std::shared_ptr<AudioInput> input);
+  explicit AudioDecode(std::shared_ptr<AudioInput> input,
+      huxerui::media::AudioSampleFormat sample_format = huxerui::media::AudioSampleFormat::S16);
   huxerui::Task<bool> Seek(huxerui::media::MediaTimestamp target);
   huxerui::Task<bool> Pump();
 
@@ -147,11 +148,14 @@ public:
 
 private:
   void Configure(const AudioDecodeStart& start);
+  void Publish(huxerui::media::AudioFrame pcm, huxerui::media::MediaPresentationRange window);
 
   std::shared_ptr<AudioInput> input_;
   huxerui::media::MediaTimestamp target_;
+  huxerui::media::AudioSampleFormat sample_format_;
   huxerui::media::AudioFormat format_;
   std::optional<huxerui::media::AudioDecoder> decoder_;
+  std::optional<huxerui::media::CodecId> pcm_codec_;
   std::optional<AudioDecodeStart> pending_start_;
   std::optional<huxerui::media::ContainerPacket> pending_;
   std::optional<huxerui::media::MediaTimestamp> first_audible_pts_;
@@ -164,10 +168,10 @@ private:
 
 std::shared_ptr<const huxerui::File> TemporaryFile(const huxerui::File& directory, std::string_view suffix);
 
-// Staged inputs and completed exports are removed when their last owner releases them.
+// Retains a selected local file when requested. Staged inputs live until their last consumer releases them.
 huxerui::Task<std::shared_ptr<const huxerui::File>> StageClip(
     huxerui::File temporary, std::optional<huxerui::FileReference> selected,
-    std::shared_ptr<huxerui::Resources> resources);
+    std::shared_ptr<huxerui::Resources> resources, bool reuse_local_file);
 huxerui::Task<void> PlayContainer(std::shared_ptr<const huxerui::File> file, ClipControls controls,
     huxerui::media::VideoStorage storage = huxerui::media::VideoStorage::Cpu);
 huxerui::Task<void> PlayAudio(std::shared_ptr<const huxerui::File> file, ClipControls controls);

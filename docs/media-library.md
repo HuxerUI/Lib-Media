@@ -110,6 +110,11 @@ An authorization prompt may also outlive Task cancellation. Denial returns `Perm
 ## Preview and validation
 
 The preview's Library tab demonstrates single/multiple selection, all three media filters, retained selection references, and saving images/videos.
+On iOS, **Open from Photos** in the Frames tab selects one video for decoded preview and packet copy.
+Frames retains the selection while it uses the local file exposed by `FileReference::AsFile()`. A reference without
+a local path is imported into a temporary file.
+The picker requests the asset's current representation so Photos can avoid a compatibility transcode where possible.
+[Photos picker representation](https://developer.apple.com/documentation/photosui/phpickerconfiguration-swift.struct/assetrepresentationmode)
 Its multiple-selection toggle is disabled when the platform maximum is below two, and its multiple-selection count is the smaller of three and the reported maximum.
 “Save first selection” imports a retained reference to a local temporary file and publishes it, exercising reference I/O after picker dismissal.
 “Save image” and “Save video” explicitly use the document picker to obtain a local source; they are separate from system photo-library selection.
