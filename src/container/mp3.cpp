@@ -26,6 +26,11 @@ std::optional<Mp3FrameHeader> ParseMp3FrameHeader(ByteView bytes) {
   return Mp3FrameHeader{version, sample_rate, channels, mpeg1 ? 1152u : 576u, length, offset, side};
 }
 
+bool Mp3FrameRestartable(ByteView bytes, const Mp3FrameHeader& header) {
+  return Number<std::uint8_t>(bytes, header.side_offset) == 0 &&
+      (header.version != 3 || !(Number<std::uint8_t>(bytes, header.side_offset + 1) & 128u));
+}
+
 namespace {
 
 constexpr auto Bad = ContainerErrorCode::InvalidData;
@@ -251,11 +256,6 @@ std::optional<Mp3Timing> ReadVbri(ByteView frame, const Mp3FrameHeader& header) 
   return Mp3Timing{.samples = std::uint64_t(frames) * header.samples};
 }
 
-bool Restartable(ByteView bytes, const Mp3FrameHeader& header) {
-  return Number<std::uint8_t>(bytes, header.side_offset) == 0 &&
-      (header.version != 3 || !(Number<std::uint8_t>(bytes, header.side_offset + 1) & 128u));
-}
-
 class Mp3Reader final : public FramedAudioReader {
 public:
   explicit Mp3Reader(ContainerInput input) : FramedAudioReader(std::move(input), ContainerFormat::Mp3) {
@@ -289,20 +289,28 @@ private:
     if (!header || header->version != info_.version || header->rate != info_.rate ||
         header->channels != info_.channels) Fail(Bad, "Invalid or changing MPEG Layer III frame");
     auto bytes = input.ReadBytes(header->length);
-    const auto restartable = Restartable(bytes, *header);
+    const auto restartable = Mp3FrameRestartable(bytes, *header);
     return AudioPacket{std::move(bytes), header->samples, restartable};
   }
   Mp3FrameHeader info_{};
 };
 
+void ValidateMp3Trim(const MediaTrack& track) {
+  if (track.priming_samples.has_value() != track.padding_samples.has_value() ||
+      track.priming_samples.value_or(0) > 4095 || track.padding_samples.value_or(0) > 4095)
+    Fail(ContainerErrorCode::InvalidArgument, "MP3 output requires both gapless trim values within their 12-bit bounds");
+}
+
 class Mp3Writer final : public ContainerWriter {
 public:
   Mp3Writer(ContainerOutput output, std::span<const MediaTrack> tracks,
              const std::optional<MediaAudioMetadata>& tags)
-      : ContainerWriter(std::move(output), tracks) {
+      : ContainerWriter(std::move(output), tracks), initial_priming_(tracks.front().priming_samples.value_or(0)) {
     if (tags) WriteId3(this->output, *tags);
     xing_offset_ = this->output.Position();
   }
+
+  bool SupportsTrim() const override { return true; }
 
   std::optional<std::uint32_t> Write(std::uint32_t, const ContainerPacket& packet) override {
     const auto bytes = packet.data.AsBytes();
@@ -318,7 +326,7 @@ public:
     ValidateAudioPacketTime(packet, samples_ - priming, header->samples, header->rate);
     const auto bitrate = Number<std::uint8_t>(bytes, 2) >> 4;
     if (offsets_.empty()) {
-      if (!Restartable(bytes, *header)) Fail(ContainerErrorCode::InvalidArgument, "First MP3 frame depends on a previous reservoir");
+      if (!Mp3FrameRestartable(bytes, *header)) Fail(ContainerErrorCode::InvalidArgument, "First MP3 frame depends on a previous reservoir");
       // Reserve a header-only frame with the stream geometry and space for Xing and LAME fields.
       Put(xing_, (Number<std::uint32_t>(bytes) & ~0xf200u) | 0xe000u | 0x10000u);
       const auto xing_header = ParseMp3FrameHeader(xing_).value();
@@ -334,8 +342,15 @@ public:
     offsets_.push_back(static_cast<std::uint32_t>(offset));
     variable_ |= bitrate != first_bitrate_;
     output.Write(bytes);
+    timed_packets_ |= packet.pts.has_value() || packet.dts.has_value();
     samples_ = AddTime(samples_, header->samples);
     return {};
+  }
+
+  void TrackEnded(std::uint32_t) override {
+    if (timed_packets_ && tracks.front().priming_samples.value_or(0) != initial_priming_)
+      Fail(ContainerErrorCode::InvalidArgument, "MP3 final priming differs from the written packet timeline");
+    ValidateMp3Trim(tracks.front());
   }
 
   void Finish() override {
@@ -373,7 +388,8 @@ private:
   std::size_t xing_data_ = 0;
   std::int64_t samples_ = 0;
   int first_bitrate_ = 0;
-  bool variable_ = false;
+  const std::uint64_t initial_priming_;
+  bool variable_ = false, timed_packets_ = false;
 };
 } // namespace
 
@@ -392,11 +408,10 @@ void ValidateMp3(std::span<const MediaTrack> tracks) {
     Fail(ContainerErrorCode::Unsupported, "MP3 output requires one MPEG Layer III track");
   const auto& track = tracks.front();
   const auto& description = track.descriptions.front();
+  ValidateMp3Trim(track);
   if (std::ranges::find(rates, description.sample_rate.value_or(0)) == rates.end() ||
-      (description.channel_count != 1 && description.channel_count != 2) || !description.initialization_data.empty() ||
-      track.priming_samples.has_value() != track.padding_samples.has_value() ||
-      track.priming_samples.value_or(0) > 4095 || track.padding_samples.value_or(0) > 4095)
-    Fail(ContainerErrorCode::InvalidArgument, "Invalid MP3 output geometry or trim");
+      (description.channel_count != 1 && description.channel_count != 2) || !description.initialization_data.empty())
+    Fail(ContainerErrorCode::InvalidArgument, "Invalid MP3 output geometry");
 }
 
 std::unique_ptr<ContainerWriter> OpenMp3Writer(ContainerOutput output, std::span<const MediaTrack> tracks,

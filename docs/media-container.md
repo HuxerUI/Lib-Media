@@ -225,6 +225,18 @@ FLAC uses Vorbis comments and PICTURE. MP3 reads ID3v2.3 and v2.4 and writes ID3
 native format rewrites these fields without modifying the compressed audio. The output mapping supports one
 track and requires a seekable destination for final metadata. [ID3 frame definitions](https://id3.org/id3v2.4.0-frames)
 
+### Writing newly encoded FLAC and MP3
+
+Use a single audio track with the encoder's codec, initialization data, sample rate, and channel count.
+For FLAC, set `speaker_mask` from the PCM input format to retain its layout. Open a random-access destination.
+Pass each complete packet with its duration and sync flag. The writer derives the file's timestamps from
+packet sample counts when PTS and DTS are absent. This lets the caller write MP3 packets as they arrive
+and supply both trim values to `EndTrack()` after draining the encoder.
+
+The FLAC writer finalizes frame sizes, total samples, and the seek table. Streaming encoder descriptions
+leave the optional PCM MD5 unset. The MP3 writer adds Xing/Info and the final gapless trim.
+[FLAC and MP3 encoding](media-codec.md#flac-and-mp3-encoding)
+
 ## Read and seek
 
 Open a `File` or `FileReference` through the SDK. Choose `OpenRandomAccess()` for positioning or for

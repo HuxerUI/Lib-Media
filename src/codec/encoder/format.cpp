@@ -1,7 +1,12 @@
 #include "format.h"
 #include "../hevc.h"
 #include "../av1.h"
+#include "container/container_io.h"
 #include "format/platform_video_storage.h"
+
+#ifdef MEDIA_HAS_FLAC_ENCODER
+#include <FLAC/format.h>
+#endif
 
 #include <algorithm>
 #include <bit>
@@ -12,16 +17,44 @@
 
 namespace huxerui::media::detail {
 CodecResult<void> ValidateAudioEncoderConfig(const AudioEncoderConfig& config) {
+  using R = CodecResult<void>;
   const auto channels = config.input.ChannelCount();
+  const auto sample_bytes = config.input.BytesPerSample();
+  const auto rate = config.input.sample_rate;
   const auto& limits = config.limits;
-  if (!channels || !config.input.sample_rate || !config.bitrate || config.bitrate > std::numeric_limits<std::int32_t>::max() ||
-      !limits.input_items || limits.input_bytes < channels * 2 || limits.output_items < 16 ||
+  if (!channels || !sample_bytes || !rate || !limits.input_items || limits.input_bytes < channels * sample_bytes || limits.output_items < 16 ||
       limits.output_bytes < 16 * kAudioEncoderPacketBytes)
-    return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid audio encoder configuration or queue limits"));
-  if (channels > 2 || config.input.sample_format != AudioSampleFormat::S16 || config.input.packing != AudioPacking::Interleaved ||
-      (config.input.sample_rate != 44100 && config.input.sample_rate != 48000))
-    return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "AAC encoding requires interleaved S16 mono/stereo at 44100 or 48000 Hz"));
-  return CodecResult<void>::Success();
+    return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid audio encoder configuration or queue limits"));
+  const bool interleaved = config.input.packing == AudioPacking::Interleaved;
+  if (config.codec == CodecId::Flac) {
+#ifdef MEDIA_HAS_FLAC_ENCODER
+    if (!interleaved || rate < 8000 || rate > 192000)
+      return R::Failure(Error(CodecErrorCode::Unsupported, "FLAC encoding requires interleaved S16 or F32 PCM at 8–192 kHz"));
+    if (!FLAC__format_sample_rate_is_subset(rate))
+      return R::Failure(Error(CodecErrorCode::Unsupported, "FLAC Streamable Subset requires rates above 65535 Hz to be multiples of 10 Hz"));
+    return R::Success();
+#else
+    return R::Failure(Error(CodecErrorCode::Unsupported, "FLAC encoding requires libFLAC"));
+#endif
+  }
+  if (config.codec == CodecId::Mp3) {
+#ifndef MEDIA_HAS_MP3_ENCODER
+    return R::Failure(Error(CodecErrorCode::Unsupported, "MP3 encoding requires libmp3lame"));
+#endif
+    constexpr std::uint32_t bitrates[]{32000, 40000, 48000, 56000, 64000, 80000, 96000, 112000,
+        128000, 160000, 192000, 224000, 256000, 320000};
+    if (std::ranges::find(bitrates, config.bitrate) == std::end(bitrates) || !interleaved ||
+        config.input.sample_format != AudioSampleFormat::S16 || channels > 2 ||
+        (rate != 32000 && rate != 44100 && rate != 48000))
+      return R::Failure(Error(CodecErrorCode::Unsupported, "MP3 encoding requires MPEG-1 Layer III CBR and interleaved S16 mono/stereo at 32, 44.1, or 48 kHz"));
+    return R::Success();
+  }
+  if (config.codec != CodecId::Aac || !config.bitrate || config.bitrate > std::numeric_limits<std::int32_t>::max())
+    return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid audio encoder codec or bitrate"));
+  if (channels > 2 || config.input.sample_format != AudioSampleFormat::S16 || !interleaved ||
+      (rate != 44100 && rate != 48000))
+    return R::Failure(Error(CodecErrorCode::Unsupported, "AAC encoding requires interleaved S16 mono/stereo at 44100 or 48000 Hz"));
+  return R::Success();
 }
 AudioEncodeFormat DescribeAac(const AudioEncoderConfig& config) {
   const auto index = config.input.sample_rate == 48000 ? 3u : 4u;
@@ -29,11 +62,27 @@ AudioEncodeFormat DescribeAac(const AudioEncoderConfig& config) {
   return {config.input.sample_rate, config.input.channel_layout, {std::byte(asc >> 8), std::byte(asc & 255)}};
 }
 CodecResult<void> ValidateAudioEncodeFormat(const AudioEncodeFormat& format, const AudioEncoderConfig& config) {
-  auto parsed = ParseAac(format.initialization_data);
-  if (!parsed.Succeeded() || format.sample_rate != config.input.sample_rate || format.channel_layout != config.input.channel_layout ||
-      parsed.Value().sample_rate != config.input.sample_rate || parsed.Value().channels != config.input.ChannelCount())
-    return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Platform encoder changed the AAC-LC stream format"));
-  return CodecResult<void>::Success();
+  using R = CodecResult<void>;
+  if (format.codec == config.codec && format.sample_rate == config.input.sample_rate &&
+      format.channel_layout == config.input.channel_layout) {
+    if (config.codec == CodecId::Mp3 && format.initialization_data.empty()) return R::Success();
+    if (config.codec == CodecId::Flac) {
+      try {
+        const auto info = ParseFlacStreamInfo(format.initialization_data, ContainerErrorCode::InvalidData);
+        if (info.rate == format.sample_rate && info.channels == config.input.ChannelCount() &&
+            info.bits == (config.input.sample_format == AudioSampleFormat::F32 ? 24u : 16u) &&
+            info.max_block == AudioEncoderBlockSamples(config.codec)) return R::Success();
+      } catch (const ContainerError& error) {
+        return R::Failure(Error(CodecErrorCode::InvalidData, error.message));
+      }
+    }
+    if (config.codec == CodecId::Aac) {
+      auto parsed = ParseAac(format.initialization_data);
+      if (parsed.Succeeded() && parsed.Value().sample_rate == format.sample_rate &&
+          parsed.Value().channels == config.input.ChannelCount()) return R::Success();
+    }
+  }
+  return R::Failure(Error(CodecErrorCode::Unsupported, "Encoder returned an unexpected audio stream format"));
 }
 CodecResult<AudioEncodeFormat> ReadAudioEncodeFormat(std::span<const std::byte> description, const AudioEncoderConfig& config) {
   using R = CodecResult<AudioEncodeFormat>;

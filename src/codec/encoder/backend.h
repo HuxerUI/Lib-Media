@@ -23,6 +23,12 @@ public:
 };
 using AudioEncoderFactory = std::function<std::unique_ptr<AudioEncoderBackend>()>;
 std::unique_ptr<AudioEncoderBackend> MakeAudioEncoderBackend();
+#ifdef MEDIA_HAS_FLAC_ENCODER
+std::unique_ptr<AudioEncoderBackend> MakeFlacEncoderBackend();
+#endif
+#ifdef MEDIA_HAS_MP3_ENCODER
+std::unique_ptr<AudioEncoderBackend> MakeMp3EncoderBackend();
+#endif
 
 struct VideoEncoderEnd {};
 using VideoEncoderBackendOutput = std::variant<VideoEncodeFormat, EncodedPacket, VideoEncoderEnd>;

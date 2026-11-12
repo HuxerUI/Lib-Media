@@ -241,11 +241,103 @@ void Validation() {
   Check(ReadAudioEncodeFormat(extended, config).Value() == format, "LC extension not normalized");
   extended.back() = std::byte{1}; Check(!ReadAudioEncodeFormat(extended, config).Succeeded(), "Unknown ASC extension accepted");
 }
+
+#if defined(MEDIA_HAS_FLAC_ENCODER) || defined(MEDIA_HAS_MP3_ENCODER)
+struct EncoderActivity {
+  std::atomic<unsigned> submits{0}, polls{0};
+};
+
+class ObservedEncoder final : public AudioEncoderBackend {
+public:
+  ObservedEncoder(std::unique_ptr<AudioEncoderBackend> encoder, std::shared_ptr<EncoderActivity> activity)
+      : encoder_(std::move(encoder)), activity_(std::move(activity)) {}
+  CodecResult<void> Open(const AudioEncoderConfig& config) override { return encoder_->Open(config); }
+  CodecResult<SubmitStatus> Submit(std::span<const std::byte> pcm, std::uint32_t samples, std::int64_t start) override {
+    auto result = encoder_->Submit(pcm, samples, start);
+    if (result.Succeeded() && result.Value() == SubmitStatus::Accepted) ++activity_->submits;
+    return result;
+  }
+  CodecResult<std::optional<AudioEncoderBackendOutput>> Poll() override {
+    if (activity_->submits) ++activity_->polls;
+    return encoder_->Poll();
+  }
+  CodecResult<SubmitStatus> Finish() override { return encoder_->Finish(); }
+  CodecResult<void> Close() override { return encoder_->Close(); }
+
+private:
+  std::unique_ptr<AudioEncoderBackend> encoder_;
+  std::shared_ptr<EncoderActivity> activity_;
+};
+
+void SoftwareEncoderWaitsForInput(CodecId codec, AudioEncoderFactory factory) {
+  auto config = Config();
+  config.codec = codec;
+  auto activity = std::make_shared<EncoderActivity>();
+  auto cleaned = std::make_shared<std::atomic<bool>>(false);
+  config.cleanup_completed = [cleaned](auto result) { *cleaned = result.Succeeded(); };
+  auto opened = AudioEncoderState::Create(config, [factory = std::move(factory), activity] {
+    return std::make_unique<ObservedEncoder>(factory(), activity);
+  });
+  Check(opened.Succeeded(), "Cannot create software encoder");
+  auto state = std::move(opened).Value();
+  const auto block = AudioEncoderBlockSamples(codec);
+  Submit(state, Frame(config, block, 0));
+  Eventually([&] { return activity->polls > 0; }, "Software encoder did not process its first PCM block");
+  const auto before = activity->polls.load();
+  std::this_thread::sleep_for(std::chrono::milliseconds(80));
+  Check(activity->polls <= before + 3, "Software encoder repeatedly polled without new input");
+
+  Submit(state, Frame(config, block, block));
+  Eventually([&] { return activity->submits == 2; }, "New PCM did not wake the software encoder");
+  Submit(state, Frame(config, 1, block * 2));
+  Check(state->Finish().Succeeded(), "Software encoder rejected drain");
+  std::optional<AudioEncodeSummary> summary;
+  Eventually([&] {
+    auto read = state->Read();
+    Check(read.Succeeded(), "Software encoder failed during drain");
+    if (!read.Value()) return false;
+    if (auto* value = std::get_if<AudioEncodeSummary>(&*read.Value())) summary = *value;
+    return std::holds_alternative<EndOfStream>(*read.Value());
+  }, "Software encoder did not drain after waiting for input");
+  Check(summary && summary->input_samples == block * 2 + 1, "Software encoder changed the accepted sample count");
+  state->Close();
+  Eventually([&] { return cleaned->load(); }, "Software encoder cleanup stalled");
+}
+#endif
+
+#ifdef MEDIA_HAS_FLAC_ENCODER
+void FlacStreamableSampleRates() {
+  auto config = Config();
+  config.codec = CodecId::Flac;
+  for (const auto rate : {65536u, 65537u, 191999u}) {
+    config.input.sample_rate = rate;
+    auto result = AudioEncoder::Create(config);
+    Check(!result.Succeeded() && result.Error().code == CodecErrorCode::Unsupported &&
+        result.Error().message.find("Streamable Subset") != std::string::npos, "FLAC accepted a non-streamable rate");
+  }
+  for (const auto rate : {8000u, 65535u, 65540u, 192000u}) {
+    config.input.sample_rate = rate;
+    std::atomic<bool> completed{false}, supported{false};
+    AudioEncoder::Probe(config, [&](auto result) { supported = result.Succeeded(); completed = true; });
+    Eventually([&] { return completed.load(); }, "FLAC sample-rate probe stalled");
+    Check(supported, "FLAC rejected a streamable rate");
+  }
+}
+#endif
 } // namespace
 int main() {
   try {
     Validation(); TinyInputsAndTiming(); BackpressureAndRetainedSlices(); StartupCloseAndIsolation(); FailureAndWorkerExit(); WakeupClose();
     std::cout << "AAC encoder queue, timing, trim, retention, isolation and lifecycle contracts passed\n";
+#ifdef MEDIA_HAS_FLAC_ENCODER
+    SoftwareEncoderWaitsForInput(CodecId::Flac, MakeFlacEncoderBackend);
+    FlacStreamableSampleRates();
+    std::cout << "FLAC encoder idle, drain, and sample-rate contracts passed\n";
+#endif
+#ifdef MEDIA_HAS_MP3_ENCODER
+    SoftwareEncoderWaitsForInput(CodecId::Mp3, MakeMp3EncoderBackend);
+    std::cout << "MP3 encoder idle and drain contracts passed\n";
+#endif
     return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -37,6 +37,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | GPU video | SDR H.264 and HEVC Main platform frames and SDK texture input on macOS, Android, iOS, Windows, and supported Web browsers. Windows x64 passed H.264 GPU transcode and SDK texture encoding for H.264 and HEVC Main. See [GPU video](docs/gpu-video.md) for platform coverage. | `VideoStorage::Platform`, `MakeExternalTexture()`, and `MakeVideoFrame()` |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; macOS native tests passed; iOS validation pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
+| FLAC and MP3 encoding | Optional libFLAC and libmp3lame backends. FLAC supports multichannel 16- or 24-bit PCM; MP3 supports mono/stereo MPEG-1 Layer III CBR with gapless trim. | [Build and platform coverage](docs/media-codec.md#flac-and-mp3-encoding) |
 | H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; macOS native tests passed; iOS validation pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | Codec capability discovery | Typed AAC-LC and H.264 snapshots, plus per-codec audio decoder queries for Opus, FLAC, and MP3. Support and reported limits depend on the adapter. | `QueryCapabilities()` on the four codec classes and `AudioDecoder::QueryCapabilities(CodecId, ...)` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | Container demuxing and muxing | MP4/M4A/fMP4, QuickTime MOV, Matroska, WebM, WAVE/RF64/Wave64, AIFF and CAF LPCM, CAF ALAC, ADTS, Ogg Opus or Vorbis, and native FLAC/MP3 with tag and cover copy | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
@@ -329,8 +330,9 @@ Windows and Linux also pass Opus, FLAC, and MP3 packet decoding and PCM preview 
 
 ## Media encoding
 
-`AudioEncoder` accepts contiguous interleaved S16 mono/stereo PCM at 44.1 or 48 kHz and emits raw AAC-LC packets,
-AudioSpecificConfig, and a final sample summary. `VideoEncoder` emits H.264 or HEVC access units with four-byte NAL
+`AudioEncoder` accepts contiguous interleaved PCM and returns complete packets, a stream description, and a final
+sample summary. AAC-LC is the default. Use `AudioEncoderConfig::codec` to select optional
+[FLAC or MP3 encoding](docs/media-codec.md#flac-and-mp3-encoding). `VideoEncoder` emits H.264 or HEVC access units with four-byte NAL
 lengths and a separate `avcC` or `hvcC` description. It takes I420/NV12 for H.264 and HEVC Main, and P010 for
 HEVC Main10. On macOS, ProRes takes CPU P210 for 422 or Ayuv16 for 4444 and emits one complete frame per
 packet. The optional desktop AV1 backend emits Main 8 or Main 10 temporal units and a separate configuration

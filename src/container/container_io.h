@@ -157,6 +157,7 @@ struct Mp3FrameHeader {
 };
 
 std::optional<Mp3FrameHeader> ParseMp3FrameHeader(ByteView bytes);
+bool Mp3FrameRestartable(ByteView bytes, const Mp3FrameHeader& header);
 
 MediaSampleDescription DescribeAdts(ByteView header);
 ByteView AacLcInitialization(ByteView config);

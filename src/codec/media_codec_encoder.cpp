@@ -4,6 +4,16 @@
 
 namespace huxerui::media {
 namespace {
+auto AudioBackend(CodecId codec) {
+#ifdef MEDIA_HAS_FLAC_ENCODER
+  if (codec == CodecId::Flac) return detail::MakeFlacEncoderBackend;
+#endif
+#ifdef MEDIA_HAS_MP3_ENCODER
+  if (codec == CodecId::Mp3) return detail::MakeMp3EncoderBackend;
+#endif
+  return detail::MakeAudioEncoderBackend;
+}
+
 struct EncoderProbe : std::enable_shared_from_this<EncoderProbe> {
   AudioEncoderConfig config;
   std::function<void(CodecResult<void>)> completion;
@@ -24,7 +34,7 @@ struct EncoderProbe : std::enable_shared_from_this<EncoderProbe> {
     try {
       if (!backend) {
         result = detail::ValidateAudioEncoderConfig(config);
-        if (result.Succeeded()) { backend = detail::MakeAudioEncoderBackend(); result = backend->Open(config); }
+        if (result.Succeeded()) { backend = AudioBackend(config.codec)(); result = backend->Open(config); }
       }
       if (result.Succeeded()) {
         auto ready = backend->Ready();
@@ -58,7 +68,7 @@ AudioEncoder& AudioEncoder::operator=(AudioEncoder&& other) noexcept {
 }
 AudioEncoder::~AudioEncoder() { Close(); }
 CodecResult<AudioEncoder> AudioEncoder::Create(const AudioEncoderConfig& config) {
-  auto state = detail::AudioEncoderState::Create(config);
+  auto state = detail::AudioEncoderState::Create(config, AudioBackend(config.codec));
   if (!state.Succeeded()) return CodecResult<AudioEncoder>::Failure(state.Error());
   return CodecResult<AudioEncoder>::Success(AudioEncoder(std::move(state).Value()));
 }

@@ -9,6 +9,7 @@ inline constexpr std::size_t kAudioEncoderPacketBytes = 64 * 1024;
 inline constexpr std::size_t kAudioEncoderExtraPackets = 8;
 
 CodecResult<void> ValidateAudioEncoderConfig(const AudioEncoderConfig& config);
+inline constexpr unsigned AudioEncoderBlockSamples(CodecId codec) { return codec == CodecId::Mp3 ? 1152 : 1024; }
 // Describes the configured LC stream after platform output rate and channel negotiation has succeeded.
 AudioEncodeFormat DescribeAac(const AudioEncoderConfig& config);
 // Validates platform ASC and removes only the recognized SBR-absent extension from the public LC description.

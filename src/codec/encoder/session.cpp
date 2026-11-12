@@ -12,7 +12,10 @@ struct SessionFailure { CodecError error; };
 void Reject(const char* message) { throw SessionFailure{Error(CodecErrorCode::InvalidData, message)}; }
 }
 AudioEncoderState::AudioEncoderState(AudioEncoderConfig config, AudioEncoderFactory factory)
-    : config_(std::move(config)), factory_(std::move(factory)) {}
+    : config_(std::move(config)), factory_(std::move(factory)),
+      block_samples_(AudioEncoderBlockSamples(config_.codec)),
+      sample_stride_(config_.input.ChannelCount() * config_.input.BytesPerSample()),
+      assembly_(block_samples_ * sample_stride_) {}
 
 CodecResult<std::shared_ptr<AudioEncoderState>> AudioEncoderState::Create(AudioEncoderConfig config, AudioEncoderFactory factory) {
   using R = CodecResult<std::shared_ptr<AudioEncoderState>>;
@@ -97,11 +100,11 @@ CodecResult<SubmitStatus> AudioEncoderState::Submit(const AudioFrame& frame) {
   if (!frame.Validate() || frame.format != config_.input || !pts)
     return R::Failure(Error(CodecErrorCode::InvalidData, "Invalid PCM frame or encoder input format"));
   const auto count = frame.sample_count;
-  const auto bytes = std::size_t(count) * config_.input.ChannelCount() * 2;
+  const auto bytes = std::size_t(count) * sample_stride_;
   if (bytes > config_.limits.input_bytes)
     return R::Failure(Error(CodecErrorCode::InvalidData, "PCM frame exceeds input byte limit"));
   const auto maximum = std::numeric_limits<std::int64_t>::max();
-  if (input_samples_ > std::uint64_t(maximum - 1023) - count || pts->ticks > maximum - count ||
+  if (input_samples_ > std::uint64_t(maximum - block_samples_ + 1) - count || pts->ticks > maximum - count ||
       (input_start_ && (input_start_->ticks > maximum - std::int64_t(input_samples_) ||
           pts->ticks != input_start_->ticks + std::int64_t(input_samples_))))
     return R::Failure(Error(CodecErrorCode::InvalidData, "PCM timestamps must be contiguous and fit the sample timeline"));
@@ -164,7 +167,7 @@ AudioEncoderState::Retired AudioEncoderState::Clear() {
   retired.reservations.swap(reservations_);
   assembly_samples_ = 0;
   input_samples_ = submitted_samples_ = encoded_samples_ = 0;
-  input_start_.reset(); last_packet_pts_.reset(); format_.reset();
+  input_start_.reset(); next_packet_pts_.reset(); format_.reset();
   waiting_credit_ = finish_sent_ = eos_queued_ = extra_reserved_ = false;
   return retired;
 }
@@ -270,8 +273,8 @@ void AudioEncoderState::Run(bool capacity) {
     std::lock_guard lock(mutex_);
     terminal = phase_ == Phase::Closed || phase_ == Phase::Failed;
     if (!terminal && (phase_ == Phase::Running || phase_ == Phase::Draining) && !eos_queued_ &&
-        ((!waiting_credit_ && (!input_.empty() || assembly_samples_ == 1024)) ||
-            (submitted_samples_ > encoded_samples_ && !waiting_credit_) ||
+        ((!waiting_credit_ && (!input_.empty() || assembly_samples_ == block_samples_)) ||
+            (config_.codec == CodecId::Aac && submitted_samples_ > encoded_samples_ && !waiting_credit_) ||
             (phase_ == Phase::Draining && (!waiting_credit_ || finish_sent_)))) ScheduleLocked(2);
   }
   if (terminal) Cleanup();
@@ -279,11 +282,11 @@ void AudioEncoderState::Run(bool capacity) {
 void AudioEncoderState::End(AudioEncoderEnd end) {
   if (eos_queued_) return;
   if (phase_ != Phase::Draining || !input_.empty() || assembly_samples_ || (input_samples_ && !finish_sent_))
-    Reject("AAC encoder ended before draining accepted PCM");
+    Reject("Audio encoder ended before draining accepted PCM");
   if (!input_samples_) end = {0, 0};
   else if (end.padding_samples) {
     const auto fill = submitted_samples_ - input_samples_;
-    if (*end.padding_samples > UINT64_MAX - fill) Reject("AAC padding count overflow");
+    if (*end.padding_samples > UINT64_MAX - fill) Reject("Audio encoder padding count overflow");
     *end.padding_samples += fill;
   }
   if (end.priming_samples && !end.padding_samples && *end.priming_samples <= encoded_samples_ &&
@@ -295,7 +298,7 @@ void AudioEncoderState::End(AudioEncoderEnd end) {
       (end.priming_samples && end.padding_samples &&
       (*end.priming_samples > encoded_samples_ || *end.padding_samples > encoded_samples_ - *end.priming_samples ||
           encoded_samples_ - *end.priming_samples - *end.padding_samples != input_samples_)))
-    Reject("Platform AAC sample accounting is inconsistent");
+    Reject("Audio encoder sample accounting is inconsistent");
   output_.push_back(AudioEncodeSummary{input_start_, input_samples_, encoded_samples_, end.priming_samples, end.padding_samples});
   output_.push_back(EndOfStream{});
   reservations_.clear();
@@ -308,33 +311,36 @@ void AudioEncoderState::Publish(AudioEncoderBackendOutput value, std::uint64_t g
   if (auto* format = std::get_if<AudioEncodeFormat>(&value)) {
     auto valid = ValidateAudioEncodeFormat(*format, config_);
     if (!valid.Succeeded()) throw SessionFailure{valid.Error()};
-    if (format_ && *format_ != *format) Reject("AAC format changed during encoding");
+    if (format_ && *format_ != *format) Reject("Audio format changed during encoding");
     if (!format_) { format_ = *format; output_.push_back(std::move(*format)); wake_pending_ = true; }
   } else if (auto* packet = std::get_if<EncodedPacket>(&value)) {
     const auto size = packet->data.AsBytes().size();
     const auto pts = packet->pts.Rescale(config_.input.sample_rate);
     const auto dts = packet->dts ? packet->dts->Rescale(config_.input.sample_rate) : std::optional<MediaTimestamp>{};
+    const auto length = config_.codec == CodecId::Aac ? std::optional{MediaTimestamp{block_samples_, config_.input.sample_rate}} :
+        packet->duration ? packet->duration->Rescale(config_.input.sample_rate) : std::nullopt;
     const auto anchor = input_start_ ? input_start_->ticks : 0;
     auto fits = [anchor](std::int64_t ticks) {
       return (anchor <= 0 || ticks <= INT64_MAX - anchor) && (anchor >= 0 || ticks >= INT64_MIN - anchor);
     };
-    if (!format_ || !input_start_ || !size || size > kAudioEncoderPacketBytes || reservations_.empty() || !pts ||
+    if (!format_ || !input_start_ || !size || size > kAudioEncoderPacketBytes || reservations_.empty() || !pts || !length ||
+        length->ticks <= 0 || length->ticks > block_samples_ ||
         (packet->dts && !dts) || !fits(pts->ticks) || (dts && !fits(dts->ticks)) ||
-        (last_packet_pts_ && (last_packet_pts_->ticks > INT64_MAX - 1024 || pts->ticks != last_packet_pts_->ticks + 1024)) ||
-        encoded_samples_ > UINT64_MAX - 1024)
-      Reject("AAC packet exceeds reserved storage or has invalid timing");
+        (next_packet_pts_ && pts->ticks != *next_packet_pts_) || pts->ticks > INT64_MAX - length->ticks ||
+        encoded_samples_ > UINT64_MAX - std::uint64_t(length->ticks))
+      Reject("Audio packet exceeds reserved storage or has invalid timing");
     auto credit = std::move(reservations_.front());
     reservations_.pop_front();
     credit->Shrink(size);
     struct Storage { std::shared_ptr<Credit> credit; BufferReference bytes; };
     auto storage = std::make_shared<Storage>(Storage{credit, packet->data});
     packet->data = BufferReference(storage->bytes.AsBytes(), storage);
-    last_packet_pts_ = pts;
+    next_packet_pts_ = pts->ticks + length->ticks;
     packet->pts = {pts->ticks + anchor, config_.input.sample_rate};
     if (dts) packet->dts = MediaTimestamp{dts->ticks + anchor, config_.input.sample_rate};
-    packet->duration = MediaTimestamp{1024, config_.input.sample_rate};
-    packet->key_frame = true;
-    encoded_samples_ += 1024;
+    packet->duration = length;
+    if (config_.codec == CodecId::Aac) packet->key_frame = true;
+    encoded_samples_ += length->ticks;
     output_.push_back(std::move(*packet));
     wake_pending_ = true;
   } else End(std::get<AudioEncoderEnd>(value));
@@ -353,22 +359,22 @@ void AudioEncoderState::Process(std::uint64_t generation) {
     {
       std::lock_guard lock(mutex_);
       if (generation != generation_ || (phase_ != Phase::Running && phase_ != Phase::Draining)) return;
-      const auto stride = config_.input.ChannelCount() * 2;
-      while (assembly_samples_ < 1024 && !input_.empty()) {
+      while (assembly_samples_ < block_samples_ && !input_.empty()) {
         auto& input = input_.front();
         const auto bytes = input.data.AsBytes().subspan(input.offset);
-        const auto count = std::min<std::size_t>(1024 - assembly_samples_, bytes.size() / stride);
-        std::memcpy(assembly_.data() + assembly_samples_ * stride, bytes.data(), count * stride);
+        const auto count = std::min<std::size_t>(block_samples_ - assembly_samples_, bytes.size() / sample_stride_);
+        std::memcpy(assembly_.data() + assembly_samples_ * sample_stride_, bytes.data(), count * sample_stride_);
         assembly_samples_ += static_cast<std::uint32_t>(count);
-        input.offset += count * stride;
+        input.offset += count * sample_stride_;
         if (input.offset == input.data.AsBytes().size()) input_.pop_front();
       }
-      if (phase_ == Phase::Draining && input_.empty() && assembly_samples_ && assembly_samples_ < 1024) {
-        std::fill(assembly_.begin() + assembly_samples_ * stride, assembly_.begin() + 1024 * stride, std::byte{});
-        assembly_samples_ = 1024;
+      const bool tail = phase_ == Phase::Draining && input_.empty();
+      if (tail && config_.codec == CodecId::Aac && assembly_samples_ && assembly_samples_ < block_samples_) {
+        std::fill(assembly_.begin() + assembly_samples_ * sample_stride_, assembly_.end(), std::byte{});
+        assembly_samples_ = block_samples_;
       }
       waiting_credit_ = false;
-      if (assembly_samples_ == 1024) {
+      if (assembly_samples_ == block_samples_ || (tail && assembly_samples_)) {
         if (!extra_reserved_) {
           while (reservations_.size() < kAudioEncoderExtraPackets) {
             auto extra = Reserve(output_budget_, kAudioEncoderPacketBytes, config_.limits.output_items, config_.limits.output_bytes);
@@ -388,13 +394,13 @@ void AudioEncoderState::Process(std::uint64_t generation) {
       }
     }
     if (submit) {
-      auto result = backend_->Submit(std::span(assembly_).first(config_.input.ChannelCount() * 2 * 1024), 1024,
+      auto result = backend_->Submit(std::span(assembly_).first(assembly_samples_ * sample_stride_), assembly_samples_,
           static_cast<std::int64_t>(submitted_samples_));
       if (!result.Succeeded()) { Fail(result.Error(), generation); return; }
       std::lock_guard lock(mutex_);
       if (generation != generation_) return;
       if (result.Value() == SubmitStatus::WouldBlock) { reservations_.pop_back(); return; }
-      submitted_samples_ += 1024;
+      submitted_samples_ += assembly_samples_;
       assembly_samples_ = 0;
     } else if (finish) {
       auto result = backend_->Finish();

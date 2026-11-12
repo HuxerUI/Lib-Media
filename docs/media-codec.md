@@ -6,7 +6,8 @@ No `Install()`, View, Runtime, window, or application Task is needed. Existing M
 
 This guide covers AAC-LC, Opus, Vorbis, FLAC, and MP3 decoded to CPU PCM, and AVC, HEVC, VP8, VP9, and AV1 decoded to video frames.
 macOS supports progressive ProRes 422 and 4444. Compatible iOS devices support standard ProRes 422. Both platforms support mono or stereo ALAC.
-The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264, HEVC, optional AV1, and macOS ProRes. Codec sessions do not
+The same header provides `AudioEncoder` for AAC-LC, optional FLAC and MP3, and `VideoEncoder` for H.264, HEVC,
+optional AV1, and macOS ProRes. Codec sessions do not
 demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
 
@@ -214,6 +215,42 @@ rate and matching layout. Mono, stereo, 5.1 back, and 7.1 decode to PCM in WAVE 
 after opening or resetting initializes the overlap and emits no PCM. Each following packet emits at most
 one PCM block with its submitted PTS. Pass the decode-start packet returned by the demuxer after a seek.
 [Vorbis container mapping](media-container.md#vorbis) · [Bundled sources](../third_party/README.md)
+
+### FLAC and MP3 encoding
+
+Set `AudioEncoderConfig::codec` to `CodecId::Flac` or `CodecId::Mp3`. Both use the same `AudioEncoder`
+queue, drain, reset, and cleanup contract as AAC-LC. Use `Probe()` for the selected configuration.
+`AudioEncoder::QueryCapabilities()` continues to describe AAC-LC.
+
+| Codec | PCM input | Output |
+| --- | --- | --- |
+| FLAC | Interleaved S16 or F32 at 8–192 kHz within the FLAC Streamable Subset, mono, stereo, 5.1 back, 5.1 side, or 7.1 | One native FLAC frame per packet and a 34-byte STREAMINFO description. S16 is preserved exactly. F32 is rounded to signed 24-bit PCM with saturation. The final block retains its actual sample count. |
+| MP3 | Interleaved S16 mono/stereo at 32, 44.1, or 48 kHz | One MPEG-1 Layer III frame per packet. `bitrate` selects a standard CBR rate from 32 to 320 kbit/s. The summary carries the encoder delay and tail padding. |
+
+FLAC rates above 65535 Hz must be multiples of 10 Hz. Unsupported sample rates are rejected during configuration validation.
+
+Set `-DHUXERUI_MEDIA_ENABLE_FLAC_ENCODER=ON` and/or `-DHUXERUI_MEDIA_ENABLE_MP3_ENCODER=ON`
+and supply libFLAC or libmp3lame for the target architecture, SDK, and deployment version.
+Both options default to off. The FLAC option can use the dependency's CMake target `FLAC::FLAC`.
+To provide libraries explicitly, set `MEDIA_FLAC_ENCODER_INCLUDE_DIR` and `MEDIA_FLAC_ENCODER_LIBRARY`
+or `MEDIA_MP3_ENCODER_INCLUDE_DIR` and `MEDIA_MP3_ENCODER_LIBRARY`. Explicit library paths must provide
+their link dependencies. A standalone libFLAC static build can disable its Ogg integration.
+For static libFLAC on Windows, use `FLAC::FLAC` so the target propagates `FLAC__NO_DLL`.
+
+The software backends use the same code on all targets. Android and iOS link libraries for the corresponding
+ABI or SDK. Web links Emscripten builds of both libraries into the WASM module. Configure Windows and Linux
+with libraries built for the chosen compiler and architecture.
+
+| Platform | Verification |
+| --- | --- |
+| macOS | Both encoders ran through file write and readback. Independent tools checked FLAC integrity and MP3 gapless output. |
+| iOS | Both encoders ran through file write and readback on the arm64 simulator. |
+| Android | The arm64-v8a test executable linked with both backends. |
+| Web | Both software encoders ran in Chrome via WASM. |
+| Windows and Linux | The same backends can be configured with target libraries. Native verification is pending. |
+
+Use the encoder's `AudioEncodeFormat` to construct the track description and pass packets to the native
+FLAC or MP3 writer. [Writing newly encoded audio](media-container.md#writing-newly-encoded-flac-and-mp3)
 
 ### Opus, FLAC, and MP3
 

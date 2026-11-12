@@ -447,23 +447,26 @@ struct VideoEncodeFormat {
   bool operator==(const VideoEncodeFormat&) const = default;
 };
 
-/// @brief Configuration for encoding interleaved S16 PCM to raw AAC-LC access units.
+/// @brief Configuration for encoding interleaved PCM to AAC-LC, FLAC, or MP3 packets.
 ///
-/// Supports mono or stereo at 44100 or 48000 Hz. Input is encoded at the configured rate and channel layout without
-/// resampling or channel mixing. The output contains one raw AAC-LC access unit per packet, with initialization
-/// data delivered separately. Probe the concrete configuration for platform codec and bitrate support.
+/// Input retains its sample rate and channel layout. Output contains complete codec packets and a separate
+/// stream description. Probe the concrete configuration before creating a session.
 /// @see AudioEncoder::Create(), AudioEncoder::Probe(), AudioEncodeFormat
 struct AudioEncoderConfig {
-  /// Required PCM format. Set a supported sample rate, S16 representation, interleaved packing, and mono/stereo
-  /// layout. Every submitted frame must match all four fields. The default AudioFormat is not a valid encoder input.
+  /// Required interleaved PCM format. AAC-LC uses S16 mono/stereo at 44100 or 48000 Hz.
+  /// MP3 uses S16 mono/stereo at 32000, 44100, or 48000 Hz. FLAC supports the defined speaker layouts
+  /// from 8000 to 192000 Hz within the FLAC Streamable Subset. Rates above 65535 Hz must be multiples of 10 Hz.
+  /// FLAC encodes S16 as 16-bit PCM or rounds finite F32 samples to signed 24-bit PCM with saturation at
+  /// the endpoints. Every submitted frame must match this format.
   AudioFormat input;
-  /// Positive target bits per second, up to INT32_MAX. Defaults to 128000. An unsupported platform target is rejected;
-  /// the encoder does not silently replace it. This is a bitrate target rather than an exact size for each packet.
+  /// Target bits per second for AAC-LC, or a supported MPEG-1 Layer III CBR bitrate for MP3.
+  /// Defaults to 128000. FLAC ignores this value.
   std::uint32_t bitrate = 128000;
   /// Bounds on copied PCM and compressed output. Input needs one slot and one sample frame of bytes.
   /// Output needs at least 16 slots and 1 MiB. Each pending packet reserves 64 KiB before platform work,
   /// including encoder delay and drain output; returned packets retain only their actual byte charge.
-  /// A separate PCM assembly buffer holds at most 1024 samples per channel. Platform scratch is bounded separately.
+  /// A separate PCM assembly buffer holds 1024 samples per channel for AAC-LC and FLAC, or 1152 for MP3.
+  /// Backend scratch is bounded separately.
   /// Defaults are 48 input slots, 256 KiB copied PCM, 48 output slots, and 3 MiB compressed output reservations.
   /// Held output shares the same pool across resets. See QueueLimits for retained-storage accounting.
   QueueLimits limits{48, 256 * 1024, 48, 3 * 1024 * 1024};
@@ -479,23 +482,27 @@ struct AudioEncoderConfig {
   /// any encoding error. Platform work that cannot safely be retired leaves it pending.
   /// Retained encoded packets remain readable and do not delay completion. Return promptly without throwing.
   std::function<void(CodecResult<void>)> cleanup_completed;
+  /// Codec for the output access units. Defaults to AAC-LC. FLAC and MP3 require their optional encoder backends.
+  CodecId codec = CodecId::Aac;
 };
 
-/// @brief Stream description preceding the first raw AAC packet, including after Reset().
+/// @brief Stream description preceding the first encoded audio packet, including after Reset().
 ///
 /// The configuration remains fixed for one stream. Supply initialization_data to AudioDecoderConfig when decoding
-/// the emitted packets. Container framing such as ADTS or MP4 is supplied by the application, not the encoder.
+/// the emitted packets. Use MediaMuxer to add file headers, tags, and seek information.
 /// @see AudioEncodeOutput, AudioEncoderConfig, AudioDecoderConfig
 struct AudioEncodeFormat {
   /// Encoded sample rate, equal to the configured PCM rate.
   std::uint32_t sample_rate = 0;
   /// Encoded speaker layout, equal to the configured PCM layout.
   AudioChannelLayout channel_layout = AudioChannelLayout::Stereo;
-  /// Two-byte MPEG-4 AudioSpecificConfig for AAC-LC with 1024 samples per access unit.
+  /// Two-byte AudioSpecificConfig for AAC-LC, the 34-byte STREAMINFO payload for FLAC, or empty for MP3.
   Bytes initialization_data;
+  /// Codec of the initialization data and following packets.
+  CodecId codec = CodecId::Aac;
 
-  /// @brief Compares the sample rate, channel layout, and initialization bytes.
-  /// @return True if all three fields are equal, otherwise false.
+  /// @brief Compares the codec, sample rate, channel layout, and initialization bytes.
+  /// @return True if all fields are equal.
   bool operator==(const AudioEncodeFormat&) const = default;
 };
 
@@ -774,9 +781,9 @@ private:
   friend struct detail::VideoDecoderAccess;
 };
 
-/// @brief Move-only AAC-LC encoder with bounded queues and independently retained compressed output.
+/// @brief Move-only audio encoder with bounded queues and independently retained compressed output.
 ///
-/// Submit contiguous interleaved S16 PCM and drain raw access units through TryRead(). The returned handle owns
+/// Submit contiguous interleaved PCM and drain encoded packets through TryRead(). The returned handle owns
 /// the session. No Runtime, window, capture source, or playback device is required.
 ///
 /// On desktop and mobile platforms, queue and control calls may run concurrently on a live handle. On Web, use the JavaScript
@@ -832,7 +839,7 @@ public:
   /// @param frame Valid AudioFrame with the configured format and a positive sample count. Keep the used plane
   /// bytes unchanged until return. PTS is rounded to the configured sample grid, using MediaTimestamp::Rescale();
   /// every frame after the first must begin immediately after the preceding accepted frame on that grid.
-  /// Frames may contain any positive sample count that fits the input byte limit; they need not align to AAC units.
+  /// Frames may contain any positive sample count that fits the input byte limit.
   /// @return Accepted after copying the used PCM bytes. WouldBlock leaves the frame and timeline unconsumed while
   /// startup or reset is pending or copied-input capacity is exhausted. Failure reports invalid input, copy resource
   /// exhaustion, InvalidState while draining or ended, Closed after retirement or on a moved-from handle, or the
@@ -845,7 +852,8 @@ public:
   ///
   /// Format precedes its dependent packets. Packet PTS uses the configured sample grid on the accepted input
   /// timeline, including any platform preroll before input_start. DTS remains absent when the platform encoder does not
-  /// report it. Each packet has a 1024-sample duration and is key-marked.
+  /// report it. AAC-LC packets carry 1024 samples. FLAC packets carry up to 1024, including an unpadded final
+  /// block. MP3 packets carry 1152 samples and key_frame marks an independent bit-reservoir restart point.
   ///
   /// Returned packet bytes are immutable and remain readable across Reset(), Close(), and cleanup completion.
   /// Copies and arbitrary slices retain the entire originating packet reservation until the last reference is
@@ -859,8 +867,8 @@ public:
 
   /// @brief Seals input and starts an asynchronous drain of accepted PCM.
   ///
-  /// A partial final AAC input block is padded with silence. The sample summary excludes that fill from
-  /// input_samples and includes it in any known padding_samples. Read remaining packets, then one summary and one
+  /// A partial final AAC input block is padded with silence. MP3 reports the backend's delay and tail padding.
+  /// The sample summary counts accepted PCM separately from coded samples. Read remaining packets, then one summary and one
   /// EndOfStream. Held output can delay the drain until capacity is released. Further submissions return
   /// InvalidState while draining or ended. The session remains open for Reset().
   /// @return Success when the drain is requested, already pending, or complete. InvalidState during startup or

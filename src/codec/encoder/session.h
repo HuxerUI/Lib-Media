@@ -67,10 +67,13 @@ private:
   std::deque<Input> input_;
   std::deque<AudioEncodeOutput> output_;
   std::deque<std::shared_ptr<Credit>> reservations_;
-  std::array<std::byte, 4096> assembly_{};
+  const unsigned block_samples_;
+  const std::size_t sample_stride_;
+  Bytes assembly_;
   std::uint32_t assembly_samples_ = 0;
   std::uint64_t input_samples_ = 0, submitted_samples_ = 0, encoded_samples_ = 0;
-  std::optional<MediaTimestamp> input_start_, last_packet_pts_;
+  std::optional<MediaTimestamp> input_start_;
+  std::optional<std::int64_t> next_packet_pts_;
   std::optional<AudioEncodeFormat> format_;
 };
 class VideoEncoderState : public std::enable_shared_from_this<VideoEncoderState> {

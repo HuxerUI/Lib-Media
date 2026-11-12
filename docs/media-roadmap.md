@@ -21,6 +21,7 @@ selection and publication. See the [capability table](../README.md#capabilities)
 | MPEG-TS, Annex B, and AVI | Import single-program AVC/HEVC and ADTS AAC, untimed AVC/HEVC, and classic AVI with supported video and PCM. Compare packets on remux and exercise timed seek. |
 | SubRip and WebVTT | Round-trip text and timed cues through Matroska. Verify cue metadata, chapters, tags, and attachments in their respective mappings. |
 | Multichannel Opus and Vorbis | Verify mapped headers, original packets, speaker order, and valid PCM samples through Ogg and Matroska. |
+| FLAC and MP3 encoding | Encode PCM with the optional software backends. Compare FLAC samples and speaker order after readback and verify MP3 delay, padding, and audible sample counts. |
 
 The Frames example opens, previews, seeks, copies, and saves supported files. The integration tests exercise
 reordered encoding, GPU crop and scale, encoded MP4 readback, and WAV export.

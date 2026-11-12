@@ -568,7 +568,8 @@ public:
   /// Supply that track's next packet or end the track, then retry. A write failure can leave partial output.
   ContainerResult<std::optional<std::uint32_t>> TryWrite(const ContainerPacket& packet);
 
-  /// @brief Ends a track so remaining tracks can continue through interleaving.
+  /// @brief Ends a track and finalizes its trim, allowing remaining tracks to continue through interleaving.
+  /// For MP3 with trim supplied here, omit packet PTS and DTS so the writer can derive its coded timeline.
   /// @param track_id Output track ID.
   /// @param priming_samples Known leading audio trim, or absent to keep the existing value.
   /// @param padding_samples Known trailing audio trim, or absent to keep the existing value.

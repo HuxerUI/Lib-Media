@@ -265,7 +265,7 @@ if (EMSCRIPTEN)
     target_link_libraries(media_audio_encoder_web_native PRIVATE huxerui_media ${MEDIA_TEST_FRAMEWORK})
     target_compile_features(media_audio_encoder_web_native PRIVATE cxx_std_20)
     target_compile_options(media_audio_encoder_web_native PRIVATE "-O1")
-    target_link_options(media_audio_encoder_web_native PRIVATE "-O1" "-sASYNCIFY=1" "-sASYNCIFY_IGNORE_INDIRECT=1" "-sALLOW_MEMORY_GROWTH=1"
+    target_link_options(media_audio_encoder_web_native PRIVATE "-O1" "-sASYNCIFY=1" "-sASYNCIFY_STACK_SIZE=16384" "-sALLOW_MEMORY_GROWTH=1"
             "-sEXPORTED_FUNCTIONS=['_main']")
     set_target_properties(media_audio_encoder_web_native PROPERTIES SUFFIX ".js")
     configure_file(audio_encoder_wasm.html "${CMAKE_CURRENT_BINARY_DIR}/audio_encoder_wasm.html" COPYONLY)
@@ -352,6 +352,9 @@ if (NOT EMSCRIPTEN)
     target_link_libraries(media_audio_encoder_contract_tests PRIVATE huxerui_media ${MEDIA_TEST_FRAMEWORK})
     target_compile_features(media_audio_encoder_contract_tests PRIVATE cxx_std_20)
     target_include_directories(media_audio_encoder_contract_tests PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_compile_definitions(media_audio_encoder_contract_tests PRIVATE
+            $<$<BOOL:${HUXERUI_MEDIA_ENABLE_FLAC_ENCODER}>:MEDIA_HAS_FLAC_ENCODER=1>
+            $<$<BOOL:${HUXERUI_MEDIA_ENABLE_MP3_ENCODER}>:MEDIA_HAS_MP3_ENCODER=1>)
     add_test(NAME media_audio_encoder_contract COMMAND media_audio_encoder_contract_tests)
     set_tests_properties(media_audio_encoder_contract PROPERTIES TIMEOUT 35)
 
