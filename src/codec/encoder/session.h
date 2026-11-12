@@ -133,7 +133,7 @@ private:
   Phase phase_ = Phase::Starting;
   std::uint64_t generation_ = 0, backend_generation_ = 0;
   bool wake_pending_ = false, cleaned_ = false, waiting_credit_ = false, finish_sent_ = false;
-  bool eos_queued_ = false, key_requested_ = false, needs_idr_ = true;
+  bool eos_queued_ = false, key_requested_ = false, needs_key_frame_ = true;
   std::uint32_t b_run_ = 0;
   std::optional<CodecError> failure_, cleanup_failure_;
   std::deque<VideoFrame> input_;

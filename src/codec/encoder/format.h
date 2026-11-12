@@ -16,9 +16,9 @@ CodecResult<void> ValidateAudioEncodeFormat(const AudioEncodeFormat& format, con
 
 // Returns the tightly packed input byte count after checking fixed video controls and queue bounds.
 CodecResult<std::size_t> ValidateVideoEncoderConfig(const VideoEncoderConfig& config);
-// Copies active samples into tightly packed I420, NV12, or P010 storage without changing color values.
+// Copies active samples into tightly packed I420, NV12, P010, or P210 storage without changing color values.
 void CopyVideoEncoderPixels(const VideoFrame& frame, VideoPixelFormat layout, std::span<std::byte> target);
-// Reads a configuration record or Annex B parameter sets and returns geometry and a four-byte-length record.
+// Reads a configuration record or Annex B parameter sets for AVC/HEVC. ProRes takes an empty description.
 // An encoder that preserves the input YUV values can supply absent AVC color signaling from its configuration.
 CodecResult<VideoEncodeFormat> ReadVideoEncodeFormat(std::span<const std::byte> description, const VideoEncoderConfig& config,
     bool complete_avc_color = false);

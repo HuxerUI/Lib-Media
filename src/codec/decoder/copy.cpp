@@ -80,17 +80,20 @@ CodecResult<VideoFrame> CopyVideo(VideoFormat format, MediaTimestamp pts,
     std::optional<MediaTimestamp> duration, std::vector<VideoPlane> planes, VideoPixelFormat requested) {
   VideoFrame source{format, pts, duration, std::move(planes)};
   if (!source.Validate()) return CodecResult<VideoFrame>::Failure(Error(CodecErrorCode::InvalidData, "Invalid platform video planes"));
-  if ((format.pixel_format == VideoPixelFormat::P010) != (requested == VideoPixelFormat::P010))
-    return CodecResult<VideoFrame>::Failure(Error(CodecErrorCode::Unsupported, "Video bit-depth conversion is unavailable"));
+  const auto component_bytes = VideoComponentBytes(requested);
+  if (VideoComponentBytes(format.pixel_format) != component_bytes ||
+      (format.pixel_format == VideoPixelFormat::P210) != (requested == VideoPixelFormat::P210))
+    return CodecResult<VideoFrame>::Failure(Error(CodecErrorCode::Unsupported, "Video bit-depth or chroma subsampling conversion is unavailable"));
   format.pixel_format = requested;
   const auto aspect_divisor = std::gcd(format.aspect_width, format.aspect_height);
   format.aspect_width /= aspect_divisor;
   format.aspect_height /= aspect_divisor;
   VideoFrame output{format, pts, duration, {}};
-  const auto cw = (std::size_t(format.width) + 1) / 2, ch = (std::size_t(format.height) + 1) / 2;
-  const std::size_t component_bytes = requested == VideoPixelFormat::P010 ? 2 : 1;
+  const auto cw = (std::size_t(format.width) + 1) / 2;
+  const auto ch = VideoChromaHeight(format.height, requested);
   for (unsigned p = 0; p < (requested == VideoPixelFormat::I420 ? 3u : 2u); ++p) {
-    const auto width = p ? cw : format.width, height = p ? ch : format.height;
+    const auto width = p ? cw : format.width;
+    const auto height = p ? ch : format.height;
     const std::size_t components = p && requested != VideoPixelFormat::I420 ? 2 : 1;
     const auto pixel_bytes = components * component_bytes;
     Bytes bytes(width * height * pixel_bytes);

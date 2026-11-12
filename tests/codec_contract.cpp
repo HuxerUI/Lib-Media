@@ -421,6 +421,11 @@ void Values() {
   Check(frame.Validate(), "Odd-sized NV12 rejected");
   frame.planes[1].row_stride = std::numeric_limits<std::size_t>::max();
   Check(!frame.Validate(), "Plane address overflow accepted");
+  format.pixel_format = VideoPixelFormat::P210;
+  VideoFrame p210{format, {}, {}, {{Own(Bytes(18)), 6, 2}, {Own(Bytes(24)), 8, 4}}};
+  Check(p210.Validate(), "Odd-sized P210 with full-height chroma rejected");
+  p210.planes[1].data = p210.planes[1].data.Slice(0, 16);
+  Check(!p210.Validate(), "P210 accepted a half-height chroma plane");
   AudioFrame audio{Config().output, {}, 1024, {Own(Bytes(8191))}};
   Check(!audio.Validate(), "Truncated PCM accepted");
   auto malformed = ParseAvc(Bytes{std::byte{1}});

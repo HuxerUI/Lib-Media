@@ -1,5 +1,9 @@
 #include "decoded_preview.h"
+#include "platform_video_storage.h"
 #include "video_frame_transformer.h"
+#ifdef MEDIA_PREVIEW_TEST_EXPORTS
+#include "packed_pcm.h"
+#endif
 
 #include <fixture_resources.h>
 #include <huxerui/media_codec.h>
@@ -234,14 +238,22 @@ struct PacketFeed {
   }
 };
 
-VideoDecoderConfig VideoConfig(const MediaSampleDescription& description, VideoStorage storage) {
+VideoDecoderConfig VideoConfig(const MediaSampleDescription& description, VideoStorage storage,
+    VideoPixelFormat prores_output = VideoPixelFormat::P010) {
   if (!description.coded_width || !description.coded_height)
     throw std::runtime_error("Decoded preview requires known video dimensions");
   if (description.codec == CodecId::Hevc && (description.framing != PacketFraming::LengthPrefixedNals ||
       (!description.sample_entry.empty() && description.sample_entry != "hvc1")))
     throw std::runtime_error("The HEVC preview requires length-prefixed packets with a separate configuration");
-  if (description.codec == CodecId::ProRes && description.sample_entry != "apcn")
-    throw std::runtime_error("The ProRes preview requires a ProRes 422 sample entry");
+  if (description.codec == CodecId::ProRes) {
+    constexpr std::string_view entries[] = {"apcn",
+#if defined(__APPLE__) && TARGET_OS_OSX
+        "apco", "apcs", "apch",
+#endif
+    };
+    if (std::ranges::find(entries, description.sample_entry) == std::end(entries))
+      throw std::runtime_error("The ProRes preview requires a ProRes 422 sample entry");
+  }
   if (HasHdrMetadata(description))
     throw std::runtime_error("HDR display needs an HDR surface. Use Copy Movie to retain the source metadata.");
   VideoDecoderConfig video_config;
@@ -259,18 +271,15 @@ VideoDecoderConfig VideoConfig(const MediaSampleDescription& description, VideoS
         (std::to_integer<unsigned>(video_config.initialization_data[17]) & 7) == 2)
       video_config.output = VideoPixelFormat::P010;
   } else if (description.codec == CodecId::ProRes) {
-    video_config.output = VideoPixelFormat::P010;
+    video_config.output = prores_output;
   }
   if (video_config.width > 8192 || video_config.height > 8192)
     throw std::runtime_error("The preview supports coded dimensions up to 8192 pixels");
-  const auto luma = std::size_t(video_config.width) * video_config.height;
-  const auto chroma = std::size_t((video_config.width + 1) / 2) * ((video_config.height + 1) / 2);
 #if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
   if (storage == VideoStorage::Platform && video_config.output != VideoPixelFormat::P010)
     video_config.output = VideoPixelFormat::Opaque;
 #endif
-  const auto frame_bytes = video_config.output == VideoPixelFormat::Opaque ? luma * 4 :
-      (luma + 2 * chroma) * (video_config.output == VideoPixelFormat::P010 ? 2 : 1);
+  const auto frame_bytes = media::detail::VideoImageBytes(video_config.width, video_config.height, video_config.output);
   video_config.limits.output_bytes = std::max(video_config.limits.output_bytes, 34 * frame_bytes);
   return video_config;
 }
@@ -750,16 +759,18 @@ struct MovieCopy {
 #ifdef MEDIA_PREVIEW_TEST_EXPORTS
 VideoFrame EncoderInput(VideoFrame frame) {
   const auto visible = frame.format.visible;
-  if ((visible.x | visible.y | visible.width | visible.height) & 1u)
-    throw std::runtime_error("Video encoding requires an even 4:2:0 crop");
+  const bool full_chroma_height = frame.format.pixel_format == VideoPixelFormat::P210;
+  if ((visible.x | visible.width | visible.height | (full_chroma_height ? 0 : visible.y)) & 1u)
+    throw std::runtime_error("Video encoding requires a chroma-aligned crop and even dimensions");
 #ifdef __EMSCRIPTEN__
   const auto texture = frame.Storage() == VideoStorage::Platform &&
       visible != VideoRectangle{0, 0, frame.format.width, frame.format.height} ? Require(MakeExternalTexture(frame)) : nullptr;
 #endif
   for (std::size_t i = 0; i < frame.planes.size(); ++i) {
     auto& plane = frame.planes[i];
-    const auto scale = i ? 2u : 1u;
-    const auto offset = visible.y / scale * plane.row_stride + visible.x / scale * plane.pixel_stride;
+    const auto x = i ? visible.x / 2 : visible.x;
+    const auto y = i && !full_chroma_height ? visible.y / 2 : visible.y;
+    const auto offset = y * plane.row_stride + x * plane.pixel_stride;
     plane.data = plane.data.Slice(offset, plane.data.AsBytes().size() - offset);
   }
   frame.format.width = visible.width;
@@ -844,11 +855,13 @@ struct ExportTrack {
             }
           } else {
             const auto& format = std::get<VideoEncodeFormat>(*output);
+            const bool prores = format.codec == CodecId::ProRes;
             queue.track = MediaTrack{.id = source->track.id, .kind = TrackKind::Video,
                 .timescale = decode_order ? std::optional{decode_order->scale} : source->track.timescale,
-                .descriptions = {{.codec = format.codec, .framing = PacketFraming::LengthPrefixedNals,
+                .descriptions = {{.codec = format.codec,
+                    .framing = prores ? PacketFraming::CodecPacket : PacketFraming::LengthPrefixedNals,
                     .initialization_data = format.initialization_data, .coded_width = format.width, .coded_height = format.height,
-                    .visible = format.visible, .pixel_aspect_ratio = pixel_aspect_ratio}},
+                    .visible = format.visible, .sample_entry = prores ? "apcn" : "", .pixel_aspect_ratio = pixel_aspect_ratio}},
                 .rotation = source->track.rotation, .edits = source->track.edits};
 
           }
@@ -964,15 +977,17 @@ Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, F
     throw std::runtime_error("Use Copy Movie to retain configuration changes and multi-segment edits");
   if (const auto range = clip.video->PresentationRange(); range && range->start == range->end)
     throw std::runtime_error("The video edit contains no pictures to export");
+  const bool prores = clip.video->InitialDescription().codec == CodecId::ProRes;
+  const auto container = prores ? ContainerFormat::Mov : ContainerFormat::Mp4;
   ExportTrack<VideoDecoder, VideoEncoder, VideoFrame> video(
-      clip.video, Require(VideoDecoder::Create(VideoConfig(clip.video->InitialDescription(), storage))));
+      clip.video, Require(VideoDecoder::Create(VideoConfig(clip.video->InitialDescription(), storage, VideoPixelFormat::P210))));
   bool ordered_pts = false;
 #if defined(__EMSCRIPTEN__)
   ordered_pts = clip.video->InitialDescription().codec == CodecId::Hevc;
 #elif defined(__APPLE__) && TARGET_OS_IOS && TARGET_OS_SIMULATOR
   if (clip.video->InitialDescription().codec == CodecId::Hevc) reorder = true;
 #endif
-  if (ordered_pts || reorder) {
+  if (!prores && (ordered_pts || reorder)) {
     const auto fallback_scale = ordered_pts ? 90000u : 9000000u;
     const auto scale = clip.video->track.timescale.value_or(fallback_scale);
     video.decode_order.emplace(DecodeOrder{.scale = scale, .ordered_pts = ordered_pts});
@@ -982,12 +997,19 @@ Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, F
   if (clip.audio) {
 #if defined(__EMSCRIPTEN__) || defined(__ANDROID__) || defined(_WIN32) || defined(__linux__)
     // Preserve source trim on backends that can omit AAC encoder delay and padding.
-    audio_copy.track = clip.audio->track;
+    const bool copy_audio = true;
 #else
-    audio.emplace(clip.audio, AudioDecode(clip.audio));
+    const bool copy_audio = prores;
 #endif
+    if (copy_audio) {
+      if (prores && !media::detail::DescribePackedPcm(clip.audio->track.descriptions.front().codec).bits)
+        throw std::runtime_error("ProRes MOV export requires packed LPCM audio");
+      audio_copy.track = clip.audio->track;
+    } else {
+      audio.emplace(clip.audio, AudioDecode(clip.audio));
+    }
   }
-  auto output = co_await OnFileThread([temporary] { return TemporaryFile(temporary, ".mp4"); });
+  auto output = co_await OnFileThread([temporary, prores] { return TemporaryFile(temporary, prores ? ".mov" : ".mp4"); });
   std::shared_ptr<MediaMuxer> mux;
   std::optional<std::uint32_t> requested;
   auto deadline = std::chrono::steady_clock::now() + 15s;
@@ -1009,8 +1031,8 @@ Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, F
     if (!mux && video.queue.track && (!soundtrack || soundtrack->track)) {
       std::vector tracks{*video.queue.track};
       if (soundtrack) tracks.push_back(*soundtrack->track);
-      mux = co_await OnFileThread([output, tracks = std::move(tracks)] {
-        return std::make_shared<MediaMuxer>(OpenMovieOutput(*output, ContainerFormat::Mp4, tracks));
+      mux = co_await OnFileThread([output, container, tracks = std::move(tracks)] {
+        return std::make_shared<MediaMuxer>(OpenMovieOutput(*output, container, tracks));
       });
     }
     if (mux) {
@@ -1038,7 +1060,7 @@ Task<std::shared_ptr<const File>> ExportClip(std::shared_ptr<const File> file, F
     }
     const auto now = std::chrono::steady_clock::now();
     if (advanced) deadline = now + 15s;
-    else if (now >= deadline) throw std::runtime_error("Timed out waiting for MP4 export");
+    else if (now >= deadline) throw std::runtime_error("Timed out waiting for movie export");
     co_await Delay(advanced ? 0ms : 2ms);
   }
   co_await OnFileThread([mux, output] {

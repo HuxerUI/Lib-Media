@@ -341,18 +341,8 @@ CodecResult<bool> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
   }
   if (const auto* video = std::get_if<VideoDecoderConfig>(&config)) {
     if (video->codec == CodecId::ProRes) {
-      const auto bytes = packet.data.AsBytes();
-      if (bytes.size() < 36 || Number<std::uint32_t>(bytes) != bytes.size() || Number<std::uint32_t>(bytes, 4) != Tag("icpf"))
-        return invalid("Invalid ProRes frame size or identifier");
-      const auto header = Number<std::uint16_t>(bytes, 8);
-      if (header < 20 || header > bytes.size() - 16 || Number<std::uint16_t>(bytes, 16) != video->width ||
-          Number<std::uint16_t>(bytes, 18) != video->height)
-        return invalid("Invalid ProRes frame header or dimensions");
-      const auto flags = Number<std::uint8_t>(bytes, 20);
-      if (Number<std::uint8_t>(bytes, 11) > 1)
-        return R::Failure(Error(CodecErrorCode::Unsupported, "Unsupported ProRes bitstream version"));
-      if (flags >> 6 != 2 || (flags & 0x0c) || (Number<std::uint8_t>(bytes, 25) & 0x0f))
-        return R::Failure(Error(CodecErrorCode::Unsupported, "ProRes requires a progressive 4:2:2 frame without alpha"));
+      const auto header = ValidateProResFrame(packet.data.AsBytes(), video->width, video->height);
+      if (!header.Succeeded()) return R::Failure(header.Error());
       if (needs_key && !packet.key_frame) return invalid("ProRes requires a marked frame after creation/reset");
       return R::Success(true);
     }
@@ -469,8 +459,9 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
 #if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
       if (!video.initialization_data.empty())
         return R::Failure(Error(CodecErrorCode::InvalidArgument, "ProRes does not use initialization data"));
-      if (platform_storage || (!eight_bit && video.output != VideoPixelFormat::P010))
-        return R::Failure(Error(CodecErrorCode::Unsupported, "ProRes requires CPU NV12, I420, or P010 output"));
+      const bool p210 = TARGET_OS_OSX && video.output == VideoPixelFormat::P210;
+      if (platform_storage || (!eight_bit && video.output != VideoPixelFormat::P010 && !p210))
+        return R::Failure(Error(CodecErrorCode::Unsupported, "Unsupported ProRes CPU output layout"));
 #else
       return R::Failure(Error(CodecErrorCode::Unsupported, "ProRes decoding is unavailable on this platform"));
 #endif

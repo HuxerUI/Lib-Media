@@ -166,9 +166,9 @@ struct EncodedPacket {
   std::optional<MediaTimestamp> dts;
   /// Optional nonnegative duration with a positive timescale. An absent duration and a zero duration are distinct.
   std::optional<MediaTimestamp> duration;
-  /// Marks a random-access unit. The first video packet after Create() or Reset() must carry an IDR or
-  /// VP8, VP9, or AV1 key frame and set this flag.
-  /// AudioEncoder output always sets this flag; VideoEncoder derives it from actual IDR syntax.
+  /// Marks a random-access unit. Set it on the first video packet after Create() or Reset() and supply an
+  /// IDR, VP8/VP9/AV1 key frame, or an independently decodable ProRes frame.
+  /// AudioEncoder and ProRes output always set this flag. H.264 and HEVC output set it on IDR pictures.
   bool key_frame = false;
 };
 
@@ -209,7 +209,8 @@ struct AudioFrame {
 
 /// @brief Pixel layout of a video frame.
 ///
-/// Luma uses the coded width and height. Chroma uses half each coded dimension, rounded up.
+/// Luma uses the coded width and height. Chroma uses half the coded width, rounded up. Its height is
+/// half the coded height, rounded up, for 4:2:0, and the full coded height for P210.
 enum class VideoPixelFormat {
   /// Three planes in Y, U, V order, with one byte per sample in each plane.
   I420,
@@ -219,7 +220,9 @@ enum class VideoPixelFormat {
   /// with its ten-bit value in the most significant bits.
   P010,
   /// A platform image whose pixel layout is opaque to the caller.
-  Opaque
+  Opaque,
+  /// Two planes in the same word layout as P010, with one U, V pair per two luma samples on every row.
+  P210
 };
 
 /// @brief Selects the storage used to exchange uncompressed video with a codec.
@@ -394,7 +397,7 @@ struct VideoFrame {
   /// precedence over platform duration. An empty value means duration is unknown. VideoEncoder requires a positive
   /// duration when supplied and restores it on the corresponding encoded packet.
   std::optional<MediaTimestamp> duration;
-  /// Y, U, V planes for I420. For NV12, a Y plane followed by one interleaved U/V plane.
+  /// Y, U, V planes for I420. NV12, P010, and P210 have a Y plane followed by one interleaved U/V plane.
   /// Plane extents are based on the coded image. Empty for platform images.
   std::vector<VideoPlane> planes;
 
@@ -403,7 +406,7 @@ struct VideoFrame {
 
   /// @brief Checks metadata, timing, and storage coverage for the full coded image.
   ///
-  /// The luma plane covers the coded dimensions. Each chroma dimension is half its coded dimension rounded up.
+  /// The luma plane covers the coded dimensions. Chroma follows the dimensions in VideoPixelFormat.
   /// Each row must fit its samples and each range must cover the last sample without size or offset overflow.
   /// @return True if format and timing are valid and the CPU planes or platform image fit the coded layout.
   [[nodiscard]] bool Validate() const noexcept;

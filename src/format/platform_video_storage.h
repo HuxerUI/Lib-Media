@@ -54,12 +54,20 @@ inline constexpr bool PlatformVideoSupported = true;
 inline constexpr bool PlatformVideoSupported = false;
 #endif
 
+inline constexpr unsigned VideoComponentBytes(VideoPixelFormat layout) noexcept {
+  return layout == VideoPixelFormat::P010 || layout == VideoPixelFormat::P210 ? 2 : 1;
+}
+
+inline constexpr std::uint32_t VideoChromaHeight(std::uint32_t height, VideoPixelFormat layout) noexcept {
+  return layout == VideoPixelFormat::P210 ? height : height / 2 + height % 2;
+}
+
 // Call with coded dimensions already bounded by the codec configuration.
 inline std::size_t VideoImageBytes(std::uint32_t width, std::uint32_t height, VideoPixelFormat layout) {
   const auto pixels = std::size_t(width) * height;
   if (layout == VideoPixelFormat::Opaque) return pixels * 4;
-  const auto bytes = pixels + 2 * ((std::size_t(width) + 1) / 2) * ((std::size_t(height) + 1) / 2);
-  return layout == VideoPixelFormat::P010 ? bytes * 2 : bytes;
+  const auto samples = pixels + 2 * ((std::size_t(width) + 1) / 2) * VideoChromaHeight(height, layout);
+  return samples * VideoComponentBytes(layout);
 }
 
 } // namespace huxerui::media::detail

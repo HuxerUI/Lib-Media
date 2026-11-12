@@ -101,8 +101,15 @@ The writer emits packed interleaved LPCM in a version-two sound description. MOV
 payload, timed samples, and supported `tmcd` and `cdsc` track references. Include the associated tracks when copying
 to MOV. `ValidateOutput()` rejects these mappings for MP4. [QuickTime timecode](https://developer.apple.com/documentation/quicktime-file-format/timecode_sample_description)
 
-On macOS and supported iOS devices, the CPU preview decodes progressive SDR ProRes 422 (`apcn`) pictures and plays
-mono or stereo LPCM using the MOV sample clock. [ProRes decoding](media-codec.md#prores-422-and-alac)
+On macOS the CPU preview decodes progressive SDR Proxy, LT, 422, and HQ pictures and plays mono or stereo LPCM on
+the MOV sample clock. Compatible iOS devices preview standard 422 (`apcn`). [ProRes decoding](media-codec.md#prores-422-and-alac)
+
+To write macOS ProRes 422 encoder output, use `ContainerFormat::Mov`. Set the video description to
+`CodecId::ProRes`, `PacketFraming::CodecPacket`, sample entry `apcn`, and the geometry from `VideoEncodeFormat`.
+Keep `initialization_data` empty. Write one complete frame per sample with its PTS, matching DTS, duration, and sync
+flag. An existing packed LPCM track can be written alongside it using the source PCM bytes and exact sample clock.
+The macOS integration test opens the encoded MOV with AVFoundation and verifies picture timing, 4:2:2 chroma, and
+unchanged LPCM bytes. [ProRes encoding](media-codec.md#prores-422-and-alac)
 
 For WAVE, an extensible track carries the 22-byte format suffix in `initialization_data`. It preserves
 the subtype, valid bits, and speaker mask when passed to a WAVE or RF64 writer. WAVE packets are

@@ -76,7 +76,8 @@ template<class T> using CodecResult = Result<T, CodecError>;
 /// Decoders require at least two input slots and a positive input byte limit. Audio decoding requires four output
 /// slots sized for the largest access unit of the configured codec. Video requires 34 output slots sized for the coded bounds.
 /// Charge each video slot by its coded layout. I420 and NV12 use one byte per luma sample and two bytes per
-/// chroma position, P010 uses twice that, and Opaque reserves four bytes per coded pixel.
+/// chroma position. P010 and P210 double the component width, and P210 has a chroma row for every luma row.
+/// Opaque reserves four bytes per coded pixel.
 /// Both output limits must accommodate the required slots. Platform codec and adapter scratch allocations are separate.
 /// AudioEncoderConfig and VideoEncoderConfig specify their respective input and compressed output minimums.
 /// @see AudioDecoderConfig::limits, VideoDecoderConfig::limits, AudioEncoderConfig::limits, VideoEncoderConfig::limits
@@ -131,8 +132,9 @@ struct AudioDecoderConfig {
 ///
 /// AVC supports Baseline, Main, and High profiles with at most 16 reference pictures and continuous frame
 /// numbering. HEVC supports single-layer Main and Main10 4:2:0. VP8 and VP9 profile 0 produce eight-bit 4:2:0.
-/// AV1 supports single-spatial-layer Main, eight-bit SDR 4:2:0, with CPU output. Progressive ProRes 422 decodes to
-/// CPU 4:2:0 on macOS and on iOS devices with a compatible decoder. P010 preserves ten-bit precision.
+/// AV1 supports single-spatial-layer Main, eight-bit SDR 4:2:0, with CPU output. On macOS, progressive ProRes 422
+/// Proxy, LT, 422, and HQ decode to CPU 4:2:0 or to P210 for ten-bit 4:2:2. On iOS, supported ProRes 422
+/// configurations decode to CPU 4:2:0.
 /// Probe the concrete configuration for platform support, storage, and pixel layout. A fresh or reset session
 /// requires a marked random-access packet, such as an AVC/HEVC IDR or an independently decodable ProRes frame.
 /// @see VideoDecoder::Create(), VideoDecoder::Probe()
@@ -149,7 +151,8 @@ struct VideoDecoderConfig {
   std::uint32_t width = 0;
   /// Maximum coded luma height in pixels, in [1, 8192], subject to the platform limit described for width.
   std::uint32_t height = 0;
-  /// Requested pixel layout. Use I420 or NV12 for eight-bit CPU output and P010 for ten-bit CPU output.
+  /// Requested pixel layout. Use I420 or NV12 for eight-bit CPU output and P010 for ten-bit 4:2:0 CPU output.
+  /// macOS ProRes supports P210 for ten-bit 4:2:2 CPU output.
   /// SDR output with platform storage uses NV12 on macOS, iOS, and Windows, and Opaque on Android and Web.
   VideoPixelFormat output = VideoPixelFormat::NV12;
   /// Retained input and output bounds. See QueueLimits for the video minimum and byte accounting.
@@ -357,11 +360,11 @@ struct VideoEncoderCapabilities {
   CodecVideoLimits platform_limits;
 };
 
-/// @brief Fixed configuration for encoding video frames to H.264 or HEVC access units.
+/// @brief Fixed configuration for encoding video frames to H.264, HEVC, or ProRes 422.
 ///
 /// Supply even dimensions in [2, 8192], a full visible rectangle, square pixels, no rotation, and SDR color facts.
 /// Every submitted frame must match input. CPU plane strides may differ. CPU H.264 and HEVC Main take I420 or NV12.
-/// CPU HEVC Main10 takes P010.
+/// CPU HEVC Main10 takes P010. On macOS, ProRes 422 takes CPU P210 in video range.
 /// Probe the concrete codec, storage, layout, dimensions, rate, and B-picture policy.
 /// @see VideoEncoder::Create(), VideoEncoder::Probe(), VideoEncodeFormat
 struct VideoEncoderConfig {
@@ -371,18 +374,18 @@ struct VideoEncoderConfig {
   std::uint32_t frame_rate_numerator = 30;
   /// Positive denominator; 30000/1001 represents approximately 29.97 frames/second. The ratio cannot exceed 240 fps.
   std::uint32_t frame_rate_denominator = 1;
-  /// Target average bitrate in bits per second, in [1, INT32_MAX]. The encoder may adjust the target.
+  /// Target average bitrate for H.264 and HEVC, in bits per second in [1, INT32_MAX]. The encoder may adjust the target.
   std::uint32_t bitrate = 4'000'000;
-  /// Requested H.264 profile. HEVC derives its profile from input.pixel_format.
+  /// Requested H.264 profile. HEVC derives its profile from input.pixel_format. ProRes uses standard 422.
   H264Profile profile = H264Profile::High;
-  /// Target distance in input pictures between random-access pictures, in [1, INT32_MAX]. Platforms may insert them earlier.
+  /// H.264/HEVC target distance between random-access pictures, in [1, INT32_MAX]. Platforms may insert them earlier.
   /// This is a rate-control request, not an exact frame boundary guarantee.
   std::uint32_t key_frame_interval = 60;
   /// Zero forbids B pictures; a positive value up to 16 bounds consecutive B pictures without requiring their use.
   /// An empty value permits platform selection within the bounded processing window. Baseline rejects positive values.
-  /// Platforms that cannot enforce a requested numeric bound return Unsupported.
+  /// Platforms that cannot enforce a requested numeric bound return Unsupported. For ProRes use zero or an empty value.
   std::optional<std::uint32_t> max_b_frames = 0;
-  /// Hard bound in [1, INT32_MAX] on one access unit after normalization to four-byte NAL lengths. Defaults to 4 MiB.
+  /// Hard bound in [1, INT32_MAX] on one output packet, after NAL normalization for H.264/HEVC. Defaults to 4 MiB.
   /// Output storage is reserved before submission, then reduced to the actual packet size. Oversize output fails.
   std::size_t max_packet_bytes = 4 * 1024 * 1024;
   /// Maximum copied input and retained output. Input must fit one packed frame. Output needs at least two full
@@ -400,7 +403,7 @@ struct VideoEncoderConfig {
   /// is separate from an encoding failure; unsafe outstanding platform work leaves completion pending.
   /// Return promptly without throwing or waiting. Use owned or weak captures that survive retirement.
   std::function<void(CodecResult<void>)> cleanup_completed;
-  /// CodecId::H264 or CodecId::Hevc. Defaults to H.264.
+  /// CodecId::H264, CodecId::Hevc, or CodecId::ProRes. ProRes selects standard 422 (apcn). Defaults to H.264.
   CodecId codec = CodecId::H264;
   /// Selects submitted frame storage. Platform SDR input takes NV12 on macOS, iOS, and Windows, and Opaque on Android
   /// and Web. Create, use, and release Web platform encoders and their input frames on the browser main thread.
@@ -411,7 +414,7 @@ struct VideoEncoderConfig {
 /// @brief Video configuration emitted before its dependent access units.
 ///
 /// Coded bounds may include padding beyond visible. Use these bounds when configuring VideoDecoder.
-/// The configuration record carries the stream profile, bit depth, and any color signaling.
+/// For H.264 and HEVC the configuration record carries the stream profile, bit depth, and any color signaling.
 /// H.264 encoding validates any explicitly requested color signaling against the emitted configuration.
 /// Initialization data carries the platform-selected level; there is no separate level request in this API.
 /// @see VideoEncodeOutput, VideoDecoderConfig
@@ -423,7 +426,7 @@ struct VideoEncodeFormat {
   /// Visible input picture within the coded bounds.
   VideoRectangle visible;
   /// AVCDecoderConfigurationRecord or HEVCDecoderConfigurationRecord of at most 64 KiB.
-  /// Parameter sets are out of band and access units use four-byte NAL lengths.
+  /// Parameter sets are out of band and access units use four-byte NAL lengths. ProRes emits an empty record.
   Bytes initialization_data;
   /// Codec used by the configuration record and following access units.
   CodecId codec = CodecId::H264;
@@ -877,7 +880,7 @@ private:
   std::shared_ptr<detail::AudioEncoderState> state_;
 };
 
-/// @brief Move-only asynchronous H.264 and HEVC encoder with bounded queues and retained packet bytes.
+/// @brief Move-only asynchronous H.264, HEVC, and ProRes 422 encoder with bounded queues and retained packet bytes.
 ///
 /// Submit pictures matching the configured storage and layout and drain access units through TryRead().
 /// The codec owns its session and any platform input surface, independently of a Runtime or UI window.
@@ -947,9 +950,10 @@ public:
 
   /// @brief Removes the next output event without waiting for platform encoding.
   ///
-  /// Format precedes its dependent packets. Each packet contains one picture with four-byte NAL lengths and is
-  /// emitted in decode order; PTS may move backward with B pictures. The original input PTS and supplied duration
-  /// are restored to the corresponding picture. DTS uses reliable platform timing and remains absent when unavailable.
+  /// Format precedes its dependent packets. H.264 and HEVC packets contain one picture with four-byte NAL lengths
+  /// in decode order. Their PTS may move backward with B pictures and their DTS uses available platform timing.
+  /// ProRes packets contain one complete frame in increasing presentation order, with DTS equal to PTS.
+  /// The original input PTS and supplied duration are restored to the corresponding picture.
   ///
   /// Returned packet bytes are immutable and remain readable across Reset(), Close(), and cleanup completion.
   /// Copies and arbitrary slices retain the entire originating packet reservation until the last reference is
@@ -964,7 +968,7 @@ public:
   /// @brief Requests a new random-access picture as soon as the platform can produce one.
   ///
   /// Repeated pending requests may coalesce. The request does not promise a particular input frame or fixed
-  /// response distance. Observe actual packet key_frame values to identify IDR pictures.
+  /// response distance. Observe packet key_frame values to identify random access. Every ProRes frame is independent.
   /// @return Success when accepted in the running phase. Other phases report InvalidState, the recorded operational
   /// error, or Closed. Platform rejection is subsequently reported through TryRead() and TrySubmit().
   /// @see EncodedPacket::key_frame, VideoEncoderConfig::key_frame_interval
@@ -984,8 +988,8 @@ public:
   ///
   /// Discard takes effect on acceptance, including during a drain. Returned packets retain storage and reservations
   /// in the same output pool. TrySubmit() returns WouldBlock until platform recreation finishes; TryRead() returns
-  /// no stale events. The new stream starts with IDR and can use a different starting PTS. Use Create() to change
-  /// the input format, encoding controls, or queue limits.
+  /// no stale events. The new stream starts with a random-access picture and can use a different starting PTS.
+  /// Use Create() to change the input format, encoding controls, or queue limits.
   /// @return Success when reset is accepted or already pending. InvalidState during startup or after a fatal
   /// error. Closed after retirement or on a moved-from handle.
   /// @see Create(), VideoEncoderConfig

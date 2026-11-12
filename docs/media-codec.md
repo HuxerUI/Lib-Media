@@ -6,7 +6,7 @@ No `Install()`, View, Runtime, window, or application Task is needed. Existing M
 
 This guide covers AAC-LC, Opus, FLAC, and MP3 decoded to CPU PCM, and AVC, HEVC, VP8, VP9, and AV1 decoded to video frames.
 macOS and iOS also support progressive ProRes 422 and mono or stereo ALAC where the platform decoder is available.
-The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264 and HEVC. Codec sessions do not
+The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264, HEVC, and macOS ProRes 422. Codec sessions do not
 demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
 
@@ -160,12 +160,26 @@ container seek and copy checks. Windows and Linux runtime support depends on the
 
 ### ProRes 422 and ALAC
 
-Set `VideoDecoderConfig::codec` to `CodecId::ProRes` for a progressive ProRes 422 (`apcn`) track. Supply its exact
-coded width and height and leave initialization data empty. Submit one complete ProRes frame per packet. Each frame
-is independently decodable. Mark the first packet after creation or reset. The macOS and iOS adapters support CPU NV12 or
-I420 for eight-bit output, or P010 to keep ten-bit precision with 4:2:0 chroma. The Frames preview uses P010 and feeds
-the MOV's packed mono or stereo LPCM through the existing audio sample clock and presentation edits.
+On macOS, set `VideoDecoderConfig::codec` to `CodecId::ProRes` for a progressive 422 Proxy (`apco`), LT (`apcs`),
+422 (`apcn`), or HQ (`apch`) track. On compatible iOS devices, use this configuration for standard 422. Supply the
+exact coded width and height and leave initialization data empty. Submit one complete, independently decodable frame
+per packet and mark the first packet after creation or reset. CPU output supports I420 or NV12 at eight bits and
+P010 at ten bits, all with 4:2:0 chroma. Frames uses P010 for SDR preview and clocks playback against the MOV's
+packed mono or stereo LPCM, applying presentation edits.
 [ProRes bitstream specification](https://pub.smpte.org/pub/rdd36/rdd36-2022.pdf) · [VideoToolbox codec type](https://developer.apple.com/documentation/coremedia/kcmvideocodectype_appleprores422)
+
+For ten-bit 4:2:2 frame transfer on macOS, request `VideoPixelFormat::P210` from the decoder. P210 uses a Y plane and
+interleaved U/V pairs with the ten-bit values in the high bits of little-endian 16-bit words. Both planes have the
+full coded height. Use the frame's strides to address rows. At even coded dimensions each tightly packed plane
+takes two bytes per luma pixel. Size the decoder's output reservation for that geometry.
+[Core Video ten-bit 4:2:2 layout](https://developer.apple.com/documentation/corevideo/kcvpixelformattype_422ypcbcr10biplanarvideorange)
+
+Set `VideoEncoderConfig::codec = CodecId::ProRes` to encode standard 422 on macOS. Use CPU P210 with even SDR
+geometry, a full visible rectangle, square pixels, and video range. Use `ColorRange::Limited` for known video-range
+samples. Bitrate and GOP controls apply to AVC and HEVC. ProRes emits one independent picture per packet in increasing
+PTS order, with exact input PTS and duration, matching DTS, and an empty initialization record. Budget
+`max_packet_bytes` for the largest picture and keep room for at least two full reservations. Mux the packets with
+the `apcn` MOV sample entry and `PacketFraming::CodecPacket`. [MOV encoding](media-container.md#sample-descriptions)
 
 Set `AudioDecoderConfig::codec` to `CodecId::Alac` and pass the sample description's 24-byte `ALACSpecificConfig`.
 Choose S16 or F32 PCM with the source sample rate and mono or stereo layout. The decoder emits the actual sample
@@ -174,10 +188,12 @@ Apply container edits when presenting PCM.
 The preview uses interleaved S16 playback. WAV export uses F32 for ALAC and packed PCM sources.
 [AudioConverter decoding](https://developer.apple.com/documentation/audiotoolbox/encoding-and-decoding-audio) · [ALAC configuration](https://github.com/macosforge/alac/blob/master/ALACMagicCookieDescription.txt)
 
-Use `Probe()` with the concrete configuration. The macOS integration cases cover repeated seeks in a ProRes 422 MOV
-with LPCM. The iOS 26.5 Simulator returned `Unsupported` for ProRes decoder creation. ProRes preview from an iPhone
-camera file requires device acceptance. macOS and the iOS Simulator cover ALAC playback, repeated seeks, and F32 WAV
-readback with a short final packet.
+Use `Probe()` with the concrete configuration. The macOS integration cases preview and seek each 422 profile with
+LPCM, then decode HQ to P210, encode standard 422, and write a MOV with the source LPCM. AVFoundation independently
+reads every video interval and PCM sample and decodes a pattern with distinct adjacent chroma rows. The exported MOV
+also passes repeated seeks on the LPCM clock. The iOS 26.5 Simulator returned `Unsupported` for ProRes decoder
+creation. ProRes preview from an iPhone camera file requires device acceptance. macOS and the iOS Simulator cover
+ALAC playback, repeated seeks, and F32 WAV readback with a short final packet.
 
 ### Opus, FLAC, and MP3
 

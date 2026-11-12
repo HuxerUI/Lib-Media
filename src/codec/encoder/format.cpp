@@ -306,15 +306,20 @@ std::size_t VideoEncoderWindow(const VideoEncoderConfig& config) {
   return std::min<std::size_t>({config.limits.output_items, config.limits.output_bytes / config.max_packet_bytes, 32});
 }
 std::uint32_t VideoEncoderBFrames(const VideoEncoderConfig& config) {
-  if (config.codec == CodecId::H264 && config.profile == H264Profile::Baseline) return 0;
+  if (config.codec == CodecId::ProRes || (config.codec == CodecId::H264 && config.profile == H264Profile::Baseline)) return 0;
   return config.max_b_frames.value_or(static_cast<std::uint32_t>(std::min<std::size_t>(2, VideoEncoderWindow(config) - 2)));
 }
 CodecResult<std::size_t> ValidateVideoEncoderConfig(const VideoEncoderConfig& config) {
   using R = CodecResult<std::size_t>;
   const auto& input = config.input;
   const bool avc = config.codec == CodecId::H264;
+  const bool prores = config.codec == CodecId::ProRes;
   const bool ten_bit = input.pixel_format == VideoPixelFormat::P010;
+  const bool p210 = input.pixel_format == VideoPixelFormat::P210;
   const bool platform_storage = config.input_storage == VideoStorage::Platform;
+#if !defined(__APPLE__) || !TARGET_OS_OSX
+  if (prores) return R::Failure(Error(CodecErrorCode::Unsupported, "ProRes encoding is unavailable on this platform"));
+#endif
   if (config.input_storage != VideoStorage::Cpu && !platform_storage)
     return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid video encoder storage"));
   if ((platform_storage && (!PlatformVideoSupported || input.pixel_format != PlatformVideoLayout)) ||
@@ -323,14 +328,16 @@ CodecResult<std::size_t> ValidateVideoEncoderConfig(const VideoEncoderConfig& co
   if (!input.Validate() || input.width < 2 || input.height < 2 || input.width > 8192 || input.height > 8192 ||
       input.width % 2 || input.height % 2 || !config.frame_rate_numerator || !config.frame_rate_denominator ||
       std::uint64_t(config.frame_rate_numerator) > std::uint64_t(config.frame_rate_denominator) * 240 ||
-      !config.bitrate || config.bitrate > INT32_MAX || (avc && !VideoProfileId(config.profile)) || !config.key_frame_interval ||
-      config.key_frame_interval > INT32_MAX || !config.max_packet_bytes || config.max_packet_bytes > INT32_MAX ||
+      (!prores && (!config.bitrate || config.bitrate > INT32_MAX || !config.key_frame_interval || config.key_frame_interval > INT32_MAX)) ||
+      (avc && !VideoProfileId(config.profile)) || !config.max_packet_bytes || config.max_packet_bytes > INT32_MAX ||
       !config.limits.input_items || config.limits.output_items < 2 ||
       config.max_packet_bytes > config.limits.output_bytes / 2 ||
-      (!avc && config.codec != CodecId::Hevc) ||
+      (!avc && config.codec != CodecId::Hevc && !prores) ||
       (avc && config.profile == H264Profile::Baseline && config.max_b_frames.value_or(0)))
     return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid video encoder geometry, controls, or queue bounds"));
-  if (input.visible != VideoRectangle{0, 0, input.width, input.height} ||
+  if (prores && (!p210 || platform_storage || config.max_b_frames.value_or(0) || input.range == ColorRange::Full))
+    return R::Failure(Error(CodecErrorCode::Unsupported, "ProRes encoding requires video-range CPU P210 input without B pictures"));
+  if (input.visible != VideoRectangle{0, 0, input.width, input.height} || (!prores && p210) ||
       (avc && ten_bit) ||
       input.aspect_width != input.aspect_height || input.rotation != VideoRotation::None ||
       input.primaries == ColorPrimaries::BT2020 || input.matrix == ColorMatrix::BT2020 ||
@@ -347,13 +354,13 @@ void CopyVideoEncoderPixels(const VideoFrame& frame, VideoPixelFormat layout, st
   if (frame.Storage() != VideoStorage::Cpu) throw std::invalid_argument("Expected a CPU video frame");
   const auto width = frame.format.width, height = frame.format.height;
   const auto base = std::size_t(width) * height;
-  if (layout == VideoPixelFormat::P010) {
-    if (frame.format.pixel_format != layout || target.size() < base * 3)
-      throw std::invalid_argument("Invalid P010 encoder pixel destination");
+  if (VideoComponentBytes(layout) == 2) {
+    if (frame.format.pixel_format != layout || target.size() < VideoImageBytes(width, height, layout))
+      throw std::invalid_argument("Invalid ten-bit encoder pixel destination");
     for (unsigned i = 0; i < 2; ++i) {
       const auto& plane = frame.planes[i];
       const auto bytes = plane.data.AsBytes();
-      const auto columns = i ? width / 2 : width, rows = i ? height / 2 : height;
+      const auto columns = i ? width / 2 : width, rows = i ? VideoChromaHeight(height, layout) : height;
       const auto sample = i ? 4u : 2u;
       auto* output = target.data() + (i ? base * 2 : 0);
       for (std::size_t y = 0; y < rows; ++y) {
@@ -369,7 +376,7 @@ void CopyVideoEncoderPixels(const VideoFrame& frame, VideoPixelFormat layout, st
     }
     return;
   }
-  if (frame.format.pixel_format == VideoPixelFormat::P010 || target.size() < base * 3 / 2)
+  if (VideoComponentBytes(frame.format.pixel_format) == 2 || target.size() < base * 3 / 2)
     throw std::invalid_argument("Invalid eight-bit encoder pixel destination");
   const auto& y_plane = frame.planes[0];
   const auto y_bytes = y_plane.data.AsBytes();
@@ -396,6 +403,10 @@ void CopyVideoEncoderPixels(const VideoFrame& frame, VideoPixelFormat layout, st
 CodecResult<VideoEncodeFormat> ReadVideoEncodeFormat(std::span<const std::byte> description, const VideoEncoderConfig& config,
     bool complete_avc_color) {
   using R = CodecResult<VideoEncodeFormat>;
+  if (config.codec == CodecId::ProRes) {
+    if (!description.empty()) return R::Failure(Error(CodecErrorCode::InvalidData, "ProRes does not use initialization data"));
+    return R::Success({config.input.width, config.input.height, config.input.visible, {}, CodecId::ProRes});
+  }
   try {
     if (description.empty() || description.size() > 65536) VideoInvalid("Invalid video configuration size");
     if (config.codec == CodecId::Hevc) return R::Success(DescribeHevc(description, config));
@@ -486,6 +497,11 @@ CodecResult<Bytes> NormalizeVideoEncoderPacket(std::span<const std::byte> bytes,
 }
 CodecResult<VideoEncoderPicture> InspectVideoEncoderPacket(const EncodedPacket& packet, const VideoEncodeFormat& format) {
   using R = CodecResult<VideoEncoderPicture>;
+  if (format.codec == CodecId::ProRes) {
+    const auto header = ValidateProResFrame(packet.data.AsBytes(), format.width, format.height);
+    if (!header.Succeeded()) return R::Failure(header.Error());
+    return R::Success({.key_frame = true});
+  }
   try {
     if (format.codec == CodecId::Hevc) {
       const auto parameters = ParseHevcConfiguration(format.initialization_data, true, true).parameters;

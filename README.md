@@ -30,8 +30,9 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`media_player.h`](include/huxerui/media_player.h) |
 | Platform image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
-| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, HEVC, VP8, VP9 profile 0, and [8-bit SDR AV1](docs/media-codec.md#av1) where available. macOS and iOS also support [mono/stereo ALAC and ProRes 422](docs/media-codec.md#prores-422-and-alac) where the decoder is available. | `AudioDecoder`, `VideoDecoder`, exact timestamps and decoded frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
+| Audio and video decoding | AAC-LC, Opus, FLAC, MP3, H.264, HEVC, VP8, VP9 profile 0, and [8-bit SDR AV1](docs/media-codec.md#av1) where available. macOS and iOS also support [mono/stereo ALAC](docs/media-codec.md#prores-422-and-alac). | `AudioDecoder`, `VideoDecoder`, exact timestamps and decoded frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
 | HEVC encoding and decoding | Main and Main10 adapters for all six platforms. Linux Main/Main10 CPU round trips and preview export passed under WSL. See the [HEVC matrix](docs/media-codec.md#hevc) for device and runtime coverage. | `CodecId::Hevc`, `VideoEncoder`, `VideoDecoder`, and `VideoPixelFormat::P010` |
+| ProRes 422 encoding and decoding | macOS decodes progressive 422 Proxy, LT, 422, and HQ and encodes standard 422. The MOV round trip retains ten-bit 4:2:2 chroma and LPCM timing. Compatible iOS devices can decode standard 422. | `CodecId::ProRes`, `VideoPixelFormat::P210`, [`MediaMuxer`](docs/media-container.md) |
 | GPU video | SDR H.264 and HEVC Main platform frames and SDK texture input on macOS, Android, iOS, Windows, and supported Web browsers. Windows x64 passed H.264 GPU transcode and SDK texture encoding for H.264 and HEVC Main. See [GPU video](docs/gpu-video.md) for platform coverage. | `VideoStorage::Platform`, `MakeExternalTexture()`, and `MakeVideoFrame()` |
 | Decoded audio and video playback | [#102](https://github.com/HuxerUI/HuxerUI/issues/102), Android, iOS, macOS, Windows, Linux, and Web | `DecodedPlayback` in [`media_playback.h`](include/huxerui/media_playback.h) |
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; macOS native tests passed; iOS validation pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
@@ -328,7 +329,9 @@ Windows and Linux also pass Opus, FLAC, and MP3 packet decoding and PCM preview 
 `AudioEncoder` accepts contiguous interleaved S16 mono/stereo PCM at 44.1 or 48 kHz and emits raw AAC-LC packets,
 AudioSpecificConfig, and a final sample summary. `VideoEncoder` emits H.264 or HEVC access units with four-byte NAL
 lengths and a separate `avcC` or `hvcC` description. It takes I420/NV12 for H.264 and HEVC Main, and P010 for
-HEVC Main10. macOS, Android, iOS, and Windows can encode [platform SDR frames](docs/gpu-video.md) with compatible
+HEVC Main10. On macOS, `VideoEncoder` also takes CPU P210 and emits one complete standard ProRes 422 frame
+per packet with an empty configuration record. [ProRes 422](docs/media-codec.md#prores-422-and-alac)
+macOS, Android, iOS, and Windows can encode [platform SDR frames](docs/gpu-video.md) with compatible
 codecs. Encoded packets can be written through `MediaMuxer`.
 
 H.264 supports Baseline, Main, and High profiles independently of its B-picture policy: `max_b_frames = 0` forbids B
@@ -452,8 +455,8 @@ with supported codecs. It switches decoders at sample-description boundaries and
 pictures and PCM. The bundled H.264/AAC sample has reordered pictures, uneven frame intervals, and AAC priming.
 VP8/VP9 with Opus can use a bounded seek index when Cues are absent. The preview accepts length-prefixed MKV
 HEVC with a separate codec configuration and 8-bit SDR AV1 in WebM, MKV, and regular MP4.
-On macOS and supported iOS devices, **CPU video** also previews progressive SDR ProRes 422 MOV with synchronized
-mono or stereo LPCM. On iOS, **Open from Photos** retains the selected video for the same preview path.
+On macOS, **CPU video** previews progressive SDR ProRes 422 Proxy, LT, 422, and HQ MOV with synchronized mono or
+stereo LPCM. Compatible iOS devices preview standard 422. **Open from Photos** on iOS retains the selected video.
 [Container seek](docs/media-container.md#read-and-seek)
 
 Switch **CPU video** to **GPU video** for supported SDR platform frames. Android can preview directly to
@@ -467,7 +470,8 @@ memory and limited to 128 MiB. MKV copies retain supported subtitle tracks, chap
 
 The [preview integration test](tests/container_preview.cpp) covers repeated seeks, presentation edits,
 configuration changes, packet-by-packet copy checks, encoded MP4 readback, and WAV sample counts including authored silence.
-The encoding and WAV export entry points are built into the test target. Hardware cases use
+The test target also exports ProRes 422 + LPCM MOV through P210 and verifies the result with AVFoundation on macOS.
+Encoding and WAV export are built into the test target. Hardware cases use
 `Probe()` for the concrete configuration. The [roadmap](docs/media-roadmap.md) tracks remaining device acceptance.
 
 ### Build and run

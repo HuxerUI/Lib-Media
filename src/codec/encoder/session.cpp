@@ -502,13 +502,13 @@ CodecResult<SubmitStatus> VideoEncoderState::Submit(const VideoFrame& frame) {
       auto owner = std::make_shared<Storage>(Storage{credit, Bytes(frame_bytes_)});
       const auto layout = config_.input.pixel_format;
       CopyVideoEncoderPixels(frame, layout, owner->bytes);
-      const auto sample = layout == VideoPixelFormat::P010 ? 2u : 1u;
+      const auto sample = VideoComponentBytes(layout);
       const auto row = std::size_t(config_.input.width) * sample;
       const auto luma = row * config_.input.height;
       BufferReference pixels(owner->bytes, owner);
       copy.planes.push_back({pixels.Slice(0, luma), row, sample});
       if (layout != VideoPixelFormat::I420)
-        copy.planes.push_back({pixels.Slice(luma, luma / 2), row, sample * 2});
+        copy.planes.push_back({pixels.Slice(luma, frame_bytes_ - luma), row, sample * 2});
       else {
         copy.planes.push_back({pixels.Slice(luma, luma / 4), row / 2, 1});
         copy.planes.push_back({pixels.Slice(luma + luma / 4, luma / 4), row / 2, 1});
@@ -563,7 +563,7 @@ VideoEncoderState::Retired VideoEncoderState::Clear() {
   Retired retired;
   retired.input.swap(input_); retired.output.swap(output_); retired.pending.swap(pending_);
   origin_.reset(); last_micro_pts_.reset(); last_input_pts_.reset(); last_dts_.reset(); format_.reset();
-  waiting_credit_ = finish_sent_ = eos_queued_ = key_requested_ = false; needs_idr_ = true; b_run_ = 0;
+  waiting_credit_ = finish_sent_ = eos_queued_ = key_requested_ = false; needs_key_frame_ = true; b_run_ = 0;
   return retired;
 }
 void VideoEncoderState::Fail(CodecError error, std::uint64_t generation) {
@@ -669,11 +669,16 @@ void VideoEncoderState::Publish(VideoEncoderBackendOutput value, std::uint64_t g
   } else if (auto* packet = std::get_if<EncodedPacket>(&value)) {
     auto size = packet->data.AsBytes().size();
     const auto pts = packet->pts.Rescale(1000000);
-    const auto dts = packet->dts ? packet->dts->Rescale(1000000) : std::optional<MediaTimestamp>{};
+    auto dts = packet->dts ? packet->dts->Rescale(1000000) : std::optional<MediaTimestamp>{};
+    const bool prores = config_.codec == CodecId::ProRes;
     if (size > config_.max_packet_bytes)
       throw SessionFailure{Error(CodecErrorCode::ResourceExhausted, "Video output exceeds the reserved packet bound")};
     if (!format_ || !origin_ || !size || !pts || (packet->dts && !dts))
       Reject("Video output has missing configuration or invalid timing");
+    if (prores) {
+      if (dts && *dts != *pts) Reject("ProRes decode and presentation timestamps must match");
+      dts = pts;
+    }
     auto found = pending_.find(pts->ticks);
     if (found == pending_.end()) {
       std::string timing = std::to_string(pts->ticks) + "; pending";
@@ -691,8 +696,8 @@ void VideoEncoderState::Publish(VideoEncoderBackendOutput value, std::uint64_t g
       if (!normalized.Succeeded()) throw SessionFailure{normalized.Error()};
       packet->data = Own(std::move(normalized).Value()); size = packet->data.AsBytes().size();
     }
-    if (needs_idr_ && !picture.Value().key_frame) Reject("Video stream must start with an IDR picture");
-    needs_idr_ = false;
+    if (needs_key_frame_ && !picture.Value().key_frame) Reject("Video stream must start with a random-access picture");
+    needs_key_frame_ = false;
     b_run_ = picture.Value().b_frame ? b_run_ + 1 : 0;
     if (config_.max_b_frames && b_run_ > *config_.max_b_frames)
       throw SessionFailure{Error(CodecErrorCode::Unsupported, "Video encoder exceeded the requested B-picture bound")};
@@ -709,6 +714,7 @@ void VideoEncoderState::Publish(VideoEncoderBackendOutput value, std::uint64_t g
     auto storage = std::make_shared<Storage>(Storage{timing.credit, packet->data});
     packet->data = BufferReference(storage->bytes.AsBytes(), storage);
     packet->pts = timing.pts; packet->duration = timing.duration; packet->key_frame = picture.Value().key_frame;
+    if (prores) packet->dts = timing.pts;
     output_.push_back(std::move(*packet)); wake_pending_ = true;
   } else {
     if (phase_ != Phase::Draining || !input_.empty() || !pending_.empty() || (origin_ && !finish_sent_))

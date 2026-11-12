@@ -12,7 +12,8 @@ selection and publication. See the [capability table](../README.md#capabilities)
 | AV1 in WebM, MKV, and regular MP4 | Preview 8-bit SDR frames and seek from marked key packets. Compare original packets after copy. Retain MKV subtitle timings, chapter and tag targets, and attachments. |
 | Matroska HEVC and AAC | Verify HEVC preview and repeated seeks. Keep the source Segment tick for negative video PTS and retain AAC sample timing when copying compatible audio to M4A. |
 | Chained Ogg Opus | Keep one track with stable description indices. Restart decoding at each link, preserve its absolute audible start, and verify seek and WAV sample counts. |
-| ProRes 422 MOV with LPCM and mono/stereo ALAC M4A | Seek and preview ProRes 422 pictures on the LPCM clock where VideoToolbox supports the configuration. On macOS and iOS, preview and seek ALAC and verify the short final packet through F32 WAV readback. |
+| ProRes 422 family MOV with LPCM | On macOS, preview and seek Proxy, LT, 422, and HQ on the LPCM clock. Transfer ten-bit 4:2:2 frames to the standard 422 encoder. Verify the exported MOV's picture timing, chroma, and LPCM with AVFoundation. |
+| Mono/stereo ALAC M4A | On macOS and iOS, preview and seek ALAC and verify the short final packet through F32 WAV readback. |
 
 The Frames example opens, previews, seeks, copies, and saves supported files. The integration tests exercise
 reordered encoding, GPU crop and scale, encoded MP4 readback, and WAV export.
@@ -39,7 +40,7 @@ Use application inputs and independent readback to scope each format, direction,
 - Extend MP4/MOV/fMP4 for needed sample entries, index layouts, edits, and metadata. Extend Matroska/WebM
   for needed codecs and subtitle, chapter, and tag preservation.
 - Evaluate additional audio mappings and PCM containers, including Vorbis, multichannel FLAC, AIFF, CAF,
-  and Wave64. Evaluate further ProRes and AV1 profiles, adapters, and encoding by platform and direction.
+  and Wave64. Evaluate ProRes 4444 and additional ProRes encoder profiles or platforms, and further AV1 profiles or encoding.
 - Evaluate transport streams, AVI, Annex B, and standalone subtitles against actual ingest requirements.
 
 Lib-AVKit owns backend selection, precise extraction, thumbnails, audio processing, compositing, timeline

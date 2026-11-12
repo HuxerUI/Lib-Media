@@ -26,6 +26,10 @@ using namespace huxerui;
 using namespace huxerui::media;
 using namespace std::chrono_literals;
 
+#if defined(__APPLE__) && TARGET_OS_OSX
+void CheckProResReadback(const File& source, const File& export_file);
+#endif
+
 #ifdef __ANDROID__
 namespace {
 std::optional<std::atomic<int>> pending_codecs;
@@ -658,12 +662,16 @@ void CheckMatroskaHevcPreview(const TaskScope& tasks, testing::UiTest& ui, const
 }
 
 #if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
-void CheckProResPreview(const TaskScope& tasks, testing::UiTest& ui) {
-  const auto input = Fixture("prores-pcm.mov");
-#if TARGET_OS_IOS
+void CheckProResPreview(const TaskScope& tasks, testing::UiTest& ui, const std::shared_ptr<const File>& input,
+    std::string_view entry) {
   const auto source = media_preview::Open(*input);
-  const auto config = VideoFixtureConfig(source.Tracks().front().descriptions.front(), VideoPixelFormat::P010,
-      VideoStorage::Cpu);
+  const auto tracks = source.Tracks();
+  const auto& description = tracks.front().descriptions.front();
+  Check(source.Format() == ContainerFormat::Mov && description.codec == CodecId::ProRes &&
+        description.sample_entry == entry, "ProRes MOV has the wrong sample entry");
+  constexpr auto output = VideoPixelFormat::P010;
+#if TARGET_OS_IOS
+  const auto config = VideoFixtureConfig(description, output, VideoStorage::Cpu);
   if (!CodecAvailable(ui, config, VideoDecoder::Probe, "ProRes 422 preview decoder")) return;
 #endif
   Observations seen;
@@ -671,7 +679,7 @@ void CheckProResPreview(const TaskScope& tasks, testing::UiTest& ui) {
   const auto playing = Play(tasks, input, seen, failure);
   Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.06F; },
         "ProRes MOV did not publish a picture and advance its PCM clock");
-  Check(seen.format->pixel_format == VideoPixelFormat::P010 && seen.size == Size{64, 48} &&
+  Check(seen.format->pixel_format == output && seen.size == Size{64, 48} &&
         seen.first_frame == MediaTimestamp{0, 1} && seen.first_duration == MediaTimestamp{1, 8},
         "ProRes preview changed the first picture format or timing");
   for (const auto target : {0.375F, 0.125F, 0.25F}) {
@@ -684,7 +692,7 @@ void CheckProResPreview(const TaskScope& tasks, testing::UiTest& ui) {
   }
   playing.Cancel();
   ui.Pump();
-  std::cout << "ProRes MOV passed LPCM preview and repeated seek\n";
+  std::cout << "ProRes " << entry << " MOV passed LPCM preview and repeated seek\n";
 }
 #endif
 
@@ -1047,7 +1055,16 @@ int main(int argc, char** argv) {
     CheckFragmentedAudioStartup(tasks, ui, temporary);
     CheckHevcMainExport(tasks, ui, temporary);
 #if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
-    CheckProResPreview(tasks, ui);
+    CheckProResPreview(tasks, ui, Fixture("prores-pcm.mov"), "apcn");
+#if TARGET_OS_OSX
+    const auto hq = Fixture("prores-hq-pcm.mov");
+    CheckProResPreview(tasks, ui, Fixture("prores-proxy-pcm.mov"), "apco");
+    CheckProResPreview(tasks, ui, Fixture("prores-lt-pcm.mov"), "apcs");
+    CheckProResPreview(tasks, ui, hq, "apch");
+    const auto prores_export = RunMovieExport(tasks, ui, temporary, hq, {});
+    CheckProResReadback(*hq, *prores_export);
+    CheckProResPreview(tasks, ui, prores_export, "apcn");
+#endif
     CheckAlacPreview(tasks, ui, temporary);
 #endif
 #if defined(__EMSCRIPTEN__) || (defined(__APPLE__) && TARGET_OS_IOS)

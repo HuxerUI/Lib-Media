@@ -7,6 +7,9 @@ FFmpeg is a fixture-generation and interoperability tool for these tests.
   matrix. The HEVC track uses the `hvc1` sample entry and the video packets include reordering.
 - `prores-pcm.mov` carries four ProRes 422 frames, 4000 stereo S24LE PCM sample frames, and an
   auxiliary timecode track. The audio uses QuickTime's version-one `in24` sample description.
+- `prores-proxy-pcm.mov`, `prores-lt-pcm.mov`, and `prores-hq-pcm.mov` use `apco`, `apcs`, and `apch`.
+  Each has four pictures with alternating ten-bit chroma rows and 4000 stereo S24LE PCM sample frames.
+  FFmpeg n4.1.3-381 generated these fixtures. The HQ fixture exercises 4:2:2 transfer to the standard 422 encoder.
 - `mkv-hevc-aac.mkv` remuxes the HEVC and AAC fixture with reordered video and Cues.
 - `mkv-avc-aac.mkv` carries H.264 Main with reordered video, mono AAC-LC, and Cues.
 - `webm-vp8-opus.webm` carries VP8 and Opus with Cues and final discard padding.
@@ -33,6 +36,13 @@ ffmpeg -display_rotation:v:0 -90 -i hevc-source.mov -c copy hevc-aac-portrait.mo
 ffmpeg -f lavfi -i testsrc2=size=64x48:rate=8:duration=0.5 \
   -f lavfi -i sine=sample_rate=8000:duration=0.5 -c:v prores_ks -profile:v 2 \
   -pix_fmt yuv422p10le -c:a pcm_s24le -ac 2 -timecode 01:00:00:00 prores-pcm.mov
+for variant in '0 proxy' '1 lt' '3 hq'; do
+  ffmpeg -f lavfi \
+    -i "nullsrc=size=64x48:rate=8:duration=0.5,format=yuv422p10le,geq=lum='320+80*N':cb='if(mod(Y,2),704,320)':cr='if(mod(Y,2),384,640)'" \
+    -f lavfi -i "aevalsrc=0.2*sin(2*PI*440*t)|0.15*sin(2*PI*660*t):s=8000:d=0.5" \
+    -c:v prores_ks -profile:v "${variant%% *}" -pix_fmt yuv422p10le -color_range tv \
+    -colorspace bt709 -color_primaries bt709 -color_trc bt709 -c:a pcm_s24le "prores-${variant##* }-pcm.mov"
+done
 ffmpeg -i hevc-aac-portrait.mov -map 0:v:0 -map 0:a:0 -c copy -map_metadata -1 mkv-hevc-aac.mkv
 ffmpeg -f lavfi -i testsrc2=size=64x48:rate=12:duration=0.75 \
   -f lavfi -i sine=sample_rate=48000:duration=0.75 -c:v libx264 -profile:v main \

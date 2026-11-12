@@ -1,6 +1,7 @@
 #include "codec/av1.h"
 #include "codec/decoder/backend.h"
 #include "media_video_macos.h"
+#include "format/platform_video_storage.h"
 #include "codec/decoder/copy.h"
 #include "codec/hevc.h"
 #include "container/container_io.h"
@@ -173,8 +174,9 @@ public:
     const auto dimensions = CMVideoFormatDescriptionGetDimensions(description_);
     if (dimensions.width <= 0 || dimensions.height <= 0 || dimensions.width > video.width || dimensions.height > video.height)
       return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidArgument, "Video dimensions exceed configured bounds"));
-    const auto pixel_type = video.output == VideoPixelFormat::P010
-        ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    const auto pixel_type = video.output == VideoPixelFormat::P210 ? kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange :
+        video.output == VideoPixelFormat::P010 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange :
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     NSDictionary* attributes = video.output_storage == VideoStorage::Platform ? @{
       (__bridge NSString*)kCVPixelBufferPixelFormatTypeKey: @(pixel_type),
       (__bridge NSString*)kCVPixelBufferMetalCompatibilityKey: @YES,
@@ -183,6 +185,10 @@ public:
     VTDecompressionOutputCallbackRecord callback{Output, this};
     status = VTDecompressionSessionCreate(kCFAllocatorDefault, description_, (__bridge CFDictionaryRef)specification,
         (__bridge CFDictionaryRef)attributes, &callback, &video_);
+    if (video.codec == CodecId::ProRes && (status == kVTCouldNotFindVideoDecoderErr ||
+        status == kVTVideoDecoderUnsupportedDataFormatErr))
+      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported,
+          "VideoToolbox cannot decode this ProRes 422 configuration", std::to_string(status)));
     if (status) return CodecResult<void>::Failure(AppleError(status, "VTDecompressionSessionCreate failed"));
     return CodecResult<void>::Success();
   }
@@ -348,15 +354,18 @@ private:
     try {
       const auto& config = std::get<VideoDecoderConfig>(self.config_);
       const auto type = CVPixelBufferGetPixelFormatType(image);
-      const bool ten_bit = type == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
-                           type == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+      const bool p210 = type == kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange ||
+                        type == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange;
+      const bool p010 = type == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+                        type == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
       const bool eight_bit = type == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
                              type == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
-      if ((!ten_bit && !eight_bit) || ten_bit != (config.output == VideoPixelFormat::P010)) {
-        self.failure_ = Error(CodecErrorCode::Unsupported, "VideoToolbox returned an unexpected CPU pixel format"); return;
+      const auto layout = p210 ? VideoPixelFormat::P210 : p010 ? VideoPixelFormat::P010 : VideoPixelFormat::NV12;
+      if ((!p210 && !p010 && !eight_bit) || (layout != config.output && !(eight_bit && config.output == VideoPixelFormat::I420))) {
+        self.failure_ = Error(CodecErrorCode::Unsupported, "VideoToolbox returned an unexpected pixel format"); return;
       }
       VideoFormat format;
-      format.pixel_format = ten_bit ? VideoPixelFormat::P010 : VideoPixelFormat::NV12;
+      format.pixel_format = layout;
       format.width = static_cast<std::uint32_t>(CVPixelBufferGetWidth(image));
       format.height = static_cast<std::uint32_t>(CVPixelBufferGetHeight(image));
       if (format.width > config.width || format.height > config.height) {
@@ -366,7 +375,8 @@ private:
       format.visible = {static_cast<std::uint32_t>(rect.origin.x), static_cast<std::uint32_t>(rect.origin.y),
           static_cast<std::uint32_t>(rect.size.width), static_cast<std::uint32_t>(rect.size.height)};
       format.range = type == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
-          type == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ? ColorRange::Full : ColorRange::Limited;
+          type == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ||
+          type == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange ? ColorRange::Full : ColorRange::Limited;
       if (auto aspect = CVBufferCopyAttachment(image, kCVImageBufferPixelAspectRatioKey, nullptr)) {
         std::int64_t horizontal = 0, vertical = 0;
         bool valid = false;
@@ -414,7 +424,7 @@ private:
         const auto stride = CVPixelBufferGetBytesPerRowOfPlane(image, i);
         const auto size = stride * CVPixelBufferGetHeightOfPlane(image, i);
         auto* base = static_cast<const std::byte*>(CVPixelBufferGetBaseAddressOfPlane(image, i));
-        planes.push_back({BufferReference({base, size}, owner), stride, (i ? 2u : 1u) * (ten_bit ? 2u : 1u)});
+        planes.push_back({BufferReference({base, size}, owner), stride, (i ? 2u : 1u) * VideoComponentBytes(layout)});
       }
       auto copied = CopyVideo(format, Timestamp(pts), duration_on_timeline, std::move(planes), config.output);
       owner.reset();
