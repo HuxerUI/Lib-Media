@@ -43,6 +43,11 @@ void AudioDecoder::QueryCapabilities(CodecId codec, std::function<void(CodecResu
       config.initialization_data[13] = std::byte{0xf0};
       audio.sample_rates = {{44100}, {48000}, {96000}, {192000}};
       audio.library_limits.sample_rate = CodecUIntRange{1, 655350, 1};
+      audio.library_limits.channels = CodecUIntRange{1, 8, 1};
+      audio.channel_layouts.insert(audio.channel_layouts.end(), {
+          {AudioChannelLayout::Surround51Back, CodecSupport::Supported},
+          {AudioChannelLayout::Surround51Side, CodecSupport::Supported},
+          {AudioChannelLayout::Surround71, CodecSupport::Supported}});
       break;
     case CodecId::Mp3:
       audio.sample_rates = {{8000}, {11025}, {12000}, {16000}, {22050}, {24000}, {32000}, {44100}, {48000}};
@@ -50,8 +55,9 @@ void AudioDecoder::QueryCapabilities(CodecId codec, std::function<void(CodecResu
       break;
     default: break;
   }
-  Probe(config, [audio = std::move(audio), rate = config.output.sample_rate,
+  Probe(config, [audio = std::move(audio), rate = config.output.sample_rate, codec,
                  completion = std::move(completion)](CodecResult<void> result) mutable {
+    if (codec == CodecId::Flac) audio.availability = CodecSupport::Supported;
     if (completion) completion(detail::ApplyAudioDecoderProbe(std::move(audio), rate, std::move(result)));
   });
 }

@@ -173,11 +173,16 @@ struct MediaSampleDescription {
   /// ALAC uses the 24-byte ALACSpecificConfig without the MP4 box header or version and flags. MOV timecode
   /// and timed metadata use the sample-entry payload after the reserved fields and data-reference index.
   /// Vorbis uses the three header packets in the Matroska `A_VORBIS` CodecPrivate layout.
+  /// AIFF and CAF LPCM retain an ordered channel layout payload here when it has no equivalent speaker mask.
   Bytes initialization_data;
   /// Audio samples per channel per second.
   std::optional<std::uint32_t> sample_rate;
   /// Audio channel count.
   std::optional<std::uint32_t> channel_count;
+  /// Speaker positions for audio stored in ascending WAVE extensible bit order. A zero mask
+  /// explicitly leaves the channels unassigned. Absence means the mapping did not supply a mask.
+  /// WAVE, RF64, Wave64, AIFF LPCM, CAF LPCM, and native FLAC can write this field.
+  std::optional<std::uint32_t> speaker_mask;
   /// Coded luma width in pixels.
   std::optional<std::uint32_t> coded_width;
   /// Coded luma height in pixels.

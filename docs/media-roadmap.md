@@ -17,6 +17,7 @@ selection and publication. See the [capability table](../README.md#capabilities)
 | Mono/stereo ALAC in CAF and M4A | Copy both ways with original packets, the short final packet, and exact trim. On macOS and iOS, preview and seek both containers and verify their F32 WAV samples. |
 | Wave64 LPCM | Reuse the PCM sample clock for preview and seek. Verify GUID chunk lengths and seek to a sample past 4 GiB in a sparse file. |
 | Vorbis in Ogg, WebM, and Matroska | Prime the overlap at open and after seeking. Preserve original packets, headers, and valid PCM samples on single-stream Ogg and audio-only WebM/MKA copies in both directions. |
+| Multichannel FLAC and LPCM | Decode 5.1 and 7.1 to ordered PCM, preserve speaker positions on FLAC packet copy and WAVE-family export, and verify repeated seeks and LPCM round trips through AIFF and CAF. |
 
 The Frames example opens, previews, seeks, copies, and saves supported files. The integration tests exercise
 reordered encoding, GPU crop and scale, encoded MP4 readback, and WAV export.
@@ -44,8 +45,8 @@ Use application inputs and independent readback to scope each format, direction,
 
 - Extend MP4/MOV/fMP4 for needed sample entries, index layouts, edits, and metadata. Extend Matroska/WebM
   for needed codecs and subtitle, chapter, and tag preservation.
-- Evaluate additional audio mappings, including multichannel FLAC and PCM.
-  Evaluate ProRes 4444 and additional ProRes encoder profiles or platforms, and further AV1 profiles or encoding.
+- Evaluate additional audio mappings, ProRes 4444 and additional ProRes encoder profiles or platforms,
+  and further AV1 profiles or encoding.
 - Evaluate transport streams, AVI, Annex B, and standalone subtitles against actual ingest requirements.
 
 Lib-AVKit owns backend selection, precise extraction, thumbnails, audio processing, compositing, timeline

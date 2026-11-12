@@ -26,6 +26,7 @@ public:
 };
 std::unique_ptr<DecoderBackend> MakeDecoderBackend();
 std::unique_ptr<DecoderBackend> MakeVorbisDecoderBackend();
+std::unique_ptr<DecoderBackend> MakeMultichannelFlacDecoderBackend();
 using BackendFactory = std::function<std::unique_ptr<DecoderBackend>()>;
 
 struct VideoDecoderAccess {

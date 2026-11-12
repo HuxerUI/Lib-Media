@@ -36,6 +36,7 @@ public:
     std::optional<MediaTrack> track;
     struct Sound { std::uint64_t offset, bytes; };
     std::optional<Sound> sound;
+    Bytes layout;
     std::uint32_t frames = 0;
     unsigned alignment = 0;
     std::size_t chunks = 0;
@@ -54,10 +55,13 @@ public:
         const auto channels = Number<std::uint16_t>(common);
         const auto bits = Number<std::uint16_t>(common, 6);
         if (!channels) Fail(Invalid, "AIFF channel count is zero");
-        if (channels > 2) Fail(ContainerErrorCode::Unsupported, "AIFF supports mono and stereo PCM");
+        if (channels > 8) Fail(ContainerErrorCode::Unsupported, "AIFF PCM supports up to eight channels");
         track = PcmTrack(SignedPcmCodec(bits, true), SampleRate(ByteView(common).subspan(8)), channels);
         frames = Number<std::uint32_t>(common, 2);
         alignment = channels * (bits / 8);
+      } else if (type == Tag("CHAN")) {
+        if (!layout.empty() || size < 12 || size > 4096) Fail(Invalid, "Invalid AIFF Channel Layout chunk");
+        layout = this->input.ReadBytes(static_cast<std::size_t>(size));
       } else if (type == Tag("SSND")) {
         if (sound || size < 8) Fail(Invalid, "Invalid AIFF Sound Data chunk");
         const auto data = this->input.ReadBytes(8);
@@ -67,19 +71,20 @@ public:
         if (!track && !this->input.Random())
           Fail(ContainerErrorCode::NeedRandomAccess, "AIFF audio precedes its Common chunk");
       }
-      if (track && sound) {
-        const auto bytes = std::uint64_t(frames) * alignment;
-        if (bytes > sound->bytes) Fail(Invalid, "AIFF sound data is shorter than its sample count");
-        if (this->input.Random()) this->input.Seek(sound->offset);
-        else SkipHeader(sound->offset);
-        Begin(std::move(*track), bytes, alignment);
-        return;
-      }
+      if (track && sound && (!this->input.Random() || !layout.empty() ||
+          track->descriptions.front().channel_count.value_or(0) <= 2)) break;
       if (this->input.Random()) this->input.Seek(next);
       else SkipHeader(next);
     }
-    if (!track || frames || end != this->input.Position()) Fail(Invalid, "AIFF is missing required audio chunks");
-    Begin(std::move(*track), 0, alignment);
+    if (!track || (!sound && (frames || end != this->input.Position()))) Fail(Invalid, "AIFF is missing required audio chunks");
+    if (!layout.empty()) ReadPcmChannelLayout(track->descriptions.front(), std::move(layout));
+    const auto bytes = std::uint64_t(frames) * alignment;
+    if (sound) {
+      if (bytes > sound->bytes) Fail(Invalid, "AIFF sound data is shorter than its sample count");
+      if (this->input.Random()) this->input.Seek(sound->offset);
+      else SkipHeader(sound->offset);
+    }
+    Begin(std::move(*track), bytes, alignment);
   }
 
 private:
@@ -108,6 +113,12 @@ public:
     Put(header, 0u);
     Put<std::uint16_t>(header, static_cast<std::uint16_t>(bits));
     PutRate(header, rate_);
+    if (const auto layout = WritePcmChannelLayout(description); !layout.empty()) {
+      Put(header, Tag("CHAN"));
+      Put(header, static_cast<std::uint32_t>(layout.size()));
+      Append(header, layout);
+      if (layout.size() & 1) header.push_back(std::byte{});
+    }
     Put(header, Tag("SSND"));
     sound_size_offset_ = header.size();
     Put(header, 0u);

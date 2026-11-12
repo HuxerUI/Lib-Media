@@ -38,8 +38,9 @@ PlaybackResult<std::shared_ptr<PlaybackSession>> PlaybackSession::Create(const A
   if (!capacity || !refill || config.refill_threshold > config.buffer_capacity || !config.format.ChannelCount() ||
       *capacity > std::vector<std::int16_t>().max_size() / config.format.ChannelCount())
     return PlaybackFailure<std::shared_ptr<PlaybackSession>>(PlaybackErrorCode::InvalidArgument, "Invalid playback format or queue bounds");
-  if (config.format.sample_format != AudioSampleFormat::S16 || config.format.packing != AudioPacking::Interleaved)
-    return PlaybackFailure<std::shared_ptr<PlaybackSession>>(PlaybackErrorCode::Unsupported, "Playback requires interleaved S16 PCM");
+  if (config.format.ChannelCount() > 2 || config.format.sample_format != AudioSampleFormat::S16 ||
+      config.format.packing != AudioPacking::Interleaved)
+    return PlaybackFailure<std::shared_ptr<PlaybackSession>>(PlaybackErrorCode::Unsupported, "Playback requires interleaved S16 mono or stereo PCM");
   try {
     auto session = std::shared_ptr<PlaybackSession>(new PlaybackSession(config, *capacity, *refill, std::move(factory)));
 #ifndef __EMSCRIPTEN__

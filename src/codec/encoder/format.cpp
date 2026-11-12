@@ -17,7 +17,7 @@ CodecResult<void> ValidateAudioEncoderConfig(const AudioEncoderConfig& config) {
       !limits.input_items || limits.input_bytes < channels * 2 || limits.output_items < 16 ||
       limits.output_bytes < 16 * kAudioEncoderPacketBytes)
     return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid audio encoder configuration or queue limits"));
-  if (config.input.sample_format != AudioSampleFormat::S16 || config.input.packing != AudioPacking::Interleaved ||
+  if (channels > 2 || config.input.sample_format != AudioSampleFormat::S16 || config.input.packing != AudioPacking::Interleaved ||
       (config.input.sample_rate != 44100 && config.input.sample_rate != 48000))
     return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "AAC encoding requires interleaved S16 mono/stereo at 44100 or 48000 Hz"));
   return CodecResult<void>::Success();

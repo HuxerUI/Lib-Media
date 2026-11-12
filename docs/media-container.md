@@ -19,8 +19,8 @@ Pass the description selected by a packet to the corresponding decoder for a sup
 | Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, VP8, VP9, AV1, raw AAC-LC, mapping-family-zero Opus, mono/stereo Vorbis, and opaque subtitle samples | Sequential or random access | Sequential or random write |
 | WebM | VP8, VP9, AV1, mapping-family-zero Opus, and mono/stereo Vorbis | Sequential or random access | Sequential or random write |
 | RIFF WAVE, RF64, and Wave64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
-| AIFF | Mono/stereo packed interleaved S16BE, S24BE, or S32BE | Random access, or sequential when `COMM` precedes `SSND` | Random write |
-| CAF | Mono/stereo packed interleaved S16, S24, S32, or F32 in either byte order, or ALAC | Sized random access | Random write |
+| AIFF | Up to eight channels of packed interleaved S16BE, S24BE, or S32BE | Random access, or sequential when `COMM` precedes `SSND` | Random write |
+| CAF | Up to eight channels of packed interleaved S16, S24, S32, or F32 in either byte order, or mono/stereo ALAC | Sized random access | Random write |
 | MPEG-4 ADTS | One raw mono/stereo AAC-LC access unit per frame | Sequential or random access | Sequential or random write |
 | Ogg | Mapping-family-zero Opus, including chained logical streams on input, or mono/stereo Vorbis | Sequential or random access | Sequential or random write for one logical stream |
 | Native FLAC | Complete FLAC frames with STREAMINFO | Sequential or random access, with native seek table support | Random write for whole-frame packet copy |
@@ -54,9 +54,12 @@ readable. [QuickTime metadata item list](https://developer.apple.com/documentati
 ### AIFF and CAF
 
 Use `ContainerFormat::Aiff` for `FORM/AIFF` files (`.aif` or `.aiff`) and `ContainerFormat::Caf` for `.caf`.
-Pass one mono or stereo audio track with one description and an integer sample rate. PCM packets contain complete
-interleaved sample frames. The reader uses the sample rate as its timescale and random-access seek selects an
-exact sample boundary. The writer finalizes the file size and sample count on `Finish()`.
+Pass one audio track with one description and an integer sample rate. PCM packets contain complete interleaved
+sample frames. Use `speaker_mask` when the channel order follows the WAVE extensible mask. AIFF writes a `CHAN`
+chunk before the sound data and CAF writes a `chan` chunk. An ordered layout without an equivalent mask is
+retained as its original chunk payload in `initialization_data`. A file with no layout can still carry raw PCM
+in its original channel order. The reader seeks to exact sample boundaries and the writer finalizes the file
+size and sample count on `Finish()`.
 [AIFF specification](https://blog.zamzar.com/wp-content/uploads/2014/10/aiffspecs.pdf) ·
 [Core Audio Format specification](https://developer.apple.com/library/archive/documentation/MusicAudio/Reference/CAFSpec/CAF_spec/CAF_spec.html)
 
@@ -153,7 +156,8 @@ The macOS integration test opens the encoded MOV with AVFoundation and verifies 
 unchanged LPCM bytes. [ProRes encoding](media-codec.md#prores-422-and-alac)
 
 For WAVE, an extensible track carries the 22-byte format suffix in `initialization_data`. It preserves
-the subtype, valid bits, and speaker mask when passed to a WAVE, RF64, or Wave64 writer. The shared PCM
+the subtype, valid bits, and speaker mask when passed to a WAVE, RF64, or Wave64 writer. For new output,
+set `speaker_mask` to write a matching extensible layout. The shared PCM
 reader emits frame-aligned blocks and seeks on the sample clock. `ContainerFormat::Wave64` writes GUID
 chunks with 64-bit lengths and a 64-bit sample count. On input, the Wave64 `fact` count identifies the valid
 samples when a writer includes alignment bytes in the data chunk length.
@@ -200,6 +204,8 @@ Native FLAC validates frame geometry, position, and checksums. Random input uses
 entries when present, with a bounded frame index as a fallback. The writer retains the compressed frames,
 updates STREAMINFO sample and frame-size statistics, and writes a bounded seek table. Frame numbering and
 timing must begin at the stream origin. The STREAMINFO PCM checksum belongs to the supplied complete stream.
+The track exposes the default FLAC speaker order or the explicit `WAVEFORMATEXTENSIBLE_CHANNEL_MASK` comment.
+Pass the track unchanged when copying FLAC packets to retain a non-default mask.
 [FLAC metadata and frame format](https://www.rfc-editor.org/rfc/rfc9639.html#section-8)
 
 MP3 handles MPEG-1, MPEG-2 and MPEG-2.5 Layer III with a fixed sample rate and layout. The reader understands

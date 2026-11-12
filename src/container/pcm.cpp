@@ -4,6 +4,8 @@
 #include "framed_audio.h"
 #include "format/packed_pcm.h"
 
+#include <bit>
+
 namespace huxerui::media::detail {
 
 CodecId SignedPcmCodec(unsigned bits, bool big_endian, bool floating_point) {
@@ -24,14 +26,62 @@ MediaTrack PcmTrack(CodecId codec, std::uint32_t rate, unsigned channels) {
       .descriptions = {{.codec = codec, .sample_rate = rate, .channel_count = channels}}};
 }
 
+namespace {
+constexpr std::uint32_t ChannelBitmap = 0x10000;
+
+std::optional<std::uint32_t> PcmSpeakerMask(ByteView bytes, unsigned channels, ContainerErrorCode error) {
+  if (bytes.size() < 12) Fail(error, "Truncated PCM channel layout");
+  const auto tag = Number<std::uint32_t>(bytes);
+  const auto mask = Number<std::uint32_t>(bytes, 4);
+  const auto count = Number<std::uint32_t>(bytes, 8);
+  if (count > (bytes.size() - 12) / 20 || (!tag && count != channels) || (tag && count))
+    Fail(error, "Invalid PCM channel description count");
+  if (tag == ChannelBitmap) {
+    if (mask && std::popcount(mask) != static_cast<int>(channels))
+      Fail(error, "PCM channel bitmap does not match the channel count");
+    return mask;
+  }
+  if (tag && (tag & 0xffff) != channels)
+    Fail(error, "PCM channel layout tag does not match the channel count");
+  switch (tag) {
+    case (100u << 16) | 1: return 0x4u;
+    case (101u << 16) | 2: return 0x3u;
+    case (121u << 16) | 6: return 0x60fu;
+  }
+  return {};
+}
+} // namespace
+
+void ReadPcmChannelLayout(MediaSampleDescription& description, Bytes layout) {
+  description.speaker_mask = PcmSpeakerMask(layout, *description.channel_count, ContainerErrorCode::InvalidData);
+  if (!description.speaker_mask) description.initialization_data = std::move(layout);
+}
+
+Bytes WritePcmChannelLayout(const MediaSampleDescription& description) {
+  if (!description.speaker_mask) return description.initialization_data;
+  Bytes layout;
+  Put(layout, ChannelBitmap);
+  Put(layout, *description.speaker_mask);
+  Put(layout, 0u);
+  return layout;
+}
+
 void ValidatePcmTrack(const MediaTrack& track) {
   const auto& description = track.descriptions.front();
   const auto channels = description.channel_count.value_or(0);
   if (!description.sample_rate.value_or(0) || !channels)
     Fail(ContainerErrorCode::InvalidArgument, "PCM requires a positive sample rate and channel count");
-  if (channels > 2 || !DescribePackedPcm(description.codec).bits || !description.initialization_data.empty() ||
+  if (channels > 8 || !DescribePackedPcm(description.codec).bits ||
       !track.edits.empty() || track.priming_samples.value_or(0) || track.padding_samples.value_or(0))
-    Fail(ContainerErrorCode::Unsupported, "Output requires packed mono or stereo PCM on a contiguous sample clock");
+    Fail(ContainerErrorCode::Unsupported, "Output requires packed PCM with up to eight channels on a contiguous sample clock");
+  constexpr auto invalid = ContainerErrorCode::InvalidArgument;
+  if (const auto mask = description.speaker_mask; mask && *mask && std::popcount(*mask) != static_cast<int>(channels))
+    Fail(invalid, "PCM speaker mask does not match the channel count");
+  if (!description.initialization_data.empty()) {
+    if (description.speaker_mask || description.initialization_data.size() > 4096)
+      Fail(invalid, "Conflicting or oversized PCM channel layout");
+    PcmSpeakerMask(description.initialization_data, channels, invalid);
+  }
 }
 
 unsigned PcmPacketFrames(const ContainerPacket& packet, unsigned alignment, std::int64_t start, unsigned rate) {

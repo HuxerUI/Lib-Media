@@ -73,7 +73,13 @@ enum class AudioChannelLayout {
   /// One center channel.
   Mono,
   /// Two channels in left, right order.
-  Stereo
+  Stereo,
+  /// Six channels in front left, front right, center, LFE, back left, back right order.
+  Surround51Back,
+  /// Six channels in front left, front right, center, LFE, side left, side right order.
+  Surround51Side,
+  /// Eight channels in front left, front right, center, LFE, back left, back right, side left, side right order.
+  Surround71
 };
 
 /// @brief PCM sample rate, representation, packing, and ordered channel layout.
@@ -88,12 +94,20 @@ struct AudioFormat {
   AudioSampleFormat sample_format = AudioSampleFormat::F32;
   /// Interleaved has one plane; planar has one plane per channel.
   AudioPacking packing = AudioPacking::Interleaved;
-  /// Channel order, limited to mono and stereo in this version.
+  /// Ordered speaker layout. Codecs and playback devices can support a subset of these layouts.
   AudioChannelLayout channel_layout = AudioChannelLayout::Stereo;
 
   /// @brief Derives the number of channels from channel_layout.
-  /// @return One for Mono, two for Stereo, or zero for an unrecognized layout value.
+  /// @return The number of speaker positions, or zero for an unrecognized layout value.
   [[nodiscard]] std::uint32_t ChannelCount() const noexcept;
+
+  /// @brief Speaker positions as a WAVE extensible mask, with channels ordered by ascending bit position.
+  /// @return Zero for an unrecognized layout value.
+  std::uint32_t SpeakerMask() const noexcept;
+
+  /// @brief Identifies a supported ordered layout from a WAVE extensible speaker mask.
+  /// @return The layout, or empty if the mask is unspecified or has no matching layout.
+  static std::optional<AudioChannelLayout> LayoutFromSpeakerMask(std::uint32_t mask) noexcept;
 
   /// @brief Derives the byte width of one channel sample from sample_format.
   /// @return Two for S16, four for F32, or zero for an unrecognized representation value.

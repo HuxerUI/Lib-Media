@@ -6,6 +6,8 @@ namespace huxerui::media::detail {
 
 CodecId SignedPcmCodec(unsigned bits, bool big_endian, bool floating_point = false);
 MediaTrack PcmTrack(CodecId codec, std::uint32_t rate, unsigned channels);
+void ReadPcmChannelLayout(MediaSampleDescription& description, Bytes layout);
+Bytes WritePcmChannelLayout(const MediaSampleDescription& description);
 void ValidatePcmTrack(const MediaTrack& track);
 unsigned PcmPacketFrames(const ContainerPacket& packet, unsigned alignment, std::int64_t start, unsigned rate);
 

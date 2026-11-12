@@ -183,3 +183,12 @@ ffmpeg -f lavfi -i 'testsrc2=size=320x240:rate=24:duration=4' \
   -c:v libx264 -profile:v main -bf 2 -g 22 -video_track_timescale 24000 \
   -c:a aac -profile:a aac_low -ac 2 -b:a 64k preview-avc-aac.mp4
 ```
+
+### Multichannel FLAC
+
+`surround-51.flac` and `surround-71.flac` contain 8201 frames at 48 kHz, encoded as 24-bit FLAC
+with the reference encoder at compression level 8 and a block size of 2048. The 5.1 source
+sets `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0x60f` for side surrounds. The 7.1 source uses
+FLAC's default layout. Both contain distinct impulses and waveforms in each channel, LPC and
+fixed predictors, Rice and Rice2 residuals, and a nine-sample final block. The
+`SurroundSample` function in the preview test describes the original integer samples.

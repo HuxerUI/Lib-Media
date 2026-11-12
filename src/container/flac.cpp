@@ -1,6 +1,10 @@
 #include "framed_audio.h"
+#include "codec/common.h"
 
 #include <array>
+#include <charconv>
+#include <cmath>
+#include <cstring>
 
 namespace huxerui::media::detail {
 
@@ -43,12 +47,20 @@ public:
       value = (value << 1) | ((std::to_integer<unsigned>(bytes_[position_ / 8]) >> (7 - position_ % 8)) & 1);
     return value;
   }
+  std::int64_t Signed(unsigned width) {
+    if (!width) return 0;
+    const auto value = Get(width);
+    const auto sign = std::int64_t{1} << (width - 1);
+    return (value ^ sign) - sign;
+  }
   void Skip(std::size_t count) {
     Require(count);
     position_ += count;
   }
-  void Unary() {
+  std::uint64_t Unary() {
+    const auto start = position_;
     while (!Get(1)) {}
+    return position_ - start - 1;
   }
   unsigned Wasted(unsigned width) {
     for (unsigned n = 1; n < width; ++n) if (Get(1)) return n;
@@ -90,7 +102,7 @@ std::uint64_t FrameNumber(FrameBits& bits) {
   return number;
 }
 
-void Residual(FrameBits& bits, unsigned block, unsigned warmup) {
+void Residual(FrameBits& bits, unsigned block, unsigned warmup, std::span<std::int64_t> samples) {
   const auto method = bits.Get(2);
   if (method > 1) Fail(Bad, "Reserved FLAC residual method");
   const auto partitions = 1u << bits.Get(4);
@@ -98,39 +110,72 @@ void Residual(FrameBits& bits, unsigned block, unsigned warmup) {
   if (block % partitions || per_partition < warmup) Fail(Bad, "Invalid FLAC residual partition size");
   const auto rice_width = 4 + method;
   const auto escape = (1u << rice_width) - 1;
+  auto out = samples.empty() ? samples : samples.subspan(warmup);
   for (unsigned p = 0; p < partitions; ++p) {
     const auto parameter = bits.Get(rice_width);
     const auto count = per_partition - (p == 0 ? warmup : 0);
     if (parameter == escape) {
-      bits.Skip(std::size_t(count) * bits.Get(5));
+      const auto width = bits.Get(5);
+      if (out.empty()) bits.Skip(std::size_t(count) * width);
+      else for (auto& sample : out.first(count)) sample = bits.Signed(width);
     } else {
       for (unsigned i = 0; i < count; ++i) {
-        bits.Unary();
-        bits.Skip(parameter);
+        const auto quotient = bits.Unary();
+        if (out.empty()) {
+          bits.Skip(parameter);
+          continue;
+        }
+        if (quotient > (UINT32_MAX >> parameter)) Fail(Bad, "FLAC Rice residual exceeds its signed range");
+        const auto folded = (quotient << parameter) | bits.Get(parameter);
+        if (folded == UINT32_MAX) Fail(Bad, "FLAC Rice residual exceeds its signed range");
+        const auto half = static_cast<std::int64_t>(folded >> 1);
+        out[i] = folded & 1 ? -half - 1 : half;
       }
     }
+    if (!out.empty()) out = out.subspan(count);
   }
 }
 
-void Subframe(FrameBits& bits, unsigned block, unsigned width) {
+void Subframe(FrameBits& bits, unsigned block, unsigned width, std::span<std::int64_t> samples = {}) {
   if (bits.Get(1)) Fail(Bad, "Invalid FLAC subframe padding");
   const auto type = bits.Get(6);
-  if (bits.Get(1)) width -= bits.Wasted(width);
+  const auto wasted = bits.Get(1) ? bits.Wasted(width) : 0u;
+  width -= wasted;
   if (type <= 1) {
-    bits.Skip(std::size_t(type ? block : 1) * width);
-    return;
+    if (samples.empty()) bits.Skip(std::size_t(type ? block : 1) * width);
+    else if (type) for (auto& sample : samples) sample = bits.Signed(width);
+    else std::ranges::fill(samples, bits.Signed(width));
+  } else {
+    const bool lpc = type >= 32;
+    if (!lpc && (type < 8 || type > 12)) Fail(Bad, "Reserved FLAC subframe type");
+    const auto order = lpc ? type - 31 : type - 8;
+    if (order > block) Fail(Bad, "FLAC predictor exceeds the block size");
+    if (samples.empty()) bits.Skip(std::size_t(order) * width);
+    else for (auto& sample : samples.first(order)) sample = bits.Signed(width);
+    std::array<int, 32> coefficients{};
+    unsigned shift = 0;
+    if (lpc) {
+      const auto precision = bits.Get(4) + 1;
+      if (precision == 16) Fail(Bad, "Reserved FLAC LPC precision");
+      shift = bits.Get(5);
+      if (shift > 15) Fail(Bad, "Negative FLAC LPC shift");
+      if (samples.empty()) bits.Skip(std::size_t(order) * precision);
+      else for (auto& value : std::span(coefficients).first(order)) value = static_cast<int>(bits.Signed(precision));
+    } else if (!samples.empty()) {
+      constexpr int Fixed[5][4]{{}, {1}, {2, -1}, {3, -3, 1}, {4, -6, 4, -1}};
+      std::copy_n(Fixed[order], order, coefficients.begin());
+    }
+    Residual(bits, block, order, samples);
+    const auto bound = std::int64_t{1} << (width - 1);
+    for (std::size_t i = order; i < samples.size(); ++i) {
+      std::int64_t prediction = 0;
+      for (unsigned j = 0; j < order; ++j) prediction += coefficients[j] * samples[i - j - 1];
+      samples[i] += prediction >> shift;
+      if (samples[i] < -bound || samples[i] >= bound) Fail(Bad, "FLAC predictor exceeds the coded sample width");
+    }
   }
-  const bool lpc = type >= 32;
-  if (!lpc && (type < 8 || type > 12)) Fail(Bad, "Reserved FLAC subframe type");
-  const auto order = lpc ? type - 31 : type - 8;
-  if (order > block) Fail(Bad, "FLAC predictor exceeds the block size");
-  bits.Skip(std::size_t(order) * width);
-  if (lpc) {
-    const auto precision = bits.Get(4) + 1;
-    if (precision == 16) Fail(Bad, "Reserved FLAC LPC precision");
-    bits.Skip(5 + std::size_t(order) * precision);
-  }
-  Residual(bits, block, order);
+  if (wasted)
+    for (auto& sample : samples) sample *= std::int64_t{1} << wasted;
 }
 
 struct FlacFrameHeader {
@@ -169,6 +214,13 @@ FlacFrameHeader ReadFrameHeader(FrameBits& bits, const FlacStreamInfo& info,
   return {block, channels};
 }
 
+void ReadFrameChecksum(FrameBits& bits) {
+  bits.Align();
+  const auto checksum = bits.Get(16);
+  if (Crc(bits.BytesRead().first(bits.BytesUsed() - 2), 0x8005, 16) != checksum)
+    Fail(Bad, "FLAC frame checksum differs");
+}
+
 unsigned ValidateFrame(FrameBits& bits, const FlacStreamInfo& info, std::int64_t position) {
   const auto [block, channels] = ReadFrameHeader(bits, info, position);
   for (unsigned channel = 0; channel < info.channels; ++channel) {
@@ -176,10 +228,7 @@ unsigned ValidateFrame(FrameBits& bits, const FlacStreamInfo& info, std::int64_t
                       (channels == 10 && channel == 1);
     Subframe(bits, block, info.bits + side);
   }
-  bits.Align();
-  const auto checksum = bits.Get(16);
-  if (Crc(bits.BytesRead().first(bits.BytesUsed() - 2), 0x8005, 16) != checksum)
-    Fail(Bad, "FLAC frame checksum differs");
+  ReadFrameChecksum(bits);
   return block;
 }
 
@@ -194,7 +243,14 @@ ByteView SizedField(ByteView& bytes, bool little = false) {
   return value;
 }
 
-void ReadComments(ByteView bytes, MediaAudioMetadata& metadata) {
+constexpr std::string_view SpeakerMaskTag = "WAVEFORMATEXTENSIBLE_CHANNEL_MASK";
+
+std::uint32_t DefaultFlacSpeakerMask(unsigned channels) {
+  constexpr std::array masks{0x4u, 0x3u, 0x7u, 0x33u, 0x37u, 0x3fu, 0x70fu, 0x63fu};
+  return masks[channels - 1];
+}
+
+void ReadComments(ByteView bytes, MediaAudioMetadata& metadata, std::optional<std::uint32_t>& speaker_mask) {
   SizedField(bytes, true);
   const auto count = Number<std::uint32_t>(bytes, 0, true);
   bytes = bytes.subspan(4);
@@ -202,11 +258,21 @@ void ReadComments(ByteView bytes, MediaAudioMetadata& metadata) {
   for (std::uint32_t i = 0; i < count; ++i) {
     const auto comment = Text(SizedField(bytes, true));
     const auto separator = comment.find('=');
-    if (separator == std::string_view::npos || separator > 11) continue;
+    if (separator == std::string_view::npos || separator > SpeakerMaskTag.size()) continue;
     std::string key(comment.substr(0, separator));
     for (auto& c : key) if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
-    const auto tag = std::ranges::find(AudioTags, key, &AudioTag::flac);
     const auto value = comment.substr(separator + 1);
+    if (key == SpeakerMaskTag) {
+      std::uint32_t mask = 0;
+      if (speaker_mask || value.size() < 3 || value[0] != '0' || (value[1] != 'x' && value[1] != 'X'))
+        Fail(Bad, "Invalid FLAC speaker mask comment");
+      const auto result = std::from_chars(value.data() + 2, value.data() + value.size(), mask, 16);
+      if (result.ec != std::errc{} || result.ptr != value.data() + value.size())
+        Fail(Bad, "Invalid FLAC speaker mask value");
+      speaker_mask = mask;
+      continue;
+    }
+    const auto tag = std::ranges::find(AudioTags, key, &AudioTag::flac);
     if (tag != AudioTags.end() && (metadata.*tag->field).empty() && value.size() <= MaxAudioText &&
         value.find('\0') == std::string_view::npos) metadata.*tag->field = value;
   }
@@ -255,6 +321,7 @@ public:
     this->input.Skip(4);
     Bytes stream_info;
     MediaAudioMetadata tags;
+    std::optional<std::uint32_t> speaker_mask;
     std::size_t metadata = 0;
     bool last = false;
     while (!last) {
@@ -272,15 +339,18 @@ public:
       } else {
         if (!type || type == 127) Fail(Bad, "Invalid FLAC metadata block type");
         if (type == 3 && this->input.Random()) seek_table_ = ReadSeekTable(this->input.ReadBytes(size), info_);
-        else if (type == 4) ReadComments(this->input.ReadBytes(size), tags);
+        else if (type == 4) ReadComments(this->input.ReadBytes(size), tags, speaker_mask);
         else if (type == 6) ReadPicture(this->input.ReadBytes(size), tags);
         else this->input.Skip(size);
       }
       metadata += size + 4;
     }
+    if (speaker_mask && std::popcount(*speaker_mask) > static_cast<int>(info_.channels))
+      Fail(Bad, "FLAC speaker mask exceeds its channel count");
     MediaTrack track{.id = 1, .kind = TrackKind::Audio, .timescale = info_.rate,
         .descriptions = {{.codec = CodecId::Flac, .initialization_data = std::move(stream_info),
-                          .sample_rate = info_.rate, .channel_count = info_.channels}}};
+                          .sample_rate = info_.rate, .channel_count = info_.channels,
+                          .speaker_mask = speaker_mask.value_or(DefaultFlacSpeakerMask(info_.channels))}}};
     if (HasAudioMetadata(tags)) audio_metadata = std::move(tags);
     Begin(std::move(track), info_.total ? std::optional{info_.total} : std::nullopt);
   }
@@ -340,14 +410,14 @@ void WriteMetadata(ContainerOutput& output, unsigned type, ByteView bytes) {
   output.Write(bytes);
 }
 
-void WriteTags(ContainerOutput& output, const MediaAudioMetadata& metadata) {
+void WriteTags(ContainerOutput& output, const MediaAudioMetadata& metadata, std::optional<std::uint32_t> mask) {
   const auto fields = std::ranges::count_if(AudioTags, [&](const auto& tag) { return !(metadata.*tag.field).empty(); });
-  if (fields) {
+  if (fields || mask) {
     Bytes comments;
     constexpr std::string_view vendor = "Lib-Media";
     Put(comments, static_cast<std::uint32_t>(vendor.size()), true);
     Append(comments, std::as_bytes(std::span(vendor)));
-    Put(comments, static_cast<std::uint32_t>(fields), true);
+    Put(comments, static_cast<std::uint32_t>(fields + mask.has_value()), true);
     for (const auto& tag : AudioTags) {
       const auto& value = metadata.*tag.field;
       if (value.empty()) continue;
@@ -355,6 +425,15 @@ void WriteTags(ContainerOutput& output, const MediaAudioMetadata& metadata) {
       Append(comments, std::as_bytes(std::span(tag.flac)));
       comments.push_back(std::byte{'='});
       Append(comments, std::as_bytes(std::span(value)));
+    }
+    if (mask) {
+      std::array<char, 8> hex;
+      const auto value = std::to_chars(hex.data(), hex.data() + hex.size(), *mask, 16);
+      Put(comments, static_cast<std::uint32_t>(SpeakerMaskTag.size() + 3 + (value.ptr - hex.data())), true);
+      Append(comments, std::as_bytes(std::span(SpeakerMaskTag)));
+      constexpr std::string_view prefix = "=0x";
+      Append(comments, std::as_bytes(std::span(prefix)));
+      Append(comments, std::as_bytes(std::span(hex.data(), value.ptr)));
     }
     WriteMetadata(output, 4, comments);
   }
@@ -382,7 +461,12 @@ public:
     Put(signature, Tag("fLaC"));
     this->output.Write(signature);
     WriteMetadata(this->output, 0, tracks.front().descriptions.front().initialization_data);
-    if (tags) WriteTags(this->output, *tags);
+    auto mask = tracks.front().descriptions.front().speaker_mask;
+    if (mask == DefaultFlacSpeakerMask(info_.channels)) mask.reset();
+    if (tags || mask) {
+      const MediaAudioMetadata empty;
+      WriteTags(this->output, tags ? *tags : empty, mask);
+    }
     seek_offset_ = this->output.Position() + 4;
     WriteMetadata(this->output, 0x83, Bytes(SeekSlots * 18));
     frames_offset_ = this->output.Position();
@@ -452,6 +536,28 @@ unsigned FlacPacketSamples(ByteView bytes, const FlacStreamInfo& info) {
   return ReadFrameHeader(bits, info).block;
 }
 
+AudioFrame DecodeMultichannelFlac(ByteView bytes, const FlacStreamInfo& info, AudioFormat format, MediaTimestamp pts) {
+  FrameBits bits(bytes);
+  const auto block = ReadFrameHeader(bits, info).block;
+  format.sample_format = AudioSampleFormat::F32;
+  format.packing = AudioPacking::Planar;
+  AudioFrame frame{format, pts, block, {}};
+  std::vector<std::int64_t> samples(block);
+  const auto scale = std::ldexp(1.0f, 1 - static_cast<int>(info.bits));
+  for (unsigned channel = 0; channel < info.channels; ++channel) {
+    Subframe(bits, block, info.bits, samples);
+    Bytes plane(std::size_t(block) * sizeof(float));
+    for (unsigned i = 0; i < block; ++i) {
+      const float sample = static_cast<float>(samples[i]) * scale;
+      std::memcpy(plane.data() + std::size_t(i) * sizeof(sample), &sample, sizeof(sample));
+    }
+    frame.planes.push_back(Own(std::move(plane)));
+  }
+  ReadFrameChecksum(bits);
+  if (bits.BytesUsed() != bytes.size()) Fail(Bad, "Trailing bytes after the FLAC frame");
+  return frame;
+}
+
 std::unique_ptr<ContainerReader> OpenFlacReader(ContainerInput input) {
   return std::make_unique<FlacReader>(std::move(input));
 }
@@ -467,6 +573,8 @@ void ValidateFlac(std::span<const MediaTrack> tracks) {
   if (description.sample_rate != info.rate || description.channel_count != info.channels ||
       track.priming_samples.value_or(0) || track.padding_samples.value_or(0))
     Fail(argument, "FLAC track geometry or trim differs from STREAMINFO");
+  if (description.speaker_mask && std::popcount(*description.speaker_mask) > static_cast<int>(info.channels))
+    Fail(argument, "FLAC speaker mask exceeds its channel count");
 }
 
 std::unique_ptr<ContainerWriter> OpenFlacWriter(ContainerOutput output, std::span<const MediaTrack> tracks,

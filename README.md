@@ -464,9 +464,9 @@ stereo LPCM. Compatible iOS devices preview standard 422. **Open from Photos** o
 Switch **CPU video** to **GPU video** for supported SDR platform frames. Android can preview directly to
 `SurfaceStreamTexture`. See the [frame storage contract and GPU performance comparison](docs/gpu-video.md).
 
-**Open audio** plays supported AIFF/CAF/Wave64 LPCM, Ogg Opus and Vorbis, WebM/MKA, FLAC, MP3, and AAC M4A sources.
+**Open audio** plays supported mono/stereo AIFF/CAF/Wave64 LPCM, Ogg Opus and Vorbis, WebM/MKA, FLAC, MP3, and AAC M4A sources.
 On macOS and iOS it also previews and seeks mono/stereo ALAC in M4A and CAF. **Copy Audio** keeps compatible AIFF,
-CAF, Wave64, and Vorbis audio in its source container, and retains supported packets, tags, and artwork for FLAC,
+CAF, WAVE-family, and Vorbis audio in its source container, and retains supported packets, tags, and artwork for FLAC,
 MP3, and AAC/ALAC M4A.
 **Copy Movie** keeps compatible MP4, MOV, WebM, or MKV access units, sample descriptions, timing, and supported metadata.
 The copy is reopened before the save action becomes available. EBML copies reuse the source Segment tick. Browser input is staged in
@@ -477,6 +477,8 @@ configuration changes, packet-by-packet copy checks, encoded MP4 readback, and W
 The test target also exports ProRes 422 + LPCM MOV through P210 and verifies the result with AVFoundation on macOS.
 The AIFF/CAF cases check PCM sample counts and seek, plus original ALAC packets, short tails, and audible trim in both
 CAF/M4A copy directions. Core Audio and AVFoundation independently read back the audio on macOS.
+The multichannel cases decode 5.1 and 7.1 FLAC, preserve speaker positions in PCM export, and verify every channel
+after seeks and WAVE-family, AIFF, and CAF round trips.
 Encoding and WAV export are built into the test target. Hardware cases use
 `Probe()` for the concrete configuration. The [roadmap](docs/media-roadmap.md) tracks remaining device acceptance.
 

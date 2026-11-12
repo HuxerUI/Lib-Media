@@ -97,7 +97,8 @@ struct QueueLimits {
 
 /// @brief Configuration for decoding complete compressed audio access units to CPU PCM.
 ///
-/// The decoder preserves the stream's mono or stereo layout and sample rate. Opus uses a 48 kHz output clock.
+/// The decoder preserves the stream's layout and sample rate. FLAC also supports ordered 5.1 and 7.1
+/// layouts. Opus uses a 48 kHz output clock.
 /// Choose PCM packing and sample representation in output. Apply container trim and seek preroll to the
 /// decoded timeline. Use Probe() to check the selected codec and stream configuration on the current platform.
 /// @see AudioDecoder::Create(), AudioDecoder::Probe()
@@ -107,6 +108,7 @@ struct AudioDecoderConfig {
   /// Leave empty for MPEG Layer III, whose complete frames carry their own configuration.
   Bytes initialization_data;
   /// Requested PCM format. Set the sample rate and channel layout to match the compressed stream.
+  /// For multichannel FLAC, use the track's speaker mask to choose the layout. STREAMINFO gives the count only.
   /// S16 and F32 are available with either interleaved or planar packing, subject to backend support.
   AudioFormat output;
   /// Retained input and output bounds. See QueueLimits for the audio minimum and byte accounting.
@@ -224,7 +226,7 @@ struct CodecUIntRange {
 struct CodecAudioLimits {
   /// Sample-rate bounds in samples per second per channel, when known.
   std::optional<CodecUIntRange> sample_rate;
-  /// Channel-count bounds, when known. The library currently admits mono and stereo only.
+  /// Channel-count bounds, when known. See the candidate layouts for supported channel configurations.
   std::optional<CodecUIntRange> channels;
   /// Average bitrate bounds in bits per second, when known.
   std::optional<CodecUIntRange> bitrate;

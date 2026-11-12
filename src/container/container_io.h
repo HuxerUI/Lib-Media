@@ -145,6 +145,7 @@ struct FlacStreamInfo {
 
 FlacStreamInfo ParseFlacStreamInfo(ByteView bytes, ContainerErrorCode error);
 unsigned FlacPacketSamples(ByteView bytes, const FlacStreamInfo& info);
+AudioFrame DecodeMultichannelFlac(ByteView bytes, const FlacStreamInfo& info, AudioFormat format, MediaTimestamp pts);
 
 struct Mp3FrameHeader {
   unsigned version, rate, channels, samples, length, side_offset, side_size;

@@ -254,8 +254,11 @@ cleanup and final callback dispatch. There is no blocking proxy to another event
   supplies pre-skip and end trim for the consumer to apply. Apple configures AudioConverter to return the complete
   packet, including a 2.5 ms first packet when pre-skip is zero. Reopen or reset when seeking into another Ogg link.
   [AudioConverter priming information](https://developer.apple.com/documentation/audiotoolbox/audioconverterprimeinfo)
-- FLAC takes complete native frames and the 34-byte STREAMINFO payload. Sample rate and mono/stereo layout must
-  match STREAMINFO. MP3 takes complete MPEG Layer III frames with empty initialization data. After a seek, start at
+- FLAC takes complete native frames and the 34-byte STREAMINFO payload. Match the sample rate and channel count
+  to STREAMINFO. The shared decoder supports 5.1 with back or side surrounds and 7.1 in interleaved or planar
+  S16 and F32. Use `AudioFormat::LayoutFromSpeakerMask()` with the source track's mask to preserve channel
+  positions, and use the source sample clock for seeking and PCM export. Mono and stereo use the platform
+  decoders listed above. MP3 takes complete MPEG Layer III frames with empty initialization data. After a seek, start at
   the demuxer's `decode_start_pts` to rebuild the MP3 bit reservoir. Linux and Web remove synthesis delay from raw MP3
   PCM and recover the trailing samples during drain. Apply the track's presentation interval to the resulting PCM.
 - AVC uses avcC and its 1-, 2-, or 4-byte NAL lengths. The initial subset is progressive 8-bit 4:2:0 Baseline/Main/High,

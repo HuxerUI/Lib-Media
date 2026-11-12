@@ -4,8 +4,11 @@
 
 namespace huxerui::media {
 namespace {
-auto AudioBackend(CodecId codec) {
-  return codec == CodecId::Vorbis ? detail::MakeVorbisDecoderBackend : detail::MakeDecoderBackend;
+auto AudioBackend(const AudioDecoderConfig& config) {
+  if (config.codec == CodecId::Vorbis) return detail::MakeVorbisDecoderBackend;
+  if (config.codec == CodecId::Flac && config.output.ChannelCount() > 2)
+    return detail::MakeMultichannelFlacDecoderBackend;
+  return detail::MakeDecoderBackend;
 }
 
 struct ProbeState : std::enable_shared_from_this<ProbeState> {
@@ -31,7 +34,7 @@ struct ProbeState : std::enable_shared_from_this<ProbeState> {
         if (!valid.Succeeded()) result = CodecResult<void>::Failure(valid.Error());
         else {
           const auto* audio = std::get_if<AudioDecoderConfig>(&config);
-          backend = audio ? AudioBackend(audio->codec)() : detail::MakeDecoderBackend();
+          backend = audio ? AudioBackend(*audio)() : detail::MakeDecoderBackend();
           result = backend->Open(config);
         }
       }
@@ -82,7 +85,7 @@ AudioDecoder& AudioDecoder::operator=(AudioDecoder&& other) noexcept {
 }
 AudioDecoder::~AudioDecoder() { Close(); }
 CodecResult<AudioDecoder> AudioDecoder::Create(const AudioDecoderConfig& config) {
-  auto state = detail::DecoderState<AudioDecodeOutput>::Create(config, AudioBackend(config.codec));
+  auto state = detail::DecoderState<AudioDecodeOutput>::Create(config, AudioBackend(config));
   if (!state.Succeeded()) return CodecResult<AudioDecoder>::Failure(state.Error());
   return CodecResult<AudioDecoder>::Success(AudioDecoder(std::move(state).Value()));
 }

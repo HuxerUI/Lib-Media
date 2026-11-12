@@ -25,7 +25,7 @@ AudioDescription ReadDescription(ByteView bytes) {
     Fail(ContainerErrorCode::Unsupported, "CAF sample rate is outside the integer sample clock");
   const auto channels = Number<std::uint32_t>(bytes, 24);
   if (!channels) Fail(Invalid, "CAF channel count is zero");
-  if (channels > 2) Fail(ContainerErrorCode::Unsupported, "CAF supports mono and stereo audio");
+  if (channels > 8) Fail(ContainerErrorCode::Unsupported, "CAF LPCM supports up to eight channels");
   return {static_cast<std::uint32_t>(rate), Number<std::uint32_t>(bytes, 8), Number<std::uint32_t>(bytes, 12),
       Number<std::uint32_t>(bytes, 16), Number<std::uint32_t>(bytes, 20), channels, Number<std::uint32_t>(bytes, 28)};
 }
@@ -224,6 +224,10 @@ public:
       Put(header, Tag("kuki"));
       Put<std::int64_t>(header, 24);
       Append(header, description.initialization_data);
+    } else if (const auto layout = WritePcmChannelLayout(description); !layout.empty()) {
+      Put(header, Tag("chan"));
+      Put<std::int64_t>(header, layout.size());
+      Append(header, layout);
     }
     Put(header, Tag("data"));
     data_size_offset_ = header.size();
@@ -340,6 +344,7 @@ std::unique_ptr<ContainerReader> OpenCafReader(ContainerInput input) {
     Fail(Invalid, "CAF requires an Audio Description chunk first");
   const auto description = ReadDescription(input.ReadBytes(32));
   std::optional<Chunk> data, table, cookie;
+  Bytes layout;
   std::size_t chunks = 0;
   while (input.Position() < file_size) {
     if (++chunks > 4096) Fail(ContainerErrorCode::LimitExceeded, "CAF chunk discovery exceeds its budget");
@@ -361,6 +366,9 @@ std::unique_ptr<ContainerReader> OpenCafReader(ContainerInput input) {
     } else if (type == Tag("kuki")) {
       if (cookie) Fail(Invalid, "Duplicate CAF Magic Cookie chunk");
       cookie = Chunk{offset, length};
+    } else if (type == Tag("chan") && description.format == Tag("lpcm")) {
+      if (!layout.empty() || length < 12 || length > 4096) Fail(Invalid, "Invalid CAF Channel Layout chunk");
+      layout = input.ReadBytes(static_cast<std::size_t>(length));
     } else if (type == Tag("desc")) {
       Fail(Invalid, "Duplicate CAF Audio Description chunk");
     }
@@ -368,6 +376,7 @@ std::unique_ptr<ContainerReader> OpenCafReader(ContainerInput input) {
   }
   if (!data) Fail(Invalid, "CAF is missing its Audio Data chunk");
   if (description.format == Tag("alac")) {
+    if (description.channels > 2) Fail(ContainerErrorCode::Unsupported, "CAF ALAC requires mono or stereo");
     if (!cookie || !table || (cookie->size != 24 && cookie->size != 48))
       Fail(Invalid, "CAF ALAC needs a cookie and packet table");
     if (table->size > MaxContainerMetadata) Fail(ContainerErrorCode::LimitExceeded, "CAF packet table exceeds its byte budget");
@@ -392,9 +401,10 @@ std::unique_ptr<ContainerReader> OpenCafReader(ContainerInput input) {
     data->offset += static_cast<std::uint64_t>(trim.priming) * alignment;
     data->size = static_cast<std::uint64_t>(trim.valid) * alignment;
   }
+  auto track = PcmTrack(codec, description.rate, description.channels);
+  if (!layout.empty()) ReadPcmChannelLayout(track.descriptions.front(), std::move(layout));
   input.Seek(data->offset);
-  return std::make_unique<PcmReader>(std::move(input), ContainerFormat::Caf,
-      PcmTrack(codec, description.rate, description.channels), data->size, alignment);
+  return std::make_unique<PcmReader>(std::move(input), ContainerFormat::Caf, std::move(track), data->size, alignment);
 }
 
 void ValidateCaf(std::span<const MediaTrack> tracks) {

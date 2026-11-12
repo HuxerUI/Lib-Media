@@ -101,6 +101,8 @@ CodecResult<unsigned> AudioSampleLimit(const AudioDecoderConfig& config) {
   if (!output.sample_rate || !output.ChannelCount() || !output.BytesPerSample() ||
       (output.packing != AudioPacking::Planar && output.packing != AudioPacking::Interleaved))
     return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid PCM output format"));
+  if (output.ChannelCount() > 2 && config.codec != CodecId::Flac)
+    return R::Failure(Error(CodecErrorCode::Unsupported, "This audio codec requires mono or stereo output"));
   const auto matches = [&](unsigned rate, unsigned channels, unsigned samples) {
     if (rate == output.sample_rate && channels == output.ChannelCount()) return R::Success(samples);
     return R::Failure(Error(CodecErrorCode::Unsupported, "PCM rate and layout must match the coded stream"));

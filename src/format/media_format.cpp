@@ -2,11 +2,21 @@
 
 #include "platform_video_storage.h"
 
+#include <array>
+#include <bit>
 #include <limits>
 #include <utility>
 
 namespace huxerui::media {
 namespace {
+constexpr std::array SpeakerLayouts{
+    std::pair{AudioChannelLayout::Mono, 0x4u},
+    std::pair{AudioChannelLayout::Stereo, 0x3u},
+    std::pair{AudioChannelLayout::Surround51Back, 0x3fu},
+    std::pair{AudioChannelLayout::Surround51Side, 0x60fu},
+    std::pair{AudioChannelLayout::Surround71, 0x63fu},
+};
+
 std::uint64_t Magnitude(std::int64_t value) noexcept {
   return value < 0 ? std::uint64_t(-(value + 1)) + 1 : std::uint64_t(value);
 }
@@ -50,11 +60,17 @@ std::optional<int> MediaTimestamp::Compare(MediaTimestamp other) const noexcept 
 }
 
 std::uint32_t AudioFormat::ChannelCount() const noexcept {
-  switch (channel_layout) {
-    case AudioChannelLayout::Mono: return 1;
-    case AudioChannelLayout::Stereo: return 2;
-  }
+  return std::popcount(SpeakerMask());
+}
+std::uint32_t AudioFormat::SpeakerMask() const noexcept {
+  for (const auto& [layout, mask] : SpeakerLayouts)
+    if (layout == channel_layout) return mask;
   return 0;
+}
+std::optional<AudioChannelLayout> AudioFormat::LayoutFromSpeakerMask(std::uint32_t mask) noexcept {
+  for (const auto& [layout, positions] : SpeakerLayouts)
+    if (positions == mask) return layout;
+  return {};
 }
 std::uint32_t AudioFormat::BytesPerSample() const noexcept {
   switch (sample_format) {

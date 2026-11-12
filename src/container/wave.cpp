@@ -68,6 +68,7 @@ void ReadFormat(ByteView bytes, MediaTrack& track, unsigned& alignment) {
     const auto suffix = Slice(bytes, 18, 22);
     format = ExtensibleFormat(suffix, bits, channels);
     description.initialization_data.assign(suffix.begin(), suffix.end());
+    description.speaker_mask = Number<std::uint32_t>(suffix, 2, true);
   }
   description.codec = PcmCodec(format, bits);
   if (!channels || !rate || alignment != channels * (bits / 8) ||
@@ -205,7 +206,7 @@ public:
     const auto rate = *description.sample_rate;
     alignment_ = channels * (bits / 8);
     const std::uint16_t coding = description.codec == CodecId::PcmF32Le ? 3 : 1;
-    const bool extensible = channels > 2 || !description.initialization_data.empty();
+    const bool extensible = channels > 2 || description.speaker_mask || !description.initialization_data.empty();
     Bytes header;
     if (wave64_) {
       PutWave64Guid(header, Tag("riff"), true);
@@ -233,7 +234,7 @@ public:
       Put<std::uint16_t>(header, 22, true);
       if (description.initialization_data.empty()) {
         Put<std::uint16_t>(header, static_cast<std::uint16_t>(bits), true);
-        Put(header, 0u, true);
+        Put(header, description.speaker_mask.value_or(0), true);
         Put<std::uint32_t>(header, coding, true);
         Append(header, WaveGuidTail);
       } else {
@@ -341,9 +342,12 @@ void ValidateWave(std::span<const MediaTrack> tracks) {
     Fail(ContainerErrorCode::InvalidArgument, "Invalid WAVE sample rate, clock, or channel count");
   if (track.priming_samples.value_or(0) || track.padding_samples.value_or(0))
     Fail(ContainerErrorCode::Unsupported, "WAVE cannot preserve compressed audio trim");
+  if (const auto mask = description.speaker_mask; mask && *mask && std::popcount(*mask) != static_cast<int>(channels))
+    Fail(ContainerErrorCode::InvalidArgument, "WAVE speaker mask does not match its channel count");
   if (!description.initialization_data.empty() &&
-      PcmCodec(ExtensibleFormat(description.initialization_data, bits, channels), bits) != description.codec)
-    Fail(ContainerErrorCode::InvalidArgument, "WAVE extensible configuration does not match its coding");
+      (PcmCodec(ExtensibleFormat(description.initialization_data, bits, channels), bits) != description.codec ||
+       (description.speaker_mask && *description.speaker_mask != Number<std::uint32_t>(description.initialization_data, 2, true))))
+    Fail(ContainerErrorCode::InvalidArgument, "WAVE extensible configuration does not match its coding or speaker mask");
 }
 
 std::unique_ptr<ContainerReader> OpenWaveReader(ContainerInput input, ContainerFormat format) {

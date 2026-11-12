@@ -55,6 +55,19 @@ AudioFrame UnpackPcm(const ContainerPacket& packet, CodecId codec, AudioFormat f
   return {format, {pts, format.sample_rate}, static_cast<std::uint32_t>(duration), {BufferReference(*output, output)}};
 }
 
+AudioFormat DecodeFormat(const MediaSampleDescription& description, AudioSampleFormat samples) {
+  auto mask = description.speaker_mask.value_or(0);
+  if (!mask && description.channel_count == 1) mask = 0x4;
+  if (!mask && description.channel_count == 2) mask = 0x3;
+  const auto layout = AudioFormat::LayoutFromSpeakerMask(mask);
+  if (!description.sample_rate || !layout)
+    throw std::runtime_error("Audio decoding requires a known sample rate and supported speaker layout");
+  AudioFormat format{*description.sample_rate, samples, AudioPacking::Interleaved, *layout};
+  if (format.ChannelCount() != description.channel_count)
+    throw std::runtime_error("Speaker layout differs from the audio channel count");
+  return format;
+}
+
 } // namespace
 
 AudioInput::AudioInput(std::shared_ptr<const File> path) : file(std::move(path)), source(Open(*file)) {
@@ -215,8 +228,7 @@ Task<bool> AudioDecode::Pump() {
 
 void AudioDecode::Configure(const AudioDecodeStart& start) {
   const auto& description = start.description;
-  format_ = PlaybackFormat(description);
-  format_.sample_format = sample_format_;
+  format_ = DecodeFormat(description, sample_format_);
   if (media::detail::DescribePackedPcm(description.codec).bits) {
     decoder_.reset();
     pcm_codec_ = description.codec;
@@ -246,6 +258,8 @@ std::string_view AudioCopySuffix(const MediaDemuxer& reader) {
   switch (reader.Format()) {
     case ContainerFormat::Aiff: return ".aiff";
     case ContainerFormat::Caf: return ".caf";
+    case ContainerFormat::Wave: return ".wav";
+    case ContainerFormat::Rf64: return ".wav";
     case ContainerFormat::Wave64: return ".w64";
     case ContainerFormat::Ogg:
     case ContainerFormat::Matroska:
@@ -421,8 +435,10 @@ Task<std::shared_ptr<const File>> CopyAudioClip(std::shared_ptr<const File> file
 #ifdef MEDIA_PREVIEW_TEST_EXPORTS
 Task<std::shared_ptr<const File>> ExportWave(std::shared_ptr<const File> file, File temporary) {
   auto input = co_await OnFileThread([file] { return std::make_shared<AudioInput>(file); });
-  const auto codec = input->track.descriptions.front().codec;
-  const bool floating = codec == CodecId::Alac || codec == CodecId::Vorbis || media::detail::DescribePackedPcm(codec).bits;
+  const auto& description = input->track.descriptions.front();
+  const auto codec = description.codec;
+  const bool floating = codec == CodecId::Alac || codec == CodecId::Vorbis || description.channel_count.value_or(0) > 2 ||
+      media::detail::DescribePackedPcm(codec).bits;
   AudioDecode decode(input, floating ? AudioSampleFormat::F32 : AudioSampleFormat::S16);
   auto result = co_await OnFileThread([temporary] { return TemporaryFile(temporary, ".wav"); });
   std::shared_ptr<MediaMuxer> mux;
@@ -438,7 +454,8 @@ Task<std::shared_ptr<const File>> ExportWave(std::shared_ptr<const File> file, F
         mux = co_await OnFileThread([result, format = *format] {
           const MediaTrack track{.id = 1, .kind = TrackKind::Audio, .descriptions = {{
               .codec = format.sample_format == AudioSampleFormat::F32 ? CodecId::PcmF32Le : CodecId::PcmS16Le,
-              .sample_rate = format.sample_rate, .channel_count = format.ChannelCount()}}};
+              .sample_rate = format.sample_rate, .channel_count = format.ChannelCount(),
+              .speaker_mask = format.ChannelCount() > 2 ? std::optional{format.SpeakerMask()} : std::nullopt}}};
           return std::make_shared<MediaMuxer>(Require(MediaMuxer::Open(
               Require(result->OpenRandomAccess(FileAccessMode::ReadWrite)), ContainerFormat::Wave, std::span(&track, 1))));
         });

@@ -8,11 +8,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <numbers>
 #include <stdexcept>
 #include <thread>
 #ifdef __ANDROID__
@@ -907,10 +909,10 @@ std::shared_ptr<const File> CopyAudioContainer(const File& source, const File& t
   const auto& original = source_tracks.front().descriptions.front();
   const auto& copied = output_tracks.front().descriptions.front();
   const auto track_id = output_tracks.front().id;
-  const bool alac = original.codec == CodecId::Alac;
+  const bool compressed = original.codec == CodecId::Alac || original.codec == CodecId::Flac;
   const MediaPresentationRange audible{{0, expected.timescale}, expected};
   Check(copy.Format() == target && copied.codec == original.codec && copied.initialization_data == original.initialization_data &&
-        copied.sample_rate == expected.timescale && copied.channel_count == channels &&
+        copied.sample_rate == expected.timescale && copied.channel_count == channels && copied.speaker_mask == original.speaker_mask &&
         copy.Duration() == expected && input.PresentationRange(source_tracks.front().id) == audible &&
         copy.PresentationRange(track_id) == audible,
         "Audio copy changed its format or audible interval");
@@ -924,7 +926,7 @@ std::shared_ptr<const File> CopyAudioContainer(const File& source, const File& t
   Check(!ReadPacket(copy), "Audio copy added packets");
   const MediaTimestamp final_sample{expected.ticks - 1, expected.timescale};
   const auto point = Require(copy.Seek(track_id, final_sample, SeekDirection::AtOrBefore));
-  Check(point && ReadPacket(copy).has_value() && (alac ?
+  Check(point && ReadPacket(copy).has_value() && (compressed ?
         point->decode_start_pts == last_pts : point->presentation_time == final_sample),
         "Audio copy could not seek to its final sample or packet");
 #if defined(__APPLE__) && TARGET_OS_OSX
@@ -980,34 +982,33 @@ std::shared_ptr<const File> CopyVorbis(const File& source, const File& temporary
   return output;
 }
 
-void CheckVorbisSeekSamples(const TaskScope& tasks, testing::UiTest& ui, const std::shared_ptr<const File>& source,
-    const File& reference) {
+void CheckDecodedSeekSamples(const TaskScope& tasks, testing::UiTest& ui, const std::shared_ptr<const File>& source,
+    const File& reference, std::span<const MediaTimestamp> targets) {
   auto input = std::make_shared<media_preview::AudioInput>(source);
   auto pcm = media_preview::Open(reference);
-  constexpr MediaTimestamp targets[]{{83000, 44100}, {12531, 44100}, {92000, 44100}};
+  media_preview::AudioDecode decode(input, AudioSampleFormat::F32);
   for (const auto target : targets) {
     const auto point = Require(pcm.Seek(pcm.Tracks().front().id, target));
     const auto expected = ReadPacket(pcm);
-    Check(point && expected && expected->pts == target, "Vorbis seek reference missed its exact sample");
+    Check(point && expected && expected->pts == target, "PCM seek reference missed its exact sample");
     std::exception_ptr failure;
     std::optional<AudioFrame> first;
     const auto seek = tasks.Launch([&]() -> Task<void> {
       try {
-        media_preview::AudioDecode decode(input, AudioSampleFormat::F32);
-        Check(co_await decode.Seek(target), "Vorbis seek returned no decode anchor");
+        Check(co_await decode.Seek(target), "Audio seek returned no decode anchor");
         while (!decode.frame && !decode.ended) {
           if (!co_await decode.Pump()) co_await Delay(1ms);
         }
         first = std::move(decode.frame);
       } catch (...) { failure = std::current_exception(); }
     });
-    Until(ui, failure, [&] { return first.has_value(); }, "Vorbis seek returned no audible samples");
+    Until(ui, failure, [&] { return first.has_value(); }, "Audio seek returned no audible samples");
     seek.Cancel();
     const auto bytes = first->planes.front().AsBytes();
     const auto baseline = expected->data.AsBytes();
     const auto common = std::min(bytes.size(), baseline.size());
     Check(first->pts == target && common && std::ranges::equal(bytes.first(common), baseline.first(common)),
-          "Vorbis seek changed the first audible samples");
+          "Audio seek changed the first audible samples");
   }
 }
 
@@ -1015,18 +1016,19 @@ void CheckWave64AndVorbis(const TaskScope& tasks, testing::UiTest& ui, const Fil
   const auto wave64 = CopyAudioContainer(fixtures.Child("preview-pcm.w64"), temporary, ContainerFormat::Wave64, ".w64", {8821, 44100}, 1);
   CheckAudioPreviewSample(tasks, ui, temporary, {wave64, {8821, 44100}, CodecId::PcmF32Le});
   constexpr MediaTimestamp samples{97593, 44100};
+  constexpr MediaTimestamp targets[]{{83000, 44100}, {12531, 44100}, {92000, 44100}};
   const auto ogg = std::make_shared<const File>(fixtures.Child("preview-vorbis.ogg"));
   const auto reference = CheckAudioPreviewSample(tasks, ui, temporary, {ogg, samples, CodecId::PcmF32Le});
-  CheckVorbisSeekSamples(tasks, ui, ogg, *reference);
+  CheckDecodedSeekSamples(tasks, ui, ogg, *reference, targets);
   for (const auto [container, suffix] : {std::pair{ContainerFormat::WebM, ".webm"}, std::pair{ContainerFormat::Matroska, ".mka"}}) {
     const auto ebml = CopyVorbis(*ogg, temporary, container, suffix, samples);
     CopyVorbis(*ebml, temporary, ContainerFormat::Ogg, ".ogg", samples);
     const auto decoded = CheckAudioPreviewSample(tasks, ui, temporary, {ebml, samples, CodecId::PcmF32Le});
     Check(Require(decoded->ReadBytes()) == Require(reference->ReadBytes()), "Vorbis copy changed decoded PCM");
-    CheckVorbisSeekSamples(tasks, ui, ebml, *reference);
+    CheckDecodedSeekSamples(tasks, ui, ebml, *reference, targets);
   }
   const auto coarse = CopyVorbis(*ogg, temporary, ContainerFormat::WebM, ".webm", samples, {.ebml_timestamp_scale = 1ms});
-  CheckVorbisSeekSamples(tasks, ui, coarse, *reference);
+  CheckDecodedSeekSamples(tasks, ui, coarse, *reference, targets);
 
   constexpr std::int64_t priming = 37;
   auto input = media_preview::Open(*ogg);
@@ -1082,6 +1084,86 @@ void CheckWave64AndVorbis(const TaskScope& tasks, testing::UiTest& ui, const Fil
   Check(Require(remuxed_pcm->ReadBytes()) == Require(trimmed_pcm->ReadBytes()), "MKA leading discard changed decoded Vorbis PCM");
 }
 
+std::int32_t SurroundSample(int frame, int channel) {
+  if (channel == 2) {
+    constexpr auto turn = 2 * std::numbers::pi;
+    return std::lround(400000 * std::sin(turn * (frame % 47) / 47) + 300000 * std::sin(turn * (frame % 8) / 8));
+  }
+  if (channel == 1 && frame >= 6144) return (frame - 6144) * 256;
+  const auto base = channel ? (frame % 257 - 128) * (channel + 1) * 1237 : 0;
+  return base + (frame % 2048 == 29 + channel * 41 ? 2097151 + channel * 32771 : 0);
+}
+
+void CheckSurroundAudio(const TaskScope& tasks, testing::UiTest& ui, const File& temporary, const File& fixtures) {
+  constexpr MediaTimestamp duration{8201, 48000};
+  constexpr MediaTimestamp targets[]{{7771, 48000}, {2053, 48000}, {8200, 48000}};
+  for (const auto& [name, mask] : {std::pair{"surround-51.flac", 0x60fu}, std::pair{"surround-71.flac", 0x63fu}}) {
+    const auto source = std::make_shared<const File>(fixtures.Child(name));
+    auto flac = media_preview::Open(*source);
+    const auto& track = flac.Tracks().front();
+    const auto channels = *track.descriptions.front().channel_count;
+    Check(track.descriptions.front().speaker_mask == mask && channels == static_cast<unsigned>(std::popcount(mask)),
+          "FLAC lost its ordered speaker positions");
+    CopyAudioContainer(*source, temporary, ContainerFormat::Flac, ".flac", duration, channels);
+
+    std::shared_ptr<const File> wave;
+    std::exception_ptr failure;
+    const auto exporting = tasks.Launch([&]() -> Task<void> {
+      try { wave = co_await media_preview::ExportWave(source, temporary); }
+      catch (...) { failure = std::current_exception(); }
+    });
+    Until(ui, failure, [&] { return bool(wave); }, "Multichannel FLAC could not export PCM");
+    exporting.Cancel();
+    auto pcm = media_preview::Open(*wave);
+    Check(pcm.Duration() == duration && pcm.Tracks().front().descriptions.front().speaker_mask == mask,
+          "WAV export changed the FLAC sample count or speaker mask");
+    int frame = 0;
+    while (const auto packet = ReadPacket(pcm)) {
+      const auto data = packet->data.AsBytes();
+      const auto stride = channels * sizeof(float);
+      Check(data.size() % stride == 0, "Multichannel WAV returned a partial PCM frame");
+      for (std::size_t offset = 0; offset < data.size(); offset += stride, ++frame) {
+        for (unsigned channel = 0; channel < channels; ++channel) {
+          float sample;
+          std::memcpy(&sample, data.data() + offset + channel * sizeof(sample), sizeof(sample));
+          Check(sample == SurroundSample(frame, channel) / 8388608.0f, "FLAC decoding changed a channel sample");
+        }
+      }
+    }
+    Check(frame == duration.ticks, "FLAC decoding lost its short final block");
+    CheckDecodedSeekSamples(tasks, ui, source, *wave, targets);
+
+    struct Output { ContainerFormat format; const char* suffix; };
+    constexpr Output outputs[]{{ContainerFormat::Wave, ".wav"}, {ContainerFormat::Rf64, ".wav"},
+        {ContainerFormat::Wave64, ".w64"}, {ContainerFormat::Aiff, ".aiff"}, {ContainerFormat::Caf, ".caf"}};
+    for (const auto& [format, suffix] : outputs) {
+      const auto file = media_preview::TemporaryFile(temporary, suffix);
+      const bool big = format == ContainerFormat::Aiff;
+      const MediaTrack pcm_track{.id = 1, .kind = TrackKind::Audio, .descriptions = {{
+          .codec = big ? CodecId::PcmS24Be : CodecId::PcmS24Le, .sample_rate = duration.timescale,
+          .channel_count = channels, .speaker_mask = mask}}};
+      auto mux = Require(MediaMuxer::Open(Require(file->OpenRandomAccess(FileAccessMode::ReadWrite)), format, std::span(&pcm_track, 1)));
+      auto bytes = std::make_shared<Bytes>();
+      for (int i = 0; i < duration.ticks; ++i) {
+        for (unsigned channel = 0; channel < channels; ++channel) {
+          const auto sample = static_cast<std::uint32_t>(SurroundSample(i, channel));
+          for (unsigned byte = 0; byte < 3; ++byte) bytes->push_back(std::byte(sample >> (8 * (big ? 2 - byte : byte))));
+        }
+      }
+      Check(!Require(mux.TryWrite({1, BufferReference(*bytes, bytes), MediaTimestamp{0, 48000}, {}, duration, true})),
+            "Multichannel PCM write requested another track");
+      Require(mux.Finish());
+      auto readback = media_preview::Open(*file);
+      Check(readback.Format() == format && readback.Duration() == duration &&
+            readback.Tracks().front().descriptions.front().speaker_mask == mask, "PCM readback changed its layout or duration");
+      CheckDecodedSeekSamples(tasks, ui, file, *wave, targets);
+#if defined(__APPLE__) && TARGET_OS_OSX
+      if (format != ContainerFormat::Wave64) CheckAudioReadback(*wave, *file, duration, channels);
+#endif
+    }
+  }
+}
+
 void CheckAudioContainers(const TaskScope& tasks, testing::UiTest& ui, const File& temporary, const File& fixtures) {
   const File aiff = fixtures.Child("preview-pcm.aiff"), caf = fixtures.Child("preview-pcm.caf");
   const auto aiff_copy = CopyAudioContainer(aiff, temporary, ContainerFormat::Aiff, ".aiff", {8821, 44100}, 1);
@@ -1102,7 +1184,8 @@ void CheckAudioContainers(const TaskScope& tasks, testing::UiTest& ui, const Fil
   Check(Require(first->ReadBytes()) == Require(second->ReadBytes()), "CAF and M4A decoded different trimmed ALAC samples");
 #endif
   CheckWave64AndVorbis(tasks, ui, temporary, fixtures);
-  std::cout << "PASS: PCM and Vorbis container preview, seek, and audio packet copy\n";
+  CheckSurroundAudio(tasks, ui, temporary, fixtures);
+  std::cout << "PASS: PCM, Vorbis, and multichannel FLAC container checks\n";
 }
 
 #if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
