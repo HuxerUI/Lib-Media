@@ -19,6 +19,8 @@ Pass the description selected by a packet to the corresponding decoder for a sup
 | Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, VP8, VP9, AV1, raw AAC-LC, mapping-family-zero Opus, and opaque subtitle samples | Sequential or random access | Sequential or random write |
 | WebM | VP8, VP9, AV1, and mapping-family-zero Opus | Sequential or random access | Sequential or random write |
 | RIFF WAVE and RF64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
+| AIFF | Mono/stereo packed interleaved S16BE, S24BE, or S32BE | Random access, or sequential when `COMM` precedes `SSND` | Random write |
+| CAF | Mono/stereo packed interleaved S16, S24, S32, or F32 in either byte order, or ALAC | Sized random access | Random write |
 | MPEG-4 ADTS | One raw mono/stereo AAC-LC access unit per frame | Sequential or random access | Sequential or random write |
 | Ogg | Mapping-family-zero Opus, including chained logical streams on input | Sequential or random access | Sequential or random write for one logical stream |
 | Native FLAC | Complete FLAC frames with STREAMINFO | Sequential or random access, with native seek table support | Random write for whole-frame packet copy |
@@ -49,9 +51,48 @@ to `AudioDecoder` for PCM preview and WAV export. [ALAC decoding](media-codec.md
 track write supported tags once in `udta/meta/ilst`. Empty optional metadata boxes leave the track and packets
 readable. [QuickTime metadata item list](https://developer.apple.com/documentation/quicktime-file-format/metadata_item_list_atom)
 
+### AIFF and CAF
+
+Use `ContainerFormat::Aiff` for `FORM/AIFF` files (`.aif` or `.aiff`) and `ContainerFormat::Caf` for `.caf`.
+Pass one mono or stereo audio track with one description and an integer sample rate. PCM packets contain complete
+interleaved sample frames. The reader uses the sample rate as its timescale and random-access seek selects an
+exact sample boundary. The writer finalizes the file size and sample count on `Finish()`.
+[AIFF specification](https://blog.zamzar.com/wp-content/uploads/2014/10/aiffspecs.pdf) ·
+[Core Audio Format specification](https://developer.apple.com/library/archive/documentation/MusicAudio/Reference/CAFSpec/CAF_spec/CAF_spec.html)
+
+To copy ALAC between CAF and M4A, pass the audio track and its `initialization_data`, edits, and original
+packets to a muxer for `ContainerFormat::Caf` or `ContainerFormat::Mp4`. The 24-byte ALAC configuration and
+compressed packet payloads are retained. The CAF mapping uses one configuration and one contiguous audible
+interval starting at presentation time zero. When writing CAF, the muxer intersects the edit with the actual
+packet coverage and rounds each retained boundary up to the sample grid, as in PCM preview. This preserves the
+valid samples when the M4A edit extends past a short final packet. CAF carries timing and codec configuration on
+this path. The separate tag and cover mapping described above is available for M4A.
+
+CAF reads packet sizes and valid sample counts from `pakt`. Packet durations use the number of samples coded
+in each ALAC packet. With a nominal packet size of 4096 samples, a final packet containing 2368 samples leaves
+1728 uncoded samples in the table's remainder. The reader applies any additional priming and padding through
+`MediaTrack::edits` and reports the effective interval through `PresentationRange()`. Use the packet times and
+edits together for copy or decoding. For newly authored ALAC, `EndTrack()` can also supply priming and padding.
+[ALAC configuration](https://github.com/macosforge/alac/blob/master/ALACMagicCookieDescription.txt)
+
+#### Verification
+
+| Platform | LPCM preview, seek, and container readback, plus CAF/M4A ALAC copy | CAF ALAC preview and seek |
+| --- | --- | --- |
+| macOS | Apple Silicon run with independent Core Audio and AVFoundation readback | Passed |
+| iOS | iOS Simulator run | Passed on Simulator |
+| Android | TAS-AN00 device run | — |
+| Web | Chrome C++/WASM run | — |
+| Windows | x64 and Arm64 cross-compilation of container and preview sources. Native run pending. | — |
+| Linux | x64 and Arm64 cross-compilation of container and preview sources. Native run pending. | — |
+
+Run `ctest --test-dir <build> -R '^media_audio_containers$' --output-on-failure` on desktop. On Android or iOS,
+run `media_container_preview_tests --audio-containers <fixture-directory>` with the audio files from
+`tests/fixtures/container`. On Web, open `container_preview_wasm.html?audio-containers` and select **Run preview checks**.
+
 ### Track presentation intervals
 
-`MediaTrack::edits` describes supported MP4 and MOV rate-one edits in order from movie time zero. Each entry
+`MediaTrack::edits` describes supported rate-one edits in order from presentation time zero. Each entry
 has a duration and an optional media start. An empty entry advances presentation without selecting media.
 Media intervals are forward and nonoverlapping. An empty edit list gives an identity mapping.
 
@@ -60,7 +101,7 @@ on a decoded media interval. Each slice contains the retained media start and it
 interval. Equivalent rational clocks are reduced before finding the exact mapping grid. Reuse the output vector
 between calls. The result can contain several slices if a frame or sample block crosses an edit boundary.
 A copy passes the edits and the original packet times together.
-Regular output rebases the media clock and edit offsets together when the first DTS is nonzero.
+Regular MP4 and MOV output rebase the media clock and edit offsets together when the first DTS is nonzero.
 
 `PresentationRange(track_id)` reports the half-open bounds of the available presented samples. The bounds
 can span gaps. Equal endpoints describe an empty interval. An absent result means coverage is unavailable

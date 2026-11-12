@@ -136,6 +136,7 @@ struct AlacConfig {
 };
 
 AlacConfig ParseAlac(ByteView config, ContainerErrorCode error);
+unsigned AlacPacketSamples(ByteView bytes, const AlacConfig& config, ContainerErrorCode error);
 
 struct FlacStreamInfo {
   unsigned min_block, max_block, max_frame, rate, channels, bits;
@@ -231,6 +232,12 @@ std::unique_ptr<ContainerWriter> OpenMp3Writer(ContainerOutput output, std::span
 std::unique_ptr<ContainerWriter> OpenWaveWriter(ContainerOutput output, ContainerFormat format,
                                                 std::span<const MediaTrack> tracks);
 void ValidateWave(std::span<const MediaTrack> tracks);
+std::unique_ptr<ContainerReader> OpenAiffReader(ContainerInput input);
+std::unique_ptr<ContainerWriter> OpenAiffWriter(ContainerOutput output, std::span<const MediaTrack> tracks);
+void ValidateAiff(std::span<const MediaTrack> tracks);
+std::unique_ptr<ContainerReader> OpenCafReader(ContainerInput input);
+std::unique_ptr<ContainerWriter> OpenCafWriter(ContainerOutput output, std::span<const MediaTrack> tracks);
+void ValidateCaf(std::span<const MediaTrack> tracks);
 std::unique_ptr<ContainerReader> OpenAdtsReader(ContainerInput input);
 std::unique_ptr<ContainerWriter> OpenAdtsWriter(ContainerOutput output, std::span<const MediaTrack> tracks);
 void ValidateAdts(std::span<const MediaTrack> tracks);

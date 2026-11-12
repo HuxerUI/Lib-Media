@@ -16,6 +16,9 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
   std::optional<ContainerFormat> recognized;
   if (prefix.size() >= 4 && Number<std::uint32_t>(prefix) == Tag("OggS")) recognized = ContainerFormat::Ogg;
   if (prefix.size() >= 4 && Number<std::uint32_t>(prefix) == Tag("fLaC")) recognized = ContainerFormat::Flac;
+  if (prefix.size() >= 4 && Number<std::uint32_t>(prefix) == Tag("caff")) recognized = ContainerFormat::Caf;
+  if (prefix.size() >= 12 && Number<std::uint32_t>(prefix) == Tag("FORM") && Number<std::uint32_t>(prefix, 8) == Tag("AIFF"))
+    recognized = ContainerFormat::Aiff;
   if (prefix.size() >= 12 && Number<std::uint32_t>(prefix, 8) == Tag("WAVE")) {
     const auto type = Number<std::uint32_t>(prefix);
     if (type == Tag("RIFF")) recognized = ContainerFormat::Wave;
@@ -38,6 +41,8 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
   switch (*recognized) {
     case ContainerFormat::Wave:
     case ContainerFormat::Rf64: return OpenWaveReader(std::move(input), *recognized);
+    case ContainerFormat::Aiff: return OpenAiffReader(std::move(input));
+    case ContainerFormat::Caf: return OpenCafReader(std::move(input));
     case ContainerFormat::Adts: return OpenAdtsReader(std::move(input));
     case ContainerFormat::Ogg: return OpenOggReader(std::move(input));
     case ContainerFormat::Flac: return OpenFlacReader(std::move(input));

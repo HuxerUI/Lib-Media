@@ -3,6 +3,7 @@
 
 #include "container/ebml.h"
 #include "container/mp4.h"
+#include "format/packed_pcm.h"
 
 #include <algorithm>
 #include <array>
@@ -630,6 +631,100 @@ void Wave(const fs::path& path, ContainerFormat format) {
   packet = *ReadPacket(demux);
   Check(packet.pts == MediaTimestamp{2, 48000} &&
         std::ranges::equal(packet.data.AsBytes(), std::span(bytes).last(frame_bytes)), "WAVE seek payload differs");
+}
+
+void PcmContainers(const fs::path& directory) {
+  struct Mapping { ContainerFormat container; CodecId codec; };
+  constexpr Mapping mappings[]{
+      {ContainerFormat::Aiff, CodecId::PcmS16Be}, {ContainerFormat::Aiff, CodecId::PcmS24Be},
+      {ContainerFormat::Aiff, CodecId::PcmS32Be}, {ContainerFormat::Caf, CodecId::PcmS16Le},
+      {ContainerFormat::Caf, CodecId::PcmS16Be}, {ContainerFormat::Caf, CodecId::PcmS24Le},
+      {ContainerFormat::Caf, CodecId::PcmS24Be}, {ContainerFormat::Caf, CodecId::PcmS32Le},
+      {ContainerFormat::Caf, CodecId::PcmS32Be}, {ContainerFormat::Caf, CodecId::PcmF32Le},
+      {ContainerFormat::Caf, CodecId::PcmF32Be},
+  };
+  unsigned index = 0;
+  for (const auto [format, codec] : mappings) {
+    const auto path = directory / ("pcm-" + std::to_string(++index));
+    const unsigned channels = index % 2 + 1, rate = index % 2 ? 44100 : 48000;
+    const auto stride = huxerui::media::detail::DescribePackedPcm(codec).bits / 8 * channels;
+    const MediaTrack track{.id = 1, .kind = TrackKind::Audio, .descriptions = {{
+        .codec = codec, .sample_rate = rate, .channel_count = channels}}};
+    Bytes bytes(3 * stride);
+    for (std::size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<std::byte>(i * 19);
+    auto mux = Take(MediaMuxer::Open(Output(path), format, std::span(&track, 1)));
+    Check(!mux.TryWrite({1, BytesRef(Bytes(1))}).Succeeded(), "PCM writer accepted an incomplete sample frame");
+    Check(!Take(mux.TryWrite({1, BytesRef(bytes), MediaTimestamp{0, rate}, {}, MediaTimestamp{3, rate}, true})),
+          "PCM writer requested another track");
+    Take(mux.Finish());
+    auto reader = Take(MediaDemuxer::Open(Take(Path(path).OpenRandomAccess())));
+    const auto metadata = reader.Tracks().front().descriptions.front();
+    Check(reader.Format() == format && metadata.codec == codec && metadata.channel_count == channels &&
+          metadata.sample_rate == rate && reader.Duration() == MediaTimestamp{3, rate}, "PCM container geometry changed");
+    const auto original = ReadPacket(reader);
+    Check(original && std::ranges::equal(original->data.AsBytes(), bytes) && !ReadPacket(reader), "PCM sample bytes changed");
+    for (const auto direction : {SeekDirection::AtOrBefore, SeekDirection::AtOrAfter, SeekDirection::AtOrBefore}) {
+      const auto point = Take(reader.Seek(1, {3, rate * 2}, direction));
+      const auto expected = direction == SeekDirection::AtOrBefore ? 1u : 2u;
+      const auto packet = ReadPacket(reader);
+      Check(point && point->presentation_time == MediaTimestamp{expected, rate} && packet &&
+            std::ranges::equal(packet->data.AsBytes(), std::span(bytes).subspan(expected * stride)), "PCM seek landed off the sample grid");
+    }
+  }
+}
+
+void CafPacketDurations(const fs::path& directory) {
+  const auto fixture = Path(fs::path(MEDIA_FIXTURES) / "container" / "tagged-alac.m4a");
+  auto source = Take(MediaDemuxer::Open(Take(fixture.OpenRandomAccess())));
+  auto track = source.Tracks().front();
+  track.edits.clear();
+  std::vector<ContainerPacket> packets;
+  while (auto packet = ReadPacket(source)) packets.push_back(std::move(*packet));
+  Check(packets.size() == 3 && packets.back().duration == MediaTimestamp{2368, 96000}, "ALAC short-tail fixture changed");
+  const auto short_path = directory / "shortened.caf";
+  auto shortened = Take(MediaMuxer::Open(Output(short_path), ContainerFormat::Caf, std::span(&track, 1)));
+  for (auto packet : packets) {
+    if (packet.duration == MediaTimestamp{2368, 96000}) packet.duration = MediaTimestamp{2351, 96000};
+    Check(!Take(shortened.TryWrite(packet)), "CAF did not accept the authored tail interval");
+  }
+  Take(shortened.Finish());
+  auto cut = Take(MediaDemuxer::Open(Take(Path(short_path).OpenRandomAccess())));
+  Check(cut.Duration() == MediaTimestamp{10543, 96000} && cut.Tracks().front().padding_samples == 17,
+        "CAF lost the difference between the coded and authored tail");
+
+  const auto fractional_path = directory / "fractional-edit.caf";
+  track.edits = {{{17, 200000}, MediaTimestamp{11, 200000}}};
+  auto fractional = Take(MediaMuxer::Open(Output(fractional_path), ContainerFormat::Caf, std::span(&track, 1)));
+  for (const auto& packet : packets)
+    Check(!Take(fractional.TryWrite(packet)), "CAF rejected an original packet with a fractional edit");
+  Take(fractional.Finish());
+  auto edited = Take(MediaDemuxer::Open(Take(Path(fractional_path).OpenRandomAccess())));
+  Check(edited.Duration() == MediaTimestamp{8, 96000} && edited.Tracks().front().priming_samples == 6,
+        "CAF did not round both ends of the edit up to sample boundaries");
+  track.edits.clear();
+
+  std::rotate(packets.begin(), std::prev(packets.end()), packets.end());
+  const auto variable_path = directory / "variable.caf";
+  auto variable = Take(MediaMuxer::Open(Output(variable_path), ContainerFormat::Caf, std::span(&track, 1)));
+  std::int64_t position = 0;
+  for (auto& packet : packets) {
+    packet.pts = packet.dts = MediaTimestamp{position, 96000};
+    Check(!Take(variable.TryWrite(packet)), "CAF did not accept a short packet before the tail");
+    position += packet.duration->Rescale(96000)->ticks;
+  }
+  Take(variable.Finish());
+  auto reader = Take(MediaDemuxer::Open(Take(Path(variable_path).OpenRandomAccess())));
+  Check(reader.Duration() == MediaTimestamp{10560, 96000}, "CAF variable packet durations changed");
+  const auto point = Take(reader.Seek(1, {2368, 96000}, SeekDirection::AtOrBefore));
+  const auto packet = ReadPacket(reader);
+  Check(point && point->decode_start_pts == packets[1].pts && packet && packet->duration == packets[1].duration &&
+        std::ranges::equal(packet->data.AsBytes(), packets[1].data.AsBytes()), "CAF variable packet table lost a seek boundary");
+  auto malformed = Take(Path(variable_path).ReadBytes());
+  malformed.pop_back();
+  const auto broken = Path(directory / "truncated-pakt.caf");
+  Check(broken.WriteBytes(malformed), "Could not stage truncated CAF packet table");
+  const auto rejected = MediaDemuxer::Open(Take(broken.OpenRandomAccess()));
+  Check(!rejected.Succeeded() && rejected.Error().code == ContainerErrorCode::InvalidData, "CAF accepted a truncated packet table");
 }
 
 void Adts(const fs::path& path) {
@@ -1854,6 +1949,8 @@ int main(int argc, char** argv) {
     Mp4(path / names[1], ContainerLayout::Fragmented);
     Wave(path / names[2], ContainerFormat::Wave);
     Wave(path / names[3], ContainerFormat::Rf64);
+    PcmContainers(path);
+    CafPacketDurations(path);
     Adts(path / names[4]);
     Mov(path / names[5], true, ContainerFormat::Mov);
     Mov(path / names[6], true, ContainerFormat::Mp4);

@@ -242,6 +242,8 @@ std::string_view AudioCopySuffix(const MediaDemuxer& reader) {
   const auto tracks = reader.Tracks();
   if (tracks.size() != 1 || tracks.front().kind != TrackKind::Audio) return {};
   switch (reader.Format()) {
+    case ContainerFormat::Aiff: return ".aiff";
+    case ContainerFormat::Caf: return ".caf";
     case ContainerFormat::Flac: return ".flac";
     case ContainerFormat::Mp3: return ".mp3";
     case ContainerFormat::Mp4:
@@ -258,7 +260,7 @@ struct AudioCopy {
       : file(std::move(input)), reader(Open(*file)) {
     const auto format = reader.Format();
     const auto suffix = AudioCopySuffix(reader);
-    if (suffix.empty()) throw std::runtime_error("Audio packet copy requires FLAC, MP3, or a single AAC/ALAC MP4 track");
+    if (suffix.empty()) throw std::runtime_error("The audio track cannot be copied to this container");
     output = TemporaryFile(temporary, suffix);
 #ifdef __EMSCRIPTEN__
     const auto layout = ContainerLayout::Default;

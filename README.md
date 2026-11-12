@@ -38,7 +38,7 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | AAC-LC audio encoding | Implemented; Windows/Linux native checks and Android/Web builds validated; macOS native tests passed; iOS validation pending | `AudioEncoder`, `AudioEncodeFormat`, and `AudioEncodeSummary` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | H.264 video encoding | Implemented; Windows/Linux native and Chrome C++/WASM round trips validated; Android build validated; macOS native tests passed; iOS validation pending | `VideoEncoder`, `VideoEncoderConfig`, `H264Profile`, and `VideoEncodeFormat` in [`media_codec.h`](include/huxerui/media_codec.h) |
 | Codec capability discovery | Typed AAC-LC and H.264 snapshots, plus per-codec audio decoder queries for Opus, FLAC, and MP3. Support and reported limits depend on the adapter. | `QueryCapabilities()` on the four codec classes and `AudioDecoder::QueryCapabilities(CodecId, ...)` in [`media_codec.h`](include/huxerui/media_codec.h) |
-| Container demuxing and muxing | MP4/M4A/fMP4, QuickTime MOV, Matroska, WebM, WAVE/RF64, ADTS, Ogg Opus with chained input, and native FLAC/MP3 with tag and cover copy | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
+| Container demuxing and muxing | MP4/M4A/fMP4, QuickTime MOV, Matroska, WebM, WAVE/RF64, AIFF and CAF LPCM, CAF ALAC, ADTS, Ogg Opus with chained input, and native FLAC/MP3 with tag and cover copy | `MediaDemuxer` and `MediaMuxer` in [`media_container.h`](include/huxerui/media_container.h) |
 
 Platform selection and saving implement [#125](https://github.com/HuxerUI/HuxerUI/issues/125). Selected media is returned as
 SDK `FileReference` values, which can be retained for reading, imported to local files, or passed to `MediaSource` for
@@ -363,6 +363,8 @@ Packet timestamps use the media clock. `MapToPresentation()` applies track edits
 `MediaMuxer` writes packets and finalizes the output through `Finish()`. Both sessions are synchronous. Use the [container guide](docs/media-container.md)
 for format mappings, seek behavior, output requirements, and packet ownership. Audio-only MP4 is saved as
 `.m4a` and supports AAC-LC or ALAC packets, supported text tags, front-cover artwork, and exact presentation trim.
+All six platforms read and write packed mono/stereo LPCM in AIFF and CAF and copy ALAC packets between CAF and M4A.
+[AIFF and CAF mappings](docs/media-container.md#aiff-and-caf)
 
 ## PCM playback
 
@@ -462,15 +464,18 @@ stereo LPCM. Compatible iOS devices preview standard 422. **Open from Photos** o
 Switch **CPU video** to **GPU video** for supported SDR platform frames. Android can preview directly to
 `SurfaceStreamTexture`. See the [frame storage contract and GPU performance comparison](docs/gpu-video.md).
 
-**Open audio** plays supported Ogg Opus, WebM/MKA, FLAC, MP3, and AAC M4A sources, plus mono/stereo ALAC M4A on macOS and iOS.
-**Copy Audio** keeps compatible FLAC, MP3, and AAC/ALAC M4A packets, supported tags, and artwork. **Copy Movie** keeps compatible
-MP4, MOV, WebM, or MKV access units, sample descriptions, timing, and supported metadata. The copy is reopened
-before the save action becomes available. EBML copies reuse the source Segment tick. Browser input is staged in
+**Open audio** plays supported AIFF/CAF LPCM, Ogg Opus, WebM/MKA, FLAC, MP3, and AAC M4A sources. On macOS and
+iOS it also previews and seeks mono/stereo ALAC in M4A and CAF. **Copy Audio** keeps compatible AIFF and CAF audio
+in its source container, and retains supported packets, tags, and artwork for FLAC, MP3, and AAC/ALAC M4A.
+**Copy Movie** keeps compatible MP4, MOV, WebM, or MKV access units, sample descriptions, timing, and supported metadata.
+The copy is reopened before the save action becomes available. EBML copies reuse the source Segment tick. Browser input is staged in
 memory and limited to 128 MiB. MKV copies retain supported subtitle tracks, chapters, tags, and attachments.
 
 The [preview integration test](tests/container_preview.cpp) covers repeated seeks, presentation edits,
 configuration changes, packet-by-packet copy checks, encoded MP4 readback, and WAV sample counts including authored silence.
 The test target also exports ProRes 422 + LPCM MOV through P210 and verifies the result with AVFoundation on macOS.
+The AIFF/CAF cases check PCM sample counts and seek, plus original ALAC packets, short tails, and audible trim in both
+CAF/M4A copy directions. Core Audio and AVFoundation independently read back the audio on macOS.
 Encoding and WAV export are built into the test target. Hardware cases use
 `Probe()` for the concrete configuration. The [roadmap](docs/media-roadmap.md) tracks remaining device acceptance.
 

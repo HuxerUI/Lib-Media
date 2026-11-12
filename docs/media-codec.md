@@ -184,7 +184,8 @@ the `apcn` MOV sample entry and `PacketFraming::CodecPacket`. [MOV encoding](med
 Set `AudioDecoderConfig::codec` to `CodecId::Alac` and pass the sample description's 24-byte `ALACSpecificConfig`.
 Choose S16 or F32 PCM with the source sample rate and mono or stereo layout. The decoder emits the actual sample
 count for each complete access unit, including a shorter final packet with leading data stream or fill elements.
-Apply container edits when presenting PCM.
+M4A and CAF use the same macOS and iOS decoder path. Apply container edits when presenting PCM or seeking
+into a trimmed stream. [CAF and M4A packet copy](media-container.md#aiff-and-caf)
 The preview uses interleaved S16 playback. WAV export uses F32 for ALAC and packed PCM sources.
 [AudioConverter decoding](https://developer.apple.com/documentation/audiotoolbox/encoding-and-decoding-audio) · [ALAC configuration](https://github.com/macosforge/alac/blob/master/ALACMagicCookieDescription.txt)
 
@@ -193,7 +194,7 @@ LPCM, then decode HQ to P210, encode standard 422, and write a MOV with the sour
 reads every video interval and PCM sample and decodes a pattern with distinct adjacent chroma rows. The exported MOV
 also passes repeated seeks on the LPCM clock. The iOS 26.5 Simulator returned `Unsupported` for ProRes decoder
 creation. ProRes preview from an iPhone camera file requires device acceptance. macOS and the iOS Simulator cover
-ALAC playback, repeated seeks, and F32 WAV readback with a short final packet.
+ALAC playback, repeated seeks, and F32 WAV readback for M4A and CAF with a short final packet and CAF trim.
 
 ### Opus, FLAC, and MP3
 

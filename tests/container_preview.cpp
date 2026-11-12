@@ -28,6 +28,7 @@ using namespace std::chrono_literals;
 
 #if defined(__APPLE__) && TARGET_OS_OSX
 void CheckProResReadback(const File& source, const File& export_file);
+void CheckAudioReadback(const File& source, const File& output, MediaTimestamp expected, unsigned channels);
 #endif
 
 #ifdef __ANDROID__
@@ -891,6 +892,69 @@ std::shared_ptr<const File> CheckAudioPreviewSample(const TaskScope& tasks, test
   return wave;
 }
 
+std::shared_ptr<const File> CopyAudioContainer(const File& source, const File& temporary, ContainerFormat target,
+    std::string_view suffix, MediaTimestamp expected, unsigned channels) {
+  auto reader = media_preview::Open(source);
+  auto output = media_preview::TemporaryFile(temporary, suffix);
+  auto mux = Require(MediaMuxer::Open(Require(output->OpenRandomAccess(FileAccessMode::ReadWrite)), target, reader.Tracks()));
+  while (const auto packet = ReadPacket(reader))
+    Check(!Require(mux.TryWrite(*packet)), "Single-track audio copy requested another track");
+  Require(mux.Finish());
+
+  auto input = media_preview::Open(source);
+  auto copy = media_preview::Open(*output);
+  const auto source_tracks = input.Tracks(), output_tracks = copy.Tracks();
+  const auto& original = source_tracks.front().descriptions.front();
+  const auto& copied = output_tracks.front().descriptions.front();
+  const auto track_id = output_tracks.front().id;
+  const bool alac = original.codec == CodecId::Alac;
+  const MediaPresentationRange audible{{0, expected.timescale}, expected};
+  Check(copy.Format() == target && copied.codec == original.codec && copied.initialization_data == original.initialization_data &&
+        copied.sample_rate == expected.timescale && copied.channel_count == channels &&
+        copy.Duration() == expected && input.PresentationRange(source_tracks.front().id) == audible &&
+        copy.PresentationRange(track_id) == audible,
+        "Audio copy changed its format or audible interval");
+  std::optional<MediaTimestamp> last_pts;
+  while (const auto packet = ReadPacket(input)) {
+    const auto next = ReadPacket(copy);
+    Check(next && packet->pts == next->pts && packet->dts == next->dts && packet->duration == next->duration &&
+          std::ranges::equal(packet->data.AsBytes(), next->data.AsBytes()), "Audio copy changed a packet or its coded timing");
+    last_pts = packet->pts;
+  }
+  Check(!ReadPacket(copy), "Audio copy added packets");
+  const MediaTimestamp final_sample{expected.ticks - 1, expected.timescale};
+  const auto point = Require(copy.Seek(track_id, final_sample, SeekDirection::AtOrBefore));
+  Check(point && ReadPacket(copy).has_value() && (alac ?
+        point->decode_start_pts == last_pts : point->presentation_time == final_sample),
+        "Audio copy could not seek to its final sample or packet");
+#if defined(__APPLE__) && TARGET_OS_OSX
+  CheckAudioReadback(source, *output, expected, channels);
+#endif
+  return output;
+}
+
+void CheckAudioContainers(const TaskScope& tasks, testing::UiTest& ui, const File& temporary, const File& fixtures) {
+  const File aiff = fixtures.Child("preview-pcm.aiff"), caf = fixtures.Child("preview-pcm.caf");
+  const auto aiff_copy = CopyAudioContainer(aiff, temporary, ContainerFormat::Aiff, ".aiff", {8821, 44100}, 1);
+  const auto caf_copy = CopyAudioContainer(caf, temporary, ContainerFormat::Caf, ".caf", {9600, 48000}, 2);
+  const File m4a = fixtures.Child("tagged-alac.m4a"), trimmed = fixtures.Child("trimmed-alac.caf");
+  const auto alac_caf = CopyAudioContainer(m4a, temporary, ContainerFormat::Caf, ".caf", {10560, 96000}, 2);
+  const auto alac_m4a = CopyAudioContainer(trimmed, temporary, ContainerFormat::Mp4, ".m4a", {10540, 96000}, 2);
+  CopyAudioContainer(*alac_caf, temporary, ContainerFormat::Mp4, ".m4a", {10560, 96000}, 2);
+  const auto trimmed_caf = CopyAudioContainer(*alac_m4a, temporary, ContainerFormat::Caf, ".caf", {10540, 96000}, 2);
+  CopyAudioContainer(fixtures.Child("alac-edit-8821.m4a"), temporary, ContainerFormat::Caf, ".caf", {8821, 44100}, 1);
+  CopyAudioContainer(fixtures.Child("alac-edit-8813.m4a"), temporary, ContainerFormat::Caf, ".caf", {8813, 44100}, 1);
+  CheckAudioPreviewSample(tasks, ui, temporary, {aiff_copy, {8821, 44100}, CodecId::PcmF32Le});
+  CheckAudioPreviewSample(tasks, ui, temporary, {caf_copy, {9600, 48000}, CodecId::PcmF32Le});
+#if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
+  CheckAudioPreviewSample(tasks, ui, temporary, {alac_caf, {10560, 96000}, CodecId::PcmF32Le});
+  const auto first = CheckAudioPreviewSample(tasks, ui, temporary, {trimmed_caf, {10540, 96000}, CodecId::PcmF32Le});
+  const auto second = CheckAudioPreviewSample(tasks, ui, temporary, {alac_m4a, {10540, 96000}, CodecId::PcmF32Le});
+  Check(Require(first->ReadBytes()) == Require(second->ReadBytes()), "CAF and M4A decoded different trimmed ALAC samples");
+#endif
+  std::cout << "PASS: AIFF/CAF PCM preview and seek, and CAF/M4A ALAC packet copy\n";
+}
+
 #if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
 void CheckAlacPreview(const TaskScope& tasks, testing::UiTest& ui, const File& temporary) {
   AudioPreviewSample sample{Fixture("tagged-alac.m4a"), {10560, 96000}, CodecId::PcmF32Le};
@@ -1025,15 +1089,21 @@ int main(int argc, char** argv) {
     });
     testing::UiTest ui(app);
     const File temporary(std::filesystem::temp_directory_path().u8string());
-#ifndef __EMSCRIPTEN__
+#ifdef __EMSCRIPTEN__
+    const bool audio_only = EM_ASM_INT({ return new URLSearchParams(location.search).has('audio-containers'); });
+    const File fixtures(MEDIA_FIXTURES);
+#else
     const bool vpx_only = argc == 3 && std::string_view(argv[1]) == "--vpx";
-    const File fixtures(vpx_only ? argv[2] : MEDIA_FIXTURES);
+    const bool audio_only = argc >= 2 && std::string_view(argv[1]) == "--audio-containers";
+    const File fixtures(argc == 3 && (vpx_only || audio_only) ? argv[2] : MEDIA_FIXTURES);
 #ifdef __ANDROID__
     if (vpx_only) pending_codecs.emplace(0);
 #endif
-#else
-    const File fixtures(MEDIA_FIXTURES);
 #endif
+    if (audio_only) {
+      CheckAudioContainers(tasks, ui, temporary, fixtures);
+      return 0;
+    }
     for (const auto* name : {"webm-vp8-opus.webm", "preview-vp9-opus-no-cues.webm"})
       CheckVpxPreview(tasks, ui, temporary, std::make_shared<const File>(fixtures.Child(name)));
 #ifndef __EMSCRIPTEN__

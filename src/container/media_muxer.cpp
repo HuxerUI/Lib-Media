@@ -33,7 +33,7 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
     if (it->seek_preroll && it->seek_preroll->ticks &&
         format != ContainerFormat::Matroska && format != ContainerFormat::WebM && format != ContainerFormat::Ogg)
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain track seek preroll");
-    if (!it->edits.empty() && !mp4)
+    if (!it->edits.empty() && !mp4 && format != ContainerFormat::Caf)
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain the supplied presentation edits");
     if (!it->references.empty() && format != ContainerFormat::Mov)
       Fail(ContainerErrorCode::Unsupported, "Output format cannot retain QuickTime track references");
@@ -60,6 +60,12 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
     case ContainerFormat::Wave:
     case ContainerFormat::Rf64:
       ValidateWave(tracks);
+      return Requirement::RandomWrite;
+    case ContainerFormat::Aiff:
+      ValidateAiff(tracks);
+      return Requirement::RandomWrite;
+    case ContainerFormat::Caf:
+      ValidateCaf(tracks);
       return Requirement::RandomWrite;
     case ContainerFormat::Adts:
       ValidateAdts(tracks);
@@ -95,6 +101,8 @@ std::unique_ptr<ContainerWriter> OpenWriter(ContainerOutput output, ContainerFor
   switch (format) {
     case ContainerFormat::Wave:
     case ContainerFormat::Rf64: return OpenWaveWriter(std::move(output), format, tracks);
+    case ContainerFormat::Aiff: return OpenAiffWriter(std::move(output), tracks);
+    case ContainerFormat::Caf: return OpenCafWriter(std::move(output), tracks);
     case ContainerFormat::Adts: return OpenAdtsWriter(std::move(output), tracks);
     case ContainerFormat::Ogg: return OpenOggWriter(std::move(output), tracks);
     case ContainerFormat::Mp4:

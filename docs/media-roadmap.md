@@ -13,7 +13,8 @@ selection and publication. See the [capability table](../README.md#capabilities)
 | Matroska HEVC and AAC | Verify HEVC preview and repeated seeks. Keep the source Segment tick for negative video PTS and retain AAC sample timing when copying compatible audio to M4A. |
 | Chained Ogg Opus | Keep one track with stable description indices. Restart decoding at each link, preserve its absolute audible start, and verify seek and WAV sample counts. |
 | ProRes 422 family MOV with LPCM | On macOS, preview and seek Proxy, LT, 422, and HQ on the LPCM clock. Transfer ten-bit 4:2:2 frames to the standard 422 encoder. Verify the exported MOV's picture timing, chroma, and LPCM with AVFoundation. |
-| Mono/stereo ALAC M4A | On macOS and iOS, preview and seek ALAC and verify the short final packet through F32 WAV readback. |
+| AIFF and CAF LPCM | Read and write packed mono/stereo PCM, preview and seek on the sample clock, and verify sample counts with independent Core Audio readback. |
+| Mono/stereo ALAC in CAF and M4A | Copy both ways with original packets, the short final packet, and exact trim. On macOS and iOS, preview and seek both containers and verify their F32 WAV samples. |
 
 The Frames example opens, previews, seeks, copies, and saves supported files. The integration tests exercise
 reordered encoding, GPU crop and scale, encoded MP4 readback, and WAV export.
@@ -29,6 +30,8 @@ reordered encoding, GPU crop and scale, encoded MP4 readback, and WAV export.
   Check codec probes, pause and seek, A/V synchronization, drain, GPU frame reuse, and cleanup.
   Verify VP8/VP9 with the installed Windows and Linux decoders and VP9 on physical iOS hardware.
   [Codec matrix](media-codec.md) · [VP8/VP9 matrix](media-codec.md#vp8-and-vp9) · [GPU video validation](gpu-video.md)
+- Run the AIFF/CAF LPCM and CAF/M4A ALAC regressions on native Windows and Linux. Verify CAF ALAC preview
+  on an iOS device. [Audio container verification](media-container.md#verification)
 - Verify platform players with local files, picker references, and HTTPS. Check selection, retained references,
   and publication on Android and iOS. [Playback checks](../README.md#automated-and-device-checks) ·
   [Media library checks](media-library.md#preview-and-validation)
@@ -39,8 +42,8 @@ Use application inputs and independent readback to scope each format, direction,
 
 - Extend MP4/MOV/fMP4 for needed sample entries, index layouts, edits, and metadata. Extend Matroska/WebM
   for needed codecs and subtitle, chapter, and tag preservation.
-- Evaluate additional audio mappings and PCM containers, including Vorbis, multichannel FLAC, AIFF, CAF,
-  and Wave64. Evaluate ProRes 4444 and additional ProRes encoder profiles or platforms, and further AV1 profiles or encoding.
+- Evaluate additional audio mappings and PCM containers, including Vorbis, multichannel FLAC, and Wave64.
+  Evaluate ProRes 4444 and additional ProRes encoder profiles or platforms, and further AV1 profiles or encoding.
 - Evaluate transport streams, AVI, Annex B, and standalone subtitles against actual ingest requirements.
 
 Lib-AVKit owns backend selection, precise extraction, thumbnails, audio processing, compositing, timeline

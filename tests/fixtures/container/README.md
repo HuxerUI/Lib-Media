@@ -94,6 +94,14 @@ ffmpeg -f lavfi -i sine=sample_rate=48000:duration=5.15 \
   an empty box and checks that the audio timeline and packets remain readable.
 - `tagged-alac.m4a` has three lossless packets at 96 kHz with 10560 samples, including a shorter final packet.
   Both M4A fixtures carry the same text tags and PNG cover and exercise fast-start copy and seek.
+- `preview-pcm.aiff` carries 8821 mono S24BE frames at 44.1 kHz and has an odd-length sound payload.
+  `preview-pcm.caf` carries 9600 stereo F32BE frames at 48 kHz. Core Audio wrote both files.
+- `trimmed-alac.caf` carries stereo ALAC at 96 kHz in packets of 4096, 4096, and 2368 coded samples.
+  Its valid interval retains 10540 samples after 7 samples of priming and 13 of tail trim. The fixed-frame
+  table includes the 1728 uncoded samples of the last nominal packet in its remainder.
+- `alac-edit-8821.m4a` and `alac-edit-8813.m4a` carry mono ALAC at 44.1 kHz with 8821 and 8813 samples.
+  Their FFmpeg edit lengths are 201 and 200 ms respectively. Both extend beyond the last packet, and the 201 ms
+  boundary also falls between samples. The regression compares every packet and checks the valid CAF sample count.
 - `fragmented-aac.m4a` has 23 AAC-LC packets over four fragments, spanning 22624 samples at 48 kHz. The
   preview test copies it to regular M4A and compares packet contents and timing with indexed source readback.
 
@@ -134,6 +142,27 @@ done <<'EOF'
 aac 660 48000 1.1
 alac 440 96000 0.11
 EOF
+```
+
+On macOS, generate the PCM fixtures and an ALAC CAF with Core Audio.
+
+```sh
+ffmpeg -f lavfi -i 'sine=sample_rate=44100:duration=0.25' -af atrim=end_sample=8821 -c:a pcm_s24le aiff-source.wav
+afconvert -f AIFF -d BEI24 aiff-source.wav preview-pcm.aiff
+ffmpeg -f lavfi -i 'aevalsrc=0.2*sin(2*PI*440*t)|0.15*sin(2*PI*660*t):s=48000:d=0.2' -c:a pcm_f32le caf-source.wav
+afconvert -f caff -d BEF32 caf-source.wav preview-pcm.caf
+afconvert -f caff -d alac tagged-alac.m4a trimmed-alac.caf
+```
+
+For `trimmed-alac.caf`, set the `pakt` header's big-endian packet count, valid frames, priming, and remainder
+to 3, 10540, 7, and 1741. Retain the packet lengths and audio data. The fixture keeps `desc`, `kuki`, `data`,
+and `pakt` chunks.
+
+```sh
+for frames in 8821 8813; do
+  ffmpeg -f lavfi -i 'sine=sample_rate=44100:duration=0.25' -af "atrim=end_sample=$frames" \
+    -c:a alac -movie_timescale 1000 "alac-edit-$frames.m4a"
+done
 ```
 
 ```sh

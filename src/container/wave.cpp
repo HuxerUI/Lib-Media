@@ -1,6 +1,4 @@
-#include "container_io.h"
-
-#include "codec/common.h"
+#include "pcm.h"
 
 #include <array>
 
@@ -70,9 +68,9 @@ void ReadFormat(ByteView bytes, MediaTrack& track, unsigned& alignment) {
   description.channel_count = channels;
 }
 
-class WaveReader final : public ContainerReader {
+class WaveReader final : public PcmReader {
 public:
-  WaveReader(ContainerInput input, ContainerFormat format) : ContainerReader(std::move(input), format) {
+  WaveReader(ContainerInput input, ContainerFormat format) : PcmReader(std::move(input), format) {
     const auto header = this->input.ReadBytes(12);
     const bool rf64 = format == ContainerFormat::Rf64;
     auto end = AddOffset(8, Number<std::uint32_t>(header, 4, true));
@@ -97,6 +95,7 @@ public:
       Fail(ContainerErrorCode::InvalidData, "WAVE length exceeds input");
 
     MediaTrack track{.descriptions = {{}}};
+    unsigned alignment = 0;
     std::size_t chunks = 0;
     while (end - this->input.Position() >= 8) {
       if (++chunks > 4096 || (!this->input.Random() && this->input.Position() > MaxContainerMetadata))
@@ -108,18 +107,11 @@ public:
       const auto padded = AddOffset(size, size & 1);
       if (padded > end - this->input.Position()) Fail(ContainerErrorCode::InvalidData, "WAVE chunk exceeds RIFF length");
       if (type == Tag("fmt ")) {
-        if (alignment_ || size < 16 || size > 65536) Fail(ContainerErrorCode::InvalidData, "Invalid WAVE format chunk");
-        ReadFormat(this->input.ReadBytes(static_cast<std::size_t>(size)), track, alignment_);
+        if (alignment || size < 16 || size > 65536) Fail(ContainerErrorCode::InvalidData, "Invalid WAVE format chunk");
+        ReadFormat(this->input.ReadBytes(static_cast<std::size_t>(size)), track, alignment);
         this->input.Skip(size & 1);
       } else if (type == Tag("data")) {
-        if (!alignment_ || size % alignment_ || size / alignment_ > std::numeric_limits<std::int64_t>::max())
-          Fail(ContainerErrorCode::InvalidData, "WAVE data is missing a format or ends inside a sample frame");
-        offset_ = this->input.Position();
-        frames_ = static_cast<std::int64_t>(size / alignment_);
-        odd_ = size & 1;
-        start = MediaTimestamp{0, *track.descriptions.front().sample_rate};
-        duration = MediaTimestamp{frames_, *track.descriptions.front().sample_rate};
-        tracks.push_back(std::move(track));
+        Begin(std::move(track), size, alignment, (size & 1) != 0);
         return;
       } else {
         if ((!this->input.Random() || !this->input.Size()) && padded > MaxContainerMetadata)
@@ -130,54 +122,6 @@ public:
     Fail(ContainerErrorCode::InvalidData, "Missing WAVE data chunk");
   }
 
-  std::optional<ContainerPacket> Read() override {
-    if (cursor_ == frames_) {
-      if (odd_) {
-        input.Skip(1);
-        odd_ = false;
-      }
-      return {};
-    }
-    // Emit bounded blocks without ever splitting an interleaved sample frame.
-    const auto frames = std::min<std::int64_t>(frames_ - cursor_, std::max(1u, 16384 / alignment_));
-    const auto size = static_cast<std::size_t>(frames) * alignment_;
-    auto bytes = Own(input.ReadBytes(size));
-    const auto time = MediaTimestamp{cursor_, *tracks[0].descriptions.front().sample_rate};
-    cursor_ += frames;
-    return ContainerPacket{1, std::move(bytes), time, time, MediaTimestamp{frames, time.timescale}, true};
-  }
-
-  std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp time, SeekDirection direction, bool seek) override {
-    if (seek && !input.Random()) Fail(ContainerErrorCode::NeedRandomAccess, "WAVE input cannot seek");
-    if (!frames_) return {};
-    const auto rate = *tracks[0].descriptions.front().sample_rate;
-    const MediaTimestamp first{0, rate}, last{frames_ - 1, rate};
-    std::int64_t frame = 0;
-    if (time.Compare(first) < 0) {
-      if (direction == SeekDirection::AtOrBefore) return {};
-    } else if (time.Compare(last) > 0) {
-      if (direction == SeekDirection::AtOrAfter) return {};
-      frame = last.ticks;
-    } else {
-      frame = time.Rescale(rate)->ticks;
-      const auto comparison = MediaTimestamp{frame, rate}.Compare(time);
-      if (direction == SeekDirection::AtOrBefore && comparison > 0) --frame;
-      if (direction == SeekDirection::AtOrAfter && comparison < 0) ++frame;
-    }
-    const auto offset = AddOffset(offset_, static_cast<std::uint64_t>(frame) * alignment_);
-    if (seek) {
-      input.Seek(offset);
-      cursor_ = frame;
-    }
-    return SeekPoint{id, {frame, rate}, SeekPoint::Kind::Independent, offset, {frame, rate}};
-  }
-
-private:
-  unsigned alignment_ = 0;
-  std::uint64_t offset_ = 0;
-  std::int64_t frames_ = 0;
-  std::int64_t cursor_ = 0;
-  bool odd_ = false;
 };
 
 class WaveWriter final : public ContainerWriter {

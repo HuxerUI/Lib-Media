@@ -92,71 +92,6 @@ CodecResult<void> ValidateSps(const AvcConfig& avc, std::uint32_t maximum_width,
   return CodecResult<void>::Success();
 }
 
-class AlacBits {
-public:
-  explicit AlacBits(ByteView bytes) : bytes_(bytes) {}
-
-  std::uint32_t Read(unsigned count) {
-    const auto bytes = bytes_;
-    const auto offset = offset_;
-    Skip(count);
-    std::uint32_t value = 0;
-    for (unsigned i = 0; i < count; ++i) {
-      const auto bit = offset + i;
-      value = (value << 1) | ((std::to_integer<unsigned>(bytes[bit / 8]) >> (7 - bit % 8)) & 1u);
-    }
-    return value;
-  }
-
-  void Skip(unsigned count) {
-    const auto end = offset_ + count;
-    const auto bytes = end / 8;
-    if (bytes > bytes_.size() || (bytes == bytes_.size() && end % 8))
-      Fail(ContainerErrorCode::InvalidData, "Truncated ALAC packet header");
-    bytes_ = bytes_.subspan(bytes);
-    offset_ = end % 8;
-  }
-
-  void Align() { Skip((8 - offset_) % 8); }
-
-private:
-  ByteView bytes_;
-  unsigned offset_ = 0;
-};
-
-unsigned AlacPacketSamples(ByteView bytes, const AlacConfig& config) {
-  constexpr unsigned data_stream = 4, fill = 6;
-  AlacBits bits(bytes);
-  auto element = bits.Read(3);
-  while (element == data_stream || element == fill) {
-    unsigned length;
-    if (element == data_stream) {
-      bits.Skip(4); // Element instance tag.
-      const bool align = bits.Read(1) != 0;
-      length = bits.Read(8);
-      if (length == 255) length += bits.Read(8);
-      if (align) bits.Align();
-    } else {
-      length = bits.Read(4);
-      if (length == 15) length = 14 + bits.Read(8);
-    }
-    bits.Skip(length * 8);
-    element = bits.Read(3);
-  }
-  if (element != config.channels - 1)
-    Fail(ContainerErrorCode::InvalidData, "Invalid mono or stereo ALAC packet header");
-  bits.Skip(4); // Element instance tag.
-  const auto reserved = bits.Read(12);
-  const bool partial = bits.Read(1) != 0;
-  const auto shifted = bits.Read(2);
-  bits.Skip(1); // Uncompressed flag.
-  if (reserved || shifted == 3)
-    Fail(ContainerErrorCode::InvalidData, "Invalid mono or stereo ALAC packet header");
-  const auto samples = partial ? bits.Read(32) : config.frame_length;
-  if (!samples || samples > config.frame_length)
-    Fail(ContainerErrorCode::InvalidData, "ALAC packet exceeds the configured frame length");
-  return samples;
-}
 } // namespace
 
 CodecResult<unsigned> AudioSampleLimit(const AudioDecoderConfig& config) {
@@ -214,7 +149,8 @@ CodecResult<unsigned> AudioPacketSamples(const AudioDecoderConfig& config, std::
     switch (config.codec) {
       case CodecId::Aac: return R::Success(1024);
       case CodecId::Alac:
-        return R::Success(AlacPacketSamples(bytes, ParseAlac(config.initialization_data, ContainerErrorCode::InvalidData)));
+        return R::Success(AlacPacketSamples(bytes, ParseAlac(config.initialization_data, ContainerErrorCode::InvalidData),
+                                            ContainerErrorCode::InvalidData));
       case CodecId::Opus: return R::Success(OpusPacketSamples(bytes, ContainerErrorCode::InvalidData));
       case CodecId::Flac:
         return R::Success(FlacPacketSamples(bytes, ParseFlacStreamInfo(config.initialization_data, ContainerErrorCode::InvalidData)));

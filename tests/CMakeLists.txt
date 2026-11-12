@@ -32,8 +32,8 @@ if ((ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linu
         target_include_directories(media_container_preview_tests PRIVATE "${PROJECT_SOURCE_DIR}/platform/ios/src")
     elseif (APPLE)
         set_target_properties(media_container_preview_tests PROPERTIES OBJCXX_STANDARD 20)
-        target_sources(media_container_preview_tests PRIVATE prores_readback_macos.mm)
-        set_source_files_properties(prores_readback_macos.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+        target_sources(media_container_preview_tests PRIVATE media_readback_macos.mm)
+        set_source_files_properties(media_readback_macos.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
         target_include_directories(media_container_preview_tests PRIVATE "${PROJECT_SOURCE_DIR}/platform/macos/src")
     elseif (WIN32)
         target_compile_definitions(media_container_preview_tests PRIVATE NOMINMAX)
@@ -49,7 +49,8 @@ if ((ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linu
         target_compile_definitions(media_container_preview_tests PRIVATE MEDIA_FIXTURES="/fixtures/container")
         foreach (fixture IN ITEMS tagged-mp3.mp3 tagged-aac.m4a fragmented-aac.m4a preview-hevc-main.mp4
                 webm-vp8-opus.webm preview-vp9-opus-no-cues.webm mkv-hevc-aac.mkv
-                preview-av1.webm preview-av1.mkv preview-av1.mp4)
+                preview-av1.webm preview-av1.mkv preview-av1.mp4
+                preview-pcm.aiff preview-pcm.caf tagged-alac.m4a trimmed-alac.caf alac-edit-8821.m4a alac-edit-8813.m4a)
             target_link_options(media_container_preview_tests PRIVATE
                     "SHELL:--preload-file \"${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container/${fixture}@/fixtures/container/${fixture}\"")
         endforeach ()
@@ -61,7 +62,8 @@ if ((ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linu
         target_compile_definitions(media_container_preview_tests PRIVATE MEDIA_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container")
         if (NOT IOS AND NOT ANDROID)
             add_test(NAME media_container_preview COMMAND media_container_preview_tests)
-            set_tests_properties(media_container_preview PROPERTIES TIMEOUT 180)
+            add_test(NAME media_audio_containers COMMAND media_container_preview_tests --audio-containers)
+            set_tests_properties(media_container_preview media_audio_containers PROPERTIES TIMEOUT 180)
         endif ()
     endif ()
 endif ()

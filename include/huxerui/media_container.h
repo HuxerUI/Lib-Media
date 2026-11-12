@@ -40,6 +40,8 @@ enum class ContainerFormat {
   Ogg,      ///< Mapping-family-zero Opus, with chained logical streams supported on input.
   Flac,     ///< Native FLAC frames following a STREAMINFO metadata block.
   Mp3,      ///< MPEG Layer III audio frames with optional ID3 and Xing information.
+  Aiff,     ///< AIFF with packed big-endian signed integer PCM.
+  Caf,      ///< Core Audio Format with packed LPCM or mono/stereo ALAC.
 };
 
 /// @brief File organization within a container format.
@@ -248,7 +250,8 @@ struct MediaTrack {
   /// Known nonnegative duration of data to decode before presenting output after seeking.
   /// Absence leaves the preroll unspecified. Matroska and WebM can retain it in the track header.
   std::optional<MediaTimestamp> seek_preroll = {};
-  /// Ordered rate-one MP4 or MOV edits. An empty list maps media times directly to presentation times.
+  /// Ordered rate-one edits. An empty list maps media times directly to presentation times.
+  /// CAF ALAC represents one contiguous media interval beginning at presentation time zero.
   /// Pass the edits and the original packet times together to preserve the authored presentation.
   /// Fragmented output needs the list at open and requires nonnegative packet DTS.
   std::vector<Edit> edits;
