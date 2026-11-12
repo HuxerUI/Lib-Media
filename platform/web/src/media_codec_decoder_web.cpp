@@ -43,23 +43,9 @@ std::string Av1CodecString(const VideoDecoderConfig& video) {
   std::string codec = "av01.0.";
   if (config.level < 10) codec += '0';
   codec += std::to_string(config.level);
-  codec += config.high_tier ? "H.08" : "M.08";
+  codec += config.high_tier ? "H." : "M.";
+  codec += config.bit_depth == 10 ? "10" : "08";
   return codec;
-}
-
-Bytes SizedAv1Packet(std::span<const std::byte> bytes, std::size_t offset) {
-  const auto header_size = (std::to_integer<unsigned>(bytes[offset]) & 4) ? 2u : 1u;
-  const auto payload = bytes.subspan(offset + header_size);
-  Bytes packet(bytes.begin(), bytes.begin() + offset + header_size);
-  packet[offset] |= std::byte{2};
-  auto size = payload.size();
-  do {
-    const auto digit = size & 127;
-    size >>= 7;
-    packet.push_back(static_cast<std::byte>(digit | (size ? 128 : 0)));
-  } while (size);
-  packet.insert(packet.end(), payload.begin(), payload.end());
-  return packet;
 }
 
 class WebDecoder final : public DecoderBackend {

@@ -1,5 +1,6 @@
 #include "mp4.h"
 #include "framed_audio.h"
+#include "pcm.h"
 
 #include "codec/common.h"
 
@@ -293,6 +294,14 @@ void ReadPcmDescription(const BoxView& entry, MediaSampleDescription& track) {
     Fail(Invalid, "Inconsistent QuickTime PCM channels, rate, or frame size");
   track.sample_rate = rate;
   track.channel_count = channels;
+  const auto extension = version == 2 ? Number<std::uint32_t>(entry.bytes, 28) - 8 : version ? 44u : 28u;
+  if (entry.bytes.size() > extension) {
+    const auto layout = Child(entry.bytes.subspan(extension), "chan", false);
+    if (!layout.empty()) {
+      if (Number<std::uint32_t>(layout) != 0 || layout.size() > 4100) Fail(Unsupported, "Invalid QuickTime channel layout");
+      ReadPcmChannelLayout(track, Bytes(layout.begin() + 4, layout.end()));
+    }
+  }
 }
 
 std::int64_t SignedTicks(std::uint64_t value) {

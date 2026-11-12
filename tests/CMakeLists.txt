@@ -51,7 +51,7 @@ if ((ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linu
                 webm-vp8-opus.webm preview-vp9-opus-no-cues.webm mkv-hevc-aac.mkv
                 preview-av1.webm preview-av1.mkv preview-av1.mp4
                 preview-pcm.aiff preview-pcm.caf tagged-alac.m4a trimmed-alac.caf alac-edit-8821.m4a alac-edit-8813.m4a
-                preview-pcm.w64 preview-vorbis.ogg surround-51.flac surround-71.flac)
+                preview-pcm.w64 preview-vorbis.ogg surround-51.flac surround-71.flac surround-opus.ogg surround-vorbis.ogg)
             target_link_options(media_container_preview_tests PRIVATE
                     "SHELL:--preload-file \"${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container/${fixture}@/fixtures/container/${fixture}\"")
         endforeach ()
@@ -162,6 +162,11 @@ if (NOT EMSCRIPTEN AND (APPLE OR ANDROID OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL 
     target_link_libraries(media_video_encoder_native_tests PRIVATE huxerui_media ${MEDIA_TEST_FRAMEWORK})
     target_compile_features(media_video_encoder_native_tests PRIVATE cxx_std_20)
     add_test(NAME media_video_encoder_native COMMAND media_video_encoder_native_tests)
+    if (NOT ANDROID AND NOT IOS)
+        add_test(NAME media_video_format_extensions COMMAND media_video_encoder_native_tests
+                --format-extensions "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/container")
+        set_tests_properties(media_video_format_extensions PROPERTIES TIMEOUT 120)
+    endif ()
     set_tests_properties(media_video_encoder_native PROPERTIES TIMEOUT 180)
 
     add_executable(media_audio_encoder_native_tests audio_encoder_native.cpp)

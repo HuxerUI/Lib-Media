@@ -16,13 +16,42 @@ ByteView AacLcInitialization(ByteView config) {
   return config;
 }
 
+std::uint32_t VorbisSpeakerMask(unsigned channels) {
+  constexpr std::array masks{0x4u, 0x3u, 0x7u, 0x33u, 0x37u, 0x3fu, 0x70fu, 0x63fu};
+  return channels && channels <= masks.size() ? masks[channels - 1] : 0;
+}
+
+unsigned WaveToVorbisChannel(unsigned channel, unsigned channels) {
+  constexpr unsigned order[8][8]{
+      {0}, {0, 1}, {0, 2, 1}, {0, 1, 2, 3}, {0, 2, 1, 3, 4}, {0, 2, 1, 5, 3, 4},
+      {0, 2, 1, 6, 5, 3, 4}, {0, 2, 1, 7, 5, 6, 3, 4}};
+  return order[channels - 1][channel];
+}
+
 OpusHead ParseOpus(ByteView bytes, ContainerErrorCode error) {
-  if (bytes.size() != 19 || Number<std::uint64_t>(bytes) != 0x4f70757348656164ull ||
-      Number<std::uint8_t>(bytes, 8) != 1 || Number<std::uint8_t>(bytes, 18) != 0)
-    Fail(error, "Opus requires a version-one mapping-family-zero OpusHead");
+  if (bytes.size() < 19 || Number<std::uint64_t>(bytes) != 0x4f70757348656164ull ||
+      Number<std::uint8_t>(bytes, 8) != 1)
+    Fail(error, "Invalid version-one OpusHead");
   const auto channels = Number<std::uint8_t>(bytes, 9);
-  if (channels != 1 && channels != 2) Fail(error, "Opus requires one or two channels");
-  return {channels, Number<std::uint32_t>(bytes, 12, true), Number<std::uint16_t>(bytes, 10, true)};
+  const auto family = Number<std::uint8_t>(bytes, 18);
+  OpusHead head{channels, Number<std::uint32_t>(bytes, 12, true), Number<std::uint16_t>(bytes, 10, true), family};
+  if (!family && channels >= 1 && channels <= 2 && bytes.size() == 19) {
+    head.coupled = channels - 1;
+    head.mapping[1] = 1;
+    return head;
+  }
+  if (family != 1 || !channels || channels > 8 || bytes.size() != 21u + channels)
+    Fail(error, "Unsupported Opus channel mapping");
+  head.streams = Number<std::uint8_t>(bytes, 19);
+  head.coupled = Number<std::uint8_t>(bytes, 20);
+  if (!head.streams || head.coupled > head.streams || head.streams + head.coupled > 255)
+    Fail(error, "Invalid Opus stream counts");
+  for (unsigned channel = 0; channel < channels; ++channel) {
+    const auto mapping = Number<std::uint8_t>(bytes, 21 + channel);
+    if (mapping != 255 && mapping >= head.streams + head.coupled) Fail(error, "Invalid Opus stream mapping index");
+    head.mapping[channel] = mapping;
+  }
+  return head;
 }
 
 unsigned OpusPacketSamples(ByteView packet, ContainerErrorCode error) {

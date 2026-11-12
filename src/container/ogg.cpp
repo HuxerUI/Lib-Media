@@ -143,7 +143,8 @@ Link ReadLink(ContainerInput& input, Cursor& cursor, std::optional<std::int64_t>
     auto configuration = PackVorbisHeaders(headers);
     link.vorbis = std::make_shared<VorbisHeaders>(configuration, Bad);
     link.description = {.codec = CodecId::Vorbis, .initialization_data = std::move(configuration),
-                        .sample_rate = link.vorbis->Rate(), .channel_count = link.vorbis->Channels()};
+                        .sample_rate = link.vorbis->Rate(), .channel_count = link.vorbis->Channels(),
+                        .speaker_mask = VorbisSpeakerMask(link.vorbis->Channels())};
     return link;
   }
   const auto info = ParseOpus(head.packets.front(), ContainerErrorCode::Unsupported);
@@ -172,7 +173,7 @@ Link ReadLink(ContainerInput& input, Cursor& cursor, std::optional<std::int64_t>
   for (std::uint32_t i = 0; i < count; ++i) skip_string();
 
   link.description = {.codec = CodecId::Opus, .initialization_data = std::move(head.packets.front()),
-                      .sample_rate = Clock, .channel_count = info.channels};
+                      .sample_rate = Clock, .channel_count = info.channels, .speaker_mask = VorbisSpeakerMask(info.channels)};
   link.pre_skip = info.pre_skip;
   return link;
 }
@@ -584,6 +585,7 @@ void ValidateOgg(std::span<const MediaTrack> tracks) {
   if (description.codec == CodecId::Vorbis) {
     const VorbisHeaders vorbis(description.initialization_data, Argument);
     if (description.channel_count != vorbis.Channels() || description.sample_rate != vorbis.Rate() ||
+        (description.speaker_mask && description.speaker_mask != VorbisSpeakerMask(vorbis.Channels())) ||
         (track.timescale && track.timescale != vorbis.Rate()) || track.priming_samples.value_or(0) > vorbis.MaxSamples() ||
         track.padding_samples.value_or(0))
       Fail(Argument, "Ogg Vorbis track metadata differs from its sample clock");
@@ -592,6 +594,7 @@ void ValidateOgg(std::span<const MediaTrack> tracks) {
   if (description.codec != CodecId::Opus) Fail(ContainerErrorCode::Unsupported, "Ogg output requires Opus or Vorbis");
   const auto info = ParseOpus(description.initialization_data, Argument);
   if (description.channel_count != info.channels || description.sample_rate != Clock ||
+      (description.speaker_mask && description.speaker_mask != VorbisSpeakerMask(info.channels)) ||
       (track.priming_samples && track.priming_samples != info.pre_skip) || track.padding_samples.value_or(0) ||
       (track.seek_preroll && *track.seek_preroll != MediaTimestamp{Preroll, Clock}))
     Fail(Argument, "Ogg Opus track metadata differs from its mapping");

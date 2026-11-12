@@ -80,6 +80,18 @@ CodecResult<VideoFrame> CopyVideo(VideoFormat format, MediaTimestamp pts,
     std::optional<MediaTimestamp> duration, std::vector<VideoPlane> planes, VideoPixelFormat requested) {
   VideoFrame source{format, pts, duration, std::move(planes)};
   if (!source.Validate()) return CodecResult<VideoFrame>::Failure(Error(CodecErrorCode::InvalidData, "Invalid platform video planes"));
+  if (format.pixel_format == VideoPixelFormat::Ayuv16 || requested == VideoPixelFormat::Ayuv16) {
+    if (format.pixel_format != requested)
+      return CodecResult<VideoFrame>::Failure(Error(CodecErrorCode::Unsupported, "Packed ProRes pixels require matching output"));
+    const auto row = std::size_t(format.width) * 8;
+    const auto& plane = source.planes.front();
+    Bytes output(row * format.height);
+    for (std::size_t y = 0; y < format.height; ++y)
+      for (std::size_t x = 0; x < format.width; ++x)
+        std::copy_n(plane.data.AsBytes().data() + y * plane.row_stride + x * plane.pixel_stride, 8,
+                    output.data() + y * row + x * 8);
+    return CodecResult<VideoFrame>::Success(VideoFrame{format, pts, duration, {{Own(std::move(output)), row, 8}}});
+  }
   const auto component_bytes = VideoComponentBytes(requested);
   if (VideoComponentBytes(format.pixel_format) != component_bytes ||
       (format.pixel_format == VideoPixelFormat::P210) != (requested == VideoPixelFormat::P210))

@@ -1968,6 +1968,150 @@ void MatroskaLacing(const fs::path& path, bool corrupt) {
   Check(point.Succeeded() && point.Value() && point.Value()->presentation_time == MediaTimestamp{0, 1},
         "Matroska scan missed the laced track's first Block");
 }
+void ImportExtensions(const fs::path& directory) {
+  const auto fixtures = fs::path(MEDIA_FIXTURES) / "container";
+  struct ImportCase { const char* input; ContainerFormat source, target; CodecId video; };
+  const ImportCase cases[]{
+      {"import-avc-aac.ts", ContainerFormat::MpegTs, ContainerFormat::Mp4, CodecId::H264},
+      {"import-hevc-aac.ts", ContainerFormat::MpegTs, ContainerFormat::Mp4, CodecId::Hevc},
+      {"import-avc-pcm.avi", ContainerFormat::Avi, ContainerFormat::Mov, CodecId::H264},
+      {"import-avc.h264", ContainerFormat::AnnexB, ContainerFormat::Mp4, CodecId::H264},
+      {"import-hevc.h265", ContainerFormat::AnnexB, ContainerFormat::Mp4, CodecId::Hevc},
+      {"preview-av1.mp4", ContainerFormat::Mp4, ContainerFormat::Mp4, CodecId::Av1},
+  };
+  for (std::size_t test = 0; test < std::size(cases); ++test) {
+    const auto& entry = cases[test];
+    std::cout << "Checking " << entry.input << std::endl;
+    auto source = Take(MediaDemuxer::Open(Take(Path(fixtures / entry.input).OpenRandomAccess())));
+    Check(source.Format() == entry.source, "Import format was not detected");
+    std::vector<MediaTrack> tracks(source.Tracks().begin(), source.Tracks().end());
+    const auto video = std::ranges::find(tracks, TrackKind::Video, &MediaTrack::kind);
+    Check(video != tracks.end() && video->descriptions.front().codec == entry.video &&
+          !video->descriptions.front().initialization_data.empty(), "Import lost its video configuration");
+    const auto video_index = std::size_t(video - tracks.begin());
+    std::vector<std::vector<ContainerPacket>> packets(tracks.size());
+    while (auto packet = ReadPacket(source)) {
+      const auto track = std::ranges::find(tracks, packet->track_id, &MediaTrack::id);
+      auto& output = packets[track - tracks.begin()];
+      if (entry.source == ContainerFormat::AnnexB) {
+        Check(!packet->pts && !packet->dts && !packet->duration, "Raw Annex B invented a timeline");
+        packet->pts = packet->dts = MediaTimestamp{static_cast<std::int64_t>(output.size()), 12};
+        packet->duration = MediaTimestamp{1, 12};
+        track->timescale = 12;
+      }
+      output.push_back(std::move(*packet));
+    }
+    const auto& images = packets[video_index];
+    Check(images.size() >= 4 && images.front().sync_sample == true, "Import did not preserve random access");
+    if (entry.source == ContainerFormat::MpegTs)
+      Check(source.StartTime() == MediaTimestamp{0, 1} && images.front().dts->ticks < 0,
+            "MPEG-TS import did not preserve reordered decoding while shifting the presentation origin");
+    if (entry.source != ContainerFormat::AnnexB) {
+      const auto target = *images[images.size() - 1].pts;
+      const auto point = Take(source.Seek(video->id, target, SeekDirection::AtOrBefore));
+      Check(point && point->presentation_time.Compare(target) <= 0, "Import could not seek to a key picture");
+    }
+    const auto path = directory / ("import-copy-" + std::to_string(test));
+    const auto layout = entry.video == CodecId::Av1 ? ContainerLayout::Fragmented : ContainerLayout::Default;
+    auto mux = Take(MediaMuxer::Open(Output(path), entry.target, tracks, {.layout = layout}));
+    std::vector<std::size_t> positions(tracks.size());
+    for (std::size_t i = 0; i < tracks.size(); ++i)
+      if (packets[i].empty()) Take(mux.EndTrack(tracks[i].id));
+    std::size_t attempts = 0;
+    for (std::size_t i = 0; i < tracks.size();) {
+      if (positions[i] == packets[i].size()) { ++i; continue; }
+      Check(++attempts < 100000, "Import copy made no progress");
+      if (const auto request = Take(mux.TryWrite(packets[i][positions[i]]))) {
+        i = std::ranges::find(tracks, *request, &MediaTrack::id) - tracks.begin();
+        Check(i < tracks.size(), "Import copy requested an absent track");
+      } else if (++positions[i] == packets[i].size()) {
+        Take(mux.EndTrack(tracks[i].id));
+        i = 0;
+      }
+    }
+    Take(mux.Finish());
+    auto copied = Take(MediaDemuxer::Open(Take(Path(path).OpenRandomAccess())));
+    Check(copied.Format() == entry.target && copied.Layout() == layout, "Import remux wrote the wrong format");
+    std::ranges::fill(positions, 0);
+    Bytes pcm;
+    while (const auto packet = ReadPacket(copied)) {
+      const auto track = std::ranges::find(tracks, packet->track_id, &MediaTrack::id);
+      Check(track != tracks.end(), "Import remux changed a track ID");
+      const auto index = static_cast<std::size_t>(track - tracks.begin());
+      if (entry.source == ContainerFormat::Avi && track->kind == TrackKind::Audio) {
+        const auto bytes = packet->data.AsBytes();
+        pcm.insert(pcm.end(), bytes.begin(), bytes.end());
+        continue;
+      }
+      Check(positions[index] < packets[index].size(), "Import remux added a packet");
+      const auto& original = packets[index][positions[index]++];
+      Check(std::ranges::equal(packet->data.AsBytes(), original.data.AsBytes()) &&
+            packet->duration == original.duration, "Import remux changed a packet or its duration");
+    }
+    for (std::size_t i = 0; i < tracks.size(); ++i) {
+      if (entry.source == ContainerFormat::Avi && tracks[i].kind == TrackKind::Audio) {
+        std::size_t offset = 0;
+        for (const auto& packet : packets[i]) {
+          const auto bytes = packet.data.AsBytes();
+          Check(bytes.size() <= pcm.size() - offset &&
+                std::ranges::equal(bytes, std::span(pcm).subspan(offset, bytes.size())), "AVI remux changed PCM samples");
+          offset += bytes.size();
+        }
+        Check(offset == pcm.size(), "AVI remux changed the PCM sample count");
+      } else Check(positions[i] == packets[i].size(), "Import remux lost a packet");
+      if (entry.source == ContainerFormat::MpegTs || entry.source == ContainerFormat::Avi)
+        Check(copied.PresentationRange(tracks[i].id) == source.PresentationRange(tracks[i].id),
+              "Import remux changed a track presentation interval");
+    }
+    if (layout == ContainerLayout::Fragmented) {
+      const auto point = Take(copied.Seek(video->id, {0, 1}, SeekDirection::AtOrAfter));
+      Check(point && ReadPacket(copied)->sync_sample == true, "AV1 fMP4 could not seek to its key picture");
+    }
+  }
+}
+
+void StandaloneSubtitles(const fs::path& directory) {
+  const std::string_view srt = "1\n00:00:00,200 --> 00:00:01,100\nfirst cue\nsecond line\n\n"
+      "2\n00:00:00,800 --> 00:00:01,550\nsecond cue\n\n";
+  const std::string_view web = "WEBVTT example\n\nSTYLE\n::cue { color: white }\n\n"
+      "cue-one\n00:00:00.200 --> 00:00:01.100 align:start\nfirst <00:00:00.450>cue\n\n"
+      "NOTE retained comment\n\n00:00:00.800 --> 00:00:01.550\nsecond cue\n\n";
+  for (const auto [format, text, suffix] : {std::tuple{ContainerFormat::Srt, srt, ".srt"},
+                                          std::tuple{ContainerFormat::WebVtt, web, ".vtt"}}) {
+    const auto input = directory / (std::string("subtitle-input") + suffix);
+    std::ofstream(input, std::ios::binary) << text;
+    auto reader = Take(MediaDemuxer::Open(Take(Path(input).OpenRandomAccess())));
+    Check(reader.Format() == format && reader.Tracks().front().kind == TrackKind::Subtitle, "Subtitle format was not detected");
+    const auto mkv = directory / (std::string("subtitle-track") + suffix + ".mkv");
+    auto mux = Take(MediaMuxer::Open(Output(mkv), ContainerFormat::Matroska, reader.Tracks()));
+    while (const auto packet = ReadPacket(reader)) Check(!Take(mux.TryWrite(*packet)), "Subtitle track could not be written");
+    Take(mux.Finish());
+
+    auto track = Take(MediaDemuxer::Open(Take(Path(mkv).OpenRandomAccess())));
+    const auto anchor = Take(track.Seek(1, {750, 1000}, SeekDirection::AtOrAfter));
+    Check(anchor && ReadPacket(track)->pts == MediaTimestamp{800, 1000}, "Matroska subtitle seek selected the wrong cue");
+    Check(Take(track.Seek(1, {200, 1000})).has_value(), "Matroska subtitle seek could not rewind");
+    const auto output = directory / (std::string("subtitle-output") + suffix);
+    auto text_mux = Take(MediaMuxer::Open(Output(output), format, track.Tracks()));
+    bool first = true;
+    while (const auto packet = ReadPacket(track)) {
+      if (first && format == ContainerFormat::WebVtt) {
+        const auto data = packet->data.AsBytes();
+        Check(std::string_view(reinterpret_cast<const char*>(data.data()), data.size()) == "first <00:00:00.250>cue",
+              "Matroska changed the relative cue timestamp");
+      }
+      first = false;
+      Check(!Take(text_mux.TryWrite(*packet)), "Subtitle track could not be extracted");
+    }
+    Take(text_mux.Finish());
+    const auto bytes = Take(Path(output).ReadBytes());
+    Check(std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()) == text,
+          "Subtitle round trip changed cue timing, text, or metadata");
+    auto readback = Take(MediaDemuxer::Open(Take(Path(output).OpenRandomAccess())));
+    const auto point = Take(readback.Seek(1, {750, 1000}, SeekDirection::AtOrAfter));
+    Check(point && ReadPacket(readback)->pts == MediaTimestamp{800, 1000}, "Subtitle seek selected the wrong cue");
+  }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2011,6 +2155,8 @@ int main(int argc, char** argv) {
     PreciseVpxCopy(path, "vp9");
     MatroskaClockSeparation(path);
     MatroskaSubtitle(path / "subtitle.mkv");
+    ImportExtensions(path);
+    StandaloneSubtitles(path);
     WebmCuePreroll(path / "webm-cue-preroll.webm", false);
     WebmCuePreroll(path / "webm-cue-late-opus.webm", true);
     AudioFormats(path);

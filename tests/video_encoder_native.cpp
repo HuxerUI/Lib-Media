@@ -143,18 +143,27 @@ Encoded Encode(VideoEncoderConfig config, unsigned count, bool request_key = fal
       auto& value = *read.Value();
       if (auto* format = std::get_if<VideoEncodeFormat>(&value)) {
         Check(!described, "Duplicate video configuration");
-        const bool hevc = config.codec == CodecId::Hevc;
-        const auto length = hevc ? 21u : 4u;
         Check(format->width >= config.input.width && format->height >= config.input.height &&
-            format->visible == config.input.visible && format->codec == config.codec &&
-            format->initialization_data.size() > length &&
-            (std::to_integer<unsigned>(format->initialization_data[length]) & 3) == 3, "Wrong coded/cropped picture or NAL length size");
-        if (hevc) {
-          const auto depth = std::to_integer<unsigned>(format->initialization_data[17]) & 7;
-          Check(depth == (config.input.pixel_format == VideoPixelFormat::P010 ? 2 : 0), "HEVC bit depth was silently changed");
+            format->visible == config.input.visible && format->codec == config.codec, "Wrong coded/cropped picture");
+        if (config.codec == CodecId::ProRes) {
+          Check(format->initialization_data.empty() && format->sample_entry == config.prores_sample_entry,
+                "ProRes encoder did not report its selected sample entry");
+        } else if (config.codec == CodecId::Av1) {
+          Check(format->initialization_data.size() >= 4 && format->initialization_data[0] == std::byte{0x81} &&
+                bool(std::to_integer<unsigned>(format->initialization_data[2]) & 0x40) ==
+                    (config.input.pixel_format == VideoPixelFormat::P010), "AV1 encoder changed its Main bit depth");
         } else {
-          const auto profile = config.profile == H264Profile::Baseline ? 66 : config.profile == H264Profile::Main ? 77 : 100;
-          Check(std::to_integer<unsigned>(format->initialization_data[1]) == unsigned(profile), "Profile was silently changed");
+          const bool hevc = config.codec == CodecId::Hevc;
+          const auto length = hevc ? 21u : 4u;
+          Check(format->initialization_data.size() > length &&
+              (std::to_integer<unsigned>(format->initialization_data[length]) & 3) == 3, "Wrong public NAL length size");
+          if (hevc) {
+            const auto depth = std::to_integer<unsigned>(format->initialization_data[17]) & 7;
+            Check(depth == (config.input.pixel_format == VideoPixelFormat::P010 ? 2 : 0), "HEVC bit depth was silently changed");
+          } else {
+            const auto profile = config.profile == H264Profile::Baseline ? 66 : config.profile == H264Profile::Main ? 77 : 100;
+            Check(std::to_integer<unsigned>(format->initialization_data[1]) == unsigned(profile), "Profile was silently changed");
+          }
         }
         encoded.format = *format; described = true;
       } else if (auto* packet = std::get_if<EncodedPacket>(&value)) {
@@ -198,7 +207,7 @@ Encoded Encode(VideoEncoderConfig config, unsigned count, bool request_key = fal
     }
     if (request_key && i == count / 2) Require(encoder.RequestKeyFrame());
   }
-  if (!images.empty()) Check(blocked, "Platform input did not exercise a submission retry");
+  if (!images.empty() && config.input_storage == VideoStorage::Platform) Check(blocked, "Platform input did not exercise a submission retry");
   Eventually([&] {
     drain(); auto result = encoder.Finish();
     if (!result.Succeeded() && result.Error().code == CodecErrorCode::InvalidState) return false;
@@ -283,7 +292,7 @@ void Decode(const Encoded& encoded, const VideoEncoderConfig& input) {
   Check(cleanup_ok->load(), "Roundtrip decoder cleanup failed");
   Check(frames == encoded.packets.size() && (input.input_storage == VideoStorage::Platform || (samples && std::sqrt(error / samples) < 12)),
         "Roundtrip video count or luma quality failed");
-  std::cout << (config.codec == CodecId::Hevc ? ten_bit ? "HEVC Main10" : "HEVC Main" : "H.264")
+  std::cout << (config.codec == CodecId::Av1 ? "AV1" : config.codec == CodecId::Hevc ? ten_bit ? "HEVC Main10" : "HEVC Main" : "H.264")
       << " pictures=" << frames;
   if (config.codec == CodecId::H264) std::cout << " B=" << encoded.bframes;
   std::cout << " reordered=" << encoded.reordered;
@@ -301,7 +310,8 @@ bool Supported(const VideoEncoderConfig& config) {
   Eventually([&] { return done->load(); }, "Video capability probe stalled");
   if (!*failure) return true;
   if ((*failure)->code != CodecErrorCode::Unsupported) throw std::runtime_error((*failure)->message);
-  std::cout << "Unsupported " << (config.codec == CodecId::Hevc ? "HEVC" : "H.264")
+  std::cout << "Unsupported " << (config.codec == CodecId::Hevc ? "HEVC" : config.codec == CodecId::Av1 ? "AV1" :
+      config.codec == CodecId::ProRes ? config.prores_sample_entry : "H.264")
       << " layout=" << int(config.input.pixel_format) << " B="
       << (config.max_b_frames ? std::to_string(*config.max_b_frames) : "auto")
       << ": " << (*failure)->message << " (" << (*failure)->platform_code << ")\n";
@@ -312,6 +322,173 @@ template<class T, class E> T Take(Result<T, E> result) {
   if (!result.Succeeded()) throw std::runtime_error(result.Error().message);
   if constexpr (!std::is_void_v<T>) return std::move(result).Value();
 }
+
+#ifndef __EMSCRIPTEN__
+std::vector<EncodedPacket> MoviePackets(MediaDemuxer& demux) {
+  const auto track = std::ranges::find(demux.Tracks(), TrackKind::Video, &MediaTrack::kind);
+  Check(track != demux.Tracks().end(), "Movie has no video track");
+  const auto id = track->id;
+  Take(demux.SelectTracks(std::span(&id, 1)));
+  std::vector<EncodedPacket> packets;
+  while (auto item = Take(demux.Read())) {
+    if (auto* packet = std::get_if<ContainerPacket>(&*item))
+      packets.push_back({std::move(packet->data), *packet->pts, packet->dts, packet->duration, packet->sync_sample.value_or(false)});
+  }
+  return packets;
+}
+
+std::vector<VideoFrame> DecodeProRes(MediaDemuxer& demux, VideoPixelFormat output) {
+  const auto& track = demux.Tracks().front();
+  const auto& description = track.descriptions.front();
+  VideoDecoderConfig config{.width = *description.coded_width, .height = *description.coded_height,
+      .output = output, .codec = CodecId::ProRes, .prores_sample_entry = description.sample_entry};
+  const auto packets = MoviePackets(demux);
+  auto decoder = Take(VideoDecoder::Create(config));
+  std::vector<VideoFrame> frames;
+  bool ended = false;
+  const auto drain = [&] {
+    while (auto next = Take(decoder.TryRead())) {
+      if (auto* frame = std::get_if<VideoFrame>(&*next)) {
+        Check(frame->Validate() && frame->format.pixel_format == output, "ProRes changed the frame layout");
+        frames.push_back(std::move(*frame));
+      } else ended = true;
+    }
+  };
+  for (const auto& packet : packets) Eventually([&] {
+    drain();
+    return Take(decoder.TrySubmit(packet)) == SubmitStatus::Accepted;
+  }, "ProRes decoder input stalled");
+  Take(decoder.Finish());
+  Eventually([&] { drain(); return ended; }, "ProRes decoder drain stalled");
+  Check(frames.size() == packets.size(), "ProRes decoder changed the picture count");
+  return frames;
+}
+
+void WriteExtendedMovie(const File& file, const Encoded& encoded, ContainerFormat container) {
+  const auto& format = encoded.format;
+  const bool mov = container == ContainerFormat::Mov;
+  const auto layout = mov ? ContainerLayout::Default : ContainerLayout::Fragmented;
+  std::vector<MediaTrack> tracks{{.id = 1, .kind = TrackKind::Video, .timescale = 90000,
+      .descriptions = {{.codec = format.codec, .initialization_data = format.initialization_data,
+          .coded_width = format.width, .coded_height = format.height, .visible = format.visible, .sample_entry = format.sample_entry}}}};
+  if (mov)
+    tracks.push_back({.id = 2, .kind = TrackKind::Audio, .timescale = 48000,
+        .descriptions = {{.codec = CodecId::PcmS16Le, .sample_rate = 48000, .channel_count = 1}}});
+  auto mux = Take(MediaMuxer::Open(Take(file.OpenRandomAccess(FileAccessMode::ReadWrite, FileOpenMode::CreateNew)),
+      container, tracks, {.layout = layout}));
+  if (mov) {
+    const auto count = PictureTime(static_cast<unsigned>(encoded.packets.size()), false).Rescale(48000)->ticks - 48000;
+    const auto bytes = std::make_shared<Bytes>(static_cast<std::size_t>(count) * 2, std::byte{0x16});
+    Check(!Take(mux.TryWrite({2, BufferReference(*bytes, bytes), MediaTimestamp{48000, 48000}, {},
+          MediaTimestamp{count, 48000}, true})), "MOV LPCM writer blocked");
+    Take(mux.EndTrack(2));
+  }
+  for (const auto& packet : encoded.packets)
+    Check(!Take(mux.TryWrite({1, packet.data, packet.pts, packet.pts, packet.duration, packet.key_frame})),
+          "Extended movie writer blocked");
+  Take(mux.Finish());
+}
+
+void ExtendedVideo(const std::filesystem::path& fixtures) {
+  const auto temporary = std::filesystem::temp_directory_path() /
+      ("lib-media-video-ext-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  Check(std::filesystem::create_directory(temporary), "Cannot create video test directory");
+  for (const auto layout : {VideoPixelFormat::NV12, VideoPixelFormat::P010}) {
+    auto config = Config(H264Profile::High, 0, layout, 64, 64);
+    config.codec = CodecId::Av1;
+    if (!Supported(config)) continue;
+    auto encoded = Encode(config, 6, true, true);
+    const File file((temporary / (layout == VideoPixelFormat::P010 ? "av1-10.mp4" : "av1-8.mp4")).u8string());
+    WriteExtendedMovie(file, encoded, ContainerFormat::Mp4);
+    auto movie = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+    auto packets = MoviePackets(movie);
+    Check(movie.Layout() == ContainerLayout::Fragmented && packets.size() == encoded.packets.size(), "AV1 fMP4 lost pictures");
+    for (std::size_t i = 0; i < packets.size(); ++i) {
+      Check(packets[i].pts == encoded.packets[i].pts && packets[i].duration == encoded.packets[i].duration &&
+            std::ranges::equal(packets[i].data.AsBytes(), encoded.packets[i].data.AsBytes()), "AV1 fMP4 changed a temporal unit");
+    }
+    encoded.packets = std::move(packets);
+    Decode(encoded, config);
+    const auto later_key = std::ranges::find(encoded.packets.begin() + 1, encoded.packets.end(), true, &EncodedPacket::key_frame);
+    Check(later_key != encoded.packets.end(), "AV1 fMP4 has no later sync sample");
+    for (const auto target : {later_key->pts, encoded.packets.front().pts, later_key->pts}) {
+      const auto anchor = Take(movie.Seek(1, target, SeekDirection::AtOrBefore));
+      auto item = Take(movie.Read());
+      if (item && std::holds_alternative<TrackDecodeStart>(*item)) item = Take(movie.Read());
+      const auto* packet = item ? std::get_if<ContainerPacket>(&*item) : nullptr;
+      Check(anchor && anchor->presentation_time == target && packet && packet->pts == target && packet->sync_sample == true,
+            "AV1 fMP4 seek did not resume at the requested sync sample");
+    }
+    std::cout << "AV1 encode, fMP4 and decode passed for " << (layout == VideoPixelFormat::P010 ? 10 : 8) << " bits\n";
+  }
+#if defined(__APPLE__) && TARGET_OS_OSX
+  const auto decode = [&](const char* name, VideoPixelFormat format) {
+    const File file((fixtures / name).u8string());
+    auto movie = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+    return DecodeProRes(movie, format);
+  };
+  const auto hq = decode("prores-hq-pcm.mov", VideoPixelFormat::P210);
+  const auto alpha = decode("prores-4444-alpha.mov", VideoPixelFormat::Ayuv16);
+  const auto opaque = decode("prores-4444-xq.mov", VideoPixelFormat::Ayuv16);
+  Check(decode("prores-4444-alpha.mov", VideoPixelFormat::P010).size() == alpha.size(),
+        "ProRes 4444 could not decode to the CPU preview layout");
+  const auto word = [](const VideoFrame& frame, unsigned x, unsigned component) {
+    const auto bytes = frame.planes.front().data.AsBytes();
+    const auto offset = x * frame.planes.front().pixel_stride + component * 2;
+    return std::to_integer<unsigned>(bytes[offset]) | (std::to_integer<unsigned>(bytes[offset + 1]) << 8);
+  };
+  Check(word(alpha.front(), 31, 0) > word(alpha.front(), 8, 0) + 10000 &&
+        std::abs(int(word(alpha.front(), 30, 2)) - int(word(alpha.front(), 31, 2))) > 3000 &&
+        word(opaque.front(), 31, 0) == 65535, "ProRes 4444 lost the alpha or per-pixel chroma pattern");
+  for (const auto* entry : {"apco", "apcs", "apcn", "apch", "ap4h", "ap4x"}) {
+    const bool packed = std::string_view(entry).starts_with("ap4");
+    const auto& input = packed ? alpha : hq;
+    auto config = Config(H264Profile::High, 0, input.front().format.pixel_format,
+        input.front().format.height, input.front().format.width);
+    config.input = input.front().format;
+    config.codec = CodecId::ProRes;
+    config.prores_sample_entry = entry;
+    if (!Supported(config)) continue;
+    const auto encoded = Encode(config, static_cast<unsigned>(input.size()), false, false, input);
+    const File file((temporary / (std::string(entry) + ".mov")).u8string());
+    WriteExtendedMovie(file, encoded, ContainerFormat::Mov);
+    auto movie = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+    Check(movie.Tracks().front().descriptions.front().sample_entry == entry && movie.Tracks().size() == 2,
+          "MOV changed the ProRes profile or lost LPCM");
+    const auto video = movie.PresentationRange(1), audio = movie.PresentationRange(2);
+    Check(video && audio && video->start == audio->start && video->end.Rescale(48000) == audio->end,
+          "ProRes and LPCM have different presentation intervals");
+    auto readback = Take(MediaDemuxer::Open(Take(file.OpenRandomAccess())));
+    const auto packets = MoviePackets(readback);
+    const auto frames = DecodeProRes(movie, config.input.pixel_format);
+    if (packed)
+      for (unsigned x = 0; x < config.input.width; ++x)
+        Check(std::abs(int(word(frames.front(), x, 0)) - int(word(input.front(), x, 0))) <= 1,
+              "ProRes 4444 round trip changed the alpha samples");
+    for (const auto index : {frames.size() - 1, std::size_t{0}, frames.size() / 2}) {
+      const auto target = PictureTime(static_cast<unsigned>(index), false);
+      const auto seek = Take(movie.Seek(1, target, SeekDirection::AtOrBefore));
+      Check(seek && seek->presentation_time == target && seek->decode_start_pts == packets[index].pts,
+            "ProRes MOV seek selected a different picture");
+    }
+    const std::uint32_t audio_id = 2;
+    Take(movie.SelectTracks(std::span(&audio_id, 1)));
+    Check(Take(movie.Seek(2, audio->start)).has_value(), "ProRes MOV could not seek to LPCM");
+    std::size_t pcm_bytes = 0;
+    while (const auto item = Take(movie.Read())) {
+      if (const auto* packet = std::get_if<ContainerPacket>(&*item)) {
+        const auto bytes = packet->data.AsBytes();
+        Check(std::ranges::all_of(bytes, [](std::byte value) { return value == std::byte{0x16}; }), "MOV changed an LPCM sample");
+        pcm_bytes += bytes.size();
+      }
+    }
+    Check(pcm_bytes == static_cast<std::size_t>(audio->end.Rescale(48000)->ticks - audio->start.Rescale(48000)->ticks) * 2, "MOV lost LPCM samples");
+    std::cout << "ProRes " << entry << " MOV and LPCM round trip passed\n";
+  }
+#endif
+  std::filesystem::remove_all(temporary);
+}
+#endif
 
 Encoded ReadbackMp4(Encoded encoded, const File& file) {
   const auto& format = encoded.format;
@@ -559,6 +736,10 @@ int main(int argc, char** argv) {
 #endif
   try {
 #ifndef __EMSCRIPTEN__
+    if (argc == 3 && std::string_view(argv[1]) == "--format-extensions") {
+      ExtendedVideo(argv[2]);
+      return 0;
+    }
     if (argc >= 2 && std::string_view(argv[1]) == "--hevc-only") {
       Hevc(argc >= 3 ? argv[2] : nullptr);
       return 0;

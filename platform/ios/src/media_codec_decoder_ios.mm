@@ -162,7 +162,7 @@ public:
         return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "AV1 decoding requires iOS 17 or later"));
       }
     } else if (video.codec == CodecId::ProRes) {
-      status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_AppleProRes422,
+      status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, ProResCodecType(video.prores_sample_entry),
           video.width, video.height, nullptr, &description_);
     } else if (video.codec == CodecId::Hevc) {
       const auto hevc = ParseHevcConfiguration(video.initialization_data, true, true);

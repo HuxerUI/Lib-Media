@@ -80,8 +80,10 @@ Av1Sequence ReadSequence(Av1Bytes payload) {
   const auto still = bits.Read(1);
   const bool reduced = bits.Read(1);
   if (profile > 2 || (reduced && !still)) throw std::invalid_argument("Invalid AV1 sequence header");
+  unsigned level = 0;
+  bool high_tier = false;
   if (reduced) {
-    bits.Read(5);
+    level = bits.Read(5);
   } else {
     unsigned delay_bits = 0;
     if (bits.Read(1)) {
@@ -98,7 +100,9 @@ Av1Sequence ReadSequence(Av1Bytes payload) {
     const auto operating_points = bits.Read(5) + 1;
     for (unsigned i = 0; i < operating_points; ++i) {
       bits.Read(12);
-      if (bits.Read(5) > 7) bits.Read(1);
+      const auto point_level = bits.Read(5);
+      const bool tier = point_level > 7 && bits.Read(1);
+      if (!i) { level = point_level; high_tier = tier; }
       if (delay_bits && bits.Read(1)) {
         bits.Read(delay_bits);
         bits.Read(delay_bits);
@@ -133,7 +137,8 @@ Av1Sequence ReadSequence(Av1Bytes payload) {
     matrix = bits.Read(8);
   }
   const bool rgb = primaries == 1 && transfer == 13 && matrix == 0;
-  return {width, height, reduced, profile == 0 && !high_bitdepth && !monochrome && !rgb && transfer != 16 && transfer != 18};
+  return {width, height, reduced, profile == 0 && !monochrome && !rgb && transfer != 16 && transfer != 18,
+          high_bitdepth ? 10u : 8u, level, high_tier};
 }
 
 } // namespace
@@ -147,7 +152,7 @@ Av1Configuration ParseAv1Configuration(Av1Bytes bytes) {
   const auto delay = Octet(bytes[3]);
   if (profile > 2 || (delay & 0xe0) || (!(delay & 0x10) && (delay & 15)))
     throw std::invalid_argument("Invalid AV1 codec configuration fields");
-  Av1Configuration config{profile, level, bool(color & 0x80), (color & 0x7c) == 0x0c, {}};
+  Av1Configuration config{profile, level, bool(color & 0x80), (color & 0x3c) == 0x0c, color & 0x40 ? 10u : 8u, {}};
   for (auto obus = bytes.subspan(4); !obus.empty();) {
     const auto obu = ReadObu(obus);
     if (!obu.has_size || obu.type == FrameHeader || obu.type == Frame)
@@ -158,6 +163,34 @@ Av1Configuration ParseAv1Configuration(Av1Bytes bytes) {
     }
   }
   return config;
+}
+
+std::vector<std::byte> MakeAv1Configuration(Av1Bytes header) {
+  auto bytes = header;
+  const auto obu = ReadObu(bytes);
+  if (obu.type != SequenceHeader || !obu.has_size || !bytes.empty())
+    throw std::invalid_argument("Expected one sized AV1 sequence header");
+  const auto sequence = ReadSequence(obu.payload);
+  if (!sequence.sdr_420) throw std::invalid_argument("Expected an AV1 Main SDR sequence");
+  std::vector record{std::byte{0x81}, std::byte(sequence.level),
+      std::byte((sequence.high_tier ? 0x80 : 0) | (sequence.bit_depth == 10 ? 0x40 : 0) | 0x0c), std::byte{}};
+  record.insert(record.end(), header.begin(), header.end());
+  return record;
+}
+
+std::vector<std::byte> SizedAv1Packet(Av1Bytes bytes, std::size_t offset) {
+  const auto header_size = (std::to_integer<unsigned>(bytes[offset]) & 4) ? 2u : 1u;
+  const auto payload = bytes.subspan(offset + header_size);
+  std::vector<std::byte> packet(bytes.begin(), bytes.begin() + offset + header_size);
+  packet[offset] |= std::byte{2};
+  auto size = payload.size();
+  do {
+    const auto digit = size & 127;
+    size >>= 7;
+    packet.push_back(static_cast<std::byte>(digit | (size ? 128 : 0)));
+  } while (size);
+  packet.insert(packet.end(), payload.begin(), payload.end());
+  return packet;
 }
 
 Av1PacketInfo InspectAv1Packet(Av1Bytes bytes) {
@@ -173,7 +206,9 @@ Av1PacketInfo InspectAv1Packet(Av1Bytes bytes) {
       if (frame_seen && !result.sequence) throw std::invalid_argument("Misplaced AV1 sequence header");
       const auto sequence = ReadSequence(obu.payload);
       // Repeated headers may vary their operating parameters within the same sequence.
-      if (result.sequence && *result.sequence != sequence)
+      if (result.sequence && (result.sequence->width != sequence.width || result.sequence->height != sequence.height ||
+          result.sequence->reduced_header != sequence.reduced_header || result.sequence->sdr_420 != sequence.sdr_420 ||
+          result.sequence->bit_depth != sequence.bit_depth))
         throw std::invalid_argument("AV1 sequence parameters change within a temporal unit");
       result.sequence = sequence;
     } else if (obu.type == FrameHeader || obu.type == Frame) {

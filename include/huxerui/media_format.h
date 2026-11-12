@@ -238,7 +238,9 @@ enum class VideoPixelFormat {
   /// A platform image whose pixel layout is opaque to the caller.
   Opaque,
   /// Two planes in the same word layout as P010, with one U, V pair per two luma samples on every row.
-  P210
+  P210,
+  /// Packed 4:4:4:4 pixels. Full-range alpha and video-range Y, U, V are four little-endian 16-bit words.
+  Ayuv16
 };
 
 /// @brief Selects the storage used to exchange uncompressed video with a codec.

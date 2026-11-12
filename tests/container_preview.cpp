@@ -687,11 +687,15 @@ void CheckProResPreview(const TaskScope& tasks, testing::UiTest& ui, const std::
         "ProRes preview changed the first picture format or timing");
   for (const auto target : {0.375F, 0.125F, 0.25F}) {
     const auto epoch = seen.epoch;
+    seen.paused = true;
     seen.seek = target;
-    Until(ui, failure, [&] { return seen.epoch > epoch && seen.first_frame && seen.position > target + 0.02F; },
-          "ProRes MOV did not resume synchronized playback after seeking");
+    Until(ui, failure, [&] { return seen.epoch > epoch && seen.first_frame; },
+          "ProRes MOV did not present a picture after seeking");
     Check(seen.first_frame == media_preview::TimeAt(target) && seen.first_duration == MediaTimestamp{1, 8},
           "ProRes MOV seek presented the wrong picture interval");
+    seen.paused = false;
+    Until(ui, failure, [&] { return seen.position > target + 0.02F; },
+          "ProRes MOV did not resume the PCM clock after seeking");
   }
   playing.Cancel();
   ui.Pump();
@@ -1084,6 +1088,92 @@ void CheckWave64AndVorbis(const TaskScope& tasks, testing::UiTest& ui, const Fil
   Check(Require(remuxed_pcm->ReadBytes()) == Require(trimmed_pcm->ReadBytes()), "MKA leading discard changed decoded Vorbis PCM");
 }
 
+void CheckSurroundOpusAndVorbis(const TaskScope& tasks, testing::UiTest& ui, const File& temporary, const File& fixtures) {
+  constexpr MediaTimestamp duration{19000, 48000};
+  const auto copy_opus = [&](const File& source, ContainerFormat format, const char* suffix) {
+    auto input = media_preview::Open(source);
+    const auto track = input.Tracks().front();
+    const auto file = media_preview::TemporaryFile(temporary, suffix);
+    auto mux = Require(MediaMuxer::Open(Require(file->OpenRandomAccess(FileAccessMode::ReadWrite)), format, std::span(&track, 1)));
+    while (const auto packet = ReadPacket(input))
+      Check(!Require(mux.TryWrite(*packet)), "Opus copy requested another track");
+    Require(mux.Finish());
+
+    input = media_preview::Open(source);
+    auto output = media_preview::Open(*file);
+    const auto tracks = output.Tracks();
+    const auto& description = tracks.front().descriptions.front();
+    Check(description.initialization_data == track.descriptions.front().initialization_data && description.speaker_mask == 0x63f,
+          "Opus copy changed its mapping");
+    const auto trim = [](const ContainerPacket& packet) {
+      return packet.discard_padding ? packet.discard_padding->Rescale(48000)->ticks : 0;
+    };
+    auto samples = -static_cast<std::int64_t>(output.Tracks().front().priming_samples.value_or(0));
+    while (const auto packet = ReadPacket(input)) {
+      const auto copied = ReadPacket(output);
+      Check(copied && copied->pts == packet->pts && copied->duration && copied->duration == packet->duration &&
+            trim(*copied) == trim(*packet) &&
+            std::ranges::equal(copied->data.AsBytes(), packet->data.AsBytes()), "Opus copy changed a packet or its trim");
+      samples += copied->duration->Rescale(48000)->ticks - trim(*copied);
+    }
+    Check(!ReadPacket(output) && samples == duration.ticks, "Opus copy changed the audible sample count");
+    return file;
+  };
+
+  for (const bool opus : {false, true}) {
+    const auto file = std::make_shared<const File>(fixtures.Child(opus ? "surround-opus.ogg" : "surround-vorbis.ogg"));
+    const auto mkv = opus ? copy_opus(*file, ContainerFormat::Matroska, ".mka") :
+        CopyVorbis(*file, temporary, ContainerFormat::Matroska, ".mka", duration);
+    const auto ogg = opus ? copy_opus(*mkv, ContainerFormat::Ogg, ".ogg") :
+        CopyVorbis(*mkv, temporary, ContainerFormat::Ogg, ".ogg", duration);
+    auto input = media_preview::Open(*ogg);
+    const auto tracks = input.Tracks();
+    const auto& description = tracks.front().descriptions.front();
+    const auto mask = opus ? 0x63fu : 0x3fu;
+    const auto channels = static_cast<unsigned>(std::popcount(mask));
+    Check(description.speaker_mask == mask && description.channel_count == channels, "Ogg lost its multichannel speaker positions");
+    const AudioDecoderConfig config{.initialization_data = description.initialization_data,
+        .output = {48000, AudioSampleFormat::F32, AudioPacking::Interleaved,
+            opus ? AudioChannelLayout::Surround71 : AudioChannelLayout::Surround51Back}, .codec = description.codec};
+    if (!CodecAvailable(ui, config, AudioDecoder::Probe, opus ? "Multichannel Opus" : "Multichannel Vorbis")) continue;
+    std::shared_ptr<const File> wave;
+    std::exception_ptr failure;
+    const auto exporting = tasks.Launch([&]() -> Task<void> {
+      try { wave = co_await media_preview::ExportWave(ogg, temporary); }
+      catch (...) { failure = std::current_exception(); }
+    });
+    Until(ui, failure, [&] { return bool(wave); }, "Mapped audio could not export PCM");
+    exporting.Cancel();
+    auto pcm = media_preview::Open(*wave);
+    Check(pcm.Duration() == duration && pcm.Tracks().front().descriptions.front().speaker_mask == mask,
+          "Mapped WAV changed its sample count or speaker mask");
+    std::array<std::array<double, 8>, 8> energy{};
+    int frame = 0;
+    while (const auto packet = ReadPacket(pcm)) {
+      const auto bytes = packet->data.AsBytes();
+      const auto stride = channels * sizeof(float);
+      Check(bytes.size() % stride == 0, "Mapped WAV returned a partial PCM frame");
+      for (std::size_t offset = 0; offset < bytes.size(); offset += stride, ++frame) {
+        const auto burst = frame >= 800 ? (frame - 800) / 2100 : -1;
+        if (burst < 0 || burst >= int(channels) || (frame - 800) % 2100 >= 1200) continue;
+        for (unsigned channel = 0; channel < channels; ++channel) {
+          float sample;
+          std::memcpy(&sample, bytes.data() + offset + channel * sizeof(sample), sizeof(sample));
+          energy[burst][channel] += double(sample) * sample;
+        }
+      }
+    }
+    for (unsigned burst = 0; burst < channels; ++burst) {
+      Check(energy[burst][burst] > 0.1, "Mapped PCM lost a channel's tone");
+      for (unsigned channel = 0; channel < channels; ++channel)
+        if (channel != burst) Check(energy[burst][burst] > energy[burst][channel] * 10, "Mapped PCM reordered the speakers");
+    }
+    Check(frame == duration.ticks, "Mapped PCM lost tail samples");
+    constexpr MediaTimestamp targets[]{{14800, 48000}, {2053, 48000}, {18999, 48000}};
+    if (!opus) CheckDecodedSeekSamples(tasks, ui, ogg, *wave, targets);
+  }
+}
+
 std::int32_t SurroundSample(int frame, int channel) {
   if (channel == 2) {
     constexpr auto turn = 2 * std::numbers::pi;
@@ -1135,7 +1225,7 @@ void CheckSurroundAudio(const TaskScope& tasks, testing::UiTest& ui, const File&
 
     struct Output { ContainerFormat format; const char* suffix; };
     constexpr Output outputs[]{{ContainerFormat::Wave, ".wav"}, {ContainerFormat::Rf64, ".wav"},
-        {ContainerFormat::Wave64, ".w64"}, {ContainerFormat::Aiff, ".aiff"}, {ContainerFormat::Caf, ".caf"}};
+        {ContainerFormat::Wave64, ".w64"}, {ContainerFormat::Aiff, ".aiff"}, {ContainerFormat::Caf, ".caf"}, {ContainerFormat::Mov, ".mov"}};
     for (const auto& [format, suffix] : outputs) {
       const auto file = media_preview::TemporaryFile(temporary, suffix);
       const bool big = format == ContainerFormat::Aiff;
@@ -1158,7 +1248,7 @@ void CheckSurroundAudio(const TaskScope& tasks, testing::UiTest& ui, const File&
             readback.Tracks().front().descriptions.front().speaker_mask == mask, "PCM readback changed its layout or duration");
       CheckDecodedSeekSamples(tasks, ui, file, *wave, targets);
 #if defined(__APPLE__) && TARGET_OS_OSX
-      if (format != ContainerFormat::Wave64) CheckAudioReadback(*wave, *file, duration, channels);
+      if (format != ContainerFormat::Wave64 && format != ContainerFormat::Mov) CheckAudioReadback(*wave, *file, duration, channels);
 #endif
     }
   }
@@ -1185,6 +1275,7 @@ void CheckAudioContainers(const TaskScope& tasks, testing::UiTest& ui, const Fil
 #endif
   CheckWave64AndVorbis(tasks, ui, temporary, fixtures);
   CheckSurroundAudio(tasks, ui, temporary, fixtures);
+  CheckSurroundOpusAndVorbis(tasks, ui, temporary, fixtures);
   std::cout << "PASS: PCM, Vorbis, and multichannel FLAC container checks\n";
 }
 

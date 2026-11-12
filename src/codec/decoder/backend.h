@@ -25,7 +25,13 @@ public:
   virtual CodecResult<void> Close() = 0;
 };
 std::unique_ptr<DecoderBackend> MakeDecoderBackend();
+#ifdef MEDIA_HAS_AOM
+std::unique_ptr<DecoderBackend> MakeAv1DecoderBackend();
+#endif
 std::unique_ptr<DecoderBackend> MakeVorbisDecoderBackend();
+#ifdef MEDIA_HAS_OPUS
+std::unique_ptr<DecoderBackend> MakeMappedOpusDecoderBackend();
+#endif
 std::unique_ptr<DecoderBackend> MakeMultichannelFlacDecoderBackend();
 using BackendFactory = std::function<std::unique_ptr<DecoderBackend>()>;
 

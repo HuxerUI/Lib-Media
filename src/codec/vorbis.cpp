@@ -52,7 +52,7 @@ VorbisHeaders::VorbisHeaders(ByteView configuration, ContainerErrorCode error) {
   const auto headers = VorbisHeaderPackets(configuration, error);
   if (headers[0].size() != 30) Fail(error, "Invalid Vorbis identification header length");
   const auto channels = Number<std::uint8_t>(headers[0], 11);
-  if (channels != 1 && channels != 2) Fail(ContainerErrorCode::Unsupported, "Vorbis requires mono or stereo");
+  if (!channels || channels > 8) Fail(ContainerErrorCode::Unsupported, "Vorbis requires one to eight channels");
   vorbis_comment comments{};
   vorbis_info_init(&info_);
   vorbis_comment_init(&comments);

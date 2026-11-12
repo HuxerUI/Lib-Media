@@ -14,17 +14,21 @@ Pass the description selected by a packet to the corresponding decoder for a sup
 | Container | Packets | Input | Output |
 | --- | --- | --- | --- |
 | Regular MP4, including audio-only M4A | Raw mono/stereo AAC-LC or ALAC, length-prefixed AVC or HEVC, and AV1 temporal units | Random access, or sequential when movie metadata precedes samples | Random write; fast-start requires random read/write |
-| Fragmented MP4 | AAC, AVC, and HEVC | Sequential from initialization. Sized random-access input supports incremental seek, including growing files. | Sequential or random write |
+| Fragmented MP4 | AAC, AVC, HEVC, and AV1 | Sequential from initialization. Sized random-access input supports incremental seek, including growing files. | Sequential or random write |
 | QuickTime MOV | AAC, AVC, HEVC, ProRes, packed interleaved PCM, timecode, and boxed timed metadata | Random access, or sequential when movie metadata precedes samples | Random write |
-| Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, VP8, VP9, AV1, raw AAC-LC, mapping-family-zero Opus, mono/stereo Vorbis, and opaque subtitle samples | Sequential or random access | Sequential or random write |
-| WebM | VP8, VP9, AV1, mapping-family-zero Opus, and mono/stereo Vorbis | Sequential or random access | Sequential or random write |
+| Matroska, including audio-only MKA | Length-prefixed AVC or HEVC, VP8, VP9, AV1, raw AAC-LC, Opus mapping families 0 and 1, Vorbis through eight channels, and opaque subtitle samples | Sequential or random access | Sequential or random write |
+| WebM | VP8, VP9, AV1, Opus mapping families 0 and 1, and Vorbis through eight channels | Sequential or random access | Sequential or random write |
 | RIFF WAVE, RF64, and Wave64 | Interleaved U8, S16LE, S24LE, S32LE, or F32LE PCM | Sequential or random access | Random write |
 | AIFF | Up to eight channels of packed interleaved S16BE, S24BE, or S32BE | Random access, or sequential when `COMM` precedes `SSND` | Random write |
 | CAF | Up to eight channels of packed interleaved S16, S24, S32, or F32 in either byte order, or mono/stereo ALAC | Sized random access | Random write |
 | MPEG-4 ADTS | One raw mono/stereo AAC-LC access unit per frame | Sequential or random access | Sequential or random write |
-| Ogg | Mapping-family-zero Opus, including chained logical streams on input, or mono/stereo Vorbis | Sequential or random access | Sequential or random write for one logical stream |
+| Ogg | Opus mapping families 0 and 1, including chained logical streams on input, or Vorbis through eight channels | Sequential or random access | Sequential or random write for one logical stream |
 | Native FLAC | Complete FLAC frames with STREAMINFO | Sequential or random access, with native seek table support | Random write for whole-frame packet copy |
 | MP3 | MPEG Layer III frames, including variable bitrate | Sequential or random access | Random write for whole-track packet copy |
+| MPEG-TS | Single-program AVC/HEVC and ADTS AAC-LC | Fixed input; random access for seek | Remux compatible tracks to MP4 or MKV |
+| RIFF AVI | Unreordered AVC/HEVC and packed LPCM | Fixed input; random access for seek | Remux compatible tracks to MOV |
+| Annex B elementary stream | Untimed AVC/HEVC access units | Fixed input; random access for seek | Remux after assigning a timeline |
+| SubRip and WebVTT | UTF-8 text cues with millisecond timing | Fixed input; random access for seek | Sequential or random write |
 
 MP4 and MOV use self-contained samples in decode order within each track. The fragmented writer emits an
 initialization movie and bounded fragments with nonnegative DTS. ADTS and sequential fragmented MP4 report
@@ -140,16 +144,16 @@ HEVC sample entries. The example uses aspect ratio for display and keeps HDR fil
 MOV uses the `qt  ` major brand and self-contained media. ProRes retains the Proxy, LT, 422, HQ,
 4444, or 4444 XQ sample entry. PCM supports U8, signed 16/24/32-bit, and 32-bit float, with little-
 and big-endian variants where applicable. The reader groups consecutive PCM frames in each chunk.
-The writer emits packed interleaved LPCM in a version-two sound description. MOV carries `tmcd` timecode and
+The writer emits packed interleaved LPCM in a version-two sound description. Supported ordered layouts use a bitmap in the QuickTime `chan` atom. MOV carries `tmcd` timecode and
 `mebx` boxed timed metadata as `TrackKind::Data` with `ContainerSample` framing. The reader retains the description
 payload, timed samples, and supported `tmcd` and `cdsc` track references. Include the associated tracks when copying
 to MOV. `ValidateOutput()` rejects these mappings for MP4. [QuickTime timecode](https://developer.apple.com/documentation/quicktime-file-format/timecode_sample_description)
 
-On macOS the CPU preview decodes progressive SDR Proxy, LT, 422, and HQ pictures and plays mono or stereo LPCM on
+On macOS the CPU preview decodes progressive SDR ProRes 422 and 4444 family pictures and plays mono or stereo LPCM on
 the MOV sample clock. Compatible iOS devices preview standard 422 (`apcn`). [ProRes decoding](media-codec.md#prores-422-and-alac)
 
-To write macOS ProRes 422 encoder output, use `ContainerFormat::Mov`. Set the video description to
-`CodecId::ProRes`, `PacketFraming::CodecPacket`, sample entry `apcn`, and the geometry from `VideoEncodeFormat`.
+To write macOS ProRes encoder output, use `ContainerFormat::Mov`. Set the video description to
+`CodecId::ProRes`, `PacketFraming::CodecPacket`, and the sample entry and geometry from `VideoEncodeFormat`.
 Keep `initialization_data` empty. Write one complete frame per sample with its PTS, matching DTS, duration, and sync
 flag. An existing packed LPCM track can be written alongside it using the source PCM bytes and exact sample clock.
 The macOS integration test opens the encoded MOV with AVFoundation and verifies picture timing, 4:2:2 chroma, and
@@ -177,7 +181,8 @@ assembles continued packets. Each link begins at the previous link's audible end
 can precede the event's absolute `first_audible_pts` in media time. Random input builds a bounded link
 and page index on the first seek query. The 80 ms Opus preroll stays within the selected link.
 The writer emits one packet per page for a single logical stream and accepts up to 1 ms of timestamp
-rounding for WebM interoperability. Supported streams use mapping family zero.
+rounding for WebM interoperability. Opus mapping families 0 and 1 retain their headers, canonical speaker positions,
+and packet trim on compatible Ogg, WebM, and Matroska copies. Mapping-family-one decode requires a compatible backend.
 [Ogg Opus mapping and seeking](https://www.rfc-editor.org/rfc/rfc7845.html#section-4.6)
 
 ### Vorbis
@@ -286,9 +291,37 @@ Sequential inputs report `IndexUnavailable` for seeking. [Matroska timing and in
 
 MP4 uses the `av01` sample entry, `av1C` configuration, and `av01` compatible brand. Matroska and WebM use `V_AV1`
 and the same configuration record in `CodecPrivate`. Pass the `MediaSampleDescription`, complete temporal units,
-and timing through the muxer. AV1 output uses regular or fast-start MP4, or the EBML layouts above. Writers check
+and timing through the muxer. AV1 output uses regular, fast-start, or fragmented MP4, or the EBML layouts above. Writers check
 marked sync packets before building seek entries. Decoder availability is independent of packet copy.
 [AV1 in MP4](https://aomediacodec.github.io/av1-isobmff/) · [Matroska codec mappings](https://www.matroska.org/technical/codec_specs.html)
+
+### MPEG-TS, Annex B, and AVI import
+
+The importers build a bounded packet index from a fixed input up to 128 MiB. MPEG-TS supports
+188-byte packets, one continuous program with stable PAT and PMT, one complete AVC or HEVC picture per
+video PES, and mono/stereo ADTS AAC-LC. Video PTS and DTS use the unwrapped 90 kHz clock and the DTS
+cadence supplies sample durations. The importer shifts all tracks by the same offset so the first
+presentation starts at zero. AVI supports
+one classic RIFF segment, one unreordered AVC or HEVC picture per video chunk, and packed PCM. Its
+video and audio timing comes from the AVI stream headers. Seek on the returned timed track using the
+same `MediaDemuxer` API as for other formats.
+
+The raw Annex B reader groups AVC or HEVC NAL units into access units. All three readers supply the video
+configuration and four-byte length-prefixed packets. Raw Annex B has no PTS, DTS, duration, or timed
+seek index. A caller with the original timing can assign it and remux. Supply actual decode order and
+presentation timestamps for reordered video.
+[ITU H.222.0](https://www.itu.int/rec/T-REC-H.222.0) · [AVI RIFF reference](https://learn.microsoft.com/en-us/windows/win32/directshow/avi-riff-file-reference)
+
+### Standalone subtitles
+
+SubRip and WebVTT use a single `TrackKind::Subtitle` track with `PacketFraming::ContainerSample`, millisecond
+PTS and duration, and `MediaTrack::matroska.subtitle_codec` set to `S_TEXT/UTF8` or `S_TEXT/WEBVTT`.
+Copy the description and packets to MKV, then select that track when exporting it back to its text format.
+The WebVTT mapping retains the header, STYLE and REGION blocks before the first cue, cue identifiers and settings,
+and NOTE blocks associated with a following cue. Inline WebVTT timestamps become relative to the Matroska
+Block and are restored to absolute cue timestamps on export. Text is normalized to UTF-8 with LF line endings and SRT
+cue numbers are regenerated. The text reader supports files up to 8 MiB and uses cue start times for seek.
+[Matroska subtitle mappings](https://www.matroska.org/technical/subtitles.html) · [WebVTT](https://www.w3.org/TR/webvtt1/)
 
 ### Matroska subtitle and metadata copy
 

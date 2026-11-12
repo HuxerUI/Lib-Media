@@ -6,8 +6,19 @@ namespace huxerui::media {
 namespace {
 auto AudioBackend(const AudioDecoderConfig& config) {
   if (config.codec == CodecId::Vorbis) return detail::MakeVorbisDecoderBackend;
+#ifdef MEDIA_HAS_OPUS
+  if (config.codec == CodecId::Opus && config.initialization_data.size() > 18 && config.initialization_data[18] == std::byte{1})
+    return detail::MakeMappedOpusDecoderBackend;
+#endif
   if (config.codec == CodecId::Flac && config.output.ChannelCount() > 2)
     return detail::MakeMultichannelFlacDecoderBackend;
+  return detail::MakeDecoderBackend;
+}
+
+auto VideoBackend(const VideoDecoderConfig& config) {
+#ifdef MEDIA_HAS_AOM
+  if (config.codec == CodecId::Av1) return detail::MakeAv1DecoderBackend;
+#endif
   return detail::MakeDecoderBackend;
 }
 
@@ -34,7 +45,7 @@ struct ProbeState : std::enable_shared_from_this<ProbeState> {
         if (!valid.Succeeded()) result = CodecResult<void>::Failure(valid.Error());
         else {
           const auto* audio = std::get_if<AudioDecoderConfig>(&config);
-          backend = audio ? AudioBackend(*audio)() : detail::MakeDecoderBackend();
+          backend = audio ? AudioBackend(*audio)() : VideoBackend(std::get<VideoDecoderConfig>(config))();
           result = backend->Open(config);
         }
       }
@@ -106,7 +117,7 @@ VideoDecoder& VideoDecoder::operator=(VideoDecoder&& other) noexcept {
 }
 VideoDecoder::~VideoDecoder() { Close(); }
 CodecResult<VideoDecoder> VideoDecoder::Create(const VideoDecoderConfig& config) {
-  return detail::VideoDecoderAccess::Create(config, detail::MakeDecoderBackend);
+  return detail::VideoDecoderAccess::Create(config, VideoBackend(config));
 }
 CodecResult<VideoDecoder> detail::VideoDecoderAccess::Create(const VideoDecoderConfig& config, BackendFactory factory) {
   auto state = DecoderState<VideoDecodeOutput>::Create(config, std::move(factory));

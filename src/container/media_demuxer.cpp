@@ -1,4 +1,4 @@
-#include "container_io.h"
+#include "import.h"
 
 namespace huxerui::media {
 namespace {
@@ -24,6 +24,8 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
     if (type == Tag("RIFF")) recognized = ContainerFormat::Wave;
     if (type == Tag("RF64")) recognized = ContainerFormat::Rf64;
   }
+  if (prefix.size() >= 12 && Number<std::uint32_t>(prefix) == Tag("RIFF") && Number<std::uint32_t>(prefix, 8) == Tag("AVI "))
+    recognized = ContainerFormat::Avi;
   if (!recognized && LooksLikeWave64(prefix)) recognized = ContainerFormat::Wave64;
   if (!recognized && prefix.size() >= 8) {
     const auto box = Number<std::uint32_t>(prefix, 4);
@@ -33,6 +35,16 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
   if (!recognized && prefix.size() >= 2 && (Number<std::uint16_t>(prefix) & 0xfff6) == 0xfff0)
     recognized = ContainerFormat::Adts;
   if (!recognized && LooksLikeMp3(prefix)) recognized = ContainerFormat::Mp3;
+
+  std::optional<CodecId> annex;
+  if (!recognized && (!hint || *hint == ContainerFormat::Srt || *hint == ContainerFormat::WebVtt))
+    recognized = LooksLikeSubtitle(input.Peek(1024));
+  if (!recognized && (!hint || *hint == ContainerFormat::MpegTs) && LooksLikeMpegTs(input.Peek(377)))
+    recognized = ContainerFormat::MpegTs;
+  if (!recognized && (!hint || *hint == ContainerFormat::AnnexB)) {
+    annex = LooksLikeAnnexB(input.Peek(65536));
+    if (annex) recognized = ContainerFormat::AnnexB;
+  }
 
   if (!recognized || (hint && *recognized != *hint &&
       !(*recognized == ContainerFormat::Mp4 && *hint == ContainerFormat::Mov)))
@@ -49,6 +61,11 @@ std::unique_ptr<ContainerReader> OpenReader(ContainerInput input, std::optional<
     case ContainerFormat::Ogg: return OpenOggReader(std::move(input));
     case ContainerFormat::Flac: return OpenFlacReader(std::move(input));
     case ContainerFormat::Mp3: return OpenMp3Reader(std::move(input));
+    case ContainerFormat::MpegTs: return OpenMpegTsReader(std::move(input));
+    case ContainerFormat::Avi: return OpenAviReader(std::move(input));
+    case ContainerFormat::AnnexB: return OpenAnnexBReader(std::move(input), *annex);
+    case ContainerFormat::Srt:
+    case ContainerFormat::WebVtt: return OpenSubtitleReader(std::move(input), *recognized);
     case ContainerFormat::Mp4:
     case ContainerFormat::Mov: return OpenMp4Reader(std::move(input), hint, mode);
     case ContainerFormat::Matroska:

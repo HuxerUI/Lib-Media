@@ -41,7 +41,7 @@ public:
       format.sample_format = AudioSampleFormat::F32;
       AudioFrame source{format, packet.pts, expected, {}};
       for (unsigned channel = 0; channel < format.ChannelCount(); ++channel) {
-        const auto bytes = std::as_bytes(std::span(planes[channel], expected));
+        const auto bytes = std::as_bytes(std::span(planes[WaveToVorbisChannel(channel, format.ChannelCount())], expected));
         source.planes.push_back(Own(Bytes(bytes.begin(), bytes.end())));
       }
       auto frame = format == output_ ? CodecResult<AudioFrame>::Success(std::move(source)) : CopyAudio(source, output_);

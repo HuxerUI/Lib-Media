@@ -5,7 +5,6 @@
 #include <array>
 
 namespace huxerui::media::detail {
-namespace {
 
 MediaSampleDescription DescribeAdts(std::span<const std::byte> header) {
   const auto first = Number<std::uint16_t>(header);
@@ -26,6 +25,8 @@ MediaSampleDescription DescribeAdts(std::span<const std::byte> header) {
   description.channel_count = config.Value().channels;
   return description;
 }
+
+namespace {
 
 class AdtsReader final : public ContainerReader {
 public:

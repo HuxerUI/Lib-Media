@@ -1,5 +1,6 @@
 #include "mp4.h"
 #include "framed_audio.h"
+#include "import.h"
 
 namespace huxerui::media {
 namespace {
@@ -57,6 +58,14 @@ Requirement Validate(ContainerFormat format, std::span<const MediaTrack> tracks,
       (layout != ContainerLayout::Fragmented && layout != ContainerLayout::FastStart)))
     Fail(ContainerErrorCode::Unsupported, "Unsupported output layout");
   switch (format) {
+    case ContainerFormat::Srt:
+    case ContainerFormat::WebVtt:
+      ValidateSubtitle(tracks, format);
+      return Requirement::SequentialWrite;
+    case ContainerFormat::MpegTs:
+    case ContainerFormat::Avi:
+    case ContainerFormat::AnnexB:
+      Fail(ContainerErrorCode::Unsupported, "This format is available for import");
     case ContainerFormat::Wave:
     case ContainerFormat::Wave64:
     case ContainerFormat::Rf64:
@@ -100,6 +109,11 @@ std::unique_ptr<ContainerWriter> OpenWriter(ContainerOutput output, ContainerFor
     Fail(ContainerErrorCode::NeedRandomAccess, "This container layout requires random writes");
   if (requirement == Requirement::RandomReadWrite) output.RequireReadable();
   switch (format) {
+    case ContainerFormat::Srt:
+    case ContainerFormat::WebVtt: return OpenSubtitleWriter(std::move(output), tracks, format);
+    case ContainerFormat::MpegTs:
+    case ContainerFormat::Avi:
+    case ContainerFormat::AnnexB: break;
     case ContainerFormat::Wave:
     case ContainerFormat::Wave64:
     case ContainerFormat::Rf64: return OpenWaveWriter(std::move(output), format, tracks);

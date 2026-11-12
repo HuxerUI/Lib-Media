@@ -66,14 +66,8 @@ Bytes WritePcmChannelLayout(const MediaSampleDescription& description) {
   return layout;
 }
 
-void ValidatePcmTrack(const MediaTrack& track) {
-  const auto& description = track.descriptions.front();
+void ValidatePcmChannelLayout(const MediaSampleDescription& description) {
   const auto channels = description.channel_count.value_or(0);
-  if (!description.sample_rate.value_or(0) || !channels)
-    Fail(ContainerErrorCode::InvalidArgument, "PCM requires a positive sample rate and channel count");
-  if (channels > 8 || !DescribePackedPcm(description.codec).bits ||
-      !track.edits.empty() || track.priming_samples.value_or(0) || track.padding_samples.value_or(0))
-    Fail(ContainerErrorCode::Unsupported, "Output requires packed PCM with up to eight channels on a contiguous sample clock");
   constexpr auto invalid = ContainerErrorCode::InvalidArgument;
   if (const auto mask = description.speaker_mask; mask && *mask && std::popcount(*mask) != static_cast<int>(channels))
     Fail(invalid, "PCM speaker mask does not match the channel count");
@@ -82,6 +76,17 @@ void ValidatePcmTrack(const MediaTrack& track) {
       Fail(invalid, "Conflicting or oversized PCM channel layout");
     PcmSpeakerMask(description.initialization_data, channels, invalid);
   }
+}
+
+void ValidatePcmTrack(const MediaTrack& track) {
+  const auto& description = track.descriptions.front();
+  const auto channels = description.channel_count.value_or(0);
+  if (!description.sample_rate.value_or(0) || !channels)
+    Fail(ContainerErrorCode::InvalidArgument, "PCM requires a positive sample rate and channel count");
+  if (channels > 8 || !DescribePackedPcm(description.codec).bits ||
+      !track.edits.empty() || track.priming_samples.value_or(0) || track.padding_samples.value_or(0))
+    Fail(ContainerErrorCode::Unsupported, "Output requires packed PCM with up to eight channels on a contiguous sample clock");
+  ValidatePcmChannelLayout(description);
 }
 
 unsigned PcmPacketFrames(const ContainerPacket& packet, unsigned alignment, std::int64_t start, unsigned rate) {

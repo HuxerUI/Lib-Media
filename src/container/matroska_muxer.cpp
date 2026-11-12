@@ -494,11 +494,13 @@ void ValidateMatroska(ContainerFormat format, std::span<const MediaTrack> tracks
       if (description.codec == CodecId::Opus) {
         const auto opus = ParseOpus(description.initialization_data, BadArgument);
         if (description.sample_rate != 48000 || description.channel_count != opus.channels ||
+            (description.speaker_mask && description.speaker_mask != VorbisSpeakerMask(opus.channels)) ||
             (track.priming_samples && track.priming_samples != opus.pre_skip))
           Fail(BadArgument, "Opus track does not match its 48 kHz timeline, channels, or pre-skip");
       } else if (description.codec == CodecId::Vorbis) {
         const VorbisHeaders vorbis(description.initialization_data, BadArgument);
         if (description.sample_rate != vorbis.Rate() || description.channel_count != vorbis.Channels() ||
+            (description.speaker_mask && description.speaker_mask != VorbisSpeakerMask(vorbis.Channels())) ||
             track.priming_samples.value_or(0) > vorbis.MaxSamples())
           Fail(BadArgument, "Matroska Vorbis track does not match its headers or sample clock");
       } else {

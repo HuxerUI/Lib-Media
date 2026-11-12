@@ -18,6 +18,8 @@ struct AvcConfig {
 };
 // Reads the shared bounded avcC description used by encoder output and decoder input.
 CodecResult<AvcConfig> ParseAvc(std::span<const std::byte> bytes);
-// Checks the frame header used by progressive ProRes 422 decoder input and encoder output.
-CodecResult<void> ValidateProResFrame(std::span<const std::byte> bytes, std::uint32_t width, std::uint32_t height);
+// Checks the frame header for the requested progressive ProRes family.
+bool IsProRes4444(std::string_view entry);
+std::uint32_t ProResCodecType(std::string_view entry);
+CodecResult<void> ValidateProResFrame(std::span<const std::byte> bytes, std::uint32_t width, std::uint32_t height, bool chroma444 = false);
 } // namespace huxerui::media::detail

@@ -166,12 +166,17 @@ public:
         throw VideoToolboxFailure{Error(CodecErrorCode::Unsupported, "VideoToolbox cannot enforce a numeric consecutive B-picture bound")};
       const bool hevc = config.codec == CodecId::Hevc;
       const bool prores = config.codec == CodecId::ProRes;
-      const auto codec = prores ? kCMVideoCodecType_AppleProRes422 : hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
+      const auto codec = prores ? ProResCodecType(config.prores_sample_entry) : hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264;
       NSDictionary* attributes = prores ? @{
-        (__bridge NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+        (__bridge NSString*)kCVPixelBufferPixelFormatTypeKey: @(IsProRes4444(config.prores_sample_entry) ? kCVPixelFormatType_4444AYpCbCr16 :
+            kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+      } : nil;
+      // The hardware encoder can corrupt packed 16-bit AYUV alpha. The software encoder preserves it.
+      NSDictionary* specification = IsProRes4444(config.prores_sample_entry) ? @{
+        (__bridge NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO
       } : nil;
       VideoStatus(VTCompressionSessionCreate(kCFAllocatorDefault, config.input.width, config.input.height,
-          codec, nullptr, (__bridge CFDictionaryRef)attributes, nullptr, Output, this, &session_),
+          codec, (__bridge CFDictionaryRef)specification, (__bridge CFDictionaryRef)attributes, nullptr, Output, this, &session_),
           "Cannot create video compression session", CodecErrorCode::Unsupported);
       if (!prores) {
         const bool ten_bit = config.input.pixel_format == VideoPixelFormat::P010;
@@ -323,11 +328,13 @@ private:
   CVPixelBufferRef pixel = nullptr;
   const auto layout = config_.input.pixel_format == VideoPixelFormat::I420 ? VideoPixelFormat::NV12 : config_.input.pixel_format;
   const bool full = config_.input.range == ColorRange::Full;
-  const auto type = layout == VideoPixelFormat::P210 ? kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange :
+  const bool ayuv = layout == VideoPixelFormat::Ayuv16;
+  const auto type = ayuv ? kCVPixelFormatType_4444AYpCbCr16 :
+      layout == VideoPixelFormat::P210 ? kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange :
       layout == VideoPixelFormat::P010 ?
       (full ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) :
       (full ? kCVPixelFormatType_420YpCbCr8BiPlanarFullRange : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
-  const auto row_bytes = std::size_t(config_.input.width) * VideoComponentBytes(layout);
+  const auto row_bytes = std::size_t(config_.input.width) * (ayuv ? 8 : VideoComponentBytes(layout));
   auto surface = CFDictionaryCreate(kCFAllocatorDefault, nullptr, nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
   if (!surface) throw std::bad_alloc();
   const void* keys[]{kCVPixelBufferIOSurfacePropertiesKey};
@@ -341,8 +348,15 @@ private:
   std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)> owner(pixel, CVPixelBufferRelease);
   VideoStatus(CVPixelBufferLockBaseAddress(pixel, 0), "Cannot map video input");
   CopyVideoEncoderPixels(frame, layout, scratch_);
-  bool valid = CVPixelBufferGetPlaneCount(pixel) == 2;
-  for (std::size_t plane = 0; valid && plane < 2; ++plane) {
+  bool valid = CVPixelBufferGetPlaneCount(pixel) == (ayuv ? 0 : 2);
+  if (ayuv && valid) {
+    auto* target = static_cast<std::byte*>(CVPixelBufferGetBaseAddress(pixel));
+    const auto stride = CVPixelBufferGetBytesPerRow(pixel);
+    valid = target && stride >= row_bytes;
+    if (valid) for (std::size_t y = 0; y < config_.input.height; ++y)
+      std::memcpy(target + y * stride, scratch_.data() + y * row_bytes, row_bytes);
+  }
+  for (std::size_t plane = 0; !ayuv && valid && plane < 2; ++plane) {
     auto* target = static_cast<std::byte*>(CVPixelBufferGetBaseAddressOfPlane(pixel, plane));
     const auto stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, plane);
     const auto rows = plane ? VideoChromaHeight(config_.input.height, layout) : config_.input.height;
@@ -404,8 +418,8 @@ private:
       int length = 0;
       Bytes configuration;
       if (prores) {
-        if (!description || CMFormatDescriptionGetMediaSubType(description) != kCMVideoCodecType_AppleProRes422)
-          throw VideoToolboxFailure{Error(CodecErrorCode::InvalidData, "VideoToolbox did not return ProRes 422")};
+        if (!description || CMFormatDescriptionGetMediaSubType(description) != ProResCodecType(self.config_.prores_sample_entry))
+          throw VideoToolboxFailure{Error(CodecErrorCode::InvalidData, "VideoToolbox did not return the requested ProRes sample entry")};
       } else {
         const std::uint8_t* parameter = nullptr;
         std::size_t size = 0, count = 0;

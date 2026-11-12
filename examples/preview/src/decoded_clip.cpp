@@ -248,11 +248,11 @@ VideoDecoderConfig VideoConfig(const MediaSampleDescription& description, VideoS
   if (description.codec == CodecId::ProRes) {
     constexpr std::string_view entries[] = {"apcn",
 #if defined(__APPLE__) && TARGET_OS_OSX
-        "apco", "apcs", "apch",
+        "apco", "apcs", "apch", "ap4h", "ap4x",
 #endif
     };
     if (std::ranges::find(entries, description.sample_entry) == std::end(entries))
-      throw std::runtime_error("The ProRes preview requires a ProRes 422 sample entry");
+      throw std::runtime_error("Unsupported ProRes preview sample entry");
   }
   if (HasHdrMetadata(description))
     throw std::runtime_error("HDR display needs an HDR surface. Use Copy Movie to retain the source metadata.");
@@ -270,8 +270,13 @@ VideoDecoderConfig VideoConfig(const MediaSampleDescription& description, VideoS
     if (video_config.initialization_data.size() >= 23 &&
         (std::to_integer<unsigned>(video_config.initialization_data[17]) & 7) == 2)
       video_config.output = VideoPixelFormat::P010;
+  } else if (description.codec == CodecId::Av1) {
+    if (description.initialization_data.size() >= 4 && (std::to_integer<unsigned>(description.initialization_data[2]) & 0x40))
+      video_config.output = VideoPixelFormat::P010;
   } else if (description.codec == CodecId::ProRes) {
-    video_config.output = prores_output;
+    video_config.prores_sample_entry = description.sample_entry;
+    const bool chroma444 = description.sample_entry == "ap4h" || description.sample_entry == "ap4x";
+    video_config.output = chroma444 && prores_output == VideoPixelFormat::P210 ? VideoPixelFormat::Ayuv16 : prores_output;
   }
   if (video_config.width > 8192 || video_config.height > 8192)
     throw std::runtime_error("The preview supports coded dimensions up to 8192 pixels");
@@ -861,7 +866,7 @@ struct ExportTrack {
                 .descriptions = {{.codec = format.codec,
                     .framing = prores ? PacketFraming::CodecPacket : PacketFraming::LengthPrefixedNals,
                     .initialization_data = format.initialization_data, .coded_width = format.width, .coded_height = format.height,
-                    .visible = format.visible, .sample_entry = prores ? "apcn" : "", .pixel_aspect_ratio = pixel_aspect_ratio}},
+                    .visible = format.visible, .sample_entry = format.sample_entry, .pixel_aspect_ratio = pixel_aspect_ratio}},
                 .rotation = source->track.rotation, .edits = source->track.edits};
 
           }
@@ -880,6 +885,8 @@ struct ExportTrack {
           VideoEncoderConfig config;
           config.input = frames.front().format;
           config.codec = source->track.descriptions.front().codec;
+          const auto& entry = source->track.descriptions.front().sample_entry;
+          if (config.codec == CodecId::ProRes && (entry == "ap4h" || entry == "ap4x")) config.prores_sample_entry = entry;
           config.input_storage = frames.front().Storage();
           if (config.input_storage == VideoStorage::Platform)
             config.bitrate = std::max(config.bitrate, config.input.width * config.input.height * 4u);

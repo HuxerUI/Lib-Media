@@ -192,3 +192,18 @@ sets `WAVEFORMATEXTENSIBLE_CHANNEL_MASK=0x60f` for side surrounds. The 7.1 sourc
 FLAC's default layout. Both contain distinct impulses and waveforms in each channel, LPC and
 fixed predictors, Rice and Rice2 residuals, and a nine-sample final block. The
 `SurroundSample` function in the preview test describes the original integer samples.
+
+
+## Extended formats
+
+- `prores-4444-alpha.mov` and `prores-4444-xq.mov` contain four synthetic frames at 64×48 and 12 fps,
+  encoded with FFmpeg `prores_ks`. The 4444 fixture uses distinct horizontal alpha and chroma patterns
+  with `alpha_bits=16`. The XQ fixture omits alpha and should decode opaque.
+- `import-avc-aac.ts` and `import-hevc-aac.ts` are 188-byte single-program transport streams with
+  AVC or HEVC B-pictures and ADTS AAC. The HEVC file uses 44.1 kHz audio.
+  `import-avc-pcm.avi` uses frame-sized unreordered AVC and packed S16 PCM in a single RIFF segment.
+  `import-avc.h264` and `import-hevc.h265` are short untimed Annex B streams with in-band parameter sets.
+- `surround-vorbis.ogg` and `surround-opus.ogg` carry 19000 audible samples at 48 kHz in 5.1 back
+  and 7.1 respectively. Each WAVE-order channel contains a distinct 1200-sample tone burst starting
+  at sample `800 + channel * 2100`. The LFE tone is 120 Hz and the other tones are 720 Hz. FFmpeg 9
+  encoded the Vorbis and mapping-family-one Opus fixtures with libvorbis and libopus.

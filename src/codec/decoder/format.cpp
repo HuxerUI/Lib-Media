@@ -101,7 +101,7 @@ CodecResult<unsigned> AudioSampleLimit(const AudioDecoderConfig& config) {
   if (!output.sample_rate || !output.ChannelCount() || !output.BytesPerSample() ||
       (output.packing != AudioPacking::Planar && output.packing != AudioPacking::Interleaved))
     return R::Failure(Error(CodecErrorCode::InvalidArgument, "Invalid PCM output format"));
-  if (output.ChannelCount() > 2 && config.codec != CodecId::Flac)
+  if (output.ChannelCount() > 2 && config.codec != CodecId::Flac && config.codec != CodecId::Vorbis && config.codec != CodecId::Opus)
     return R::Failure(Error(CodecErrorCode::Unsupported, "This audio codec requires mono or stereo output"));
   const auto matches = [&](unsigned rate, unsigned channels, unsigned samples) {
     if (rate == output.sample_rate && channels == output.ChannelCount()) return R::Success(samples);
@@ -126,10 +126,17 @@ CodecResult<unsigned> AudioSampleLimit(const AudioDecoderConfig& config) {
       }
       case CodecId::Opus: {
         const auto info = ParseOpus(config.initialization_data, ContainerErrorCode::Unsupported);
+#ifndef MEDIA_HAS_OPUS
+        if (info.family) return R::Failure(Error(CodecErrorCode::Unsupported, "Opus mapping family one decoding requires libopus"));
+#endif
+        if (VorbisSpeakerMask(info.channels) != output.SpeakerMask())
+          return R::Failure(Error(CodecErrorCode::Unsupported, "PCM speaker layout differs from Opus"));
         return matches(48000, info.channels, 5760);
       }
       case CodecId::Vorbis: {
         const VorbisHeaders info(config.initialization_data, ContainerErrorCode::InvalidArgument);
+        if (VorbisSpeakerMask(info.Channels()) != output.SpeakerMask())
+          return R::Failure(Error(CodecErrorCode::Unsupported, "PCM speaker layout differs from Vorbis"));
         return matches(info.Rate(), info.Channels(), info.MaxSamples());
       }
       case CodecId::Flac: {
@@ -285,7 +292,7 @@ CodecResult<bool> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
   }
   if (const auto* video = std::get_if<VideoDecoderConfig>(&config)) {
     if (video->codec == CodecId::ProRes) {
-      const auto header = ValidateProResFrame(packet.data.AsBytes(), video->width, video->height);
+      const auto header = ValidateProResFrame(packet.data.AsBytes(), video->width, video->height, IsProRes4444(video->prores_sample_entry));
       if (!header.Succeeded()) return R::Failure(header.Error());
       if (needs_key && !packet.key_frame) return invalid("ProRes requires a marked frame after creation/reset");
       return R::Success(true);
@@ -313,8 +320,9 @@ CodecResult<bool> ValidatePacket(const EncodedPacket& packet, const DecoderConfi
         if ((needs_key || packet.key_frame) && (!packet.key_frame || !info.sync))
           return invalid("AV1 requires a marked key packet with an in-band sequence header");
         if (info.pictures > 1 || info.spatial_layers || (info.sequence &&
-            (!info.sequence->sdr_420 || info.sequence->width > video->width || info.sequence->height > video->height)))
-          return R::Failure(Error(CodecErrorCode::Unsupported, "AV1 requires single-layer 8-bit SDR 4:2:0 within the configured bounds"));
+            (!info.sequence->sdr_420 || info.sequence->bit_depth != (video->output == VideoPixelFormat::P010 ? 10u : 8u) ||
+              info.sequence->width > video->width || info.sequence->height > video->height)))
+          return R::Failure(Error(CodecErrorCode::Unsupported, "AV1 requires matching single-layer SDR 4:2:0 within the configured bounds"));
         return R::Success(info.pictures != 0);
       } catch (const std::invalid_argument& error) {
         return invalid(error.what());
@@ -392,10 +400,12 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
     } else if (video.codec == CodecId::Av1) {
       try {
         const auto description = ParseAv1Configuration(video.initialization_data);
-        if (platform_storage || !eight_bit || description.profile != 0 || !description.eight_bit_420 ||
-            (description.sequence && (!description.sequence->sdr_420 || description.sequence->width > video.width ||
-                                      description.sequence->height > video.height)))
-          return R::Failure(Error(CodecErrorCode::Unsupported, "AV1 requires 8-bit SDR 4:2:0 with CPU NV12 or I420 output"));
+        const auto depth = video.output == VideoPixelFormat::P010 ? 10u : 8u;
+        if (platform_storage || (!eight_bit && video.output != VideoPixelFormat::P010) || description.profile != 0 ||
+            !description.main_420 || description.bit_depth != depth ||
+            (description.sequence && (!description.sequence->sdr_420 || description.sequence->bit_depth != depth ||
+                                      description.sequence->width > video.width || description.sequence->height > video.height)))
+          return R::Failure(Error(CodecErrorCode::Unsupported, "AV1 output must match an eight- or ten-bit SDR Main stream"));
       } catch (const std::invalid_argument& error) {
         return R::Failure(Error(CodecErrorCode::InvalidArgument, error.what()));
       }
@@ -403,8 +413,11 @@ CodecResult<std::size_t> ValidateConfig(const DecoderConfig& config) {
 #if defined(__APPLE__) && (TARGET_OS_OSX || TARGET_OS_IOS)
       if (!video.initialization_data.empty())
         return R::Failure(Error(CodecErrorCode::InvalidArgument, "ProRes does not use initialization data"));
-      const bool p210 = TARGET_OS_OSX && video.output == VideoPixelFormat::P210;
-      if (platform_storage || (!eight_bit && video.output != VideoPixelFormat::P010 && !p210))
+      const bool chroma444 = IsProRes4444(video.prores_sample_entry);
+      if (!ProResCodecType(video.prores_sample_entry) || (chroma444 && !TARGET_OS_OSX))
+        return R::Failure(Error(CodecErrorCode::Unsupported, "Unsupported ProRes sample entry"));
+      const bool extended = TARGET_OS_OSX && (chroma444 ? video.output == VideoPixelFormat::Ayuv16 : video.output == VideoPixelFormat::P210);
+      if (platform_storage || (!eight_bit && video.output != VideoPixelFormat::P010 && !extended))
         return R::Failure(Error(CodecErrorCode::Unsupported, "Unsupported ProRes CPU output layout"));
 #else
       return R::Failure(Error(CodecErrorCode::Unsupported, "ProRes decoding is unavailable on this platform"));

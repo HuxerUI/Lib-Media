@@ -119,10 +119,15 @@ template<class T> void Put(Bytes& bytes, T value, bool little = false) {
 
 inline void Append(Bytes& bytes, ByteView tail) { bytes.insert(bytes.end(), tail.begin(), tail.end()); }
 
+std::uint32_t VorbisSpeakerMask(unsigned channels);
+unsigned WaveToVorbisChannel(unsigned channel, unsigned channels);
+
 struct OpusHead {
   std::uint32_t channels;
   std::uint32_t input_rate;
   std::uint16_t pre_skip;
+  unsigned family = 0, streams = 1, coupled = 0;
+  std::array<unsigned char, 8> mapping{};
   std::int64_t Delay() const { return static_cast<std::int64_t>(pre_skip) * 1'000'000'000 / 48000; }
 };
 
@@ -153,6 +158,7 @@ struct Mp3FrameHeader {
 
 std::optional<Mp3FrameHeader> ParseMp3FrameHeader(ByteView bytes);
 
+MediaSampleDescription DescribeAdts(ByteView header);
 ByteView AacLcInitialization(ByteView config);
 std::uint64_t AddOffset(std::uint64_t offset, std::uint64_t size);
 std::int64_t AddTime(std::int64_t time, std::int64_t delta);

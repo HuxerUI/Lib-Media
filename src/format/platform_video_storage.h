@@ -66,6 +66,7 @@ inline constexpr std::uint32_t VideoChromaHeight(std::uint32_t height, VideoPixe
 inline std::size_t VideoImageBytes(std::uint32_t width, std::uint32_t height, VideoPixelFormat layout) {
   const auto pixels = std::size_t(width) * height;
   if (layout == VideoPixelFormat::Opaque) return pixels * 4;
+  if (layout == VideoPixelFormat::Ayuv16) return pixels * 8;
   const auto samples = pixels + 2 * ((std::size_t(width) + 1) / 2) * VideoChromaHeight(height, layout);
   return samples * VideoComponentBytes(layout);
 }

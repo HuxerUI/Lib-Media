@@ -3,6 +3,7 @@
 #include "../common.h"
 
 namespace huxerui::media::detail {
+CodecResult<VideoEncodeFormat> ReadAnnexBVideoFormat(std::span<const std::byte> parameter_sets, CodecId codec);
 // Pending output reserves the packet bound, with separate headroom for encoder delay and drain output.
 inline constexpr std::size_t kAudioEncoderPacketBytes = 64 * 1024;
 inline constexpr std::size_t kAudioEncoderExtraPackets = 8;

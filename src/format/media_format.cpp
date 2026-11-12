@@ -99,7 +99,8 @@ bool VideoFormat::Validate() const noexcept {
       && visible.width <= width - visible.x && visible.height <= height - visible.y
       && aspect_width && aspect_height && (pixel_format == VideoPixelFormat::I420 ||
           pixel_format == VideoPixelFormat::NV12 || pixel_format == VideoPixelFormat::P010 ||
-          pixel_format == VideoPixelFormat::Opaque || pixel_format == VideoPixelFormat::P210)
+          pixel_format == VideoPixelFormat::Opaque || pixel_format == VideoPixelFormat::P210 ||
+          pixel_format == VideoPixelFormat::Ayuv16)
       && primaries >= ColorPrimaries::Unknown && primaries <= ColorPrimaries::BT2020
       && transfer >= ColorTransfer::Unknown && transfer <= ColorTransfer::HLG
       && matrix >= ColorMatrix::Unknown && matrix <= ColorMatrix::BT2020
@@ -116,6 +117,8 @@ bool VideoFrame::Validate() const noexcept {
     return planes.empty() && platform_storage_->width == format.width && platform_storage_->height == format.height &&
         platform_storage_->layout == format.pixel_format;
   if (format.pixel_format == VideoPixelFormat::Opaque) return false;
+  if (format.pixel_format == VideoPixelFormat::Ayuv16)
+    return planes.size() == 1 && PlaneFits(planes[0], format.width, format.height, 8);
   const auto planar = format.pixel_format == VideoPixelFormat::I420;
   const auto bytes = detail::VideoComponentBytes(format.pixel_format);
   if (planes.size() != (planar ? 3 : 2)) return false;

@@ -79,6 +79,13 @@ CodecResult<void> AudioEncoder::Finish() { return state_ ? state_->Finish() : Cl
 CodecResult<void> AudioEncoder::Reset() { return state_ ? state_->Reset() : Closed<void>(); }
 void AudioEncoder::Close() noexcept { if (state_) state_->Close(); }
 namespace {
+auto VideoBackend(const VideoEncoderConfig& config) {
+#ifdef MEDIA_HAS_AOM
+  if (config.codec == CodecId::Av1) return detail::MakeAv1EncoderBackend;
+#endif
+  return detail::MakeVideoEncoderBackend;
+}
+
 struct VideoEncoderProbe : std::enable_shared_from_this<VideoEncoderProbe> {
   VideoEncoderConfig config;
   std::function<void(CodecResult<void>)> completion;
@@ -100,7 +107,7 @@ struct VideoEncoderProbe : std::enable_shared_from_this<VideoEncoderProbe> {
       if (!backend) {
         auto valid = detail::ValidateVideoEncoderConfig(config);
         if (!valid.Succeeded()) result = CodecResult<void>::Failure(valid.Error());
-        else { backend = detail::MakeVideoEncoderBackend(); result = backend->Open(config); }
+        else { backend = VideoBackend(config)(); result = backend->Open(config); }
       }
       if (result.Succeeded()) {
         auto ready = backend->Ready();
@@ -133,7 +140,7 @@ VideoEncoder& VideoEncoder::operator=(VideoEncoder&& other) noexcept {
 }
 VideoEncoder::~VideoEncoder() { Close(); }
 CodecResult<VideoEncoder> VideoEncoder::Create(const VideoEncoderConfig& config) {
-  auto state = detail::VideoEncoderState::Create(config);
+  auto state = detail::VideoEncoderState::Create(config, VideoBackend(config));
   if (!state.Succeeded()) return CodecResult<VideoEncoder>::Failure(state.Error());
   return CodecResult<VideoEncoder>::Success(VideoEncoder(std::move(state).Value()));
 }

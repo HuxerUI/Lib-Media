@@ -4,9 +4,9 @@
 [codec issue #20](https://github.com/HuxerUI/HuxerUI/issues/20). Link `HuxerUI::Media` with the installed public SDK.
 No `Install()`, View, Runtime, window, or application Task is needed. Existing MediaPlayer and photo-library APIs are unchanged.
 
-This guide covers AAC-LC, Opus, FLAC, and MP3 decoded to CPU PCM, and AVC, HEVC, VP8, VP9, and AV1 decoded to video frames.
-macOS and iOS also support progressive ProRes 422 and mono or stereo ALAC where the platform decoder is available.
-The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264, HEVC, and macOS ProRes 422. Codec sessions do not
+This guide covers AAC-LC, Opus, Vorbis, FLAC, and MP3 decoded to CPU PCM, and AVC, HEVC, VP8, VP9, and AV1 decoded to video frames.
+macOS supports progressive ProRes 422 and 4444. Compatible iOS devices support standard ProRes 422. Both platforms support mono or stereo ALAC.
+The same header provides `AudioEncoder` for raw AAC-LC and `VideoEncoder` for H.264, HEVC, optional AV1, and macOS ProRes. Codec sessions do not
 demux MP4, load URLs/files, play PCM, or publish textures. A source/demuxer owns packet extraction;
 [decoded-input playback #102](https://github.com/HuxerUI/HuxerUI/issues/102) is an independent consumer.
 
@@ -142,7 +142,8 @@ Set `VideoDecoderConfig::codec` to `CodecId::Av1`. Pass the AV1 configuration re
 and submit one low-overhead temporal unit per packet. A marked key packet carries its sequence header before a
 displayed key frame. Sequence headers may repeat within the temporal unit. Each temporal unit can present at most
 one picture. Hidden frames update decoder references.
-The decoder supports one spatial layer, eight-bit SDR Main 4:2:0, and CPU NV12 or I420 output.
+The decoder supports one spatial layer and SDR Main 4:2:0. Use CPU NV12 or I420 for eight-bit streams
+and P010 for ten-bit streams. Depth support depends on the decoder.
 Use `Probe()` with the actual configuration.
 
 | Platform | Decoder |
@@ -153,15 +154,18 @@ Use `Probe()` with the actual configuration.
 | Linux | GStreamer `av1parse` and an installed compatible decoder |
 | Web | WebCodecs `av01` with the record's level and tier and in-band sequence headers |
 
-The Chrome WASM preview test opens AV1 WebM, MKV, and MP4 copies, plays them, and seeks backward and forward.
-The Android and iOS adapters build with the SDK. The macOS test host reported AV1 hardware unavailable and ran
-container seek and copy checks. Windows and Linux runtime support depends on the installed decoder.
+On macOS, Windows, and Linux, configure `-DHUXERUI_MEDIA_ENABLE_AOM=ON` with a target-compatible libaom
+installation to enable CPU AV1 encoding and decoding. Use I420 or NV12 for Main 8 and P010 for Main 10.
+The encoder emits one low-overhead temporal unit per picture, with no reordering and a separate AV1
+configuration record. The macOS regression checks both depths through fMP4 muxing, seeking, and decoding.
+The Chrome WASM preview regression covers eight-bit WebM, MKV, and regular MP4.
 [AV1 in MP4](https://aomediacodec.github.io/av1-isobmff/) · [WebCodecs AV1 registration](https://www.w3.org/TR/webcodecs-av1-codec-registration/)
 
 ### ProRes 422 and ALAC
 
 On macOS, set `VideoDecoderConfig::codec` to `CodecId::ProRes` for a progressive 422 Proxy (`apco`), LT (`apcs`),
-422 (`apcn`), or HQ (`apch`) track. On compatible iOS devices, use this configuration for standard 422. Supply the
+422 (`apcn`), HQ (`apch`), 4444 (`ap4h`), or 4444 XQ (`ap4x`) track. Pass the MOV sample entry as
+`prores_sample_entry`. An empty entry selects standard 422. On compatible iOS devices, use standard 422. Supply the
 exact coded width and height and leave initialization data empty. Submit one complete, independently decodable frame
 per packet and mark the first packet after creation or reset. CPU output supports I420 or NV12 at eight bits and
 P010 at ten bits, all with 4:2:0 chroma. Frames uses P010 for SDR preview and clocks playback against the MOV's
@@ -174,12 +178,17 @@ full coded height. Use the frame's strides to address rows. At even coded dimens
 takes two bytes per luma pixel. Size the decoder's output reservation for that geometry.
 [Core Video ten-bit 4:2:2 layout](https://developer.apple.com/documentation/corevideo/kcvpixelformattype_422ypcbcr10biplanarvideorange)
 
-Set `VideoEncoderConfig::codec = CodecId::ProRes` to encode standard 422 on macOS. Use CPU P210 with even SDR
-geometry, a full visible rectangle, square pixels, and video range. Use `ColorRange::Limited` for known video-range
-samples. Bitrate and GOP controls apply to AVC and HEVC. ProRes emits one independent picture per packet in increasing
-PTS order, with exact input PTS and duration, matching DTS, and an empty initialization record. Budget
-`max_packet_bytes` for the largest picture and keep room for at least two full reservations. Mux the packets with
-the `apcn` MOV sample entry and `PacketFraming::CodecPacket`. [MOV encoding](media-container.md#sample-descriptions)
+For 4444 frame transfer, request `VideoPixelFormat::Ayuv16`. Each packed pixel has four little-endian 16-bit
+words in A, Y, U, V order. Alpha uses the full range and YUV uses video range. A source without alpha decodes
+with fully opaque alpha. The Frames example uses P010 for SDR display.
+
+On macOS, set `VideoEncoderConfig::codec = CodecId::ProRes` and supply the desired MOV sample entry.
+Use CPU P210 for 422 profiles and CPU Ayuv16 for 4444 profiles. Supply even dimensions, a full visible
+rectangle, square pixels, and video-range samples. The 4444 path uses VideoToolbox software encoding to
+preserve packed 16-bit alpha. Each packet is an independent picture with matching PTS and DTS and an empty
+initialization record. Pass `VideoEncodeFormat::sample_entry` and `PacketFraming::CodecPacket` to the MOV
+writer. Size `max_packet_bytes` for the largest picture and leave room for at least two packet reservations.
+[MOV encoding](media-container.md#sample-descriptions) · [Apple ProRes](https://www.apple.com/final-cut-pro/docs/Apple_ProRes.pdf)
 
 Set `AudioDecoderConfig::codec` to `CodecId::Alac` and pass the sample description's 24-byte `ALACSpecificConfig`.
 Choose S16 or F32 PCM with the source sample rate and mono or stereo layout. The decoder emits the actual sample
@@ -200,7 +209,8 @@ ALAC playback, repeated seeks, and F32 WAV readback for M4A and CAF with a short
 
 The shared software decoder uses the bundled Xiph Vorbis synthesis library on all six targets. Use
 `CodecId::Vorbis`, the three Xiph-laced headers from the sample description, and the source sample
-rate and mono or stereo layout. `Probe()` validates the actual configuration. The first accepted packet
+rate and matching layout. Mono, stereo, 5.1 back, and 7.1 decode to PCM in WAVE speaker order.
+`Probe()` validates the actual configuration. The first accepted packet
 after opening or resetting initializes the overlap and emits no PCM. Each following packet emits at most
 one PCM block with its submitted PTS. Pass the decode-start packet returned by the demuxer after a seek.
 [Vorbis container mapping](media-container.md#vorbis) · [Bundled sources](../third_party/README.md)
@@ -250,7 +260,9 @@ cleanup and final callback dispatch. There is no blocking proxy to another event
   explicit SBR extensions, resampling, and channel mixing are unsupported. Choose S16/F32 and packed/planar PCM;
   sample rate and channel layout must match initialization data. Decoder output includes untrimmed priming/padding;
   the source/container layer owns any trim metadata.
-- Opus uses mapping family zero, a complete packet and OpusHead, and mono/stereo output at 48 kHz. The container
+- Opus uses a complete packet and OpusHead with a 48 kHz output clock. The platform adapters accept family zero.
+  On macOS, Windows, and Linux, configure `-DHUXERUI_MEDIA_ENABLE_OPUS=ON` with target-compatible libopus
+  to decode family one in supported PCM layouts. The container
   supplies pre-skip and end trim for the consumer to apply. Apple configures AudioConverter to return the complete
   packet, including a 2.5 ms first packet when pre-skip is zero. Reopen or reset when seeking into another Ogg link.
   [AudioConverter priming information](https://developer.apple.com/documentation/audiotoolbox/audioconverterprimeinfo)

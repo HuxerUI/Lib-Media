@@ -32,6 +32,9 @@ enum class ContainerFormat {
 
   Matroska, ///< EBML media with the matroska document type, including audio-only files.
   WebM,     ///< EBML media with the webm document type and its restricted codec mappings.
+  MpegTs,   ///< A fixed single-program MPEG transport stream.
+  Avi,      ///< RIFF AVI with supported video and PCM streams.
+  AnnexB,   ///< Untimed AVC or HEVC elementary stream.
 
   Wave,     ///< RIFF WAVE with 32-bit chunk sizes.
   Rf64,     ///< RF64 WAVE with a 64-bit size table.
@@ -41,9 +44,12 @@ enum class ContainerFormat {
   Caf,      ///< Core Audio Format with packed LPCM or mono/stereo ALAC.
 
   Adts,     ///< AAC with an ADTS header on each access unit.
-  Ogg,      ///< Mapping-family-zero Opus or Vorbis. Opus input can contain chained logical streams.
+  Ogg,      ///< Opus mapping families 0 and 1, or Vorbis. Opus input can contain chained logical streams.
   Flac,     ///< Native FLAC frames following a STREAMINFO metadata block.
   Mp3,      ///< MPEG Layer III audio frames with optional ID3 and Xing information.
+
+  Srt,      ///< UTF-8 SubRip cues.
+  WebVtt,   ///< UTF-8 WebVTT cues and their text metadata.
 };
 
 /// @brief File organization within a container format.
@@ -173,15 +179,15 @@ struct MediaSampleDescription {
   /// ALAC uses the 24-byte ALACSpecificConfig without the MP4 box header or version and flags. MOV timecode
   /// and timed metadata use the sample-entry payload after the reserved fields and data-reference index.
   /// Vorbis uses the three header packets in the Matroska `A_VORBIS` CodecPrivate layout.
-  /// AIFF and CAF LPCM retain an ordered channel layout payload here when it has no equivalent speaker mask.
+  /// AIFF, CAF, and MOV LPCM retain an ordered channel layout payload here when it has no equivalent speaker mask.
   Bytes initialization_data;
   /// Audio samples per channel per second.
   std::optional<std::uint32_t> sample_rate;
   /// Audio channel count.
   std::optional<std::uint32_t> channel_count;
-  /// Speaker positions for audio stored in ascending WAVE extensible bit order. A zero mask
+  /// Speaker positions for decoded audio. Packed PCM uses ascending WAVE extensible bit order. A zero mask
   /// explicitly leaves the channels unassigned. Absence means the mapping did not supply a mask.
-  /// WAVE, RF64, Wave64, AIFF LPCM, CAF LPCM, and native FLAC can write this field.
+  /// WAVE, RF64, Wave64, AIFF, CAF, MOV, native FLAC, Opus, and Vorbis can carry this information.
   std::optional<std::uint32_t> speaker_mask;
   /// Coded luma width in pixels.
   std::optional<std::uint32_t> coded_width;

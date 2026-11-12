@@ -313,7 +313,7 @@ public:
   std::optional<SeekPoint> Find(std::uint32_t id, MediaTimestamp time, SeekDirection direction, bool seek) override {
     if (!input.Random()) return ContainerReader::Find(id, time, direction, seek);
     const auto track = PacketTrack(tracks, id);
-    if (tracks[track].descriptions.front().codec == CodecId::Unknown)
+    if (!HasSeekMapping(track))
       Fail(Unsupported, "No packet mapping for the requested Matroska track");
 
     const auto previous = input.Position();
@@ -639,7 +639,7 @@ private:
       }
       if (description.codec != CodecId::Unknown) ReadVideo(video, description);
     } else if (track.kind == TrackKind::Audio && codec == "A_OPUS") {
-      if (description.initialization_data.size() >= 19 && Number<std::uint8_t>(description.initialization_data, 18) != 0) return;
+      if (description.initialization_data.size() >= 19 && Number<std::uint8_t>(description.initialization_data, 18) > 1) return;
       const auto opus = ParseOpus(description.initialization_data, BadData);
       ReadAudio(audio, description);
       if (description.channel_count != opus.channels || (opus.input_rate && description.sample_rate != opus.input_rate) ||
@@ -647,6 +647,7 @@ private:
         Fail(BadData, "OpusHead does not match Matroska audio channels, frequency, or CodecDelay");
       description.codec = CodecId::Opus;
       description.sample_rate = 48000;
+      description.speaker_mask = VorbisSpeakerMask(opus.channels);
       track.priming_samples = opus.pre_skip;
     } else if (track.kind == TrackKind::Audio && codec == "A_VORBIS") {
       auto vorbis = std::make_unique<VorbisHeaders>(description.initialization_data, BadData);
@@ -654,6 +655,7 @@ private:
       if (description.sample_rate != vorbis->Rate() || description.channel_count != vorbis->Channels())
         Fail(BadData, "Matroska Vorbis metadata does not match its headers");
       description.codec = CodecId::Vorbis;
+      description.speaker_mask = VorbisSpeakerMask(vorbis->Channels());
       const MediaTimestamp overlap{vorbis->MaxSamples(), vorbis->Rate()};
       if (!track.seek_preroll || track.seek_preroll->Compare(overlap) < 0) track.seek_preroll = overlap;
       if (state.delay) {
@@ -1059,8 +1061,15 @@ private:
     Fail(ContainerErrorCode::IndexUnavailable, "Matroska Vorbis seek anchor is unavailable");
   }
 
+  bool HasSeekMapping(std::size_t index) const {
+    const auto& track = tracks[index];
+    if (track.descriptions.front().codec != CodecId::Unknown) return true;
+    return track.kind == TrackKind::Subtitle && track.matroska &&
+        (track.matroska->subtitle_codec == "S_TEXT/UTF8" || track.matroska->subtitle_codec == "S_TEXT/WEBVTT");
+  }
+
   bool CanAnchor(std::size_t track, const IndexedBlock& block) const {
-    return !block.codec_state && tracks[track].descriptions.front().codec != CodecId::Unknown &&
+    return !block.codec_state && HasSeekMapping(track) &&
         (tracks[track].kind != TrackKind::Video || block.sync);
   }
 

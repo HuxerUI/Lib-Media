@@ -46,4 +46,7 @@ public:
 };
 using VideoEncoderFactory = std::function<std::unique_ptr<VideoEncoderBackend>()>;
 std::unique_ptr<VideoEncoderBackend> MakeVideoEncoderBackend();
+#ifdef MEDIA_HAS_AOM
+std::unique_ptr<VideoEncoderBackend> MakeAv1EncoderBackend();
+#endif
 } // namespace huxerui::media::detail

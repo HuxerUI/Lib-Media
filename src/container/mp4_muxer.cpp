@@ -1,5 +1,6 @@
 #include "mp4.h"
 #include "framed_audio.h"
+#include "pcm.h"
 
 #include "codec/common.h"
 
@@ -152,6 +153,8 @@ void PcmDescription(Bytes& bytes, const MediaSampleDescription& track) {
     Put(bytes, flags);
     Put(bytes, PcmFrameSize(track));
     Put(bytes, 1u);
+    if (const auto layout = WritePcmChannelLayout(track); !layout.empty())
+      FullBox(bytes, "chan", 0, [&] { Append(bytes, layout); });
   });
 }
 
@@ -821,9 +824,9 @@ void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, con
       } else if (track.kind == TrackKind::Audio && format == ContainerFormat::Mov && DescribePackedPcm(description.codec).bits) {
         const auto rate = description.sample_rate.value_or(0), channels = description.channel_count.value_or(0);
         if (!rate || !channels || channels > 64 || Mp4Scale(track) % rate ||
-            description.framing != PacketFraming::CodecPacket || !description.initialization_data.empty() ||
-            !description.sample_entry.empty())
+            description.framing != PacketFraming::CodecPacket || !description.sample_entry.empty())
           Fail(WriteError, "Invalid QuickTime PCM format or sample clock");
+        ValidatePcmChannelLayout(description);
       } else if (track.kind == TrackKind::Data && format == ContainerFormat::Mov &&
                  description.codec == CodecId::Unknown && description.framing == PacketFraming::ContainerSample) {
         if (description.sample_rate || description.channel_count || track.priming_samples || track.padding_samples ||
@@ -839,8 +842,6 @@ void ValidateMp4(ContainerFormat format, std::span<const MediaTrack> tracks, con
           HevcNalLength(description.initialization_data, VideoEntry(description) == "hvc1", WriteError);
         } else if (description.codec == CodecId::Av1 && format == ContainerFormat::Mp4 &&
                    description.framing == PacketFraming::CodecPacket && VideoEntry(description) == "av01") {
-          if (options.layout == ContainerLayout::Fragmented)
-            Fail(ContainerErrorCode::Unsupported, "AV1 output requires regular or fast-start MP4");
           ValidateAv1Configuration(description.initialization_data, WriteError);
         } else if (description.codec != CodecId::ProRes || format != ContainerFormat::Mov ||
                    description.framing != PacketFraming::CodecPacket || description.sample_entry.size() != 4 ||

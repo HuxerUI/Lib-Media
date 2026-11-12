@@ -53,7 +53,16 @@ CodecResult<AvcConfig> ParseAvc(std::span<const std::byte> bytes) {
   }
   return R::Success(std::move(result));
 }
-CodecResult<void> ValidateProResFrame(ByteView bytes, std::uint32_t width, std::uint32_t height) {
+bool IsProRes4444(std::string_view entry) {
+  return entry == "ap4h" || entry == "ap4x";
+}
+std::uint32_t ProResCodecType(std::string_view entry) {
+  if (entry.empty()) return Tag("apcn");
+  if (entry == "apco" || entry == "apcs" || entry == "apcn" || entry == "apch" || IsProRes4444(entry))
+    return Tag(entry);
+  return 0;
+}
+CodecResult<void> ValidateProResFrame(ByteView bytes, std::uint32_t width, std::uint32_t height, bool chroma444) {
   using R = CodecResult<void>;
   if (bytes.size() < 36 || Number<std::uint32_t>(bytes) != bytes.size() || Number<std::uint32_t>(bytes, 4) != Tag("icpf"))
     return R::Failure(Error(CodecErrorCode::InvalidData, "Invalid ProRes frame size or identifier"));
@@ -64,8 +73,9 @@ CodecResult<void> ValidateProResFrame(ByteView bytes, std::uint32_t width, std::
   const auto flags = Number<std::uint8_t>(bytes, 20);
   if (Number<std::uint8_t>(bytes, 11) > 1)
     return R::Failure(Error(CodecErrorCode::Unsupported, "Unsupported ProRes bitstream version"));
-  if (flags >> 6 != 2 || (flags & 0x0c) || (Number<std::uint8_t>(bytes, 25) & 0x0f))
-    return R::Failure(Error(CodecErrorCode::Unsupported, "ProRes requires a progressive 4:2:2 frame without alpha"));
+  const auto alpha = Number<std::uint8_t>(bytes, 25) & 0x0f;
+  if (flags >> 6 != (chroma444 ? 3 : 2) || (flags & 0x0c) || alpha > (chroma444 ? 2 : 0))
+    return R::Failure(Error(CodecErrorCode::Unsupported, "ProRes frame chroma or alpha differs from its progressive profile"));
   return R::Success();
 }
 } // namespace huxerui::media::detail

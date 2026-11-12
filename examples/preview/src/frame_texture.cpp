@@ -45,6 +45,9 @@ unsigned Sample(const VideoPlane& plane, unsigned x, unsigned y, bool ten_bit, u
 
 Bytes ConvertFramePixels(const VideoFrame& frame) {
   if (frame.Storage() != VideoStorage::Cpu || !frame.Validate()) throw std::runtime_error("Expected a CPU video frame");
+  if (frame.format.pixel_format != VideoPixelFormat::I420 && frame.format.pixel_format != VideoPixelFormat::NV12 &&
+      frame.format.pixel_format != VideoPixelFormat::P010)
+    throw std::runtime_error("The CPU preview requires 4:2:0 pixels");
   if (frame.format.transfer == ColorTransfer::PQ || frame.format.transfer == ColorTransfer::HLG)
     throw std::runtime_error("HDR frames require an HDR display path");
   const auto matrix = frame.format.matrix == ColorMatrix::Unknown ? ColorMatrix::BT601 : frame.format.matrix;

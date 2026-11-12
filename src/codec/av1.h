@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace huxerui::media::detail {
 
@@ -13,6 +14,8 @@ struct Av1Sequence {
   unsigned height;
   bool reduced_header;
   bool sdr_420;
+  unsigned bit_depth, level;
+  bool high_tier;
 
   bool operator==(const Av1Sequence&) const = default;
 };
@@ -21,7 +24,8 @@ struct Av1Configuration {
   unsigned profile;
   unsigned level;
   bool high_tier;
-  bool eight_bit_420;
+  bool main_420;
+  unsigned bit_depth;
   std::optional<Av1Sequence> sequence;
 };
 
@@ -35,5 +39,7 @@ struct Av1PacketInfo {
 
 Av1Configuration ParseAv1Configuration(Av1Bytes bytes);
 Av1PacketInfo InspectAv1Packet(Av1Bytes bytes);
+std::vector<std::byte> SizedAv1Packet(Av1Bytes bytes, std::size_t offset);
+std::vector<std::byte> MakeAv1Configuration(Av1Bytes sequence_header);
 
 } // namespace huxerui::media::detail

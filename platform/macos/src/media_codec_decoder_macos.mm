@@ -157,7 +157,7 @@ public:
           (__bridge CFDictionaryRef)extensions, &description_);
       specification = @{(__bridge NSString*)kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: @YES};
     } else if (video.codec == CodecId::ProRes) {
-      status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, kCMVideoCodecType_AppleProRes422,
+      status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault, ProResCodecType(video.prores_sample_entry),
           video.width, video.height, nullptr, &description_);
     } else if (video.codec == CodecId::Hevc) {
       const auto hevc = ParseHevcConfiguration(video.initialization_data, true, true);
@@ -174,7 +174,8 @@ public:
     const auto dimensions = CMVideoFormatDescriptionGetDimensions(description_);
     if (dimensions.width <= 0 || dimensions.height <= 0 || dimensions.width > video.width || dimensions.height > video.height)
       return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidArgument, "Video dimensions exceed configured bounds"));
-    const auto pixel_type = video.output == VideoPixelFormat::P210 ? kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange :
+    const auto pixel_type = video.output == VideoPixelFormat::Ayuv16 ? kCVPixelFormatType_4444AYpCbCr16 :
+        video.output == VideoPixelFormat::P210 ? kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange :
         video.output == VideoPixelFormat::P010 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange :
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
     NSDictionary* attributes = video.output_storage == VideoStorage::Platform ? @{
@@ -188,7 +189,7 @@ public:
     if (video.codec == CodecId::ProRes && (status == kVTCouldNotFindVideoDecoderErr ||
         status == kVTVideoDecoderUnsupportedDataFormatErr))
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported,
-          "VideoToolbox cannot decode this ProRes 422 configuration", std::to_string(status)));
+          "VideoToolbox cannot decode this ProRes configuration", std::to_string(status)));
     if (status) return CodecResult<void>::Failure(AppleError(status, "VTDecompressionSessionCreate failed"));
     return CodecResult<void>::Success();
   }
@@ -360,8 +361,9 @@ private:
                         type == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
       const bool eight_bit = type == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
                              type == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
-      const auto layout = p210 ? VideoPixelFormat::P210 : p010 ? VideoPixelFormat::P010 : VideoPixelFormat::NV12;
-      if ((!p210 && !p010 && !eight_bit) || (layout != config.output && !(eight_bit && config.output == VideoPixelFormat::I420))) {
+      const bool ayuv = type == kCVPixelFormatType_4444AYpCbCr16;
+      const auto layout = ayuv ? VideoPixelFormat::Ayuv16 : p210 ? VideoPixelFormat::P210 : p010 ? VideoPixelFormat::P010 : VideoPixelFormat::NV12;
+      if ((!ayuv && !p210 && !p010 && !eight_bit) || (layout != config.output && !(eight_bit && config.output == VideoPixelFormat::I420))) {
         self.failure_ = Error(CodecErrorCode::Unsupported, "VideoToolbox returned an unexpected pixel format"); return;
       }
       VideoFormat format;
@@ -420,7 +422,13 @@ private:
       if (locked) { self.failure_ = AppleError(locked, "Cannot map decoded pixels"); return; }
       owner->locked = true;
       std::vector<VideoPlane> planes;
-      for (std::size_t i = 0; i < 2; ++i) {
+      if (ayuv) {
+        const auto stride = CVPixelBufferGetBytesPerRow(image);
+        const auto* base = static_cast<const std::byte*>(CVPixelBufferGetBaseAddress(image));
+        if (!base) { self.failure_ = Error(CodecErrorCode::InvalidData, "Missing packed ProRes pixels"); return; }
+        planes.push_back({BufferReference({base, stride * format.height}, owner), stride, 8});
+      }
+      for (std::size_t i = 0; !ayuv && i < 2; ++i) {
         const auto stride = CVPixelBufferGetBytesPerRowOfPlane(image, i);
         const auto size = stride * CVPixelBufferGetHeightOfPlane(image, i);
         auto* base = static_cast<const std::byte*>(CVPixelBufferGetBaseAddressOfPlane(image, i));
