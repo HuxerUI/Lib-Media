@@ -5,6 +5,7 @@
 #include "format/video_frame_transformer.h"
 
 #include <huxerui/web/external_texture.h>
+#include <emscripten.h>
 #include <emscripten/threading.h>
 
 namespace huxerui::media::detail {
@@ -86,6 +87,96 @@ CodecResult<std::shared_ptr<ExternalTexture>> MakePlatformVideoTexture(const Vid
   lease->texture.Publish(*source);
   lease->texture.Finish();
   return R::Success(std::shared_ptr<ExternalTexture>(lease, &lease->texture));
+}
+
+namespace {
+
+using emscripten::EM_VAL;
+
+EM_JS(EM_VAL, RenderVideoTexture, (EM_VAL source, double timestamp, int width, int height, int rotation,
+    double crop_x, double crop_y, double crop_width, double crop_height, double x, double y, double w, double h), {
+  try {
+    const frame = Emval.toValue(source);
+    const canvas = typeof OffscreenCanvas === 'function' ? new OffscreenCanvas(width, height)
+        : Object.assign(document.createElement('canvas'), {width, height});
+    const context = canvas.getContext('2d', {alpha: false});
+    if (!context) return Emval.toHandle('Canvas 2D is unavailable');
+    context.fillStyle = 'black';
+    context.fillRect(0, 0, width, height);
+    context.translate(x + w / 2, y + h / 2);
+    context.rotate(rotation * Math.PI / 180);
+    if (rotation === 90 || rotation === 270) [w, h] = [h, w];
+    context.drawImage(frame, crop_x, crop_y, crop_width, crop_height, -w / 2, -h / 2, w, h);
+    return Emval.toHandle(new VideoFrame(canvas, {timestamp}));
+  } catch (error) {
+    return Emval.toHandle(String(error));
+  }
+});
+
+EM_JS(EM_VAL, UploadVideoTexture, (const void* pixels, int width, int height), {
+  try {
+    const bytes = HEAPU8.subarray(pixels, pixels + width * height * 4);
+    return Emval.toHandle(new VideoFrame(bytes, {format: 'RGBA', codedWidth: width, codedHeight: height, timestamp: 0}));
+  } catch (error) {
+    return Emval.toHandle(String(error));
+  }
+});
+
+VideoTextureResult PublishTextureFrame(emscripten::val value, VideoTextureOptions options) {
+  if (value.typeOf().as<std::string>() == "string")
+    return VideoTextureResult::Failure(Error(CodecErrorCode::PlatformFailure, value.as<std::string>()));
+  BrowserVideoFrame frame(std::move(value));
+  auto texture = std::make_shared<web::VideoFrameTexture>(Size{float(options.width), float(options.height)});
+  texture->Publish(frame.value);
+  texture->Finish();
+  return VideoTextureResult::Success(std::move(texture));
+}
+
+} // namespace
+
+VideoTextureResult MakeFittedPlatformVideoTexture(const VideoFrame& frame,
+    VideoTextureOptions options, const VideoTextureGeometry& geometry) {
+  const auto* image = BrowserFrame(frame);
+  if (!image || !emscripten_is_main_browser_thread())
+    return VideoTextureResult::Failure(Error(CodecErrorCode::Unsupported, "Expected a browser video frame on the main thread"));
+  const auto format = (*image)["format"];
+  if (!format.isNull() && !format.isUndefined()) {
+    const auto layout = format.as<std::string>();
+    if (layout.ends_with("P10") || layout.ends_with("P12"))
+      return VideoTextureResult::Failure(Error(CodecErrorCode::Unsupported, "Expected an eight-bit browser video frame"));
+  }
+  if (geometry.identity && ValidateBrowserFrame(*image, frame.format).Succeeded() &&
+      (*image)["codedWidth"].as<unsigned>() == options.width && (*image)["codedHeight"].as<unsigned>() == options.height)
+    return MakePlatformVideoTexture(frame);
+  const auto native_rotation = (*image)["rotation"];
+  const auto flipped = (*image)["flip"];
+  if ((!native_rotation.isUndefined() && native_rotation.as<int>() != 0) ||
+      (!flipped.isUndefined() && flipped.as<bool>()))
+    return VideoTextureResult::Failure(Error(CodecErrorCode::Unsupported, "Expected a browser frame in coded orientation"));
+  const auto crop = VideoSourceRectangle(frame.format, geometry.source);
+  const auto visible = (*image)["visibleRect"];
+  const auto left = visible["x"].as<unsigned>(), top = visible["y"].as<unsigned>();
+  if (crop.x < left || crop.y < top || crop.x + crop.width > left + visible["width"].as<unsigned>() ||
+      crop.y + crop.height > top + visible["height"].as<unsigned>())
+    return VideoTextureResult::Failure(Error(CodecErrorCode::InvalidArgument, "The crop is outside the decoded browser image"));
+  const double sx = (*image)["displayWidth"].as<double>() / visible["width"].as<double>();
+  const double sy = (*image)["displayHeight"].as<double>() / visible["height"].as<double>();
+  const auto& area = geometry.destination;
+  int rotation = 0;
+  switch (frame.format.rotation) {
+    case VideoRotation::None: break;
+    case VideoRotation::Clockwise90: rotation = 90; break;
+    case VideoRotation::Clockwise180: rotation = 180; break;
+    case VideoRotation::Clockwise270: rotation = 270; break;
+  }
+  return PublishTextureFrame(emscripten::val::take_ownership(RenderVideoTexture(image->as_handle(),
+      (*image)["timestamp"].as<double>(), options.width, options.height, rotation,
+      (crop.x - left) * sx, (crop.y - top) * sy, crop.width * sx, crop.height * sy,
+      area.x, area.y, area.width, area.height)), options);
+}
+
+VideoTextureResult PublishVideoPixels(Bytes pixels, VideoTextureOptions options) {
+  return PublishTextureFrame(emscripten::val::take_ownership(UploadVideoTexture(pixels.data(), options.width, options.height)), options);
 }
 
 } // namespace huxerui::media::detail

@@ -75,7 +75,8 @@ HRESULT WaitForVideo(ID3D11DeviceContext& context, ID3D11Query& query, bool wait
 class VideoProcessor {
 public:
   HRESULT Run(const TextureStorage& source, const VideoFormat& format, UINT width, UINT height,
-      DXGI_FORMAT layout, ComPtr<ID3D11Texture2D>& output, const windows::D3D11Frame* snapshot = nullptr) {
+      DXGI_FORMAT layout, ComPtr<ID3D11Texture2D>& output, const windows::D3D11Frame* snapshot = nullptr,
+      const Rect* destination = nullptr) {
     auto& device = *source.device;
     std::unique_lock lock(device.commands);
     D3D11_TEXTURE2D_DESC source_desc{};
@@ -115,8 +116,15 @@ public:
     context.VideoProcessorSetStreamFrameFormat(processor, 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
     context.VideoProcessorSetStreamAutoProcessingMode(processor, 0, FALSE);
     context.VideoProcessorSetStreamSourceRect(processor, 0, TRUE, &crop);
-    context.VideoProcessorSetStreamDestRect(processor, 0, TRUE, &target);
+    const RECT content = destination ? RECT{LONG(destination->x), LONG(destination->y),
+        LONG(destination->x + destination->width), LONG(destination->y + destination->height)} : target;
+    context.VideoProcessorSetStreamDestRect(processor, 0, TRUE, &content);
     context.VideoProcessorSetOutputTargetRect(processor, TRUE, &target);
+    if (destination) {
+      D3D11_VIDEO_COLOR background{};
+      background.RGBA.A = 1;
+      context.VideoProcessorSetOutputBackgroundColor(processor, FALSE, &background);
+    }
 
     D3D11_VIDEO_PROCESSOR_COLOR_SPACE color{};
     color.YCbCr_Matrix = format.matrix == ColorMatrix::BT709;
@@ -399,6 +407,34 @@ CodecResult<std::shared_ptr<ExternalTexture>> MakePlatformVideoTexture(const Vid
   if (auto result = PublishWindowsVideo(*texture, frame); !result.Succeeded()) return R::Failure(std::move(result.Error()));
   texture->Finish();
   return R::Success(std::move(texture));
+}
+
+VideoTextureResult MakeFittedPlatformVideoTexture(const VideoFrame& frame,
+    VideoTextureOptions options, const VideoTextureGeometry& geometry) {
+  const auto* source = dynamic_cast<const TextureStorage*>(VideoFrameAccess::PlatformStorage(frame).get());
+  if (!source) return VideoTextureResult::Failure(Error(CodecErrorCode::Unsupported, "Expected a D3D11 video image"));
+  auto format = frame.format;
+  format.visible = VideoSourceRectangle(format, geometry.source);
+  VideoProcessor processor;
+  ComPtr<ID3D11Texture2D> output;
+  const auto status = processor.Run(*source, format, options.width, options.height, DXGI_FORMAT_B8G8R8A8_UNORM,
+      output, nullptr, &geometry.destination);
+  if (FAILED(status)) return VideoTextureResult::Failure(VideoError(status, "Cannot prepare the fitted D3D11 texture"));
+  auto texture = std::make_shared<windows::D3D11Texture>(Size{float(options.width), float(options.height)});
+  {
+    std::lock_guard lock(source->device->commands);
+    texture->Publish({output.Get(), windows::D3D11Texture::Alpha::Opaque});
+  }
+  texture->Finish();
+  return VideoTextureResult::Success(std::move(texture));
+}
+
+VideoTextureResult PublishVideoPixels(Bytes pixels, VideoTextureOptions options) {
+  auto texture = std::make_shared<windows::PixelTexture>(Size{float(options.width), float(options.height)});
+  texture->Publish({int(options.width), int(options.height), std::size_t(options.width) * 4,
+      windows::PixelFormat::Rgba8888, pixels});
+  texture->Finish();
+  return VideoTextureResult::Success(std::move(texture));
 }
 
 std::unique_ptr<VideoFrameTransformBackend> MakeVideoFrameTransformBackend() { return std::make_unique<D3D11VideoFrameTransformer>(); }

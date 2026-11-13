@@ -110,6 +110,8 @@ const huxerui::Application application{
 The hook registers platform integration. Put the UI components below in codegen-enabled C++ sources with the
 corresponding headers included. The [preview application](examples/preview/src/app.cpp) provides a complete integration.
 For headless decoding, include `<huxerui/media_codec.h>` and see [Media decoding](#media-decoding).
+For time-based thumbnail extraction, read frames with `VideoDecoder::TryRead()` and use
+`MakeExternalTexture(frame, options)` on selected frames. See [Timeline thumbnail extraction](docs/timeline-thumbnail-extraction.md).
 
 ### Handles and execution
 

@@ -277,7 +277,7 @@ struct AndroidVideoRenderer::Context {
     if (surface != EGL_NO_SURFACE) eglDestroySurface(display, surface);
   }
 
-  void Open(ANativeWindow* target) {
+  void Open(ANativeWindow* target, bool sample_video = true) {
     window = target != nullptr;
     display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (display == EGL_NO_DISPLAY || !eglInitialize(display, nullptr, nullptr))
@@ -299,6 +299,7 @@ struct AndroidVideoRenderer::Context {
     eglBindAPI(api);
     if (surface == EGL_NO_SURFACE || context == EGL_NO_CONTEXT)
       throw std::runtime_error("Cannot create the video EGL surface or context");
+    if (!sample_video) return;
     CurrentEgl current(display, surface, context);
     client_buffer = EglProc<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>("eglGetNativeClientBufferANDROID");
     create_image = EglProc<PFNEGLCREATEIMAGEKHRPROC>("eglCreateImageKHR");
@@ -340,28 +341,37 @@ struct AndroidVideoRenderer::Context {
     GLuint name = 0;
   };
 
-  void Draw(const VideoFrame& frame, unsigned width, unsigned height) {
+  void Draw(const VideoFrame& frame, unsigned width, unsigned height, const VideoTextureGeometry* geometry = nullptr) {
     glActiveTexture(GL_TEXTURE0);
     if (const auto* snapshot = GlSnapshot(frame)) {
       if (!snapshot_program.name) snapshot_program.Open(false);
       const Texture texture(*this, *snapshot);
-      DrawImage(frame.format, width, height, snapshot_program, true);
+      DrawImage(frame.format, width, height, snapshot_program, true, geometry);
       return;
     }
     const auto source = HardwareBuffer(frame);
     if (!source) throw std::runtime_error("Expected an Android hardware video buffer");
     const Texture texture(*this, source, GL_TEXTURE_EXTERNAL_OES);
-    DrawImage(frame.format, width, height, hardware_program, false);
+    DrawImage(frame.format, width, height, hardware_program, false, geometry);
   }
 
-  void DrawImage(const VideoFormat& format, unsigned width, unsigned height, const Program& program, bool bottom_left) const {
-    auto coordinates = VideoSampleCoordinates(format);
+  void DrawImage(const VideoFormat& format, unsigned width, unsigned height, const Program& program, bool bottom_left,
+      const VideoTextureGeometry* geometry) const {
+    auto coordinates = geometry ? VideoSampleCoordinates(format, geometry->source) : VideoSampleCoordinates(format);
     if (bottom_left) {
       coordinates[0][1] = 1.0f - coordinates[0][1];
       coordinates[1][1] = -coordinates[1][1];
       coordinates[2][1] = -coordinates[2][1];
     }
-    glViewport(0, 0, width, height);
+    if (geometry) {
+      glClearColor(0, 0, 0, 1);
+      glClear(GL_COLOR_BUFFER_BIT);
+      const auto& area = geometry->destination;
+      // The texture is published with its first GL row interpreted as the top edge.
+      glViewport(int(area.x), int(area.y), int(area.width), int(area.height));
+    } else {
+      glViewport(0, 0, width, height);
+    }
     glUseProgram(program.name);
     glUniform2fv(program.mapping, 3, coordinates.front().data());
     glUniform2f(program.half_texel, 0.5f / format.width, 0.5f / format.height);
@@ -409,10 +419,12 @@ CodecResult<VideoFrame> AndroidVideoRenderer::DrawToBuffer(const VideoFrame& sou
   return RetainHardwareBuffer(buffer, target, source.pts, source.duration, {});
 }
 
-void AndroidVideoRenderer::DrawToTexture(const VideoFrame& frame, huxerui::android::GlTexture& texture) {
+void AndroidVideoRenderer::DrawToTexture(const VideoFrame& frame, huxerui::android::GlTexture& texture,
+    VideoTextureOptions options, const VideoTextureGeometry* geometry) {
   auto& egl = *context_;
   CurrentEgl current(egl.display, egl.surface, egl.context);
-  const auto width = int(frame.format.width), height = int(frame.format.height);
+  const auto width = int(geometry ? options.width : frame.format.width);
+  const auto height = int(geometry ? options.height : frame.format.height);
   struct RenderTexture {
     RenderTexture(int width, int height) {
       glGenTextures(1, &name);
@@ -426,7 +438,7 @@ void AndroidVideoRenderer::DrawToTexture(const VideoFrame& frame, huxerui::andro
   } output(width, height);
   const VideoFramebuffer framebuffer(output.name);
   if (!framebuffer.Complete()) throw std::runtime_error("Cannot prepare the Android video texture");
-  egl.Draw(frame, width, height);
+  egl.Draw(frame, width, height, geometry);
   using Texture = huxerui::android::GlTexture;
   texture.PublishCurrent({output.name, width, height, -1, Texture::Origin::TopLeft, Texture::Alpha::Opaque});
 }
@@ -452,6 +464,40 @@ CodecResult<std::shared_ptr<ExternalTexture>> MakePlatformVideoTexture(const Vid
   AndroidVideoRenderer().DrawToTexture(frame, *texture);
   texture->Finish();
   return R::Success(std::move(texture));
+}
+
+VideoTextureResult MakeFittedPlatformVideoTexture(const VideoFrame& frame,
+    VideoTextureOptions options, const VideoTextureGeometry& geometry) {
+  const auto size = Size{float(options.width), float(options.height)};
+  const auto* storage = dynamic_cast<const GlFrameStorage*>(VideoFrameAccess::PlatformStorage(frame).get());
+  if (!HardwareBuffer(frame) && !storage)
+    return VideoTextureResult::Failure(Error(CodecErrorCode::Unsupported, "Expected an Android platform video image"));
+  auto texture = std::make_shared<android::GlTexture>(size);
+  thread_local AndroidVideoRenderer renderer;
+  renderer.DrawToTexture(frame, *texture, options, &geometry);
+  texture->Finish();
+  return VideoTextureResult::Success(std::move(texture));
+}
+
+VideoTextureResult PublishVideoPixels(Bytes pixels, VideoTextureOptions options) {
+  thread_local auto upload = [] {
+    auto context = std::make_unique<AndroidVideoRenderer::Context>();
+    context->Open(nullptr, false);
+    return context;
+  }();
+  auto& context = *upload;
+  CurrentEgl current(context.display, context.surface, context.context);
+  GLuint source = 0;
+  glGenTextures(1, &source);
+  struct TextureOwner { GLuint& name; ~TextureOwner() { glDeleteTextures(1, &name); } } owner{source};
+  glBindTexture(GL_TEXTURE_2D, source);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, options.width, options.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+  if (glGetError() != GL_NO_ERROR) throw std::runtime_error("Cannot upload the video texture");
+  auto texture = std::make_shared<android::GlTexture>(Size{float(options.width), float(options.height)});
+  texture->PublishCurrent({source, int(options.width), int(options.height), -1,
+      android::GlTexture::Origin::TopLeft, android::GlTexture::Alpha::Opaque});
+  texture->Finish();
+  return VideoTextureResult::Success(std::move(texture));
 }
 
 class GlesVideoFrameTransformer final : public VideoFrameTransformBackend {

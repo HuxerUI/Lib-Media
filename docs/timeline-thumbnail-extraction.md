@@ -23,27 +23,38 @@ when mapping frames back to the target timeline.
 Cache the thumbnail by source, track, target time, output pixel size, and any applied crop or rotation. Record
 the actual frame PTS so a different timeline zoom can reuse the same image when its target selects that frame.
 
-## Android GPU snapshots
+## Texture output
 
-The Android path sends selected MediaCodec outputs to a `SurfaceStreamTexture`. HuxerUI samples the OES
-image with its SurfaceTexture transform and draws directly into a thumbnail-sized `GlFrame` on the GPU. Pass
-the coded video dimensions to the decoder and the thumbnail pixel dimensions to `SurfaceStreamTexture::Create()`.
-The SDK uses the latter for the published snapshot and the requested Surface default buffer size. Android
-video producers can override that default buffer size.
-[Android SurfaceTexture](https://developer.android.com/reference/android/graphics/SurfaceTexture#setDefaultBufferSize(int,int))
+Use `VideoDecoder::Create(config)` and read its format, frame, and EOS events with `TryRead()`. Use `frame.pts`,
+`frame.duration`, and the track's edits to select the frame for a presentation time. Keep one frame for lookahead if
+needed. Release unselected frames promptly to free their decoder reservations.
 
-Lib-Media's Android preview already chooses which decoder outputs reach the Surface. It currently creates
-the texture at the coded dimensions. The thumbnail path should accept the target pixel dimensions and provide
-Lib-AVKit with the selected frame's completed snapshot. This uses the SDK's existing OES conversion and avoids
-a full-size RGBA snapshot before scaling. [Android preview](gpu-video.md#preview-and-verification)
+Apply the track's display rotation and pixel aspect ratio to the selected frame. Intersect any container clean
+aperture with its decoded visible rectangle. Convert the selected frame with the sized overload of `MakeExternalTexture`.
 
-Allow one selected frame to await publication on a thumbnail surface at a time. Once it publishes, retain the
-immutable `GlFrame` from `AcquireFrame()` and associate it with the selected decoder output's PTS. Complete or
-retire pending work before associating a new result after a seek or source change. `SurfaceTexture` latches the
-latest available image, so this ordering matters for exact thumbnails.
-[Android frame latching](https://developer.android.com/reference/android/graphics/SurfaceTexture#updateTexImage())
+```cpp
+const auto pts = frame.pts;
+auto result = MakeExternalTexture(frame, {
+    .width = 320,
+    .height = 240,
+    .fit = ImageFit::Cover,
+});
+```
 
-For an initial Android check, compare sparse and dense thumbnail requests on a long-GOP SDR H.264 MP4 with a
-sequential decode of the same source. Check the selected frame times, snapshot dimensions, retention across
-later publications, and absence of CPU pixel readback. Measure time to first thumbnail and the number of
-packets submitted to the decoder.
+The target size is in physical pixels. `Contain` centers the complete image with opaque black padding, and `Cover`
+center-crops to fill. Both account for visible geometry, pixel aspect, and rotation. Conversion is synchronous and
+accepts eight-bit SDR frames. Keep the cache bounded because a texture that directly retains a decoder image can also
+retain an output credit. On Web, handle the frame and texture on the browser main thread.
+
+| Platform | Selected picture conversion |
+| --- | --- |
+| Android | MediaCodec delivers platform frames through the session's `AImageReader` Surface. A frame retains its `AHardwareBuffer` until release. Only a selected frame passed to `MakeExternalTexture` is imported and sampled by GLES into a small RGBA target. SDK publication copies that small target on the GPU. |
+| macOS | Retain the original pixel buffer for matching geometry when its attachments allow it. Otherwise Core Image uses Metal to render into a small BGRA pixel buffer. |
+| iOS | The iOS backend independently uses the same Core Image and pixel-buffer publication contract. |
+| Windows | The D3D11 video processor renders the selected picture directly to a small BGRA texture. The SDK makes its shared GPU snapshot at that size. A CPU decoder configuration produces a software `PixelTexture`. |
+| Linux | GStreamer supplies CPU YUV. Convert and scale only selected pictures to RGBA, and retain the result through the SDK's GDK texture wrapper. DMA-BUF decoding and GPU scaling need a separate platform backend. |
+| Web | Retain the original browser frame for matching geometry. Otherwise draw to a target-sized canvas and publish its `VideoFrame`. The application does not read back the pixels of a browser frame. |
+
+Completed textures survive subsequent output, reset, and close. The `media_video_texture_selection` regression checks
+PTS and physical dimensions across reset. On Android it also checks that reading and discarding frames issues no GL
+draw and that texture creation uses no CPU pixel readback.

@@ -15,6 +15,8 @@ class GlTexture;
 
 namespace huxerui::media::detail {
 
+struct VideoTextureGeometry;
+
 AHardwareBuffer* HardwareBuffer(const VideoFrame& frame) noexcept;
 CodecResult<std::shared_ptr<AImageReader>> OpenVideoImageReader(const VideoDecoderConfig& config);
 ANativeWindow* VideoImageReaderWindow(AImageReader* reader);
@@ -45,11 +47,13 @@ public:
 
   void DrawToSurface(const VideoFrame& frame);
   CodecResult<VideoFrame> DrawToBuffer(const VideoFrame& source, VideoFormat target);
-  void DrawToTexture(const VideoFrame& frame, huxerui::android::GlTexture& texture);
+  void DrawToTexture(const VideoFrame& frame, huxerui::android::GlTexture& texture,
+      VideoTextureOptions options = {}, const VideoTextureGeometry* geometry = nullptr);
 
 private:
   struct Context;
   std::unique_ptr<Context> context_;
+  friend CodecResult<std::shared_ptr<ExternalTexture>> PublishVideoPixels(Bytes pixels, VideoTextureOptions options);
 };
 
 } // namespace huxerui::media::detail

@@ -15,6 +15,7 @@
 #include <string>
 #include <variant>
 #include <huxerui/media_format.h>
+#include <huxerui/paint.h>
 
 namespace huxerui {
 class ExternalTexture;
@@ -1047,6 +1048,28 @@ private:
 /// @return A texture with its frame published and further publication closed. InvalidArgument reports
 /// an invalid or CPU frame. Unsupported reports an unavailable backend or unsupported platform image.
 CodecResult<std::shared_ptr<ExternalTexture>> MakeExternalTexture(const VideoFrame& frame);
+
+/// @brief Physical output size and framing for a display-oriented video texture.
+struct VideoTextureOptions {
+  /// Positive output width in pixels, up to 8192 and subject to the backend limit.
+  std::uint32_t width = 0;
+  /// Positive output height in pixels, up to 8192 and subject to the backend limit.
+  std::uint32_t height = 0;
+  /// Contain centers the entire image over opaque black. Cover center-crops the image to fill the texture.
+  ImageFit fit = ImageFit::Contain;
+};
+
+/// @brief Creates an immutable texture with the requested physical dimensions.
+///
+/// Synchronously fits the frame's visible rectangle after applying pixel aspect ratio and display rotation.
+/// Matching platform images can be retained directly, including their decoder output reservation. The texture
+/// survives release of the input frame and decoder reset or close. Keep timing separately using frame.pts.
+/// Create, use, and release Web frames and textures on the browser main thread.
+/// @param frame Valid eight-bit SDR image with I420 or NV12 CPU planes or supported platform storage.
+/// @param options Target pixel dimensions and either ImageFit::Contain or ImageFit::Cover.
+/// @return The finished texture, InvalidArgument for invalid frame metadata or options, or Unsupported for an
+/// unsupported layout, color space, or platform image.
+CodecResult<std::shared_ptr<ExternalTexture>> MakeExternalTexture(const VideoFrame& frame, VideoTextureOptions options);
 
 /// @brief Retains one published SDK texture image as a platform VideoFrame.
 ///

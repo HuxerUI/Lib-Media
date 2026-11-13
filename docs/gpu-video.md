@@ -49,6 +49,8 @@ An Opaque decoder output slot is budgeted at four bytes per coded pixel. For lar
 
 ## Accessing a single frame as an SDK texture
 
+For a sized, display-oriented texture selected by PTS, see [Timeline thumbnail extraction](timeline-thumbnail-extraction.md).
+
 Include `<huxerui/media_codec.h>` and call `MakeExternalTexture(frame)` on an SDR frame with `VideoStorage::Platform`.
 On success it returns a `std::shared_ptr<huxerui::ExternalTexture>` with one frame already published. The texture
 remains usable after the input frame is released or the decoder is reset or closed. On macOS, iOS, Android,
@@ -112,9 +114,6 @@ platform images and reopens the MP4. It tests half-size output on platforms with
 uses the browser frame's visible size on Web.
 The macOS test publishes into the SDK's PixelBufferTexture. The AppKit renderer's own conversion is outside the
 application pixel audit.
-
-See [timeline thumbnail extraction](timeline-thumbnail-extraction.md) for the proposed Android Surface path
-with small GPU snapshots and GOP skips.
 
 `media_video_gpu_tests` runs both codecs headlessly. It checks output storage, all picture times,
 MP4 decode timing, visible dimensions, crop and rotation pixels, reset at keyframes, and a retained image

@@ -40,14 +40,16 @@ if ((ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linu
         target_include_directories(media_container_preview_tests PRIVATE "${PROJECT_SOURCE_DIR}/platform/windows/src")
     elseif (ANDROID)
         target_include_directories(media_container_preview_tests PRIVATE "${PROJECT_SOURCE_DIR}/platform/android/src/main/cpp")
+        target_link_libraries(media_container_preview_tests PRIVATE GLESv3)
         target_link_options(media_container_preview_tests PRIVATE
-                "LINKER:--wrap=AMediaCodec_createDecoderByType" "LINKER:--wrap=AMediaCodec_delete")
+                "LINKER:--wrap=AMediaCodec_createDecoderByType" "LINKER:--wrap=AMediaCodec_delete"
+                "LINKER:--wrap=glDrawArrays" "LINKER:--wrap=glReadPixels")
     endif ()
     huxerui_add_resources(media_container_preview_tests ROOT "${MEDIA_PREVIEW_FIXTURES}" NAMESPACE fixture)
     if (EMSCRIPTEN)
         target_include_directories(media_container_preview_tests PRIVATE "${PROJECT_SOURCE_DIR}/platform/web/src")
         target_compile_definitions(media_container_preview_tests PRIVATE MEDIA_FIXTURES="/fixtures/container")
-        foreach (fixture IN ITEMS tagged-mp3.mp3 tagged-aac.m4a fragmented-aac.m4a preview-hevc-main.mp4
+        foreach (fixture IN ITEMS preview-avc-aac.mp4 tagged-mp3.mp3 tagged-aac.m4a fragmented-aac.m4a preview-hevc-main.mp4
                 webm-vp8-opus.webm preview-vp9-opus-no-cues.webm mkv-hevc-aac.mkv
                 preview-av1.webm preview-av1.mkv preview-av1.mp4
                 preview-pcm.aiff preview-pcm.caf tagged-alac.m4a trimmed-alac.caf alac-edit-8821.m4a alac-edit-8813.m4a
@@ -64,6 +66,7 @@ if ((ANDROID OR APPLE OR EMSCRIPTEN OR WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linu
         if (NOT IOS AND NOT ANDROID)
             add_test(NAME media_container_preview COMMAND media_container_preview_tests)
             add_test(NAME media_audio_containers COMMAND media_container_preview_tests --audio-containers)
+            add_test(NAME media_video_texture_selection COMMAND media_container_preview_tests --video-texture-selection)
             set_tests_properties(media_container_preview media_audio_containers PROPERTIES TIMEOUT 180)
         endif ()
     endif ()

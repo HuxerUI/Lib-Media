@@ -191,6 +191,7 @@ endif ()
 
 if (APPLE)
     target_link_libraries(huxerui_media PRIVATE "-framework AVFoundation" "-framework QuartzCore" "-framework CoreMedia" "-framework AudioToolbox" "-framework VideoToolbox" "-framework CoreVideo" "-framework Metal")
+    target_link_libraries(huxerui_media PRIVATE "-framework CoreImage" "-framework CoreGraphics")
     if (IOS)
         target_link_libraries(huxerui_media PRIVATE "-framework Photos" "-framework PhotosUI" "-framework UniformTypeIdentifiers")
     endif ()

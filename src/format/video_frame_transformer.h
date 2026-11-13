@@ -10,6 +10,23 @@ namespace huxerui::media::detail {
 using VideoSampling = std::array<std::array<float, 2>, 3>;
 VideoSampling VideoSampleCoordinates(const VideoFormat& format);
 
+struct VideoTextureGeometry {
+  // Source rectangle in normalized, display-oriented coordinates.
+  Rect source;
+  // Content rectangle in output pixels, measured from the top left.
+  Rect destination;
+  bool identity;
+};
+
+VideoTextureGeometry FitVideoTexture(const VideoFormat& format, VideoTextureOptions options);
+VideoSampling VideoSampleCoordinates(const VideoFormat& format, Rect source);
+VideoRectangle VideoSourceRectangle(const VideoFormat& format, Rect source);
+
+using VideoTextureResult = CodecResult<std::shared_ptr<ExternalTexture>>;
+VideoTextureResult MakeFittedPlatformVideoTexture(const VideoFrame& frame,
+    VideoTextureOptions options, const VideoTextureGeometry& geometry);
+VideoTextureResult PublishVideoPixels(Bytes pixels, VideoTextureOptions options);
+
 class VideoFrameTransformBackend {
 public:
   virtual ~VideoFrameTransformBackend() = default;

@@ -1,4 +1,5 @@
 #include "decoded_preview.h"
+#include "video_frame_transformer.h"
 
 #include <huxerui/huxerui.h>
 #include <huxerui/media_codec.h>
@@ -18,10 +19,21 @@
 #include <stdexcept>
 #include <thread>
 #ifdef __ANDROID__
+#include <GLES3/gl3.h>
+#include <huxerui/android/external_texture.h>
 #include <media/NdkMediaCodec.h>
+#elif defined(__APPLE__)
+#if TARGET_OS_IOS
+#include <huxerui/ios/external_texture.h>
+#else
+#include <huxerui/macos/external_texture.h>
+#endif
+#elif defined(_WIN32)
+#include <huxerui/windows/external_texture.h>
 #endif
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#include <huxerui/web/external_texture.h>
 #endif
 
 using namespace huxerui;
@@ -36,6 +48,7 @@ void CheckAudioReadback(const File& source, const File& output, MediaTimestamp e
 #ifdef __ANDROID__
 namespace {
 std::optional<std::atomic<int>> pending_codecs;
+std::atomic<unsigned> texture_draws, readbacks;
 }
 
 extern "C" AMediaCodec* __real_AMediaCodec_createDecoderByType(const char* mime);
@@ -50,6 +63,18 @@ extern "C" media_status_t __wrap_AMediaCodec_delete(AMediaCodec* codec) {
   const auto status = __real_AMediaCodec_delete(codec);
   if (pending_codecs) --*pending_codecs;
   return status;
+}
+
+extern "C" void __real_glDrawArrays(GLenum, GLint, GLsizei);
+extern "C" void __wrap_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+  ++texture_draws;
+  __real_glDrawArrays(mode, first, count);
+}
+
+extern "C" void __real_glReadPixels(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
+extern "C" void __wrap_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels) {
+  ++readbacks;
+  __real_glReadPixels(x, y, width, height, format, type, pixels);
 }
 #endif
 
@@ -146,7 +171,7 @@ struct Observations {
   std::optional<MediaTimestamp> first_frame;
   std::optional<MediaTimestamp> first_duration;
   std::optional<VideoFormat> format;
-  Size size;
+  huxerui::Size size;
   float position = 0;
   float duration = 0;
   unsigned epoch = 0;
@@ -160,7 +185,7 @@ TaskHandle Play(const TaskScope& tasks, std::shared_ptr<const File> file, Observ
     try {
       std::shared_ptr<ExternalTexture> texture;
       co_await media_preview::PlayContainer(file, {
-          .reset_video = [&](Size size, const std::shared_ptr<ExternalTexture>& surface) {
+          .reset_video = [&](huxerui::Size size, const std::shared_ptr<ExternalTexture>& surface) {
             if (storage == VideoStorage::Platform) texture = surface ? surface : media_preview::MakeFrameTexture(size, storage);
             seen.size = size;
             if (!seen.retain_first_publication) seen.first_frame.reset();
@@ -207,6 +232,148 @@ void Until(testing::UiTest& ui, const std::exception_ptr& failure, Condition con
   }
   if (failure) std::rethrow_exception(failure);
   Check(condition(), error);
+}
+
+void CheckVideoTextureSelection(const TaskScope& tasks, testing::UiTest& ui, const File& source) {
+  const VideoFormat geometry_format{.width = 1920, .height = 1080, .visible = {0, 0, 1920, 1080}};
+  const auto contain = media::detail::FitVideoTexture(geometry_format, {320, 240, ImageFit::Contain});
+  const auto cover = media::detail::FitVideoTexture(geometry_format, {320, 240, ImageFit::Cover});
+  Check(contain.destination == huxerui::Rect{0, 30, 320, 180}, "Contain geometry did not center the image");
+  Check(media::detail::VideoSourceRectangle(geometry_format, cover.source) == VideoRectangle{240, 0, 1440, 1080},
+      "Cover geometry did not crop the center");
+  Check(media::detail::FitVideoTexture(geometry_format, {1920, 1080}).identity, "Identical geometry requires a transform");
+  std::exception_ptr failure;
+  bool done = false;
+#ifdef __ANDROID__
+  const auto initial_readbacks = readbacks.load();
+#endif
+  const auto task = tasks.Launch([&]() -> Task<void> {
+    try {
+      auto input = Require(MediaDemuxer::Open(Require(source.OpenRandomAccess())));
+      const auto track = std::ranges::find(input.Tracks(), TrackKind::Video, &MediaTrack::kind);
+      Check(track != input.Tracks().end(), "Missing thumbnail test video track");
+      const auto& desc = track->descriptions.front();
+      VideoDecoderConfig config;
+      config.codec = desc.codec;
+      config.initialization_data = desc.initialization_data;
+      config.width = (*desc.coded_width + 15) & ~15u;
+      config.height = (*desc.coded_height + 15) & ~15u;
+#if !defined(__linux__) || defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+      config.output_storage = VideoStorage::Platform;
+#endif
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+      config.output = VideoPixelFormat::Opaque;
+#endif
+      std::vector<EncodedPacket> packets;
+      while (const auto packet = ReadPacket(input)) {
+        if (packet->track_id == track->id)
+          packets.push_back({packet->data, *packet->pts, packet->dts, packet->duration, packet->sync_sample.value_or(false)});
+      }
+      Check(packets.size() >= 5 && packets.front().key_frame, "Missing thumbnail test pictures");
+      auto decoder = Require(VideoDecoder::Create(config));
+      std::shared_ptr<ExternalTexture> first;
+      std::optional<MediaTimestamp> first_pts;
+      for (auto fit : {ImageFit::Contain, ImageFit::Cover}) {
+#ifdef __ANDROID__
+        const auto initial_draws = texture_draws.load();
+#endif
+        std::size_t submitted = 0, seen = 0;
+        const auto deadline = std::chrono::steady_clock::now() + 10s;
+        while (seen < 3 && std::chrono::steady_clock::now() < deadline) {
+          while (submitted < packets.size() && Require(decoder.TrySubmit(packets[submitted])) == SubmitStatus::Accepted)
+            ++submitted;
+          if (submitted == packets.size()) Require(decoder.Finish());
+          auto event = Require(decoder.TryRead());
+          if (!event) {
+            co_await Delay(2ms);
+            continue;
+          }
+          auto* frame = std::get_if<VideoFrame>(&*event);
+          if (!frame) continue;
+          if (++seen != 3) continue;
+          const auto pts = frame->pts;
+          Check(std::ranges::any_of(packets, [&](const EncodedPacket& packet) { return packet.pts == pts; }),
+                "A selected picture lost its packet PTS");
+          frame->format.rotation = VideoRotation::Clockwise90;
+          frame->format.aspect_width = 4;
+          frame->format.aspect_height = 3;
+          ++frame->format.visible.x;
+          --frame->format.visible.width;
+#ifdef __ANDROID__
+          Check(texture_draws.load() == initial_draws, "A decoded picture triggered GL drawing before selection");
+#endif
+          auto texture = Require(MakeExternalTexture(*frame, {80, 62, fit}));
+#ifdef __ANDROID__
+          Check(texture_draws.load() > initial_draws, "The selected picture did not render to a GL texture");
+#endif
+          Check(texture->IntrinsicSize() == huxerui::Size{80, 62} && texture->Revision() == 1, "Invalid thumbnail texture");
+#if defined(__APPLE__)
+#if TARGET_OS_IOS
+          using Texture = ios::PixelBufferTexture;
+#else
+          using Texture = macos::PixelBufferTexture;
+#endif
+          const auto* sdk = dynamic_cast<Texture*>(texture.get());
+          const std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)>
+              buffer(sdk ? sdk->AcquireFrame() : nullptr, CVPixelBufferRelease);
+          Check(buffer && CVPixelBufferGetWidth(buffer.get()) == 80 && CVPixelBufferGetHeight(buffer.get()) == 62,
+              "The Apple thumbnail has the wrong physical size");
+          Check(CVPixelBufferGetPixelFormatType(buffer.get()) == kCVPixelFormatType_32BGRA &&
+              CVPixelBufferLockBaseAddress(buffer.get(), kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess,
+              "Cannot inspect the fitted Apple thumbnail");
+          const auto* row = static_cast<const std::uint8_t*>(CVPixelBufferGetBaseAddress(buffer.get())) +
+              31 * CVPixelBufferGetBytesPerRow(buffer.get());
+          const bool black_margin = row[0] < 3 && row[1] < 3 && row[2] < 3 && row[3] == 255;
+          const bool has_picture = std::any_of(row + 30 * 4, row + 50 * 4, [](std::uint8_t channel) {
+            return channel > 8 && channel < 255;
+          });
+          CVPixelBufferUnlockBaseAddress(buffer.get(), kCVPixelBufferLock_ReadOnly);
+          Check(has_picture && (fit != ImageFit::Contain || black_margin), "The Apple thumbnail has incorrect fit pixels");
+#elif defined(__ANDROID__) || defined(_WIN32)
+#ifdef __ANDROID__
+          using Texture = android::GlTexture;
+#else
+          using Texture = windows::D3D11Texture;
+#endif
+          const auto* sdk = dynamic_cast<Texture*>(texture.get());
+          const auto snapshot = sdk ? sdk->AcquireFrame() : nullptr;
+          Check(snapshot && snapshot->PixelWidth() == 80 && snapshot->PixelHeight() == 62,
+              "The GPU thumbnail has the wrong physical size");
+#elif defined(__EMSCRIPTEN__)
+          const auto* sdk = dynamic_cast<web::VideoFrameTexture*>(texture.get());
+          Check(sdk != nullptr, "The browser thumbnail has the wrong texture type");
+          auto snapshot = sdk->AcquireFrame();
+          const auto width = snapshot["codedWidth"].as<int>(), height = snapshot["codedHeight"].as<int>();
+          snapshot.call<void>("close");
+          Check(width == 80 && height == 62, "The browser thumbnail has the wrong physical size");
+#endif
+          if (first) {
+            Check(pts == first_pts && first != texture && first->Revision() == 1, "Reset changed the selected PTS or cached texture");
+          } else {
+            first = std::move(texture);
+            first_pts = pts;
+            Require(decoder.Reset());
+          }
+        }
+        Check(seen == 3, "The thumbnail decoder did not deliver the selected picture");
+      }
+      decoder.Close();
+      Check(first && first->Revision() == 1, "Decoder close invalidated the thumbnail");
+#ifdef __ANDROID__
+      Check(readbacks.load() == initial_readbacks, "The Android thumbnail path read GPU pixels back to the CPU");
+#endif
+      std::cout << "PASS: video texture selection and reset\n";
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    done = true;
+  });
+  try {
+    Until(ui, failure, [&] { return done; }, "Video texture selection did not finish", 25s);
+  } catch (...) {
+    task.Cancel();
+    throw;
+  }
 }
 
 std::vector<MediaPresentationSlice> PictureSlices(const MediaTrack& track, const ContainerPacket& packet) {
@@ -682,7 +849,7 @@ void CheckProResPreview(const TaskScope& tasks, testing::UiTest& ui, const std::
   const auto playing = Play(tasks, input, seen, failure);
   Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.06F; },
         "ProRes MOV did not publish a picture and advance its PCM clock");
-  Check(seen.format->pixel_format == output && seen.size == Size{64, 48} &&
+  Check(seen.format->pixel_format == output && seen.size == huxerui::Size{64, 48} &&
         seen.first_frame == MediaTimestamp{0, 1} && seen.first_duration == MediaTimestamp{1, 8},
         "ProRes preview changed the first picture format or timing");
   for (const auto target : {0.375F, 0.125F, 0.25F}) {
@@ -1415,15 +1582,21 @@ int main(int argc, char** argv) {
     const File temporary(std::filesystem::temp_directory_path().u8string());
 #ifdef __EMSCRIPTEN__
     const bool audio_only = EM_ASM_INT({ return new URLSearchParams(location.search).has('audio-containers'); });
+    const bool video_textures_only = EM_ASM_INT({ return new URLSearchParams(location.search).has('video-texture-selection'); });
     const File fixtures(MEDIA_FIXTURES);
 #else
     const bool vpx_only = argc == 3 && std::string_view(argv[1]) == "--vpx";
     const bool audio_only = argc >= 2 && std::string_view(argv[1]) == "--audio-containers";
-    const File fixtures(argc == 3 && (vpx_only || audio_only) ? argv[2] : MEDIA_FIXTURES);
+    const bool video_textures_only = argc >= 2 && std::string_view(argv[1]) == "--video-texture-selection";
+    const File fixtures(argc == 3 && (vpx_only || audio_only || video_textures_only) ? argv[2] : MEDIA_FIXTURES);
 #ifdef __ANDROID__
     if (vpx_only) pending_codecs.emplace(0);
 #endif
 #endif
+    if (video_textures_only) {
+      CheckVideoTextureSelection(tasks, ui, fixtures.Child("preview-avc-aac.mp4"));
+      return 0;
+    }
     if (audio_only) {
       CheckAudioContainers(tasks, ui, temporary, fixtures);
       return 0;
@@ -1525,7 +1698,7 @@ int main(int argc, char** argv) {
     seen = {};
     preview = Play(tasks, edited, seen, failure);
     Until(ui, failure, [&] { return seen.first_frame && seen.position > 0.15F; }, "The edited MP4 did not start playing");
-    Check(seen.format->visible == EditedAperture && seen.size == Size{316.0F * 4 / 3, 236.0F} &&
+    Check(seen.format->visible == EditedAperture && seen.size == huxerui::Size{316.0F * 4 / 3, 236.0F} &&
           seen.first_frame->Compare({1, 4}) >= 0, "MP4 preview lost its clean aperture or showed a preroll frame");
     const auto edited_epoch = seen.epoch;
     seen.seek = 2.1F;

@@ -6,8 +6,11 @@
 
 #include <huxerui/macos/external_texture.h>
 
+#import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
+
+#include <cstring>
 
 #include <stdexcept>
 
@@ -202,6 +205,91 @@ CodecResult<std::shared_ptr<ExternalTexture>> detail::MakePlatformVideoTexture(c
   lease->texture.Publish(image);
   lease->texture.Finish();
   return R::Success(std::shared_ptr<ExternalTexture>(lease, &lease->texture));
+}
+
+namespace {
+
+using PixelBufferOwner = std::unique_ptr<std::remove_pointer_t<CVPixelBufferRef>, decltype(&CVPixelBufferRelease)>;
+
+PixelBufferOwner AllocateTextureBuffer(VideoTextureOptions options) {
+  CVPixelBufferRef buffer = nullptr;
+  NSDictionary* attributes = @{
+    (__bridge NSString*)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    (__bridge NSString*)kCVPixelBufferMetalCompatibilityKey: @YES
+  };
+  if (CVPixelBufferCreate(nullptr, options.width, options.height, kCVPixelFormatType_32BGRA,
+      (__bridge CFDictionaryRef)attributes, &buffer) != kCVReturnSuccess)
+    throw std::runtime_error("Cannot allocate a BGRA video texture buffer");
+  return PixelBufferOwner(buffer, CVPixelBufferRelease);
+}
+
+detail::VideoTextureResult PublishTextureBuffer(CVPixelBufferRef buffer, VideoTextureOptions options) {
+  auto texture = std::make_shared<huxerui::macos::PixelBufferTexture>(Size{float(options.width), float(options.height)});
+  texture->Publish(buffer);
+  texture->Finish();
+  return detail::VideoTextureResult::Success(std::move(texture));
+}
+
+} // namespace
+
+detail::VideoTextureResult detail::MakeFittedPlatformVideoTexture(const VideoFrame& frame,
+    VideoTextureOptions options, const VideoTextureGeometry& geometry) {
+  const auto source = macos::PixelBuffer(frame);
+  if (!source) return VideoTextureResult::Failure(Error(CodecErrorCode::Unsupported, "Expected an IOSurface video image"));
+  const auto coded = CGRectMake(0, 0, frame.format.width, frame.format.height);
+  if (geometry.identity && CGRectEqualToRect(CVImageBufferGetCleanRect(source), coded) &&
+      CGSizeEqualToSize(CVImageBufferGetDisplaySize(source), coded.size))
+    return MakePlatformVideoTexture(frame);
+  @autoreleasepool {
+    static CIContext* const context = [] {
+      auto device = MTLCreateSystemDefaultDevice();
+      return device ? [CIContext contextWithMTLDevice:device options:@{kCIContextCacheIntermediates: @NO}] : nil;
+    }();
+    if (!context) return VideoTextureResult::Failure(Error(CodecErrorCode::Unsupported, "No Metal device for video textures"));
+    auto buffer = AllocateTextureBuffer(options);
+    CIImage* image = [CIImage imageWithCVPixelBuffer:source];
+    const auto crop = VideoSourceRectangle(frame.format, geometry.source);
+    const auto coded_crop = CGRectMake(crop.x, frame.format.height - crop.y - crop.height, crop.width, crop.height);
+    image = [image imageByCroppingToRect:coded_crop];
+    switch (frame.format.rotation) {
+      case VideoRotation::None: break;
+      case VideoRotation::Clockwise90: image = [image imageByApplyingOrientation:6]; break;
+      case VideoRotation::Clockwise180: image = [image imageByApplyingOrientation:3]; break;
+      case VideoRotation::Clockwise270: image = [image imageByApplyingOrientation:8]; break;
+    }
+    const auto extent = image.extent;
+    const auto& area = geometry.destination;
+    const auto sx = area.width / extent.size.width, sy = area.height / extent.size.height;
+    image = [image imageByApplyingTransform:CGAffineTransformMake(
+        sx, 0, 0, sy, area.x - sx * extent.origin.x,
+        options.height - area.y - area.height - sy * extent.origin.y)];
+    const auto output = CGRectMake(0, 0, options.width, options.height);
+    auto black = [[CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0 alpha:1]] imageByCroppingToRect:output];
+    image = [image imageByCompositingOverImage:black];
+    const auto color = std::unique_ptr<std::remove_pointer_t<CGColorSpaceRef>, decltype(&CGColorSpaceRelease)>(
+        CGColorSpaceCreateWithName(kCGColorSpaceSRGB), CGColorSpaceRelease);
+    [context render:image toCVPixelBuffer:buffer.get() bounds:output colorSpace:color.get()];
+    return PublishTextureBuffer(buffer.get(), options);
+  }
+}
+
+detail::VideoTextureResult detail::PublishVideoPixels(Bytes pixels, VideoTextureOptions options) {
+  @autoreleasepool {
+    auto buffer = AllocateTextureBuffer(options);
+    if (CVPixelBufferLockBaseAddress(buffer.get(), 0) != kCVReturnSuccess)
+      throw std::runtime_error("Cannot lock the software video texture");
+    auto* output = static_cast<std::byte*>(CVPixelBufferGetBaseAddress(buffer.get()));
+    const auto stride = CVPixelBufferGetBytesPerRow(buffer.get());
+    const auto row_bytes = std::size_t(options.width) * 4;
+    for (unsigned row = 0; row < options.height; ++row) {
+      const auto* input = pixels.data() + row * row_bytes;
+      auto* destination = output + row * stride;
+      std::memcpy(destination, input, row_bytes);
+      for (std::size_t x = 0; x < row_bytes; x += 4) std::swap(destination[x], destination[x + 2]);
+    }
+    CVPixelBufferUnlockBaseAddress(buffer.get(), 0);
+    return PublishTextureBuffer(buffer.get(), options);
+  }
 }
 
 std::unique_ptr<detail::VideoFrameTransformBackend> detail::MakeVideoFrameTransformBackend() {
