@@ -1,15 +1,19 @@
 #pragma once
 
 /// @file
-/// @brief Platform image/video selection and publication to the system photo library for HuxerUI.
+/// @brief System photo-library browsing, image/video selection, and publication for HuxerUI.
 ///
 /// Include <huxerui/media_library.h> and link HuxerUI::Media. Register Install() through the application's
-/// application hooks before obtaining composition-owned handles with UseMediaPicker() or UseMediaLibrary().
+/// application hooks before obtaining a composition-owned handle with UseMediaLibrary().
 /// Launch asynchronous operations through TaskScope from UI events or committed Lifecycle setup.
 /// Android and iOS provide backends; other platforms report unavailable capabilities and Unsupported operations.
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,11 +21,16 @@
 #include <huxerui/app.h>
 #include <huxerui/data.h>
 #include <huxerui/file.h>
+#include <huxerui/external_texture.h>
+#include <huxerui/lifecycle.h>
+#include <huxerui/navigation.h>
 #include <huxerui/task.h>
+#include <huxerui/theme.h>
+#include <huxerui/view.h>
 
 namespace huxerui::media {
 
-namespace detail { class MediaLibraryState; }
+namespace detail { class MediaLibraryState; struct MediaLibraryAccess; }
 
 /// @brief Portable categories for platform media selection and publication failures.
 ///
@@ -38,6 +47,10 @@ enum class MediaLibraryErrorCode {
   Unavailable,
   /// Reading selected content, copying a source, or publishing through the system photo library failed.
   Io,
+  /// The requested asset or album is no longer visible to the application.
+  NotFound,
+  /// The page cursor no longer belongs to the current library revision. Restart from the first page.
+  StaleCursor,
   /// The failure could not be mapped more specifically, including a malformed platform result.
   Unknown,
 };
@@ -59,13 +72,13 @@ struct MediaLibraryError {
 /// std::logic_error. Accessors borrow the stored value; std::move(result).Value() allows ownership to be transferred.
 /// Selection dismissal is a successful empty vector. Saving uses void for confirmed publication with no payload.
 /// A canceled Task delivers no result; cancellation follows the SDK TaskScope contract.
-/// @tparam T Owned success type: MediaLibraryCapabilities, std::vector<FileReference>, or void for these APIs.
+/// @tparam T Owned success type of the operation.
 template <class T> using MediaLibraryResult = Result<T, MediaLibraryError>;
 
-/// @brief The kinds of media offered by the platform picker.
+/// @brief The kinds of media to offer in a photo-library query or picker.
 ///
 /// Filters select system photo-library content; they do not enable document selection or format conversion.
-enum class MediaPickerFilter {
+enum class MediaFilter {
   /// Offer images only.
   Images,
   /// Offer videos only.
@@ -75,12 +88,12 @@ enum class MediaPickerFilter {
   ImagesAndVideos,
 };
 
-/// @brief Media filtering and maximum result count for one platform picker request.
+/// @brief Media filtering and maximum result count for one system picker request.
 ///
-/// Options are validated by MediaPicker::PickAsync(), not when this aggregate is constructed.
-struct MediaPickerOptions {
+/// Options are validated by MediaLibrary::PickAsync(), not when this aggregate is constructed.
+struct SystemMediaPickerOptions {
   /// Allowed media kinds; defaults to both images and videos.
-  MediaPickerFilter filter = MediaPickerFilter::ImagesAndVideos;
+  MediaFilter filter = MediaFilter::ImagesAndVideos;
   /// Positive maximum number of selected items. One enables single selection; larger values enable multiple selection.
   /// Zero is invalid and does not mean unlimited. Limits above MediaLibraryCapabilities::max_selection_count return
   /// Unsupported; the adapter does not silently clamp the request or truncate a platform result that exceeds it.
@@ -88,9 +101,9 @@ struct MediaPickerOptions {
   std::uint32_t selection_limit = 1;
 };
 
-/// @brief A snapshot of platform selection and publication support, independent of permission authorization.
+/// @brief A snapshot of platform browsing, selection, and publication support, independent of authorization.
 ///
-/// Obtain through either handle's CapabilitiesAsync(). Modifying a returned copy does not configure the backend.
+/// Obtain through MediaLibrary::CapabilitiesAsync(). Modifying a returned copy does not configure the backend.
 /// Support can change, and a supported operation can still fail because of permissions, source content, or host state.
 struct MediaLibraryCapabilities {
   /// Largest selection_limit accepted by this backend; zero means platform selection is unavailable.
@@ -100,6 +113,8 @@ struct MediaLibraryCapabilities {
   std::uint32_t max_selection_count = 0;
   /// Whether platform publication is supported, independently of CanPick(). Required permission may still be denied.
   bool can_save = false;
+  /// Whether library browsing is supported. The host must separately obtain photo/video read access.
+  bool can_browse = false;
 
   /// @brief Tests whether this snapshot supports platform image/video selection.
   /// @return True when max_selection_count is positive; false when it is zero. This derived query does not grant
@@ -107,33 +122,103 @@ struct MediaLibraryCapabilities {
   [[nodiscard]] bool CanPick() const noexcept { return max_selection_count > 0; }
 };
 
-/// @brief A UI-thread handle to platform media selection owned by the UseMediaPicker() composition lifetime.
+/// Identifies the primary media representation of a library asset.
+enum class MediaAssetKind { Image, Video };
+
+/// Opaque identity of an asset in the current system library. Copies compare by value across albums.
+/// Use IDs obtained from library queries. Their storage format and persistence across app launches are unspecified.
+struct MediaAssetId {
+  std::string value;
+  bool operator==(const MediaAssetId&) const = default;
+};
+
+/// Opaque identity of a platform album. Albums with the same display name can have distinct IDs.
+struct MediaAlbumId {
+  std::string value;
+  bool operator==(const MediaAlbumId&) const = default;
+};
+
+/// Metadata for a visible image or video. A value neither retains read permission nor opens the media file.
+struct MediaAsset {
+  MediaAssetId id;
+  MediaAssetKind kind = MediaAssetKind::Image;
+  /// Capture or creation time where known. Android may use the time the asset entered the library.
+  std::optional<std::chrono::system_clock::time_point> date;
+  /// Video playback duration when known. Images have no duration.
+  std::optional<std::chrono::milliseconds> duration;
+};
+
+/// A visible album with at least one asset matching the requested filter.
+struct MediaAlbum {
+  MediaAlbumId id;
+  std::string name;
+  /// Newest matching asset, suitable for a thumbnail request.
+  MediaAssetId cover_id;
+};
+
+/// Selects a page of metadata from a photo library. A missing album queries Recents across visible albums.
+struct MediaAssetQuery {
+  MediaFilter filter = MediaFilter::ImagesAndVideos;
+  /// Album ID returned by ListAlbumsAsync(). Leave unset to query Recents.
+  std::optional<MediaAlbumId> album_id;
+  /// Number of records to request, in [1, 256].
+  std::uint32_t page_size = 60;
+  /// Opaque continuation from a previous page in this session with the same filter, album, and page size.
+  std::optional<std::string> cursor;
+};
+
+/// A page ordered newest first, with an empty continuation at the end.
+struct MediaAssetPage {
+  std::vector<MediaAsset> assets;
+  std::optional<std::string> next_cursor;
+};
+
+/// Requests a bounded photo or video poster at physical pixel dimensions while preserving aspect ratio.
+struct MediaImageRequest {
+  /// Positive pixel limits in [1, 4096]. The output may be smaller.
+  std::uint32_t max_width = 0;
+  std::uint32_t max_height = 0;
+  /// Allow a platform provider to download the representation if needed.
+  bool allow_network = false;
+};
+
+/// @brief A UI-thread handle to system photo-library browsing, selection, and publication.
 ///
-/// Copies refer to the same session and original host window. Retaining a handle does not keep that session active
-/// after unmount. Unmount cancels pending platform work; a waiting application Task that remains active receives
-/// Unavailable, while a canceled Task receives no result. Requests started before attachment or after unmount fail.
+/// Copies share a session bound to the original window. All access and handle destruction belong on its UI thread;
+/// run returned Tasks through TaskScope on that execution. Before attachment or after unmount, operations return
+/// Unavailable. Unmount cancels platform requests and settles surviving application Tasks with Unavailable;
+/// Tasks canceled through their scope receive no result. Retaining a handle does not extend the active session.
 ///
-/// Access and handle destruction belong on the owning UI thread; this is not a thread-safe interface. Run returned
-/// Tasks on that UI execution through TaskScope. Platform presentation shares SDK coordination with FilePicker.
-/// Android prefers the system Photo Picker and falls back to an available ACTION_PICK gallery for single selection.
-/// iOS uses PHPicker. No document-picker fallback is implicit.
-/// @see UseMediaPicker(), MediaLibrary
-class MediaPicker final {
+/// Saving creates a new asset on every successful call and preserves the source. No destination picker, transcoding,
+/// album management, or separate gallery-notification call is provided. Success means the system photo library confirmed
+/// publication; it does not guarantee immediate refresh in another gallery application or return a persistent asset ID.
+///
+/// Android uses MediaStore on Android 10+ without storage permission. iOS requires a nonempty
+/// NSPhotoLibraryAddUsageDescription in the application's Info.plist and requests Photos add-only authorization.
+/// A missing description returns Unavailable before prompting; denial returns PermissionDenied. An authorization
+/// prompt may outlive Task cancellation. Desktop and Web publication returns Unsupported.
+///
+/// Cancellation suppresses delivery but cannot undo committed publication. Android attempts to delete an unfinished
+/// pending entry, subject to provider cleanup failures. A submitted iOS Photos transaction may still finish after
+/// cancellation; its staged source remains retained until platform completion. Canceling or unmounting is not a
+/// rollback guarantee.
+/// @see UseMediaLibrary(), MediaLibraryPicker()
+class MediaLibrary final {
 public:
-  /// @brief Queries platform selection and publication support without presenting UI or requesting permission.
+  /// @brief Queries platform browsing, publication, and selection support without requesting permission.
   ///
-  /// Android prefers an available system Photo Picker on Android 13+, or Android 11/12 with R SDK extension 2+.
-  /// Otherwise an installed ACTION_PICK gallery provides single selection; multiple selection is unsupported on
-  /// that path because it cannot enforce a portable maximum. At least one image/video handler must be available;
-  /// PickAsync() checks handlers for the requested filter. iOS uses the library's iOS 15 minimum.
-  /// Query this snapshot when preparing UI; platform availability and host state may change before PickAsync() starts.
+  /// can_save is independent of CanPick(). In particular, Android can support saving while its platform picker is absent.
+  /// A true can_save reports platform support, not current authorization or support for every image/video format.
   /// @return A Task yielding a result containing MediaLibraryCapabilities, or MediaLibraryError on query failure.
-  /// On unsupported desktop and Web platforms, an attached session returns a zero selection limit and can_save = false.
+  /// On desktop and Web, the attached session reports a zero selection limit and false for can_save and can_browse.
   /// @pre Call and run the Task on the owning UI thread after committed attachment.
   Task<MediaLibraryResult<MediaLibraryCapabilities>> CapabilitiesAsync() const;
 
   /// @brief Presents the platform picker and obtains access to selected images or videos.
   ///
+  /// Android prefers the system Photo Picker on Android 13+, or Android 11/12 with R SDK extension 2+ when available.
+  /// Otherwise, it uses an installed ACTION_PICK gallery. iOS uses PHPicker with the library's iOS 15 minimum.
+  /// Platform presentation shares the SDK's coordination with FilePicker.
   /// Selection requests no broad photo-library or storage-read permission. Completion may wait for remote/provider
   /// content to become readable. If any selected item cannot be materialized, the operation fails and releases partial
   /// results. Unsupported platform selection or limits return Unsupported rather than using a document picker.
@@ -158,46 +243,47 @@ public:
   /// @pre Call and run the Task on the owning UI thread from UI events or committed Lifecycle work.
   /// @throws std::invalid_argument If filter is invalid or selection_limit is zero, synchronously before returning
   /// the Task, including when the session is unavailable.
-  /// @see CapabilitiesAsync(), MediaPickerOptions, UseMediaPicker()
-  Task<MediaLibraryResult<std::vector<FileReference>>> PickAsync(MediaPickerOptions options = {}) const;
+  /// @see CapabilitiesAsync(), SystemMediaPickerOptions, UseMediaLibrary()
+  Task<MediaLibraryResult<std::vector<FileReference>>> PickAsync(SystemMediaPickerOptions options = {}) const;
 
-private:
-  explicit MediaPicker(std::shared_ptr<detail::MediaLibraryState> state) : state_(std::move(state)) {}
-  std::shared_ptr<detail::MediaLibraryState> state_;
-  friend MediaPicker UseMediaPicker();
-};
+  /// Lists matching albums and their cover IDs. Query Recents with an unset MediaAssetQuery::album_id.
+  /// Call after attachment on the owning UI thread. The operation uses current read authorization without prompting.
+  Task<MediaLibraryResult<std::vector<MediaAlbum>>> ListAlbumsAsync(
+      MediaFilter filter = MediaFilter::ImagesAndVideos) const;
 
-/// @brief A UI-thread handle to system photo-library publication owned by the UseMediaLibrary() composition lifetime.
-///
-/// Copies share a session bound to the original window. All access and handle destruction belong on its UI thread;
-/// run returned Tasks through TaskScope on that execution. Before attachment or after unmount, operations return
-/// Unavailable. Unmount cancels platform requests and settles surviving application Tasks with Unavailable;
-/// Tasks canceled through their scope receive no result. Retaining a handle does not extend the active session.
-///
-/// Saving creates a new asset on every successful call and preserves the source. No destination picker, transcoding,
-/// album management, or separate gallery-notification call is provided. Success means the system photo library confirmed
-/// publication; it does not guarantee immediate refresh in another gallery application or return a persistent asset ID.
-///
-/// Android uses MediaStore on Android 10+ without storage permission. iOS requires a nonempty
-/// NSPhotoLibraryAddUsageDescription in the application's Info.plist and requests Photos add-only authorization.
-/// A missing description returns Unavailable before prompting; denial returns PermissionDenied. An authorization
-/// prompt may outlive Task cancellation. Desktop and Web publication returns Unsupported.
-///
-/// Cancellation suppresses delivery but cannot undo committed publication. Android attempts to delete an unfinished
-/// pending entry, subject to provider cleanup failures. A submitted iOS Photos transaction may still finish after
-/// cancellation; its staged source remains retained until platform completion. Canceling or unmounting is not a
-/// rollback guarantee.
-/// @see UseMediaLibrary(), MediaPicker
-class MediaLibrary final {
-public:
-  /// @brief Queries platform publication and selection support without requesting permission or accessing a source.
-  ///
-  /// can_save is independent of CanPick(). In particular, Android can support saving while its platform picker is absent.
-  /// A true can_save reports platform support, not current authorization or support for every image/video format.
-  /// @return A Task yielding a result containing MediaLibraryCapabilities, or MediaLibraryError on query failure.
-  /// Unsupported desktop and Web platforms return a zero selection limit and can_save = false while attached.
-  /// @pre Call and run the Task on the owning UI thread after committed attachment.
-  Task<MediaLibraryResult<MediaLibraryCapabilities>> CapabilitiesAsync() const;
+  /// Lists a page of visible asset metadata without opening files or loading thumbnails.
+  /// Unknown dates sort last. Pagination is stable within a library revision, including ties.
+  /// Use a returned cursor unchanged for the next page. On StaleCursor, discard the continuation and query anew.
+  /// An unset album_id means Recents. An album with no remaining visible matches returns NotFound.
+  Task<MediaLibraryResult<MediaAssetPage>> ListAssetsAsync(MediaAssetQuery query = {}) const;
+
+  /// Looks up IDs across visible albums and returns the visible subset in input order, including duplicate inputs.
+  /// A successful empty vector means no requested ID was visible. A provider failure is returned separately.
+  Task<MediaLibraryResult<std::vector<MediaAsset>>> FindAssetsAsync(std::vector<MediaAssetId> ids) const;
+
+  /// Loads a displayable photo or video poster. Pass the returned texture directly to huxerui::Image.
+  /// Successful null means the asset is visible but this request has no representation. The texture retains
+  /// its image independently of this handle. LoadImageAsync() does not return the source file or change the asset.
+  /// The optional progress callback receives normalized values on the owning UI thread when the provider reports them.
+  Task<MediaLibraryResult<std::shared_ptr<ExternalTexture>>> LoadImageAsync(
+      MediaAssetId id, MediaImageRequest request, std::function<void(double)> on_progress = {}) const;
+
+  /// Opens the current file representation for a visible asset. Android URI references remain subject to system
+  /// authorization. iOS may copy into temporary storage retained by the returned reference. Keep the reference
+  /// alive while using any projected path. This operation may download cloud assets and reports progress when available.
+  Task<MediaLibraryResult<FileReference>> OpenAssetAsync(
+      MediaAssetId id, std::function<void(double)> on_progress = {}) const;
+
+  /// Subscribes during composition to library invalidation on the owning UI thread.
+  /// Notifications may coalesce and carry no change list. Query again to refresh displayed data. No initial event
+  /// is replayed. Changing dependencies replaces this subscriber, and unmount stops delivery.
+  /// @throws std::invalid_argument If handler is empty.
+  template <class... Dependencies>
+  void OnChanged(std::function<void()> handler, Dependencies&&... dependencies) const {
+    if (!handler) throw std::invalid_argument("Media library change handler must not be empty");
+    Lifecycle([library = *this, handler = std::move(handler)] { return library.ConnectChanged(handler); },
+              *this, std::forward<Dependencies>(dependencies)...);
+  }
 
   /// @brief Publishes a local image as a new asset in the system photo library.
   ///
@@ -227,19 +313,23 @@ public:
   /// @see SaveImageAsync(), MediaLibrary
   Task<MediaLibraryResult<void>> SaveVideoAsync(File source) const;
 
+  bool operator==(const MediaLibrary&) const = default;
+
 private:
+  std::function<void()> ConnectChanged(std::function<void()> handler) const;
   explicit MediaLibrary(std::shared_ptr<detail::MediaLibraryState> state) : state_(std::move(state)) {}
   std::shared_ptr<detail::MediaLibraryState> state_;
   friend MediaLibrary UseMediaLibrary();
+  friend struct detail::MediaLibraryAccess;
 };
 
-/// @brief Creates or retrieves a platform media-picker session retained by the current composition scope.
+/// @brief Creates or retrieves a photo-library session retained by the current composition scope.
 ///
 /// Attachment occurs through Lifecycle. Unmount cancels pending work and makes retained handles unavailable;
 /// already returned FileReference values keep their own lifetime. Register Install() first and start operations
 /// from UI events or committed Lifecycle work rather than as unconditional composition side effects.
 /// @pre Call from an active HuxerUI composition scope with this library installed in its application.
-/// @return A handle to the scope-owned picker session, bound to its original window.
+/// @return A handle for system selection, browsing, and publication, bound to its original window.
 /// @code{.cpp}
 /// // Define this component in a codegen-enabled .cpp file.
 /// #include <huxerui/huxerui.h>
@@ -250,14 +340,14 @@ private:
 ///
 /// [[huxerui::composable]]
 /// View PhotoPickerPane() {
-///   auto picker = UseMediaPicker();
+///   auto library = UseMediaLibrary();
 ///   auto tasks = UseTaskScope();
 ///   auto files = UseState(std::make_shared<std::vector<FileReference>>());
 ///   auto message = UseState(std::string("No selection yet."));
 ///   return Column {
-///     Button("Choose photos").OnClick([picker, tasks, files, message] {
-///       tasks.Launch([picker, files, message]() -> Task<void> {
-///         auto result = co_await picker.PickAsync({MediaPickerFilter::Images, 3});
+///     Button("Choose photos").OnClick([library, tasks, files, message] {
+///       tasks.Launch([library, files, message]() -> Task<void> {
+///         auto result = co_await library.PickAsync(SystemMediaPickerOptions{MediaFilter::Images, 3});
 ///         if (!result.Succeeded()) {
 ///           message = result.Error().message;
 ///         } else {
@@ -274,16 +364,10 @@ private:
 /// @endcode
 /// The example retains selected references in composition state; dismissal leaves the previous selection intact.
 /// Query CapabilitiesAsync() when adapting controls or selection limits to the current device.
-MediaPicker UseMediaPicker();
-
-/// @brief Creates or retrieves a photo-library publication session retained by the current composition scope.
 ///
-/// The session attaches through Lifecycle and becomes unavailable on unmount. It can save local files without a
-/// MediaPicker, media player, or video view. Retaining the handle elsewhere does not extend its active lifetime.
-/// @pre Call from an active HuxerUI composition scope with Install() registered in the application's hooks.
-/// @return A handle to the scope-owned publication session, bound to its original window.
+/// For publication, keep the source readable until the operation completes.
 /// @code{.cpp}
-/// // With the includes and namespaces from the UseMediaPicker() example:
+/// // With the same includes and namespaces:
 /// [[huxerui::composable]]
 /// View SaveImagePane(File source) {
 ///   auto library = UseMediaLibrary();
@@ -304,6 +388,65 @@ MediaPicker UseMediaPicker();
 /// The caller supplies an accessible image file and keeps its contents available until the save completes.
 /// Use SaveVideoAsync() for a local video; the same ownership and permission rules apply.
 MediaLibrary UseMediaLibrary();
+
+/// Optional local overrides for the in-app picker. Unset values follow the surrounding HuxerUI theme.
+/// Each supplied component style is used in full. To give the picker a separate light or dark theme,
+/// place it inside the corresponding HuxerUI Theme.
+struct MediaLibraryPickerStyle {
+  /// Top app bar style shared by the grid and preview.
+  std::optional<TopAppBarStyle> top_app_bar;
+  /// Style of the confirmation button, including its disabled appearance and indication.
+  std::optional<ButtonStyle> confirm_button;
+  /// Style of auxiliary buttons, including authorization, management, and retry.
+  std::optional<ButtonStyle> secondary_button;
+  /// Outline of selected grid items. Defaults to the resolved badge background.
+  std::optional<Color> selection_outline;
+  /// Fill of the selected badge in the grid and preview. Defaults to the theme's primary color.
+  std::optional<Color> selection_badge_background;
+  /// Color of the badge checkmark and selection number. Defaults to the theme's on-primary color.
+  std::optional<Color> selection_badge_foreground;
+  /// Fixed number of grid columns, when set. Defaults to three in a compact viewport and five elsewhere.
+  std::optional<std::uint32_t> grid_columns;
+  /// Requested gap between grid cells in logical pixels, in both directions. Narrow grids may reduce the gap.
+  float grid_spacing = 3.0F;
+
+  /// Returns the inherited appearance with no local overrides.
+  static MediaLibraryPickerStyle Default() { return {}; }
+  bool operator==(const MediaLibraryPickerStyle&) const = default;
+};
+
+/// Options for the in-app picker. The custom selection limit is independent of the system picker's limit.
+struct MediaLibraryPickerOptions {
+  MediaFilter filter = MediaFilter::ImagesAndVideos;
+  /// Positive maximum. One selects a single asset; larger values allow ordered multiple selection.
+  std::uint32_t selection_limit = 1;
+  /// Browsing title. Defaults to the localized title for the active filter. Preview shows its own title.
+  std::optional<StringVariant> title;
+  /// Local appearance overrides. Updating the title or style preserves the current picker session.
+  MediaLibraryPickerStyle style{};
+  /// Receives all readable references in selection order after the user confirms.
+  std::function<void(std::vector<FileReference>)> on_confirm;
+  /// Invoked when the user exits the picker without submitting a selection.
+  std::function<void()> on_cancel;
+};
+
+/// @brief Builds a full-height, composition-owned photo-library picker for Android and iOS.
+///
+/// Mount in a bounded viewport, such as a screen or navigation destination, after registering Install().
+/// The view starts in Recents, paginates as the user scrolls, and keeps a shared selection across album and preview
+/// changes. Tapping a thumbnail opens preview; the separate selection control changes selection. For multiple selection,
+/// the selected-items strip opens the chosen assets in selection order. The album list opens below the top bar and
+/// spans the picker width. The grid uses square cells sized to the available width and configured column count.
+/// Preview supports horizontal paging, pinch zoom and pan for images, and playback for the current video. Returning
+/// from preview restores the grid position. The picker inherits the host HuxerUI theme, locale, and motion policy.
+/// Read authorization is requested only from an explicit user action.
+/// A finished selection invokes on_confirm once. Exiting invokes on_cancel once. Unmount cancels outstanding work and
+/// delivers neither callback. The host owns presentation and dismissal. Mount a new picker for another session.
+/// @param options Filter, positive selection limit, optional title, local styles, and owning-thread completion callbacks.
+/// A new filter or limit starts a fresh selection session.
+/// @throws std::invalid_argument If the filter is invalid, the selection limit or specified column count is zero,
+/// or grid spacing is negative or non-finite.
+View MediaLibraryPicker(MediaLibraryPickerOptions options);
 
 /// @brief Registers this platform's playback, video output, and media-library integration for an application.
 ///

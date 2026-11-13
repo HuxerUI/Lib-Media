@@ -3,12 +3,17 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 using namespace huxerui;
 using namespace huxerui::media;
 using namespace huxerui::media::detail;
 
 namespace {
+static_assert(std::is_same_v<decltype(std::declval<const MediaLibrary&>().PickAsync(SystemMediaPickerOptions{})),
+                             Task<MediaLibraryResult<std::vector<FileReference>>>>);
+static_assert(!std::is_convertible_v<MediaAlbumId, MediaAssetId> && !std::is_convertible_v<MediaAssetId, MediaAlbumId>);
+
 void Check(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
 }
@@ -20,9 +25,9 @@ template <class Function> void Invalid(Function function) {
 
 int main() {
   try {
-    ValidatePickerOptions({MediaPickerFilter::Videos, 4});
-    Invalid([] { ValidatePickerOptions({MediaPickerFilter::Images, 0}); });
-    Invalid([] { ValidatePickerOptions({static_cast<MediaPickerFilter>(99), 1}); });
+    ValidatePickerOptions(MediaFilter::Videos, 4);
+    Invalid([] { ValidatePickerOptions(MediaFilter::Images, 0); });
+    Invalid([] { ValidatePickerOptions(static_cast<MediaFilter>(99), 1); });
     const auto selection = [](const PlatformPayload& payload) { return DecodeSelection(payload, 1); };
     auto dismissal = DecodeLibraryReply<std::vector<FileReference>>(PlatformPayload{}, selection);
     Check(dismissal.Succeeded() && dismissal.Value().empty(), "Platform dismissal must be a successful empty selection");
@@ -43,6 +48,10 @@ int main() {
     auto supported = DecodeCapabilities(PlatformPayload::Object{{"maxSelectionCount", 3}, {"canSave", false}});
     Check(supported.CanPick() && supported.max_selection_count == 3 && !supported.can_save,
           "The platform selection count must determine picker support without a separate flag");
+    const auto browser = DecodeCapabilities(PlatformPayload::Object{
+        {"maxSelectionCount", 0}, {"canSave", false}, {"canBrowse", true}});
+    Check(browser.can_browse && !browser.CanPick() && !browser.can_save,
+          "Browsing must remain available independently of platform picking and publication");
     Invalid([] { DecodeCapabilities(PlatformPayload::Object{
         {"maxSelectionCount", -1}, {"canSave", true}}); });
     Invalid([] { DecodeCapabilities(PlatformPayload::Object{
@@ -61,6 +70,30 @@ int main() {
           "Permission denial must be distinguishable");
     Check(LibraryError({"media/unsupported", "unsupported", {}}).code == MediaLibraryErrorCode::Unsupported,
           "Unsupported capability must be distinguishable");
+    const auto albums = DecodeAlbums(PlatformPayload::List{
+        PlatformPayload::Object{{"id", "album"}, {"name", "Photos"}, {"cover", "photo"}},
+    });
+    Check(albums.size() == 1 && albums.front().name == "Photos" && albums.front().cover_id == MediaAssetId{"photo"},
+          "Album decoding must preserve the asset ID of its cover");
+    const MediaAssetQuery query{.album_id = albums.front().id};
+    Check(query.album_id == MediaAlbumId{"album"} && !MediaAssetQuery{}.album_id,
+          "Album queries must use the album ID and default to Recents");
+    Invalid([] { DecodeAlbums(PlatformPayload::List{
+        PlatformPayload::Object{{"id", "album"}, {"name", "Photos"}, {"cover", ""}},
+    }); });
+    auto page = DecodePage(PlatformPayload::Object{
+        {"assets", PlatformPayload::List{
+            PlatformPayload::Object{{"id", "photo"}, {"video", false}, {"date", 10}, {"duration", {}}},
+            PlatformPayload::Object{{"id", "video"}, {"video", true}, {"date", {}}, {"duration", 1300}},
+        }}, {"next", "next-page"}});
+    Check(page.assets.size() == 2 && page.assets[0].id.value == "photo" && page.assets[0].date &&
+          page.assets[1].kind == MediaAssetKind::Video && !page.assets[1].date &&
+          page.assets[1].duration == std::chrono::milliseconds(1300) && page.next_cursor == "next-page",
+          "Media pages must preserve order, unknown metadata, and the opaque continuation");
+    Invalid([] { DecodePage(PlatformPayload::Object{{"assets", PlatformPayload::List{}}, {"next", "invalid"}}); });
+    Check(LibraryError({"media/stale-cursor", "", {}}).code == MediaLibraryErrorCode::StaleCursor &&
+          LibraryError({"media/not-found", "", {}}).code == MediaLibraryErrorCode::NotFound,
+          "Cursor expiry and a missing asset must remain distinct from I/O failure");
 
     auto state = std::make_shared<MediaLibraryState>();
     LibraryCompletion reply;
@@ -114,6 +147,21 @@ int main() {
     });
     state->Request("pick", {}, [&](LibraryReply) { ++completed; });
     Check(completed == 5 && canceled == 3, "Retirement during startup must cancel the returned platform operation");
+
+    std::vector<std::string> observer_commands;
+    state->Attach([&](std::string method, PlatformPayload, LibraryCompletion callback) -> LibraryCancel {
+      observer_commands.push_back(std::move(method));
+      callback(PlatformPayload{});
+      return {};
+    });
+    auto first = state->ConnectChanged([] {});
+    auto second = state->ConnectChanged([] {});
+    first();
+    first();
+    state->Invalidate();
+    second();
+    Check(observer_commands == std::vector<std::string>{"observe", "invalidate"},
+          "Observers must share platform registration for the session");
     std::cout << "Media library contract checks passed\n";
     return 0;
   } catch (const std::exception& error) {

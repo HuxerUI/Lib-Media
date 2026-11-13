@@ -24,6 +24,10 @@
   <string>LaunchScreen</string>
   <key>NSPhotoLibraryAddUsageDescription</key>
   <string>Save the image or video you choose to your photo library.</string>
+  <key>NSPhotoLibraryUsageDescription</key>
+  <string>Browse the photos and videos you make available to Media Preview.</string>
+  <key>PHPhotoLibraryPreventAutomaticLimitedAccessAlert</key>
+  <true/>
   <key>UISupportedInterfaceOrientations</key>
   <array>
     <string>UIInterfaceOrientationPortrait</string>

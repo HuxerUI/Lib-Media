@@ -28,7 +28,8 @@ Repository: [HuxerUI/Lib-Media](https://github.com/HuxerUI/Lib-Media).
 | Capability | Current status | Public entry points |
 | --- | --- | --- |
 | Audio/video playback | Available on Android, iOS, macOS, Windows, Linux, and Web | `UseMediaPlayer()`, `MediaSource`, `VideoSurface()` in [`media_player.h`](include/huxerui/media_player.h) |
-| Platform image/video selection | Available on Android and iOS | `UseMediaPicker()`, `MediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
+| System image/video selection | Available on Android and iOS | `UseMediaLibrary()`, `MediaLibrary::PickAsync()`, and `SystemMediaPickerOptions` in [`media_library.h`](include/huxerui/media_library.h) |
+| Browse the system photo library | Android and iOS with media read access | `MediaLibraryPicker()`, album and paged asset queries, image textures, and change notifications in [`media_library.h`](include/huxerui/media_library.h) |
 | Save images/videos to the system library | Available on Android and iOS | `UseMediaLibrary()`, `SaveImageAsync()`, `SaveVideoAsync()` in [`media_library.h`](include/huxerui/media_library.h) |
 | Audio and video decoding | AAC-LC, Opus, Vorbis, FLAC, MP3, H.264, HEVC, VP8, VP9 profile 0, and [8- or 10-bit SDR AV1](docs/media-codec.md#av1) where available. macOS and iOS also support [mono/stereo ALAC](docs/media-codec.md#prores-422-and-alac). | `AudioDecoder`, `VideoDecoder`, exact timestamps and decoded frames in [`media_codec.h`](include/huxerui/media_codec.h) / [`media_format.h`](include/huxerui/media_format.h) |
 | HEVC encoding and decoding | Main and Main10 adapters for all six platforms. Linux Main/Main10 CPU round trips and preview export passed under WSL. See the [HEVC matrix](docs/media-codec.md#hevc) for device and runtime coverage. | `CodecId::Hevc`, `VideoEncoder`, `VideoDecoder`, and `VideoPixelFormat::P010` |
@@ -115,7 +116,7 @@ For time-based thumbnail extraction, read frames with `VideoDecoder::TryRead()` 
 
 ### Handles and execution
 
-Obtain `UseMediaPlayer()`, `UseMediaPicker()`, and `UseMediaLibrary()` during composition. Each handle belongs to its
+Obtain handles through `UseMediaPlayer()` or `UseMediaLibrary()` during composition. Each handle belongs to its
 owning composition scope and UI thread; retaining a copy does not keep its session active after unmount. Start commands
 from UI events or committed Lifecycle work. Run asynchronous operations through a `TaskScope` on the owning UI thread.
 
@@ -203,12 +204,13 @@ and [DecodedPlayback](#pcm-playback) to play its PCM frames.
 
 ## Media selection and saving
 
-`MediaPicker` opens platform image/video selection UI. `MediaLibrary` publishes local images and videos to the system
-photo library. They can be used independently of each other and of `MediaPlayer`.
+`MediaLibrary` opens the platform image/video picker, browses the system photo library, and publishes local images
+and videos. Use `UseMediaLibrary()` to obtain the handle for these operations.
 
 ### Selecting media
 
-`PickAsync()` accepts `MediaPickerOptions` with `Images`, `Videos`, or `ImagesAndVideos` and a positive `selection_limit`.
+`PickAsync()` opens the system picker with `SystemMediaPickerOptions`, which accepts `Images`, `Videos`, or
+`ImagesAndVideos` and a positive `selection_limit`.
 Its Task yields `MediaLibraryResult<std::vector<FileReference>>`. User dismissal succeeds with an empty vector; failures
 carry `MediaLibraryError` and are never represented as empty successful selections.
 
@@ -217,16 +219,16 @@ using namespace huxerui;
 using namespace huxerui::media;
 
 [[huxerui::composable]]
-View MediaPickerPane() {
-  auto picker = UseMediaPicker();
+View SystemMediaPickerPane() {
+  auto library = UseMediaLibrary();
   auto tasks = UseTaskScope();
   auto files = UseState(std::make_shared<std::vector<FileReference>>());
   auto notice = UseState(std::string("No media selected."));
 
   return Column {
-    Button("Choose media").OnClick([picker, tasks, files, notice] {
-      tasks.Launch([picker, files, notice]() -> Task<void> {
-        auto result = co_await picker.PickAsync({MediaPickerFilter::ImagesAndVideos, 1});
+    Button("Choose media").OnClick([library, tasks, files, notice] {
+      tasks.Launch([library, files, notice]() -> Task<void> {
+        auto result = co_await library.PickAsync(SystemMediaPickerOptions{});
         if (!result.Succeeded()) {
           notice = result.Error().message;
         } else {
@@ -249,7 +251,7 @@ references do not promise access after process restart. Prefer `OpenReadAsync()`
 
 ### Selection limits and compatibility
 
-Query `CapabilitiesAsync()` on either handle when preparing controls. `MediaLibraryCapabilities::CanPick()` derives
+Query `MediaLibrary::CapabilitiesAsync()` when preparing controls. `MediaLibraryCapabilities::CanPick()` derives
 availability from a positive `max_selection_count`; zero means no platform selection is available. `can_save` is separate
 and can be true even when selection is unavailable. A capability snapshot does not grant permission or reserve UI.
 
@@ -300,6 +302,12 @@ Canceling a save cannot undo committed publication. Android attempts to delete a
 provider cleanup failures. Once an iOS Photos transaction is submitted, it may finish after cancellation; its staged
 source remains retained until completion. Partial selection results are released if materializing any item fails.
 See the [media library guide](docs/media-library.md) and [`media_library.h`](include/huxerui/media_library.h) for details.
+
+`MediaLibraryPicker()` provides an in-app Recents and album grid with ordered selection, video playback,
+and pinch-to-zoom photo preview. Mount it in a bounded view and receive the selected `FileReference` values
+through its callbacks. Apps that provide their own UI can use the same paged queries, texture loading, and
+`MediaLibrary::OnChanged()` invalidation. See the [browsing setup](docs/media-library.md#browsing-the-library)
+for the application permission declarations.
 
 ## Media decoding
 
@@ -453,11 +461,11 @@ The [preview](examples/preview) exercises the library through four tabs.
 | --- | --- |
 | Video | Local/reference/URL sources, playback controls, progress, seeking, volume, looping, and video fitting |
 | Music | Audio playback using the same player API without a video surface |
-| Library | Platform image/video/mixed selection, capability-aware multi-select, retained references, and publication |
+| Library | System selection, an in-app album picker with photo/video preview, retained references, and publication |
 | Frames | Open, preview, and seek decoded video or audio, then copy and save compatible files |
 
-The Library tab disables multi-select when the maximum is below two; otherwise it requests up to three items within
-the platform limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
+The Library tab offers up to three selections. The system path honors its platform limit, and the in-app picker uses
+the configured limit. “Save first selection” imports and publishes a retained reference. “Save image” and “Save video” use
 FilePicker explicitly to obtain a source. Switching tabs unmounts the previous session and cancels its pending work.
 
 The Frames tab uses `MediaDemuxer` and `DecodedPlayback` to preview and seek MP4, MOV, WebM, and MKV files

@@ -1,3 +1,4 @@
 -keep public class org.huxerui.lib.media.MediaPlayerModule$Factory { public *; }
 -keep public class org.huxerui.lib.media.VideoSurfaceView$Factory { public *; }
 -keep public class org.huxerui.lib.media.MediaLibraryModule$Factory { public *; }
+-keepclasseswithmembernames class org.huxerui.lib.media.MediaLibraryBrowser { native <methods>; }

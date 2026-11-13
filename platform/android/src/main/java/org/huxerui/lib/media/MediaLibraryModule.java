@@ -13,6 +13,7 @@ import android.graphics.BitmapFactory;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Build;
+import android.os.CancellationSignal;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
@@ -20,6 +21,7 @@ import android.os.ext.SdkExtensions;
 import android.provider.MediaStore;
 
 import org.huxerui.HuxerUIActivityResultLauncher;
+import org.huxerui.HuxerUIExternalTexture;
 import org.huxerui.HuxerUIFileReference;
 import org.huxerui.HuxerUIPlatformChannel;
 import org.huxerui.HuxerUIPlatformModule;
@@ -43,27 +45,34 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Platform selection and publication; no storage-read permission or document-picker fallback is requested. */
+/** System photo-library operations bound to the original window. */
 public final class MediaLibraryModule implements HuxerUIPlatformModule {
     public static final class Factory implements HuxerUIPlatformModule.WindowFactory {
         @Override public HuxerUIPlatformModule create(HuxerUIView view, PlatformPayload options,
                 HuxerUIPlatformChannel.Events events) {
-            return new MediaLibraryModule(view);
+            return new MediaLibraryModule(view, events);
         }
     }
 
     private static final ThreadPoolExecutor workers = new ThreadPoolExecutor(2, 2, 30, TimeUnit.SECONDS,
             new ArrayBlockingQueue<>(32));
-    static { workers.allowCoreThreadTimeOut(true); }
+    private static final ThreadPoolExecutor images = new ThreadPoolExecutor(4, 4, 30, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(64));
+    static {
+        workers.allowCoreThreadTimeOut(true);
+        images.allowCoreThreadTimeOut(true);
+    }
     private final Context context;
     private final HuxerUIActivityResultLauncher launcher;
+    private final MediaLibraryBrowser browser;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final Set<Request> pending = new HashSet<>();
     private boolean closed;
 
-    private MediaLibraryModule(HuxerUIView view) {
+    private MediaLibraryModule(HuxerUIView view, HuxerUIPlatformChannel.Events events) {
         context = view.getContext().getApplicationContext();
         launcher = view.getActivityResultLauncher();
+        browser = new MediaLibraryBrowser(context, events, main);
     }
 
     private boolean canResolve(Intent intent) {
@@ -97,7 +106,14 @@ public final class MediaLibraryModule implements HuxerUIPlatformModule {
             Map<String, PlatformPayload> fields = new HashMap<>();
             fields.put("maxSelectionCount", PlatformPayload.int64(maxSelectionCount()));
             fields.put("canSave", PlatformPayload.booleanValue(Build.VERSION.SDK_INT >= 29));
+            fields.put("canBrowse", PlatformPayload.booleanValue(true));
             result.complete(PlatformPayload.object(fields));
+            return null;
+        }
+        if (method.equals("observe") || method.equals("invalidate")) {
+            if (method.equals("observe")) browser.observe();
+            if (method.equals("invalidate")) browser.invalidate();
+            result.complete(PlatformPayload.nullValue());
             return null;
         }
         Request request = new Request(result);
@@ -113,7 +129,20 @@ public final class MediaLibraryModule implements HuxerUIPlatformModule {
                 boolean video = arguments.requireField("video").requireBoolean();
                 if (Build.VERSION.SDK_INT < 29) request.fail("media/unsupported", "Saving requires Android 10 or later");
                 else request.work(() -> request.save(new File(path), video));
-            } else request.fail("media/unsupported", "Unknown media library operation");
+            } else {
+                browser.observe();
+                request.work(method.equals("loadImage") ? images : workers, () -> {
+                    if (method.equals("openAsset")) browser.open(arguments, request.signal, request::complete);
+                    else {
+                        PlatformPayload value = browser.invoke(method, arguments, request.signal);
+                        if (method.equals("loadImage") && !value.isNull()) {
+                            try (HuxerUIExternalTexture texture = value.requireExternalTexture()) {
+                                request.complete(value);
+                            }
+                        } else request.complete(value);
+                    }
+                });
+            }
         } catch (RuntimeException error) {
             request.fail("media/unknown", error.toString());
         }
@@ -122,6 +151,7 @@ public final class MediaLibraryModule implements HuxerUIPlatformModule {
 
     @Override public void dispose() {
         closed = true;
+        browser.close();
         for (Request request : new ArrayList<>(pending)) request.cancel();
         pending.clear();
     }
@@ -134,13 +164,19 @@ public final class MediaLibraryModule implements HuxerUIPlatformModule {
         private final AtomicBoolean finished = new AtomicBoolean();
         private HuxerUIPlatformChannel.Cancellation presentation;
         private Future<?> future;
+        private ThreadPoolExecutor executor;
+        private final CancellationSignal signal = new CancellationSignal();
 
         Request(HuxerUIPlatformChannel.Result result) { this.result = result; }
 
         @Override public void cancel() {
             if (finished.get() || !canceled.compareAndSet(false, true)) return;
             if (presentation != null) presentation.cancel();
-            if (future != null) future.cancel(true);
+            signal.cancel();
+            if (future != null) {
+                future.cancel(true);
+                if (future instanceof Runnable) executor.remove((Runnable) future);
+            }
             pending.remove(this);
             result.close();
         }
@@ -160,9 +196,15 @@ public final class MediaLibraryModule implements HuxerUIPlatformModule {
         }
 
         void work(Work work) {
+            work(workers, work);
+        }
+
+        void work(ThreadPoolExecutor executor, Work work) {
+            this.executor = executor;
             try {
-                future = workers.submit(() -> {
+                future = executor.submit(() -> {
                     try { if (!canceled.get()) work.run(); }
+                    catch (MediaLibraryBrowser.Failure error) { fail(error.code, error.getMessage()); }
                     catch (SecurityException error) { fail("media/permission", error.toString()); }
                     catch (Exception error) { fail("media/io", error.toString()); }
                 });

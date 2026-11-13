@@ -300,21 +300,18 @@ View MediaPage(bool music) {
 }
 
 [[huxerui::composable]]
-View LibraryPage() {
-  auto picker = UseMediaPicker();
+View LibraryPage(State<bool> browse, State<bool> multiple, State<std::shared_ptr<std::vector<FileReference>>> selection) {
   auto library = UseMediaLibrary();
   auto documents = UseService<FilePicker>();
   auto tasks = UseTaskScope();
   auto current = UseState(TaskHandle{});
   auto busy = UseState(false);
-  auto multiple = UseState(false);
   auto capabilities = UseState(MediaLibraryCapabilities{});
   auto notice = UseState(std::string("Checking platform media support..."));
-  auto selection = UseState(std::make_shared<std::vector<FileReference>>());
   auto temporary = UseApplication().Directories().temporary_directory;
-  Lifecycle([tasks, picker, capabilities, notice] {
-    auto task = tasks.Launch([picker, capabilities, notice]() -> Task<void> {
-      auto result = co_await picker.CapabilitiesAsync();
+  Lifecycle([tasks, library, capabilities, notice] {
+    auto task = tasks.Launch([library, capabilities, notice]() -> Task<void> {
+      auto result = co_await library.CapabilitiesAsync();
       if (!result.Succeeded()) notice = result.Error().message;
       else {
         capabilities = result.Value();
@@ -328,10 +325,13 @@ View LibraryPage() {
     return [task] { task.Cancel(); };
   });
   const auto multiple_limit = std::min(3u, capabilities->max_selection_count);
-  auto pick = [=](MediaPickerFilter filter) {
+  auto pick = [=](MediaFilter filter) {
     busy = true;
     current = tasks.Launch([=]() -> Task<void> {
-      auto result = co_await picker.PickAsync({filter, multiple ? multiple_limit : 1u});
+      auto result = co_await library.PickAsync(SystemMediaPickerOptions{
+          .filter = filter,
+          .selection_limit = multiple ? multiple_limit : 1u,
+      });
       if (!result.Succeeded()) notice = result.Error().message;
       else {
         auto chosen = std::move(result).Value();
@@ -380,13 +380,16 @@ View LibraryPage() {
   const bool can_save = capabilities->can_save && documents->CanOpenFiles() && !busy;
   return Column {
     Text("Photos & videos", TextRole::Title),
+    Button("Browse media library").OnClick([browse] { browse = true; })
+        .With(Enabled{capabilities->can_browse && !busy}),
     Button(multiple ? "Multiple selection (up to " + std::to_string(multiple_limit) + ")" :
         "Single selection")
-        .OnClick([multiple] { multiple = !multiple; }).With(Enabled{can_pick && multiple_limit > 1}),
+        .OnClick([multiple] { multiple = !multiple; })
+        .With(Enabled{!busy && (capabilities->can_browse || multiple_limit > 1)}),
     Flow {
-      Button("Choose images").OnClick([pick] { pick(MediaPickerFilter::Images); }).With(Enabled{can_pick}),
-      Button("Choose videos").OnClick([pick] { pick(MediaPickerFilter::Videos); }).With(Enabled{can_pick}),
-      Button("Choose both").OnClick([pick] { pick(MediaPickerFilter::ImagesAndVideos); }).With(Enabled{can_pick}),
+      Button("Choose images").OnClick([pick] { pick(MediaFilter::Images); }).With(Enabled{can_pick}),
+      Button("Choose videos").OnClick([pick] { pick(MediaFilter::Videos); }).With(Enabled{can_pick}),
+      Button("Choose both").OnClick([pick] { pick(MediaFilter::ImagesAndVideos); }).With(Enabled{can_pick}),
     }.With(Spacing(12.0F)),
     Text(names.empty() ? "No media selected." : names),
     Button("Save first selection").OnClick([save, selection, notice] {
@@ -418,7 +421,7 @@ View LibraryPage() {
 View FramesPage() {
   auto tasks = UseTaskScope();
   auto picker = UseService<FilePicker>();
-  auto photos = UseMediaPicker();
+  auto library = UseMediaLibrary();
   auto resources = UseService<Resources>();
   const auto temporary = UseApplication().Directories().temporary_directory;
   auto current = UseState(TaskHandle{});
@@ -489,7 +492,8 @@ View FramesPage() {
         const bool from_photos = input == PreviewSource::Photos;
         std::optional<FileReference> chosen;
         if (from_photos) {
-          auto selected = media_preview::Require(co_await photos.PickAsync({.filter = MediaPickerFilter::Videos}));
+          auto selected = media_preview::Require(
+              co_await library.PickAsync(SystemMediaPickerOptions{.filter = MediaFilter::Videos}));
           if (!selected.empty()) chosen = std::move(selected.front());
         } else if (!sample) {
           const auto filter = audio ? FilePickerFilter{.name = "Audio",
@@ -591,20 +595,32 @@ View FramesPage() {
 [[huxerui::composable]]
 View MediaContent() {
   auto selected = UseState(std::size_t{0});
+  auto browse = UseState(false);
+  auto multiple = UseState(false);
+  auto library_selection = UseState(std::make_shared<std::vector<FileReference>>());
   const std::size_t page = selected;
   const bool compact = UseViewportClass() == ViewportClass::Compact;
-  return Column {
+  return browse ? MediaLibraryPicker({
+    .selection_limit = multiple.Get() ? 3u : 1u,
+    .title = "Photos & videos",
+    .style = {.confirm_button = UseEnvironment<ButtonStyle>(), .grid_columns = 3, .grid_spacing = 2.0F},
+    .on_confirm = [browse, library_selection](std::vector<FileReference> files) {
+      library_selection = std::make_shared<std::vector<FileReference>>(std::move(files));
+      browse = false;
+    },
+    .on_cancel = [browse] { browse = false; },
+  }) : View(Column {
     TopAppBar("Media"),
     ScrollView(Column {
       Text("HUXERUI / MEDIA PREVIEW", TextRole::Label).With(Foreground(UseTheme().colors.on_surface_variant)),
       Tabs({"Video", "Music", "Library", "Frames"}, selected).OnChanged([selected](std::size_t index) { selected = index; }),
       (page == 3 ? FramesPage() :
-       page == 2 ? LibraryPage() : MediaPage(page == 1)).Key(page),
+       page == 2 ? LibraryPage(browse, multiple, library_selection) : MediaPage(page == 1)).Key(page),
       Text("Switching pages stops playback and clears the current source.", TextRole::Label)
           .With(Foreground(UseTheme().colors.on_surface_variant)),
     }.With(Frame{.max_width = 1000.0F}, Padding(compact ? 16.0F : 32.0F),
         Spacing(20.0F), CrossAlign(CrossAxisAlignment::Stretch))).With(Grow()),
-  }.With(CrossAlign(CrossAxisAlignment::Stretch), Background(UseTheme().colors.background));
+  }.With(CrossAlign(CrossAxisAlignment::Stretch), Background(UseTheme().colors.background)));
 }
 
 [[huxerui::composable]]
@@ -659,9 +675,15 @@ View PreviewTheme() {
   return Theme(overrides, MediaContent());
 }
 
+[[huxerui::composable]]
+View PreviewAppearance() {
+  return Theme(UseSystemThemeBrightness() == ThemeBrightness::Dark ? FlatDarkThemeDefinition() : FlatThemeDefinition(),
+               PreviewTheme());
+}
+
 } // namespace
 
-View App() { return FlatDarkTheme(PreviewTheme()); }
+View App() { return PreviewAppearance(); }
 
 const Application application{
     App,

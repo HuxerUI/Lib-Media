@@ -12,7 +12,11 @@ MediaLibraryError LibraryError(const PlatformError& error);
 MediaLibraryCapabilities DecodeCapabilities(const PlatformPayload& payload);
 std::vector<FileReference> DecodeSelection(const PlatformPayload& payload, std::uint32_t limit);
 void DecodeSave(const PlatformPayload& payload);
-void ValidatePickerOptions(MediaPickerOptions options);
+void ValidatePickerOptions(MediaFilter filter, std::uint32_t selection_limit);
+void ValidateFilter(MediaFilter filter);
+std::vector<MediaAsset> DecodeAssets(const PlatformPayload& payload);
+std::vector<MediaAlbum> DecodeAlbums(const PlatformPayload& payload);
+MediaAssetPage DecodePage(const PlatformPayload& payload);
 
 template <class T, class Decode>
 MediaLibraryResult<T> DecodeLibraryReply(const LibraryReply& reply, Decode decode) {

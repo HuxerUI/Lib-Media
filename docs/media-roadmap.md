@@ -40,7 +40,8 @@ reordered encoding, GPU crop and scale, encoded MP4 readback, and WAV export.
 - Run the AIFF/CAF LPCM and CAF/M4A ALAC regressions on native Windows and Linux. Verify CAF ALAC preview
   on an iOS device. [Audio container verification](media-container.md#verification)
 - Verify platform players with local files, picker references, and HTTPS. Check selection, retained references,
-  and publication on Android and iOS. [Playback checks](../README.md#automated-and-device-checks) ·
+  and publication on Android and iOS. For the in-app picker, verify limited access changes, cloud-backed files,
+  and first-screen and scrolling performance with large libraries. [Playback checks](../README.md#automated-and-device-checks) ·
   [Media library checks](media-library.md#preview-and-validation)
 
 ## Candidate format work

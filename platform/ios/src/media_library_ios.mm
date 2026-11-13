@@ -3,6 +3,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <huxerui/ios/platform_registry.h>
 #include "library/backend.h"
+#import "media_library_browser.h"
 
 @interface HUXMediaLibraryRequest : NSObject <HUXPlatformCancellation, PHPickerViewControllerDelegate,
     UIAdaptivePresentationControllerDelegate>
@@ -18,6 +19,7 @@
 @property(nonatomic, strong) HUXFileReference* saveReference;
 @property(atomic) BOOL canceled;
 @property(nonatomic) BOOL settled;
+@property(nonatomic) BOOL presenting;
 @property(nonatomic) BOOL dismissing;
 @property(nonatomic) NSUInteger limit;
 - (void)pickWithFilter:(NSInteger)filter limit:(NSUInteger)limit;
@@ -56,17 +58,25 @@
   self.presentationFinished = nil;
   if (finished) finished();
 }
-- (void)dismiss:(void (^)(void))completion {
-  if (self.dismissing) return;
+- (void)finishDismissal {
+  [self releasePresentation];
+  if (self.canceled || self.settled) return;
+  if (self.selections.count == 0) [self complete:[HUXPlatformPayload nullValue]];
+  else if (self.selections.count > self.limit) [self fail:@"media/io" message:@"The picker exceeded the selection limit"];
+  else {
+    self.references = [NSMutableArray array];
+    [self loadNext];
+  }
+}
+- (void)dismiss {
+  if (self.presenting || self.dismissing) return;
   self.dismissing = YES;
-  if (self.picker.presentingViewController == nil) {
-    [self releasePresentation];
-    if (completion) completion();
+  if (self.picker.presentingViewController == nil && self.picker.viewIfLoaded.window == nil) {
+    [self finishDismissal];
     return;
   }
   [self.picker dismissViewControllerAnimated:YES completion:^{
-    [self releasePresentation];
-    if (completion) completion();
+    [self finishDismissal];
   }];
 }
 - (void)cancel {
@@ -77,7 +87,7 @@
   self.presentation = nil;
   // The coordinator may call cancel again while forwarding cancellation to the installed platform UI.
   [presentation cancel];
-  [self dismiss:nil];
+  [self dismiss];
   [self retire];
 }
 - (void)pickWithFilter:(NSInteger)filter limit:(NSUInteger)limit {
@@ -96,34 +106,27 @@
         PHPickerViewController* picker = [[PHPickerViewController alloc] initWithConfiguration:configuration];
         request.picker = picker;
         picker.delegate = request;
-        [presenter presentViewController:picker animated:YES completion:nil];
+        // Keep the presentation slot while UIKit installs the picker. A pending cancel can dismiss it afterward.
+        request.presenting = YES;
+        [presenter presentViewController:picker animated:YES completion:^{
+          request.presenting = NO;
+          if (request.canceled || request.selections != nil) [request dismiss];
+        }];
         picker.presentationController.delegate = request;
-        if (picker.presentingViewController == nil) {
-          [request releasePresentation];
-          [request fail:@"media/unavailable" message:@"The platform media picker could not be presented"];
-          return nil;
-        }
         return request;
       } failure:^(NSError* error) {
         [weak fail:@"media/unavailable" message:error.localizedDescription];
       }];
 }
 - (void)presentationControllerDidDismiss:(UIPresentationController*)controller {
-  [self releasePresentation];
-  [self complete:[HUXPlatformPayload nullValue]];
+  if (controller.presentedViewController != self.picker || self.dismissing) return;
+  self.dismissing = YES;
+  [self finishDismissal];
 }
 - (void)picker:(PHPickerViewController*)picker didFinishPicking:(NSArray<PHPickerResult*>*)results {
-  if (self.canceled || self.settled || self.dismissing) return;
+  if (picker != self.picker || self.canceled || self.settled || self.dismissing || self.selections != nil) return;
   self.selections = results;
-  [self dismiss:^{
-    if (self.canceled || self.settled) return;
-    if (results.count == 0) [self complete:[HUXPlatformPayload nullValue]];
-    else if (results.count > self.limit) [self fail:@"media/io" message:@"The picker exceeded the selection limit"];
-    else {
-      self.references = [NSMutableArray array];
-      [self loadNext];
-    }
-  }];
+  [self dismiss];
 }
 - (void)loadNext {
   if (self.canceled || self.settled) return;
@@ -210,6 +213,7 @@
 
 @interface HUXMediaLibraryModule : NSObject <HUXPlatformModule>
 @property(nonatomic, strong) HUXPresentationCoordinator* coordinator;
+@property(nonatomic, strong) HUXMediaLibraryBrowser* browser;
 @property(nonatomic, strong) NSMutableSet<HUXMediaLibraryRequest*>* requests;
 @property(nonatomic) BOOL closed;
 @end
@@ -225,9 +229,12 @@
     [result complete:[HUXPlatformPayload objectValue:@{
       @"maxSelectionCount": [HUXPlatformPayload integerValue:INT32_MAX],
       @"canSave": [HUXPlatformPayload booleanValue:YES],
+      @"canBrowse": [HUXPlatformPayload booleanValue:YES],
     }]];
     return nil;
   }
+  if (![method isEqualToString:@"pick"] && ![method isEqualToString:@"save"])
+    return [self.browser invoke:method arguments:arguments result:result];
   HUXMediaLibraryRequest* request = [[HUXMediaLibraryRequest alloc] init];
   request.result = result;
   request.coordinator = self.coordinator;
@@ -245,6 +252,7 @@
 }
 - (void)dispose {
   self.closed = YES;
+  [self.browser dispose];
   for (HUXMediaLibraryRequest* request in self.requests.allObjects) [request cancel];
   [self.requests removeAllObjects];
 }
@@ -257,6 +265,7 @@
                                          events:(id<HUXPlatformEventEmitter>)events {
   HUXMediaLibraryModule* module = [[HUXMediaLibraryModule alloc] init];
   module.coordinator = HUXGetPresentationCoordinator(owner);
+  module.browser = [[HUXMediaLibraryBrowser alloc] initWithCoordinator:module.coordinator events:events];
   module.requests = [NSMutableSet set];
   return module;
 }
