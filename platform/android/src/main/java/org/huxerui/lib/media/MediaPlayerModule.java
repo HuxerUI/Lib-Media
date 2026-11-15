@@ -11,7 +11,10 @@ import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.common.VideoSize;
+import androidx.media3.datasource.DefaultDataSource;
+import androidx.media3.datasource.DefaultHttpDataSource;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
 
 import org.huxerui.HuxerUIFileReference;
 import org.huxerui.HuxerUIPlatformChannel;
@@ -27,6 +30,8 @@ import java.util.Map;
 
 public final class MediaPlayerModule implements HuxerUIPlatformModule {
     private static final Map<Long, WeakReference<MediaPlayerModule>> sessions = new HashMap<>();
+    private static final int HTTP_CONNECT_TIMEOUT_MS = 15_000;
+    private static final int HTTP_READ_TIMEOUT_MS = 20_000;
     private final Context context;
     private final HuxerUIPlatformChannel.Events events;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -150,7 +155,15 @@ public final class MediaPlayerModule implements HuxerUIPlatformModule {
         } else {
             uri = Uri.parse(args.requireField("value").requireString());
         }
-        final ExoPlayer current = new ExoPlayer.Builder(context).build();
+        // ExoPlayer's bare HTTP factory disables cross-protocol redirects and times out at eight
+        // seconds, which breaks common CDN redirects and slow mobile networks. Keep file, content,
+        // and asset playback by wrapping the HTTP factory in the default data source.
+        final DefaultHttpDataSource.Factory http = new DefaultHttpDataSource.Factory()
+                .setAllowCrossProtocolRedirects(true)
+                .setConnectTimeoutMs(HTTP_CONNECT_TIMEOUT_MS)
+                .setReadTimeoutMs(HTTP_READ_TIMEOUT_MS);
+        final ExoPlayer current = new ExoPlayer.Builder(context,
+                new DefaultMediaSourceFactory(new DefaultDataSource.Factory(context, http))).build();
         player = current;
         current.setAudioAttributes(new AudioAttributes.Builder()
                                            .setUsage(C.USAGE_MEDIA)
