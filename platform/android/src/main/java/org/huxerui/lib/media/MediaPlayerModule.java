@@ -132,6 +132,12 @@ public final class MediaPlayerModule implements HuxerUIPlatformModule {
         } catch (RuntimeException exception) {
             error("output", "The platform media command failed", exception.getClass().getSimpleName(), true);
             result.complete(PlatformPayload.nullValue());
+        } catch (Throwable failure) {
+            // Media engine Errors such as NoClassDefFoundError or LinkageError must not escape
+            // into JNI and terminate the process.
+            error("engine", "The media engine failed: " + failure,
+                    failure.getClass().getName(), true);
+            result.complete(PlatformPayload.nullValue());
         }
         return null;
     }
