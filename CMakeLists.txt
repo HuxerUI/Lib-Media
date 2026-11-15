@@ -10,6 +10,12 @@ endif ()
 
 project(huxerui_media VERSION 0.1.0 LANGUAGES NONE)
 
+# Lib-Media requires C++20. Keep the compiler in ISO mode: GCC's GNU dialects define
+# `linux` as a macro, which collides with the SDK's huxerui::linux namespace.
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/HuxerUIProject.cmake")
 if (HUXERUI_PROJECT_PLAN_ONLY)
     return()
