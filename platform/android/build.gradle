@@ -9,6 +9,7 @@ dependencies {
         compileOnly files(rootProject.gradle.ext.huxeruiAndroidArchive)
     }
     implementation "androidx.media3:media3-exoplayer:1.9.3"
+    implementation "androidx.media3:media3-datasource:1.9.3"
 }
 
 android {
