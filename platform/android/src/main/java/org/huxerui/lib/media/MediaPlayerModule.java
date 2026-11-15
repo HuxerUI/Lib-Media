@@ -200,6 +200,11 @@ public final class MediaPlayerModule implements HuxerUIPlatformModule {
                     send("interrupted");
             }
             @Override
+            public void onRenderedFirstFrame() {
+                if (valid() && surface != null)
+                    surface.firstFrameRendered(current);
+            }
+            @Override
             public void onVideoSizeChanged(VideoSize size) {
                 if (!valid())
                     return;
