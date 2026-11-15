@@ -16,8 +16,10 @@ import org.huxerui.PlatformPayload;
 public final class VideoSurfaceView implements HuxerUIPlatformView {
     MediaPlayerModule session;
     private final TextureView texture;
+    private final View shutter;
     private final FrameLayout host;
     private ExoPlayer attached;
+    private boolean hasFirstFrame;
     private String fit = "contain", horizontal = "center", vertical = "center";
 
     public static final class Factory implements HuxerUIPlatformView.Factory {
@@ -31,15 +33,22 @@ public final class VideoSurfaceView implements HuxerUIPlatformView {
 
     private VideoSurfaceView(Context context, PlatformPayload properties) {
         texture = new TextureView(context);
+        shutter = new View(context);
+        shutter.setBackgroundColor(Color.BLACK);
         host = new FrameLayout(context) {
             @Override
             protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
                 layoutVideo();
+                shutter.layout(0, 0, host.getWidth(), host.getHeight());
             }
         };
         host.setBackgroundColor(Color.BLACK);
         host.setClipChildren(true);
         host.addView(texture, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        // The texture must stay attached to create a SurfaceTexture. Hide it with a shutter
+        // instead of making it invisible while waiting for the first frame and video size.
+        host.addView(shutter, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         texture.setVisibility(View.INVISIBLE);
         update(properties);
@@ -54,9 +63,15 @@ public final class VideoSurfaceView implements HuxerUIPlatformView {
         fit = properties.requireField("fit").requireString();
         horizontal = properties.requireField("horizontal").requireString();
         vertical = properties.requireField("vertical").requireString();
-        host.requestLayout();
+        refresh();
     }
     void attachPlayer(ExoPlayer player) {
+        if (attached == player) {
+            refresh();
+            return;
+        }
+        hasFirstFrame = false;
+        shutter.setVisibility(View.VISIBLE);
         if (attached != null)
             attached.clearVideoTextureView(texture);
         attached = player;
@@ -65,13 +80,23 @@ public final class VideoSurfaceView implements HuxerUIPlatformView {
         refresh();
     }
     void refresh() {
-        // Video size may arrive only after rendering, so surface creation must not wait for it.
+        // Apply the current video size synchronously before the next layout pass; otherwise a
+        // cached first frame can be shown at the full host size for one frame.
         texture.setVisibility(attached != null ? View.VISIBLE : View.INVISIBLE);
+        layoutVideo();
         host.requestLayout();
+    }
+    void firstFrameRendered(ExoPlayer player) {
+        if (attached != player)
+            return;
+        hasFirstFrame = true;
+        refresh();
     }
     private void layoutVideo() {
         VideoSize size = attached == null ? VideoSize.UNKNOWN : attached.getVideoSize();
-        if (size.width <= 0 || size.height <= 0) {
+        if (size.width <= 0 || size.height <= 0
+                || host.getWidth() <= 0 || host.getHeight() <= 0) {
+            shutter.setVisibility(View.VISIBLE);
             texture.layout(0, 0, host.getWidth(), host.getHeight());
             return;
         }
@@ -96,13 +121,21 @@ public final class VideoSurfaceView implements HuxerUIPlatformView {
                                 : vertical.equals("end") ? 1
                                                          : 0.5f));
         texture.layout(x, y, x + Math.round(width), y + Math.round(height));
+        // Reveal the picture only after the first frame, the real video size, and the host
+        // dimensions are known, so no black, stale, or unscaled frame is shown.
+        shutter.setVisibility(hasFirstFrame ? View.INVISIBLE : View.VISIBLE);
     }
     @Override
     public HuxerUIPlatformChannel.Cancellation invoke(
             String method, PlatformPayload args, HuxerUIPlatformChannel.Result result) {
         if (method.equals("bind")) {
-            unbind();
-            session = MediaPlayerModule.find(args.requireInt64());
+            final MediaPlayerModule wanted = MediaPlayerModule.find(args.requireInt64());
+            // Re-binding the session that already owns this surface must not detach the texture
+            // or reset the presented frame.
+            if (session != wanted || session == null || session.surface != this) {
+                unbind();
+                session = wanted;
+            }
             if (session == null) {
                 result.fail("media/disconnected", "Media session is disconnected", PlatformPayload.nullValue());
                 return null;
