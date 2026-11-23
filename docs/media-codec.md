@@ -474,13 +474,17 @@ fails with `ResourceExhausted`. Platform codec allocations and bounded conversio
 | --- | --- | --- |
 | Windows | System synchronous H.264 MFT; Baseline/Main/High, numeric B bounds 0..2 and Auto | Native round trips, real B reordering, requested IDR, variable PTS, crop, padded input and cleanup on Windows 11 |
 | Linux | GStreamer `x264enc` + `h264parse`; Baseline/Main/High, numeric B bounds 0..16 and Auto | Headless native round trips and shared contracts on Ubuntu 24.04/WSL; no GTK initialization |
-| Android | NDK MediaCodec API 28+; Main/High numeric B bounds require API 29+, with codec confirmation for positive bounds; interpretable packed I420/NV12 CPU input or Surface input | Baseline software fallback, Surface recording with 4 Mbps negotiated to 4.8 Mbps, and MP4 readback on Android 12 (TAS-AN00) |
+| Android | NDK MediaCodec API 28+; Main/High numeric B bounds require API 29+, with codec confirmation for positive bounds; interpretable packed I420/NV12 CPU input or Surface input | Baseline, Main, and High MP4 readback from CPU and Surface input on Android 12 (TAS-AN00), including Surface recording with 4 Mbps negotiated to 4.8 Mbps |
 | iOS | Independent VideoToolbox implementation; zero or Auto B pictures; positive numeric bounds return `Unsupported` | Simulator Baseline/Main/High round trips and High profile automatic B pictures with variable-frame-rate MP4 readback |
 | macOS | Independent VideoToolbox implementation with the same B-policy limitation | Native H.264 round trips and two-slot output regression on Apple Silicon |
 | Web | WebCodecs quality mode; Baseline with zero/Auto, Main/High with Auto only | Chrome C++/WASM Baseline/Main/High round trips and Node bridge contracts |
 
 The library minimum on Android remains API 23; video encoding resolves newer NDK entry points at runtime and
-returns `Unsupported` below API 28. Linux requires installed x264/parser plugins and does not install them for the
+returns `Unsupported` below API 28. Android pairs the requested AVC profile with a level that fits the coded
+dimensions, frame rate, and target bitrate. It starts at the lowest eligible level and uses MediaCodec format
+support when available, then confirms the configuration on the encoder. MediaCodec receives the B-picture bound
+separately and may use fewer B pictures. The output configuration carries the level emitted by MediaCodec.
+Linux requires installed x264/parser plugins and does not install them for the
 application. Apple `MaxFrameDelayCount` bounds retained work; it is not treated as a numeric B-picture bound.
 WebCodecs has no portable exact B control, so Main/High with the default zero policy returns `Unsupported`.
 Web uses quality mode because realtime mode permits dropped pictures. A nonterminal flush makes progress within
@@ -646,7 +650,18 @@ ctest --test-dir build/tests -R media_video_encoder --output-on-failure
 For Web, build `media_video_encoder_web_native` and serve its generated `tests/video_encoder_wasm.html` beside
 the JS/WASM files over localhost. The C++ test exercises all available requested profiles and decoder round trips.
 Node tests separately cover bounded progress flushes, late callbacks/promises, unsupported controls and malformed
-output. Android compilation and static Apple review do not replace device runs; those encoder validations remain pending.
+output. On Android, run the AVC profile regression with `media_video_gpu_tests` and the H.264 preview fixture on the
+device. Each run checks the output profile, picture count, and timing by reopening the MP4.
+
+```sh
+for input in cpu gpu; do
+  for profile in baseline main high; do
+    ./media_video_gpu_tests preview-avc-aac.mp4 - "$input" 1280 720 4000000 "$profile" || exit 1
+  done
+done
+```
+
+The TAS-AN00 run produced Level 3.1 for all six 720p configurations and Level 4 for a 1080p High Surface run.
 
 Capability discovery adds `media_codec_capabilities`, `media_codec_capabilities_contract` on native targets, and
 `media_codec_capabilities_web_contract` when Node is available. The public API test queries all four codecs without

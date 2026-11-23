@@ -347,7 +347,8 @@ if (NOT EMSCRIPTEN)
     add_executable(media_video_encoder_contract_tests video_encoder_contract.cpp)
     target_link_libraries(media_video_encoder_contract_tests PRIVATE huxerui_media ${MEDIA_TEST_FRAMEWORK})
     target_compile_features(media_video_encoder_contract_tests PRIVATE cxx_std_20)
-    target_include_directories(media_video_encoder_contract_tests PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_include_directories(media_video_encoder_contract_tests PRIVATE "${PROJECT_SOURCE_DIR}/src"
+            "${PROJECT_SOURCE_DIR}/platform/android/src/main/cpp")
     add_test(NAME media_video_encoder_contract COMMAND media_video_encoder_contract_tests)
     set_tests_properties(media_video_encoder_contract PROPERTIES TIMEOUT 40)
 

@@ -536,7 +536,7 @@ void CheckWatermark(const Clip& clip) {
 }
 
 void Transcode(const Clip& clip, const File& file, unsigned width, unsigned height, bool gpu, bool regression,
-    std::uint32_t bitrate, bool texture_input) {
+    std::uint32_t bitrate, bool texture_input, H264Profile profile) {
 #ifdef _WIN32
   constexpr bool allow_pts_as_dts = true;
 #else
@@ -557,7 +557,7 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
   if (gpu) {
     if (!texture_input && !CodecAvailable<VideoDecoder>(decoder_config)) throw MissingHardware{};
     VideoEncoderConfig config{.input = watermark_format, .bitrate = bitrate,
-        .profile = H264Profile::Baseline, .codec = clip.track.descriptions.front().codec, .input_storage = VideoStorage::Platform};
+        .profile = profile, .codec = clip.track.descriptions.front().codec, .input_storage = VideoStorage::Platform};
     if (reorder) config.max_b_frames = std::nullopt;
     if (!CodecAvailable<VideoEncoder>(config)) throw MissingHardware{};
   }
@@ -662,7 +662,7 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
         Check(pending->Validate() && pending->Storage() == decoder_config.output_storage &&
               (gpu ? pending->planes.empty() : !pending->planes.empty()), "Unexpected encoder input frame storage");
         if (!encoder) {
-          VideoEncoderConfig config{.input = pending->format, .bitrate = bitrate, .profile = H264Profile::Baseline,
+          VideoEncoderConfig config{.input = pending->format, .bitrate = bitrate, .profile = profile,
               .codec = clip.track.descriptions.front().codec, .input_storage = decoder_config.output_storage};
 #ifdef __APPLE__
           if (gpu && regression && clip.track.descriptions.front().codec == CodecId::H264) config.limits.input_items = 1;
@@ -731,6 +731,13 @@ void Transcode(const Clip& clip, const File& file, unsigned width, unsigned heig
   Check(description.codec == clip.track.descriptions.front().codec &&
         description.visible.value_or(VideoRectangle{0, 0, *description.coded_width, *description.coded_height}) ==
             VideoRectangle{0, 0, width, height}, "MP4 readback changed codec, visible geometry, or PTS");
+  if (description.codec == CodecId::H264) {
+    const auto profile_idc = profile == H264Profile::Baseline ? 66 : profile == H264Profile::Main ? 77 : 100;
+    Check(description.initialization_data.size() >= 4 && description.initialization_data[1] == std::byte(profile_idc),
+          "MP4 readback changed the requested AVC profile");
+    std::cout << "AVC profile_idc=" << profile_idc
+              << " level_idc=" << std::to_integer<unsigned>(description.initialization_data[3]) << '\n';
+  }
   std::optional<MediaTimestamp> previous_dts;
   for (const auto& packet : readback.packets) {
     Check(packet.dts && (!previous_dts || packet.dts->Compare(*previous_dts) > 0) &&
@@ -783,8 +790,8 @@ extern "C" void __wrap_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei hei
 #endif
 
 int main(int argc, char** argv) {
-  if (argc != 4 && argc != 6 && argc != 7) {
-    std::cerr << "usage: media_video_gpu_tests INPUT OUTPUT|- gpu|cpu|texture [WIDTH HEIGHT [BITRATE]]\n";
+  if (argc != 4 && (argc < 6 || argc > 8)) {
+    std::cerr << "usage: media_video_gpu_tests INPUT OUTPUT|- gpu|cpu|texture [WIDTH HEIGHT [BITRATE [baseline|main|high]]]\n";
     return 2;
   }
   try {
@@ -807,8 +814,16 @@ int main(int argc, char** argv) {
     } cleanup{path, temporary};
     const auto width = argc >= 6 ? unsigned(std::stoul(argv[4])) : 112u;
     const auto height = argc >= 6 ? unsigned(std::stoul(argv[5])) : 144u;
-    const auto bitrate = argc == 7 ? unsigned(std::stoul(argv[6])) : 4'000'000u;
-    Transcode(clip, File(path.u8string()), width, height, gpu, argc == 4 && !texture_input, bitrate, texture_input);
+    const auto bitrate = argc >= 7 ? unsigned(std::stoul(argv[6])) : 4'000'000u;
+    H264Profile profile = H264Profile::Baseline;
+    if (argc == 8) {
+      Check(clip.track.descriptions.front().codec == CodecId::H264, "An AVC profile requires an H.264 fixture");
+      const std::string_view name(argv[7]);
+      if (name == "main") profile = H264Profile::Main;
+      else if (name == "high") profile = H264Profile::High;
+      else Check(name == "baseline", "Unknown AVC profile");
+    }
+    Transcode(clip, File(path.u8string()), width, height, gpu, argc == 4 && !texture_input, bitrate, texture_input, profile);
     return 0;
 #ifdef _WIN32
   } catch (const MissingHardware&) {

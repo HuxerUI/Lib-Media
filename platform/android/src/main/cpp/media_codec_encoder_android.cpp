@@ -1,4 +1,5 @@
 #include "codec/encoder/backend.h"
+#include "media_codec_android.h"
 #include "media_video_android.h"
 
 #include <cstring>
@@ -184,6 +185,12 @@ public:
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "P010 encoding requires Android API 33 or later"));
     if (api < 29 && !baseline && config.max_b_frames)
       return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "A numeric B-picture bound requires Android API 29 or later"));
+    std::span<const AndroidAvcLevel> avc_levels;
+    if (!hevc) {
+      avc_levels = AndroidAvcLevelCandidates(config);
+      if (avc_levels.empty())
+        return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Video configuration exceeds AVC level limits"));
+    }
     codec_ = AMediaCodec_createEncoderByType(mime);
     if (!codec_) return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "No Android video encoder"));
     auto* format = AMediaFormat_new();
@@ -222,8 +229,8 @@ public:
         return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Android video cannot request exact sRGB transfer signaling"));
       AMediaFormat_setInt32(format, "color-transfer", config.input.transfer == ColorTransfer::Linear ? 1 : 3);
     }
-    auto status = AMediaCodec_configure(codec_, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
-    if (status != AMEDIA_OK && (baseline || hevc)) {
+    auto configured = Configure(format, avc_levels);
+    if (!configured.Succeeded() && configured.Error().code == CodecErrorCode::Unsupported && (baseline || hevc)) {
       // A vendor encoder can advertise byte-buffer input and still reject the configuration.
       const char* candidates[]{hevc ? "c2.android.hevc.encoder" : "c2.android.avc.encoder",
           hevc ? nullptr : "OMX.google.h264.encoder"};
@@ -236,12 +243,11 @@ public:
         }
         codec_ = AMediaCodec_createCodecByName(name);
         if (!codec_) continue;
-        status = AMediaCodec_configure(codec_, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
-        if (status == AMEDIA_OK) break;
+        configured = Configure(format, avc_levels, name);
+        if (configured.Succeeded() || configured.Error().code != CodecErrorCode::Unsupported) break;
       }
     }
-    if (status != AMEDIA_OK)
-      return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "Android rejected video configuration", std::to_string(status)));
+    if (!configured.Succeeded()) return configured;
     auto* actual = input_format_(codec_);
     if (!actual) return CodecResult<void>::Failure(Error(CodecErrorCode::InvalidData, "Android video input format is missing"));
     std::unique_ptr<AMediaFormat, decltype(&AMediaFormat_delete)> actual_owner(actual, AMediaFormat_delete);
@@ -265,13 +271,13 @@ public:
       if (!create_surface || !surface_eos_)
         return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "MediaCodec encoder surfaces are unavailable"));
       ANativeWindow* window = nullptr;
-      status = create_surface(codec_, &window);
+      const auto status = create_surface(codec_, &window);
       if (status != AMEDIA_OK || !window)
         return CodecResult<void>::Failure(Error(CodecErrorCode::Unsupported, "MediaCodec rejected its encoder input surface", std::to_string(status)));
       surface_.reset(window);
       renderer_ = std::make_unique<AndroidVideoRenderer>(surface_.get());
     }
-    status = AMediaCodec_start(codec_);
+    const auto status = AMediaCodec_start(codec_);
     if (status != AMEDIA_OK) return CodecResult<void>::Failure(MediaCodecError(status, "Cannot start video encoder"));
     started_ = true;
     return CodecResult<void>::Success();
@@ -396,6 +402,39 @@ public:
     return failure ? CodecResult<void>::Failure(*failure) : CodecResult<void>::Success();
   }
 private:
+  CodecResult<void> Configure(AMediaFormat* format, std::span<const AndroidAvcLevel> avc_levels,
+                              const char* codec_name = nullptr) {
+    using R = CodecResult<void>;
+    if (avc_levels.empty()) {
+      const auto status = AMediaCodec_configure(codec_, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
+      if (status == AMEDIA_OK) return R::Success();
+      return R::Failure(Error(CodecErrorCode::Unsupported, "Android rejected video configuration", std::to_string(status)));
+    }
+
+    static const auto supported = reinterpret_cast<std::int32_t (*)(const AMediaCodecInfo*, const AMediaFormat*)>(
+        dlsym(RTLD_DEFAULT, "AMediaCodecInfo_isFormatSupported"));
+    const auto* info = supported ? AndroidCodecInfo(codec_) : nullptr;
+    media_status_t status = AMEDIA_ERROR_UNSUPPORTED;
+    bool attempted = false;
+    for (const auto& level : avc_levels) {
+      AMediaFormat_setInt32(format, "level", level.value);
+      if (info && supported(info, format) == 0) continue;
+      if (attempted) {
+        // A failed configure can leave vendor component state unsuitable for retry.
+        const auto retired = AMediaCodec_delete(std::exchange(codec_, nullptr));
+        if (retired != AMEDIA_OK) return R::Failure(MediaCodecError(retired, "Cannot retire rejected AVC encoder"));
+        codec_ = codec_name ? AMediaCodec_createCodecByName(codec_name) : AMediaCodec_createEncoderByType("video/avc");
+        if (!codec_) return R::Failure(Error(CodecErrorCode::PlatformFailure, "Cannot reopen the Android AVC encoder"));
+      }
+      attempted = true;
+      status = AMediaCodec_configure(codec_, format, nullptr, nullptr, AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
+      if (status == AMEDIA_OK) return R::Success();
+      if (status == AMEDIACODEC_ERROR_INSUFFICIENT_RESOURCE || status == AMEDIACODEC_ERROR_RECLAIMED)
+        return R::Failure(MediaCodecError(status, "Android AVC encoder resources are unavailable"));
+    }
+    return R::Failure(Error(CodecErrorCode::Unsupported, "Android rejected video configuration", std::to_string(status)));
+  }
+
   CodecResult<VideoEncodeFormat> ReadFormat() {
     using R = CodecResult<VideoEncodeFormat>;
     auto* format = AMediaCodec_getOutputFormat(codec_);

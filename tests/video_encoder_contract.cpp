@@ -1,5 +1,6 @@
 #include "codec/encoder/session.h"
 #include "codec/decoder/format.h"
+#include "media_codec_android.h"
 
 #include <algorithm>
 #include <atomic>
@@ -290,10 +291,38 @@ void Validation() {
     Check(ValidateConfig(decoder).Succeeded(), "A gaps-allowed declaration rejected a continuous stream");
   }
 }
+
+void AvcLevels() {
+  const auto level = [](std::uint32_t width, std::uint32_t height, std::uint32_t rate, std::uint32_t bitrate,
+                        H264Profile profile = H264Profile::Main, std::optional<std::uint32_t> b_frames = 0,
+                        std::uint32_t denominator = 1) {
+    const VideoEncoderConfig config{.input = {.width = width, .height = height},
+        .frame_rate_numerator = rate, .frame_rate_denominator = denominator, .bitrate = bitrate,
+        .profile = profile, .max_b_frames = b_frames};
+    const auto candidates = AndroidAvcLevelCandidates(config);
+    return candidates.empty() ? 0 : candidates.front().value;
+  };
+  Check(level(640, 360, 24, 4'000'000) == 256, "AVC level selection did not round coded height to macroblocks");
+  Check(level(1280, 720, 30, 4'000'000) == 512, "720p30 did not fit AVC Level 3.1");
+  Check(level(1280, 720, 30000, 4'000'000, H264Profile::Main, 0, 1001) == 512,
+        "AVC level selection lost the rational frame rate");
+  Check(level(1280, 720, 31, 4'000'000) == 1024, "AVC level selection ignored the macroblock rate");
+  Check(level(1920, 1080, 30, 4'000'000) == 2048, "1080p30 did not select AVC Level 4");
+  Check(level(1280, 720, 30, 16'000'000) == 1024 &&
+        level(1280, 720, 30, 16'000'000, H264Profile::High) == 512,
+        "AVC level selection ignored the profile-specific bitrate");
+  Check(level(1920, 1080, 30, 4'000'000, H264Profile::High, 4) == 2048 &&
+        level(1920, 1080, 30, 4'000'000, H264Profile::High, std::nullopt) == 2048,
+        "An AVC B-picture bound removed levels that can encode with fewer B pictures");
+  Check(level(1920, 16, 24, 64'000) == 512, "AVC level selection ignored the maximum macroblock dimension");
+  Check(level(8192, 8192, 240, 4'000'000) == 0 &&
+        level(640, 360, 24, 1'001'000'000, H264Profile::High) == 0,
+        "Configuration above all AVC levels was accepted");
+}
 }
 int main() {
   try {
-    Validation(); ReorderingAndTiming(); RetentionAndReset(); StartupAndFailure(); WakeupClose();
+    Validation(); AvcLevels(); ReorderingAndTiming(); RetentionAndReset(); StartupAndFailure(); WakeupClose();
     std::cout << "H.264 queue, reorder identity, DTS, retained storage, reset, isolation, and cleanup contracts passed\n";
     return 0;
   } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

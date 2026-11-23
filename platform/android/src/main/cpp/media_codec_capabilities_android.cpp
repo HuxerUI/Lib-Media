@@ -1,4 +1,5 @@
 #include "codec/capabilities.h"
+#include "media_codec_android.h"
 
 #include <cstdlib>
 #include <dlfcn.h>
@@ -78,6 +79,19 @@ bool Profile(const AMediaCodecInfo* info, H264Profile profile) {
   return supported(info, format.get()) == 1;
 }
 }
+const AMediaCodecInfo* AndroidCodecInfo(AMediaCodec* codec) {
+  static const auto get_name = Api<media_status_t (*)(AMediaCodec*, char**)>("AMediaCodec_getName");
+  static const auto release_name = Api<void (*)(AMediaCodec*, char*)>("AMediaCodec_releaseName");
+  static const auto get_info =
+      Api<media_status_t (*)(const char*, const AMediaCodecInfo**)>("AMediaCodecStore_getCodecInfo");
+  if (!get_name || !release_name || !get_info) return nullptr;
+  const AMediaCodecInfo* info = nullptr;
+  char* name = nullptr;
+  if (get_name(codec, &name) == AMEDIA_OK && name && get_info(name, &info) != AMEDIA_OK) info = nullptr;
+  if (name) release_name(codec, name);
+  return info;
+}
+
 CapabilityResult QueryPlatformCapabilities(CapabilityKind kind) {
   auto snapshot = DefaultCapabilities(kind);
   char version[PROP_VALUE_MAX]{};
@@ -101,16 +115,7 @@ CapabilityResult QueryPlatformCapabilities(CapabilityKind kind) {
     return CapabilityResult::Success(std::move(snapshot));
   }
   std::visit([](auto& value) { value.availability = CodecSupport::Supported; }, snapshot);
-  const AMediaCodecInfo* info = nullptr;
-  auto get_name = Api<media_status_t (*)(AMediaCodec*, char**)>("AMediaCodec_getName");
-  auto release_name = Api<void (*)(AMediaCodec*, char*)>("AMediaCodec_releaseName");
-  auto get_info = Api<media_status_t (*)(const char*, const AMediaCodecInfo**)>("AMediaCodecStore_getCodecInfo");
-  if (api >= 36 && get_name && release_name && get_info) {
-    char* name = nullptr;
-    const auto status = get_name(codec.get(), &name);
-    if (status == AMEDIA_OK && name && get_info(name, &info) != AMEDIA_OK) info = nullptr;
-    if (name) release_name(codec.get(), name);
-  }
+  const auto* info = AndroidCodecInfo(codec.get());
   if (!info) std::visit([](auto& value) { value.diagnostic = "Detailed NDK metadata is unavailable; unreported platform limits remain unknown"; }, snapshot);
   if (info) {
     auto type = Api<AMediaCodecType (*)(const AMediaCodecInfo*)>("AMediaCodecInfo_getMediaCodecInfoType");
